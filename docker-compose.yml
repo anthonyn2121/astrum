@@ -1,0 +1,156 @@
+name: forge
+
+# FORGE runtime topology: an authoritative `sim` service (Bevy ECS state server)
+# and one or more `controller` services (flight controllers), talking over ZMQ on
+# a shared network. Both share one dev image built from docker/Dockerfile.
+#
+#   sim        -> M4  (runs forge-sim: PUB telemetry, PULL commands)
+#   recorder   -> M4  (forge-bag-record; `--profile record up recorder`)
+#   controller -> M5  (builds & runs controllers/cpp/forge-controller)
+
+services:
+  sim:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: forge-dev:latest
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    environment:
+      # The sim BINDS these; controllers connect to tcp://sim:5555 / :5556.
+      FORGE_TELEMETRY_BIND: tcp://0.0.0.0:5555
+      FORGE_COMMAND_BIND: tcp://0.0.0.0:5556
+      # Overridable from the host env (e.g. `make demo` injects the bounded
+      # single-ship scenario); defaults to the multi-aircraft fleet.
+      FORGE_SCENARIO: ${FORGE_SCENARIO:-config/scenario.example.toml}
+    ports:
+      - "5555:5555"   # telemetry PUB
+      - "5556:5556"   # command PULL
+    networks:
+      - forge
+    command:
+      - bash
+      - -lc
+      - "cargo run --release -p forge-sim"
+
+  recorder:
+    # Records the live telemetry stream to a bag file for later replay
+    # (`forge-bag-play`). Opt-in: `docker compose --profile record up recorder`.
+    image: forge-dev:latest
+    working_dir: /workspace
+    profiles: ["record"]
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    environment:
+      FORGE_TELEMETRY_CONNECT: tcp://sim:5555
+      FORGE_BAG: /workspace/recordings/session.bag
+      FORGE_BAG_SECONDS: "0" # record until stopped
+    depends_on:
+      - sim
+    networks:
+      - forge
+    command:
+      - bash
+      - -lc
+      - "mkdir -p recordings && cargo run --release -p forge-bag --bin forge-bag-record"
+
+  controller:
+    # Reuses the image built by the `sim` service (no second build).
+    image: forge-dev:latest
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    environment:
+      # The controller CONNECTS to the sim service by name.
+      FORGE_TELEMETRY_CONNECT: tcp://sim:5555
+      FORGE_COMMAND_CONNECT: tcp://sim:5556
+      # Command aircraft 1 to fly north at 1500 m / 50 m/s, closing the loop in
+      # the controller (raw actuators). Set FORGE_CONTROL_MODE=autopilot to hand
+      # the target to the sim's built-in inner loop instead.
+      FORGE_TARGET_ID: "1"
+      FORGE_TARGET_HEADING_DEG: "0"
+      FORGE_TARGET_ALT_M: "1500"
+      FORGE_TARGET_SPD_MPS: "50"
+      FORGE_CONTROL_MODE: raw
+    depends_on:
+      - sim
+    networks:
+      - forge
+    command:
+      - bash
+      - -lc
+      - "cmake -S controllers/cpp -B controllers/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build controllers/cpp/build -j && exec ./controllers/cpp/build/forge-controller"
+
+  controller-python:
+    # The Python twin of `controller` — same wiring, runs controllers/python.
+    # Opt-in: `docker compose --profile python up sim controller-python`
+    # (or `make demo-python`). No build step; pyzmq + pycapnp ship in the image.
+    image: forge-dev:latest
+    working_dir: /workspace
+    profiles: ["python"]
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    environment:
+      FORGE_TELEMETRY_CONNECT: tcp://sim:5555
+      FORGE_COMMAND_CONNECT: tcp://sim:5556
+      FORGE_TARGET_ID: "1"
+      FORGE_TARGET_HEADING_DEG: "0"
+      FORGE_TARGET_ALT_M: "1500"
+      FORGE_TARGET_SPD_MPS: "50"
+      FORGE_CONTROL_MODE: raw
+    depends_on:
+      - sim
+    networks:
+      - forge
+    command:
+      - bash
+      - -lc
+      - "exec python controllers/python/controller.py"
+
+  controller-quad:
+    # Flies the F450 quadrotor (FORGE's second vehicle class) via the built-in
+    # multirotor hover-hold autopilot: hands the sim one high-level target
+    # (climb + heading) and monitors. Reuses the Python controller unchanged —
+    # the wire protocol is vehicle-agnostic; only the sim's autopilot law differs.
+    # Opt-in: `docker compose --profile quad up sim controller-quad`
+    # (or `make demo-quad`), which pairs with config/scenario.quad.toml.
+    image: forge-dev:latest
+    working_dir: /workspace
+    profiles: ["quad"]
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    environment:
+      FORGE_TELEMETRY_CONNECT: tcp://sim:5555
+      FORGE_COMMAND_CONNECT: tcp://sim:5556
+      FORGE_TARGET_ID: "1"
+      FORGE_TARGET_HEADING_DEG: "180"  # yaw from the initial 90° to 180°
+      FORGE_TARGET_ALT_M: "130"        # climb from 100 m to 130 m and hold
+      FORGE_TARGET_SPD_MPS: "0"        # ignored for a hovering rotorcraft
+      FORGE_CONTROL_MODE: autopilot    # the sim's multirotor hover-hold flies it
+    depends_on:
+      - sim
+    networks:
+      - forge
+    command:
+      - bash
+      - -lc
+      - "exec python controllers/python/controller.py"
+
+networks:
+  forge:
+    driver: bridge
+
+volumes:
+  cargo-registry:
+  cargo-target:

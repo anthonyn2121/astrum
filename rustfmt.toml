@@ -1,0 +1,3 @@
+# FORGE house style: keep struct literals, calls, and control flow on one line
+# when they fit within max_width (rather than rustfmt's narrow default sub-widths).
+use_small_heuristics = "Max"

@@ -1,0 +1,30 @@
+# Short bounded scenario used to smoke-test forge-sim (spawn -> step -> ENU ->
+# clean max-time exit). Two aircraft diverging via different headings/altitudes.
+
+[world]
+origin_lat_deg = 37.6188
+origin_lon_deg = -122.3756
+origin_alt_m = 0.0
+
+[sim]
+rate_hz = 120.0
+max_time_s = 3.0
+realtime = false  # run as fast as possible for the test
+
+[[aircraft]]
+id = 1
+model = "c172x"
+lat_deg = 37.6188
+lon_deg = -122.3756
+alt_ft = 5000.0
+heading_deg = 90.0
+airspeed_kts = 100.0
+
+[[aircraft]]
+id = 2
+model = "c172x"
+lat_deg = 37.6200
+lon_deg = -122.3700
+alt_ft = 5500.0
+heading_deg = 180.0
+airspeed_kts = 110.0

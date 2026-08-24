@@ -1,0 +1,25 @@
+[package]
+name = "forge-sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "FORGE headless Bevy ECS: the authoritative multi-aircraft state server."
+
+[lib]
+name = "forge_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forge-sim"
+path = "src/main.rs"
+
+[dependencies]
+# Headless: no render/winit/audio. default-features = false keeps the GUI/GPU
+# feature stack (and its system-lib deps, absent in the container) out of the build.
+bevy = { version = "0.19", default-features = false }
+forge-fdm = { path = "../forge-fdm" }
+forge-geo = { path = "../forge-geo" }
+forge-net = { path = "../forge-net" }
+forge-proto = { path = "../forge-proto" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

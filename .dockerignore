@@ -1,0 +1,8 @@
+# Keep the build context small. JSBSim is cloned inside the image, not sent from here.
+.git
+target
+**/target
+controllers/cpp/build
+*.log
+.env
+docker-compose.override.yml

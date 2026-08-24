@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge-fdm",
+    "crates/forge-geo",
+    "crates/forge-proto",
+    "crates/forge-net",
+    "crates/forge-bag",
+    "crates/forge-sim",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Shared dependencies are added here as milestones land (bevy, zmq, capnp, ...).
