@@ -199,15 +199,18 @@ services:
   # config/scenario.formation.toml. The leader flies a figure-eight; each
   # follower independently watches the leader's telemetry and MPC-tracks its
   # slot. Altitude 4572 m (15000 ft). The --speed 100 command settles ~120 m/s
-  # through the throttle loop; the speed-synced carrot and the 18 km x 9 km
-  # pattern keep the required bank ~19 deg (under the sim's 25-deg limit).
+  # through the throttle loop; the speed-synced carrot and the 8 km x 4 km pattern
+  # drive the leader to ~41 deg of bank — an aggressive, easy-to-see figure-eight.
+  # This is about as tight as this formation holds: much tighter and the inner
+  # wingman/trail need >60 deg of bank to keep their slots and diverge (the f16's
+  # 60-deg cap is the limit). Shrink the slots too to carve a tighter pattern.
   controller-lead:
     <<: *formation-controller
     command:
       - bash
       - -lc
       - "exec python controllers/optimal/python/run.py --law figure8 --id 1
-         --alt 4572 --speed 100 --fig-rx 18000 --fig-ry 9000"
+         --alt 4572 --speed 100 --fig-rx 8000 --fig-ry 4000"
 
   controller-wing-left:
     <<: *formation-controller

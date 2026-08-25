@@ -69,11 +69,11 @@ def add_args(p):
         help="total look-ahead (s); model step = horizon-s / horizon",
     )
     # Defaults tuned offline against a point-mass model of the sim's fixed-wing
-    # inner loop (bank = 1.2*hdg_err, clamped +/-25 deg, ~1.5 s roll lag) and then
-    # confirmed in a full JSBSim run: they capture the slot in ~5 s and hold it to
-    # ~20 m over the gentle sections, degrading to ~35 m only at the figure-eight's
-    # tightest lobe tip (where the leader decelerates hardest) — well clear of the
-    # gains where the inner-loop lag drives instability.
+    # inner loop and confirmed in a full JSBSim run. With the f16 inner loop (bank
+    # to 60 deg, snappy roll) the followers capture their slots and then hold them
+    # to ~15 m mean / ~23 m peak even through the 8 km x 4 km figure-eight's hardest
+    # lobes — the extra bank authority lets each follower chase the fast-sweeping
+    # slot, and these gains stay clear of the inner-loop lag that drives instability.
     p.add_argument("--q-pos", type=float, default=0.8, help="MPC weight on slot position error")
     p.add_argument("--q-vel", type=float, default=3.0, help="MPC weight on slot velocity error")
     p.add_argument("--r-acc", type=float, default=2.0, help="MPC weight on commanded acceleration")

@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use std::time::{Duration, Instant};
 
 use crate::components::{Aircraft, FdmInstance, GeoState, SimParams, VehicleKind, WorldFrame};
-use crate::net::AutopilotState;
+use crate::net::{AutopilotState, FixedWingGains};
 use crate::scenario::Scenario;
 
 /// JSBSim data root (`aircraft/`, `engine/`, `systems/`).
@@ -55,7 +55,7 @@ pub fn spawn_fleet(mut commands: Commands, scenario: Res<Scenario>, params: Res<
         }
         fdm.set_dt(params.dt);
 
-        commands.spawn((
+        let mut ent = commands.spawn((
             Aircraft { id: spec.id },
             FdmInstance(fdm),
             kind,
@@ -63,6 +63,12 @@ pub fn spawn_fleet(mut commands: Commands, scenario: Res<Scenario>, params: Res<
             Transform::default(),
             AutopilotState::default(),
         ));
+        // Fixed-wing entities carry a per-airframe gain set for the built-in
+        // autopilot inner loop (a fighter turns far harder than a trainer);
+        // multirotors use a separate hover-hold law and need none.
+        if kind == VehicleKind::FixedWing {
+            ent.insert(FixedWingGains::for_model(&spec.model));
+        }
         spawned += 1;
     }
 

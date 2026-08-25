@@ -23,11 +23,13 @@ high), so a fixed-period carrot would out- or under-run the jet and the pattern
 would smear. Pacing by the measured speed keeps the carrot glued to the aircraft
 whatever it actually flies.
 
-Size the pattern for the vehicle: with the sim's ~25 deg bank limit the tightest
-curvature (the lobe ends, radius ~Ry) must stay above the min turn radius
-V^2/(g*tan 25deg). The defaults (Rx=18 km, Ry=9 km) keep the required bank near
-19 deg for an F-16 flying ~120 m/s — a few degrees under the limit so the inner
-loop tracks the curve cleanly, with margin up to ~135 m/s.
+Size the pattern for the vehicle. The tightest curvature (the lobe ends, radius
+~Ry) sets the peak bank, ~atan(V^2 / (g*R)). The defaults (Rx=8 km, Ry=4 km)
+drive an F-16 flying ~120 m/s to ~40 deg of bank at the lobes — aggressive, but
+comfortably inside the f16 inner loop's 60 deg limit (which also feeds the turn's
+load factor forward to hold altitude). Scale Rx/Ry together to keep the two-lobe
+shape; for a gentler airframe (the c172x's 25 deg limit) grow the pattern so the
+lobe radius stays above the min turn radius V^2/(g*tan(limit)).
 """
 
 import math
@@ -38,8 +40,8 @@ from astrum_control import Law as BaseLaw
 
 def add_args(p):
     """figure-eight geometry + guidance flags."""
-    p.add_argument("--fig-rx", type=float, default=18000.0, help="half-width along East (m)")
-    p.add_argument("--fig-ry", type=float, default=9000.0, help="lobe height along North (m)")
+    p.add_argument("--fig-rx", type=float, default=8000.0, help="half-width along East (m)")
+    p.add_argument("--fig-ry", type=float, default=4000.0, help="lobe height along North (m)")
     p.add_argument("--fig-center-e", type=float, default=0.0, help="pattern centre, ENU East (m)")
     p.add_argument("--fig-center-n", type=float, default=0.0, help="pattern centre, ENU North (m)")
     p.add_argument(

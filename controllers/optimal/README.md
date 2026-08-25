@@ -93,11 +93,13 @@ machinery; the control theory is yours to fill in.
   talks to another and there is no central optimizer — the only coupling is that
   one broadcast state.
 
-In a full JSBSim run the leader holds an 18 km × 9 km pattern at ~19° bank (under
-the sim's 25° limit) and the followers capture in ~5 s, then hold their slots to
-~20 m (≈35 m at the tightest lobe tip). Watch it live with `make replay` in a
-second shell, or record it and scrub the replay offline (`make export`, then drag
-the exported JSON onto the renderer — see DEVELOP.md §7).
+In a full JSBSim run the leader carves an 8 km × 4 km pattern at ~41° bank —
+tracked cleanly by the F-16 inner loop, whose 60° bank limit and load-factor
+feedforward (see `FixedWingGains::f16` in `astrum-sim`) hold altitude through the
+hard lobes — and the followers hold their slots to ~15 m mean / ~23 m peak. Watch
+it live with `make replay` in a second shell, or record it and scrub the replay
+offline (`make export`, then drag the exported JSON onto the renderer — see
+DEVELOP.md §7).
 
 ## Run (inside the dev container)
 

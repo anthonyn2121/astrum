@@ -19,8 +19,8 @@ origin_alt_m = 0.0
 [sim]
 rate_hz = 120.0
 # Bounded so `make demo-formation` self-terminates. At ~120 m/s a full lap of the
-# 18 km x 9 km pattern takes ~715 s; 220 s covers the formation-capture transient
-# plus a full turn through the first lobe (the tightest part of the track).
+# 8 km x 4 km pattern takes ~320 s; 220 s covers the formation-capture transient
+# plus both hard lobes and the crossover (the most aggressive parts of the track).
 max_time_s = 220.0
 # Real-time so the run is watchable in the 3-D replay renderer.
 realtime = true
@@ -28,8 +28,9 @@ realtime = true
 # --- Fleet -------------------------------------------------------------------
 # All F-16s (fixed-wing inferred from the model). ~15000 ft, ~233 kts (~120 m/s)
 # — the speed the leader's --speed 100 command settles at through the sim's
-# throttle loop, so starting there avoids a speed transient. The 18 km x 9 km
-# pattern keeps the sim's 25-deg-bank inner loop tracking the curve at ~19 deg.
+# throttle loop, so starting there avoids a speed transient. The 8 km x 4 km
+# pattern drives the f16 inner loop to ~41 deg of bank at the lobes (well under
+# its 60-deg limit), with the load-factor feedforward holding altitude in the turn.
 
 [[aircraft]]
 # LEADER — figure-eight. Initial heading ~= the pattern tangent at tau=0
