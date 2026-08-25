@@ -59,6 +59,35 @@ services:
       - -lc
       - "mkdir -p recordings && cargo run --release -p forge-bag --bin forge-bag-record"
 
+  replay:
+    # The browser-based 3-D replay renderer. Serves the static `web/` app over
+    # HTTP and bridges the live telemetry PUB to connected browsers over
+    # WebSocket (one JSON frame per sample). Point a browser at
+    # http://localhost:8080 while the sim (or `forge-bag-play`) is running.
+    # Started alongside the fleet by `make replay`, or on its own:
+    #   docker compose up replay
+    image: forge-dev:latest
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    environment:
+      # Subscribe to the sim's telemetry; serve the renderer on :8080.
+      FORGE_TELEMETRY_CONNECT: tcp://sim:5555
+      FORGE_WEB_BIND: 0.0.0.0:8080
+      FORGE_WEB_ROOT: /workspace/web
+    ports:
+      - "8080:8080"   # HTTP + WebSocket (/telemetry)
+    depends_on:
+      - sim
+    networks:
+      - forge
+    command:
+      - bash
+      - -lc
+      - "cargo run --release -p forge-web --bin forge-web"
+
   controller:
     # Reuses the image built by the `sim` service (no second build).
     image: forge-dev:latest

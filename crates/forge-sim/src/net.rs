@@ -190,10 +190,10 @@ fn multirotor_autopilot(f: &mut Fdm, ap: &AutopilotState) {
 /// socket (topic = aircraft id). Runs after `sync_geo_transform`.
 pub fn publish_telemetry(
     publisher: Option<NonSend<TelemetryPublisher>>,
-    q: Query<(&Aircraft, &GeoState, &Transform)>,
+    q: Query<(&Aircraft, &GeoState, &Transform, &VehicleKind)>,
 ) {
     let Some(publisher) = publisher else { return };
-    for (ac, gs, tf) in &q {
+    for (ac, gs, tf, kind) in &q {
         let sample = TelemetrySample {
             aircraft_id: ac.id,
             sim_time_s: gs.sim_time_s,
@@ -211,6 +211,10 @@ pub fn publish_telemetry(
             psi_rad: gs.psi_rad,
             airspeed_mps: gs.airspeed_mps,
             health: 0,
+            vehicle_kind: match kind {
+                VehicleKind::FixedWing => forge_proto::VehicleKind::FixedWing,
+                VehicleKind::Multirotor => forge_proto::VehicleKind::Multirotor,
+            },
         };
         // A dropped telemetry frame is non-fatal — log once and keep flying.
         if let Err(e) = publisher.publish(&sample) {

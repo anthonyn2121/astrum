@@ -3,7 +3,7 @@
 
 use forge_proto::{
     decode_command, decode_telemetry, encode_command, encode_telemetry, write_bag_frame, BagReader,
-    CommandMsg, Control, TelemetrySample,
+    CommandMsg, Control, TelemetrySample, VehicleKind,
 };
 
 fn sample(id: u32, t: f64) -> TelemetrySample {
@@ -24,6 +24,7 @@ fn sample(id: u32, t: f64) -> TelemetrySample {
         psi_rad: 1.57,
         airspeed_mps: 51.4,
         health: 0,
+        vehicle_kind: VehicleKind::FixedWing,
     }
 }
 
@@ -31,6 +32,18 @@ fn sample(id: u32, t: f64) -> TelemetrySample {
 fn telemetry_roundtrip() {
     let s = sample(7, 12.5);
     assert_eq!(decode_telemetry(&encode_telemetry(&s)).unwrap(), s);
+}
+
+#[test]
+fn telemetry_vehicle_kind_roundtrip() {
+    // Both classes survive the wire, and it defaults to fixed-wing.
+    let mut s = sample(2, 3.0);
+    s.vehicle_kind = VehicleKind::Multirotor;
+    assert_eq!(
+        decode_telemetry(&encode_telemetry(&s)).unwrap().vehicle_kind,
+        VehicleKind::Multirotor
+    );
+    assert_eq!(VehicleKind::default(), VehicleKind::FixedWing);
 }
 
 #[test]

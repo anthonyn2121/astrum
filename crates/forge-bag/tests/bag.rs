@@ -22,6 +22,7 @@ fn sample(id: u32, t: f64) -> TelemetrySample {
         psi_rad: 0.5,
         airspeed_mps: 51.0,
         health: 0,
+        vehicle_kind: forge_proto::VehicleKind::FixedWing,
     }
 }
 

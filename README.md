@@ -12,8 +12,9 @@ fixed-wing aircraft and sUAS quadrotors, each with its own high-fidelity flight 
 - Flight controllers live **outside** the sim (C++ first, Python later) and talk only over ZMQ.
 - **Cap'n Proto** wire format, shared across Rust / C++ / Python.
 
-Telemetry can be recorded to a **bag** and replayed to any subscriber byte-for-byte (ROS-style);
-a live 3-D replay *renderer* consuming those bags remains future work.
+Telemetry can be recorded to a **bag** and replayed to any subscriber byte-for-byte (ROS-style),
+and a browser-based **3-D replay renderer** (Three.js, procedural meshes) visualises the fleet
+live or from an exported bag — `make replay`, then open http://localhost:8080.
 
 ## Status
 
@@ -28,12 +29,14 @@ Under active construction. Milestones:
 | M4 | Wire schema + ZMQ transport + bag replay (`forge-proto`, `forge-net`, `forge-bag`) | **done** ✓ |
 | M5 | C++ example flight controller (`controllers/cpp`) | **done** ✓ |
 | M6 | Integration demo (`make demo`) + docs | **done** ✓ |
+| M7 | Browser 3-D replay renderer (`forge-web` + `web/`) | **done** ✓ |
 
 The engine is end-to-end functional: `make demo` brings up the sim and a C++ controller that
 flies an aircraft to a commanded heading/altitude over ZMQ (`make demo-python` runs the equivalent
 Python controller). `make demo-quad` flies FORGE's second vehicle class — an **F450 quadrotor** that
-climbs and yaws under the built-in multirotor hover-hold autopilot. A 3-D replay renderer is the
-natural next addition.
+climbs and yaws under the built-in multirotor hover-hold autopilot. `make replay` starts the fleet
+alongside a browser-based **3-D replay renderer** that visualises every aircraft in real time (or
+from an exported bag) on the ENU grid.
 
 ## Architecture & data flow
 
@@ -185,8 +188,8 @@ flat serialization (Rust `serialize::write_message`/`read_message` ↔ C++
 ## Recording & replay (bag)
 
 Recording and replay are ROS-style: the recorder is just another `SUB` client and replay is
-just another `PUB`, so a replayed bag reaches any subscriber (a controller, the future replay
-renderer) byte-for-byte identically to the live sim.
+just another `PUB`, so a replayed bag reaches any subscriber (a controller, the 3-D renderer)
+byte-for-byte identically to the live sim.
 
 ```bash
 # record the live stream to a bag (Ctrl-C or set FORGE_BAG_SECONDS to stop)
@@ -201,6 +204,33 @@ docker compose --profile record up recorder
 
 `FORGE_REPLAY_RATE` scales playback speed (default `1.0`); `FORGE_BAG_REPLAY_BIND` overrides
 the replay endpoint (defaults to the live telemetry endpoint, so replay is a drop-in).
+
+## 3-D replay renderer (`forge-web` + `web/`)
+
+A browser-based renderer visualises the fleet on the ENU grid — procedurally-generated Cessna and
+F450 meshes (no external assets), tinted per vehicle class and per id, oriented from the telemetry
+Euler angles, with motion trails, orbit + follow cameras, a playback transport (play/pause/scrub/
+speed) and per-aircraft readouts. It's self-contained: Three.js is vendored under `web/vendor/`,
+so nothing loads from the network at runtime.
+
+There are two data paths, both feeding one shared JSON frame shape (`forge_web::FrameJson`), so the
+live stream and an offline export can't drift:
+
+```bash
+# LIVE / replay — start the fleet + the bridge, then open http://localhost:8080
+make replay          # docker compose up -d sim replay
+# (the bridge also serves a bag being replayed by forge-bag-play — same endpoint)
+
+# OFFLINE — bake a bag into a single JSON the renderer opens with "Open file…" (no services)
+make export BAG=recordings/session.bag OUT=recordings/session.json
+```
+
+`forge-web` is one synchronous process (no async runtime): a background ZMQ `SUB` fans each
+telemetry sample out to every connected browser over WebSocket (`GET /telemetry`), while the same
+port serves the static `web/` app. Config via env: `FORGE_TELEMETRY_CONNECT` (upstream PUB,
+default `tcp://127.0.0.1:5555`), `FORGE_WEB_BIND` (default `0.0.0.0:8080`), `FORGE_WEB_ROOT`
+(default `web`). `forge-web-export` reads a bag and writes a `forge-replay-bag` document
+(`$FORGE_BAG` → `$FORGE_WEB_EXPORT`).
 
 ## Extending FORGE
 

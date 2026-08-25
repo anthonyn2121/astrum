@@ -50,13 +50,15 @@ crates/            # Rust workspace (one crate per responsibility)
   forge-proto/     #   the Cap'n Proto schema + encode/decode helpers
   forge-net/       #   ZMQ transport (PUB/SUB telemetry, PUSH/PULL commands)
   forge-bag/       #   record/replay telemetry to a file ("bag")
+  forge-web/       #   WebSocket+HTTP bridge (forge-web) + bag→JSON exporter (forge-web-export)
   forge-sim/       #   the Bevy ECS app — the sim binary
 controllers/       # flight controllers (clients), one dir per language
   cpp/  python/
+web/               # browser 3-D replay renderer (Three.js, vendored; static app served by forge-web)
 config/            # scenario files (*.toml) — the fleet + world origin
 docker/            # Dockerfile + entrypoint for the dev image
 scripts/           # helper scripts (e.g. verify-toolchain.sh)
-docker-compose.yml # service presets: sim, controllers, recorder
+docker-compose.yml # service presets: sim, controllers, recorder, replay
 Makefile           # the commands you'll actually type
 ```
 
@@ -175,6 +177,22 @@ make demo-python   # same, with the Python controller
 make demo-quad     # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
 ```
 
+**Watch it in 3-D.** `make replay` starts the fleet sim + the `forge-web` bridge; open
+http://localhost:8080 to see every aircraft on the ENU grid (orbit/follow cameras, trails,
+playback transport). It works against a *live* sim or a bag being replayed by `forge-bag-play`
+(both PUB on the telemetry endpoint the bridge subscribes to). For an offline, service-free view,
+bake a bag to JSON and drag it onto the page (or use "Open file…"):
+
+```bash
+make replay                                          # sim + renderer at http://localhost:8080
+make export BAG=recordings/session.bag OUT=out.json  # bag → forge-replay-bag JSON
+make down                                            # stop the sim + renderer
+```
+
+The renderer is static files under `web/` (Three.js vendored in `web/vendor/`; the module contract
+lives in `web/js/`); the bridge and exporter are the two binaries in `crates/forge-web/`, both
+projecting telemetry through the one `forge_web::FrameJson` shape.
+
 **To develop your own controller**, don't add a compose service — treat it as a
 process you run in a dev shell against a running sim:
 
@@ -201,7 +219,8 @@ how a controller subscribes, decodes telemetry, and pushes commands.
 ## 8. Cap'n Proto wire quick reference
 
 The schema (`crates/forge-proto/schema/forge.capnp`) defines three messages:
-- **`Telemetry`** — sim → subscribers (topic = aircraft id as 4 big-endian bytes).
+- **`Telemetry`** — sim → subscribers (topic = aircraft id as 4 big-endian bytes). Carries
+  `vehicleKind` (fixed-wing | multirotor) so a subscriber knows the class without the scenario.
 - **`Command`** — controllers → sim; a union of **`raw`** actuator setpoints
   (`fcs/*-cmd-norm`) *or* high-level **`autopilot`** targets.
 - **`BagFrame`** — one recorded telemetry sample + timestamp (for record/replay).

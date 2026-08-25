@@ -7,7 +7,7 @@ COMPOSE ?= docker compose
 SERVICE ?= sim
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down demo demo-python demo-quad shell exec verify logs ps clean
+.PHONY: help build up down demo demo-python demo-quad replay export shell exec verify logs ps clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -33,6 +33,16 @@ demo-python: ## Same demo, but the Python controller flies aircraft 1
 demo-quad: ## Quadrotor demo: an F450 hovers/climbs under the built-in multirotor autopilot
 	-FORGE_SCENARIO=config/scenario.quad.toml $(COMPOSE) --profile quad up --exit-code-from sim sim controller-quad
 	$(COMPOSE) --profile quad down
+
+replay: ## Start the fleet sim + the 3-D replay renderer, then open http://localhost:8080
+	$(COMPOSE) up -d sim replay
+	@echo "FORGE replay renderer → http://localhost:8080  (Ctrl-C-safe; run 'make down' to stop)"
+
+export: ## Bake a bag to a replay JSON the browser can open offline (BAG=path OUT=path)
+	$(COMPOSE) run --rm --no-deps \
+	  -e FORGE_BAG=$(or $(BAG),recordings/session.bag) \
+	  -e FORGE_WEB_EXPORT=$(or $(OUT),recordings/session.json) \
+	  sim bash -lc 'cargo run --release -p forge-web --bin forge-web-export'
 
 shell: ## Open a one-off shell in a fresh container (SERVICE=sim|controller)
 	$(COMPOSE) run --rm --no-deps $(SERVICE) bash

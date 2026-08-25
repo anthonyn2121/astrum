@@ -28,6 +28,14 @@ struct Euler {
   psiRad   @2 :Float64;   # yaw / true heading
 }
 
+# Flight-vehicle class. Carried in telemetry so a subscriber (e.g. the 3-D replay
+# renderer) can pick the right model without any out-of-band scenario knowledge.
+# Mirrors `forge_sim::components::VehicleKind`.
+enum VehicleKind {
+  fixedWing  @0;
+  multirotor @1;
+}
+
 # One aircraft's authoritative state for a single sim step.
 struct Telemetry {
   aircraftId  @0 :UInt32;
@@ -38,6 +46,7 @@ struct Telemetry {
   attitude    @5 :Euler;
   airspeedMps @6 :Float64;    # true airspeed
   health      @7 :UInt8;      # 0 = nominal (reserved for future fault flags)
+  vehicleKind @8 :VehicleKind;   # additive (ordinal 8); pre-existing readers ignore it
 }
 
 # Raw actuator setpoints — the controller writes the control law directly.

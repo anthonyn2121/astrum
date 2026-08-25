@@ -17,6 +17,19 @@ pub mod forge_capnp {
 use capnp::message::{Builder, HeapAllocator, ReaderOptions};
 use capnp::serialize;
 
+/// Flight-vehicle class carried alongside telemetry. Mirrors the `VehicleKind`
+/// enum in the schema (and `forge_sim::components::VehicleKind`) so a subscriber
+/// — notably the 3-D replay renderer — can pick the right model without any
+/// out-of-band scenario knowledge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VehicleKind {
+    /// Aerodynamic fixed-wing (control surfaces + throttle).
+    #[default]
+    FixedWing,
+    /// Multirotor / quadrotor (body-rate + collective demands).
+    Multirotor,
+}
+
 /// Plain-data telemetry sample. Mirrors `Telemetry` in the schema.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TelemetrySample {
@@ -36,6 +49,7 @@ pub struct TelemetrySample {
     pub psi_rad: f64,
     pub airspeed_mps: f64,
     pub health: u8,
+    pub vehicle_kind: VehicleKind,
 }
 
 /// The control payload of a [`CommandMsg`].
@@ -59,6 +73,10 @@ fn build_telemetry(b: &mut forge_capnp::telemetry::Builder, s: &TelemetrySample)
     b.set_sim_time_s(s.sim_time_s);
     b.set_airspeed_mps(s.airspeed_mps);
     b.set_health(s.health);
+    b.set_vehicle_kind(match s.vehicle_kind {
+        VehicleKind::FixedWing => forge_capnp::VehicleKind::FixedWing,
+        VehicleKind::Multirotor => forge_capnp::VehicleKind::Multirotor,
+    });
     {
         let mut geo = b.reborrow().init_geo();
         geo.set_lat_deg(s.lat_deg);
@@ -107,6 +125,11 @@ fn read_telemetry(r: forge_capnp::telemetry::Reader) -> capnp::Result<TelemetryS
         psi_rad: att.get_psi_rad(),
         airspeed_mps: r.get_airspeed_mps(),
         health: r.get_health(),
+        // Unknown-future variants (from a newer schema) degrade to fixed-wing.
+        vehicle_kind: match r.get_vehicle_kind() {
+            Ok(forge_capnp::VehicleKind::Multirotor) => VehicleKind::Multirotor,
+            _ => VehicleKind::FixedWing,
+        },
     })
 }
 

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FORGE · 3-D Replay</title>
+  <link rel="stylesheet" href="./style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js",
+        "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="view"></div>
+
+  <!-- Top bar -->
+  <header id="topbar">
+    <div class="brand"><span class="mark">◆</span> FORGE <em>Replay</em></div>
+    <div class="source">
+      <span id="statusPill" class="pill idle">idle</span>
+      <span id="sourceLabel" class="muted">no source</span>
+    </div>
+    <div class="source-controls">
+      <input id="wsUrl" type="text" spellcheck="false" placeholder="ws://host:8080/telemetry" />
+      <button id="connectBtn" title="Connect to a live/replay WebSocket">Connect</button>
+      <button id="openFileBtn" title="Open a forge-web-export JSON bag">Open file…</button>
+      <input id="fileInput" type="file" accept=".json,application/json" hidden />
+    </div>
+  </header>
+
+  <!-- Left: fleet -->
+  <aside id="fleet">
+    <div class="panel-title">Fleet <span id="fleetCount" class="badge">0</span></div>
+    <ul id="fleetList"></ul>
+  </aside>
+
+  <!-- Right: selected aircraft readout -->
+  <aside id="readout" class="hidden">
+    <div class="panel-title">Aircraft <span id="ro-id" class="badge">—</span></div>
+    <div id="ro-kind" class="kind-tag">—</div>
+    <dl>
+      <dt>sim time</dt><dd><span id="ro-time">—</span> s</dd>
+      <dt>latitude</dt><dd><span id="ro-lat">—</span>°</dd>
+      <dt>longitude</dt><dd><span id="ro-lon">—</span>°</dd>
+      <dt>altitude</dt><dd><span id="ro-alt">—</span> m</dd>
+      <dt class="sep">ENU east</dt><dd><span id="ro-e">—</span> m</dd>
+      <dt>ENU north</dt><dd><span id="ro-n">—</span> m</dd>
+      <dt>ENU up</dt><dd><span id="ro-u">—</span> m</dd>
+      <dt class="sep">heading</dt><dd><span id="ro-hdg">—</span>°</dd>
+      <dt>pitch</dt><dd><span id="ro-pitch">—</span>°</dd>
+      <dt>roll</dt><dd><span id="ro-roll">—</span>°</dd>
+      <dt class="sep">airspeed</dt><dd><span id="ro-as">—</span> m/s</dd>
+      <dt>ground speed</dt><dd><span id="ro-gs">—</span> m/s</dd>
+      <dt>vertical speed</dt><dd><span id="ro-vs">—</span> m/s</dd>
+    </dl>
+  </aside>
+
+  <!-- View toggles -->
+  <div id="toggles">
+    <label><input type="checkbox" id="tglFollow" /> Follow cam</label>
+    <label><input type="checkbox" id="tglTrails" checked /> Trails</label>
+    <label><input type="checkbox" id="tglLabels" checked /> Labels</label>
+    <button id="fitBtn" title="Frame the selection">Reset view</button>
+  </div>
+
+  <!-- Bottom transport -->
+  <footer id="transport">
+    <button id="playBtn" class="icon" title="Play / pause (space)">▶</button>
+    <button id="liveBtn" class="live" title="Jump to live head">LIVE</button>
+    <span id="timeCur" class="time">0:00.0</span>
+    <input id="scrub" type="range" min="0" max="1000" value="0" />
+    <span id="timeTot" class="time">0:00.0</span>
+    <select id="speedSel" title="Playback speed">
+      <option value="0.25">0.25×</option>
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+      <option value="8">8×</option>
+    </select>
+    <span id="fps" class="muted">—</span>
+  </footer>
+
+  <div id="dropHint">Drop a <code>forge-web-export</code> JSON here</div>
+
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>
