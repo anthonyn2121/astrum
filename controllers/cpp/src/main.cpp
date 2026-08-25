@@ -11,7 +11,7 @@
 // raw mode computes and publishes the next command inline (Zenoh invokes a
 // subscriber's callbacks serially, so the hold-law state needs no locking).
 //
-// Two modes (env `ASTRUM_CONTROL_MODE`):
+// Two modes (`--mode`):
 //   * "raw" (default) — closes a heading/altitude/airspeed hold loop *here*,
 //     in the controller, sending raw `fcs/*-cmd-norm` deflections each tick.
 //     This is ASTRUM's intended usage: the user owns the control law.
@@ -19,13 +19,15 @@
 //     of telemetry to clear the startup race) and then just monitors, letting the
 //     sim's built-in inner loop fly it.
 //
-// Config (env):
-//   ASTRUM_ZENOH_CONNECT      (default tcp/127.0.0.1:7447; tcp/sim:7447 under compose)
-//   ASTRUM_TARGET_ID          (default 1)
-//   ASTRUM_TARGET_HEADING_DEG (default 0    — due north)
-//   ASTRUM_TARGET_ALT_M       (default 1500)
-//   ASTRUM_TARGET_SPD_MPS     (default 50)
-//   ASTRUM_CONTROL_MODE       (default raw)
+// Config is via CLI flags (run with `--help`); each falls back to its old
+// ASTRUM_* env var, then a default, so precedence is CLI arg > env > default and
+// the compose wiring keeps working:
+//   --connect  ASTRUM_ZENOH_CONNECT      (default tcp/127.0.0.1:7447; tcp/sim:7447 under compose)
+//   --id       ASTRUM_TARGET_ID          (default 1)
+//   --heading  ASTRUM_TARGET_HEADING_DEG (default 0    — due north, degrees)
+//   --alt      ASTRUM_TARGET_ALT_M       (default 1500)
+//   --speed    ASTRUM_TARGET_SPD_MPS     (default 50)
+//   --mode     ASTRUM_CONTROL_MODE       (default raw)
 
 #include <algorithm>
 #include <atomic>
@@ -66,6 +68,21 @@ double wrap_pi(double a) {
 }
 
 double clampd(double x, double lo, double hi) { return std::max(lo, std::min(hi, x)); }
+
+void print_usage(const char* prog) {
+  std::cerr
+      << "Usage: " << prog << " [options]\n\n"
+      << "ASTRUM example flight controller (C++). Each option falls back to its\n"
+      << "ASTRUM_* env var, then a default (precedence: CLI arg > env > default).\n\n"
+      << "Options:\n"
+      << "  --connect <endpoint>    sim Zenoh endpoint       [env ASTRUM_ZENOH_CONNECT]\n"
+      << "  --id <n>                aircraft id              [env ASTRUM_TARGET_ID]\n"
+      << "  --heading <deg>         target heading, degrees  [env ASTRUM_TARGET_HEADING_DEG]\n"
+      << "  --alt <m>               target MSL altitude (m)  [env ASTRUM_TARGET_ALT_M]\n"
+      << "  --speed <mps>           target airspeed (m/s)    [env ASTRUM_TARGET_SPD_MPS]\n"
+      << "  --mode <raw|autopilot>  control mode             [env ASTRUM_CONTROL_MODE]\n"
+      << "  -h, --help              show this help and exit\n";
+}
 
 // Serialise a Command to an owned Zenoh payload (Zenoh copies it out of the
 // temporary string, so the capnp buffer can be released immediately).
@@ -122,16 +139,65 @@ struct HoldLaw {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   using namespace zenoh;
 
-  const std::string connect = env_or("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447");
-  const uint32_t target_id = static_cast<uint32_t>(
+  // Seed every knob from its env var (or built-in default), then let CLI flags
+  // override — so precedence is CLI arg > env > default, and compose keeps working.
+  std::string connect = env_or("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447");
+  uint32_t target_id = static_cast<uint32_t>(
       std::strtoul(env_or("ASTRUM_TARGET_ID", "1").c_str(), nullptr, 10));
-  const double target_hdg = env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0) * kPi / 180.0;
-  const double target_alt = env_f64("ASTRUM_TARGET_ALT_M", 1500.0);
-  const double target_spd = env_f64("ASTRUM_TARGET_SPD_MPS", 50.0);
-  const std::string mode = env_or("ASTRUM_CONTROL_MODE", "raw");
+  double heading_deg = env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0);
+  double target_alt = env_f64("ASTRUM_TARGET_ALT_M", 1500.0);
+  double target_spd = env_f64("ASTRUM_TARGET_SPD_MPS", 50.0);
+  std::string mode = env_or("ASTRUM_CONTROL_MODE", "raw");
+
+  // Hand-rolled parse (no argument-parsing dependency, matching the controller's
+  // minimal-deps ethos). Accepts "--flag value" and "--flag=value".
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "-h" || arg == "--help") {
+      print_usage(argv[0]);
+      return 0;
+    }
+
+    std::string key = arg;
+    std::string inline_val;
+    bool has_inline = false;
+    if (arg.rfind("--", 0) == 0) {
+      if (const auto eq = arg.find('='); eq != std::string::npos) {
+        key = arg.substr(0, eq);
+        inline_val = arg.substr(eq + 1);
+        has_inline = true;
+      }
+    }
+    auto value = [&]() -> std::string {
+      if (has_inline) return inline_val;
+      if (i + 1 < argc) return argv[++i];
+      std::cerr << "[controller] missing value for " << key << "\n";
+      std::exit(2);
+    };
+
+    if (key == "--connect") {
+      connect = value();
+    } else if (key == "--id") {
+      target_id = static_cast<uint32_t>(std::strtoul(value().c_str(), nullptr, 10));
+    } else if (key == "--heading") {
+      heading_deg = std::strtod(value().c_str(), nullptr);
+    } else if (key == "--alt") {
+      target_alt = std::strtod(value().c_str(), nullptr);
+    } else if (key == "--speed") {
+      target_spd = std::strtod(value().c_str(), nullptr);
+    } else if (key == "--mode") {
+      mode = value();
+    } else {
+      std::cerr << "[controller] unknown argument: " << arg << "\n";
+      print_usage(argv[0]);
+      return 2;
+    }
+  }
+
+  const double target_hdg = heading_deg * kPi / 180.0;
 
   const std::string telemetry_key = "astrum/telemetry/" + std::to_string(target_id);
   const std::string command_key = "astrum/command/" + std::to_string(target_id);

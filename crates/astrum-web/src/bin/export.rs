@@ -1,10 +1,8 @@
 //! `astrum-web-export` — bake a telemetry bag into a single JSON document the
 //! browser renderer can open offline (no sim, no bridge, no network).
 //!
-//! Config (args / env):
-//! * arg 1 or `$ASTRUM_BAG` — input bag path (default `astrum.bag`).
-//! * arg 2 or `$ASTRUM_WEB_EXPORT` — output path (default `<bag>.json`; `-` =
-//!   stdout).
+//! Config (CLI arg > env > default): see `--help`. `--out` (env
+//! `$ASTRUM_WEB_EXPORT`) defaults to `<bag>.json`; `-` writes to stdout.
 //!
 //! The output shape is [`astrum_web::ExportDoc`]; open it in the renderer with
 //! its "Open file" control.
@@ -12,19 +10,31 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
 
 use astrum_proto::BagReader;
 use astrum_web::ExportDoc;
+use clap::Parser;
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// Bake a telemetry bag into a single JSON document for offline replay.
+#[derive(Parser)]
+#[command(name = "astrum-web-export", version, about)]
+struct Cli {
+    /// Input bag path.
+    #[arg(env = "ASTRUM_BAG", default_value = "astrum.bag")]
+    input: PathBuf,
+
+    /// Output path (defaults to `<bag>.json`; `-` writes to stdout).
+    #[arg(long, env = "ASTRUM_WEB_EXPORT")]
+    out: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let input = std::env::args().nth(1).unwrap_or_else(|| env_or("ASTRUM_BAG", "astrum.bag"));
-    let output = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| env_or("ASTRUM_WEB_EXPORT", &format!("{input}.json")));
+    let cli = Cli::parse();
+    let input = cli.input.display().to_string();
+    // The output default depends on the input, so resolve it after parsing.
+    let output =
+        cli.out.map(|p| p.display().to_string()).unwrap_or_else(|| format!("{input}.json"));
 
     let file = File::open(&input).map_err(|e| format!("opening bag {input}: {e}"))?;
     let mut reader = BagReader::new(BufReader::new(file));

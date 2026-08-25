@@ -105,9 +105,15 @@ JSBSim flight-dynamics instance — per `[[aircraft]]` entry in a scenario file:
 ```bash
 make shell                              # into a dev container
 cargo run -p astrum-sim                  # uses config/scenario.example.toml
-ASTRUM_SCENARIO=config/my.toml cargo run -p astrum-sim
+cargo run -p astrum-sim -- config/my.toml   # scenario is a positional argument
+cargo run -p astrum-sim -- --help        # every flag, each with its [env: …] fallback
 cargo test --workspace                  # astrum-fdm / astrum-geo / astrum-sim suites
 ```
+
+Every binary takes its config as normal **command-line arguments**; each flag
+also falls back to its old `ASTRUM_*` env var, then a default, so precedence is
+**CLI arg > `$ENV` > default** and `docker compose` / `make` keep working
+unchanged. Run any binary with `--help` to see its flags and env fallbacks.
 
 Scenario files (see `config/scenario.example.toml`) set the WGS84 **ENU origin**, the fixed
 physics `rate_hz`, an optional `max_time_s`, and a `realtime` flag. Physics advances **exactly
@@ -145,15 +151,18 @@ send **raw** actuators with a law written for that class. ASTRUM picks the class
 docker compose up sim controller
 
 # or standalone in one dev shell against a bounded demo scenario:
-ASTRUM_SCENARIO=config/scenario.demo.toml cargo run --release -p astrum-sim &   # aircraft 1 heads east
+cargo run --release -p astrum-sim -- config/scenario.demo.toml &     # aircraft 1 heads east
 cmake -S controllers/cpp -B controllers/cpp/build && cmake --build controllers/cpp/build -j
-ASTRUM_TARGET_HEADING_DEG=0 ./controllers/cpp/build/astrum-controller           # commands it north
+./controllers/cpp/build/astrum-controller --heading 0               # commands it north
 # ...or the Python controller, no build step:
-ASTRUM_TARGET_HEADING_DEG=0 python controllers/python/controller.py
+python controllers/python/controller.py --heading 0
 ```
 
-The controller's target aircraft and setpoints are set via `ASTRUM_TARGET_*` env vars (defaults:
-id 1, heading 0°/north, 1500 m, 50 m/s); `ASTRUM_CONTROL_MODE` selects `raw` (default) or `autopilot`.
+The controller's target aircraft and setpoints are `--id` / `--heading` / `--alt` / `--speed`
+flags (defaults: id 1, heading 0°/north, 1500 m, 50 m/s) and `--mode raw` (default) or
+`--mode autopilot`; run `controller --help` for the full list. Each flag also honours its old
+`ASTRUM_TARGET_*` / `ASTRUM_CONTROL_MODE` env var as a fallback, so the compose services are
+unchanged.
 
 ## Wire protocol, telemetry & commands
 
@@ -214,19 +223,21 @@ just another publisher, so a replayed bag reaches any subscriber (a controller, 
 byte-for-byte identically to the live sim.
 
 ```bash
-# record the live stream to a bag (Ctrl-C or set ASTRUM_BAG_SECONDS to stop)
-ASTRUM_BAG=recordings/session.bag cargo run -p astrum-bag --bin astrum-bag-record
+# record the live stream to a bag (Ctrl-C, or --seconds N, to stop)
+cargo run -p astrum-bag --bin astrum-bag-record -- recordings/session.bag
 
 # replay it — listens on the telemetry endpoint, preserving recorded inter-frame timing
-ASTRUM_BAG=recordings/session.bag cargo run -p astrum-bag --bin astrum-bag-play
+cargo run -p astrum-bag --bin astrum-bag-play -- recordings/session.bag
 
 # under compose: record the sim's stream to recordings/session.bag
 docker compose --profile record up recorder
 ```
 
-`ASTRUM_REPLAY_RATE` scales playback speed (default `1.0`); `ASTRUM_ZENOH_LISTEN` overrides the
-endpoint replay listens on (defaults to the live sim endpoint, so replay is a drop-in for any
-subscriber), and `ASTRUM_REPLAY_WARMUP_MS` pauses after opening so subscribers can attach first.
+The bag path is a positional argument; `--rate` scales playback speed (default `1.0`), `--listen`
+overrides the endpoint replay listens on (defaults to the live sim endpoint, so replay is a drop-in
+for any subscriber), and `--warmup-ms` pauses after opening so subscribers can attach first. As
+everywhere, each flag falls back to its old env var (`ASTRUM_BAG`, `ASTRUM_REPLAY_RATE`,
+`ASTRUM_ZENOH_LISTEN`, `ASTRUM_REPLAY_WARMUP_MS`) — run with `--help` to see them.
 
 ## 3-D replay renderer (`astrum-web` + `web/`)
 
@@ -250,10 +261,11 @@ make export BAG=recordings/session.bag OUT=recordings/session.json
 
 `astrum-web` is one synchronous process (no async runtime): a background Zenoh subscriber fans each
 telemetry sample out to every connected browser over WebSocket (`GET /telemetry`), while the same
-port serves the static `web/` app. Config via env: `ASTRUM_ZENOH_CONNECT` (upstream sim/replay
-endpoint, default `tcp/127.0.0.1:7447`), `ASTRUM_WEB_BIND` (default `0.0.0.0:8080`), `ASTRUM_WEB_ROOT`
-(default `web`). `astrum-web-export` reads a bag and writes a `astrum-replay-bag` document
-(`$ASTRUM_BAG` → `$ASTRUM_WEB_EXPORT`).
+port serves the static `web/` app. Flags: `--connect` (upstream sim/replay endpoint, default
+`tcp/127.0.0.1:7447`), `--bind` (default `0.0.0.0:8080`), `--root` (default `web`) — each with its
+old `ASTRUM_WEB_*` / `ASTRUM_ZENOH_CONNECT` env fallback. `astrum-web-export` takes the bag as a
+positional argument and writes a `astrum-replay-bag` document to `--out` (defaults to `<bag>.json`;
+env fallbacks `ASTRUM_BAG` / `ASTRUM_WEB_EXPORT`).
 
 ## Extending ASTRUM
 

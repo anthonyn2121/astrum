@@ -1,21 +1,33 @@
 //! `astrum-bag-record` — subscribe to the live telemetry stream and write every
 //! sample to a bag file.
 //!
-//! Config (env / args):
-//! * arg 1 or `$ASTRUM_BAG` — output path (default `astrum.bag`).
-//! * `$ASTRUM_ZENOH_CONNECT` — sim/replay endpoint to connect to (default `tcp/127.0.0.1:7447`).
-//! * `$ASTRUM_BAG_SECONDS` — wall-clock seconds to record, then stop; `0`/unset
-//!   records until the process is killed (frames are flushed as they arrive, so
-//!   a kill loses nothing).
+//! Config (CLI arg > env > default): see `--help`. Each flag falls back to its
+//! `ASTRUM_*` env var, so compose/CI keep working.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use astrum_bag::BagWriter;
 use astrum_net::{NetError, Session, TelemetrySubscriber};
+use clap::Parser;
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// Record the live telemetry stream to a bag file.
+#[derive(Parser)]
+#[command(name = "astrum-bag-record", version, about)]
+struct Cli {
+    /// Output bag path.
+    #[arg(env = "ASTRUM_BAG", default_value = "astrum.bag")]
+    out: PathBuf,
+
+    /// Zenoh endpoint to connect to (the sim or a replay).
+    #[arg(long, env = "ASTRUM_ZENOH_CONNECT", default_value_t = astrum_net::DEFAULT_CONNECT_ENDPOINT.to_string())]
+    connect: String,
+
+    /// Wall-clock seconds to record, then stop; 0 = until killed (frames are
+    /// flushed as they arrive, so a kill loses nothing).
+    #[arg(long, env = "ASTRUM_BAG_SECONDS", default_value_t = 0.0)]
+    seconds: f64,
 }
 
 fn now_ns() -> u64 {
@@ -23,9 +35,10 @@ fn now_ns() -> u64 {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let out = std::env::args().nth(1).unwrap_or_else(|| env_or("ASTRUM_BAG", "astrum.bag"));
-    let endpoint = env_or("ASTRUM_ZENOH_CONNECT", astrum_net::DEFAULT_CONNECT_ENDPOINT);
-    let seconds: f64 = env_or("ASTRUM_BAG_SECONDS", "0").parse().unwrap_or(0.0);
+    let cli = Cli::parse();
+    let out = cli.out.display().to_string();
+    let endpoint = cli.connect;
+    let seconds = cli.seconds;
 
     let session = Session::connect(&endpoint)?;
     let mut sub = TelemetrySubscriber::connect(&session)?;

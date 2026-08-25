@@ -11,7 +11,7 @@ exists to prove a controller in any language plugs into ASTRUM with nothing but
 - **SUB** `astrum/telemetry/<id>` — telemetry for one aircraft.
 - **PUB** `astrum/command/<id>` — commands (target id + raw actuators *or* autopilot targets).
 
-## Modes (`ASTRUM_CONTROL_MODE`)
+## Modes (`--mode`)
 
 - **`raw`** (default) — the controller closes a heading / altitude / airspeed hold loop
   *itself* (identical gains to the C++ `HoldLaw`) and sends raw `fcs/*-cmd-norm`
@@ -23,24 +23,27 @@ exists to prove a controller in any language plugs into ASTRUM with nothing but
   matching subscriber yet (unlike ZMQ PUSH, which queued it), so a single shot at t=0 would be
   lost while the sim loads JSBSim — receiving telemetry proves the link is up.
 
-## Configuration (environment)
+## Configuration (flags)
 
-Identical to the C++ controller, so the compose wiring is shared:
+The same knobs as the C++ controller. Pass them as command-line flags (run
+`--help` for the list); each falls back to its old `ASTRUM_*` env var, then the
+default, so precedence is **CLI arg > `$ENV` > default** and the compose wiring is
+shared and unchanged.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `ASTRUM_ZENOH_CONNECT`     | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (telemetry + commands) |
-| `ASTRUM_TARGET_ID`         | `1`    | aircraft id to subscribe to / command |
-| `ASTRUM_TARGET_HEADING_DEG`| `0`    | target heading (0 = due north) |
-| `ASTRUM_TARGET_ALT_M`      | `1500` | target MSL altitude (m) |
-| `ASTRUM_TARGET_SPD_MPS`    | `50`   | target airspeed (m/s) |
-| `ASTRUM_CONTROL_MODE`      | `raw`  | `raw` or `autopilot` |
-| `ASTRUM_SCHEMA`            | `../../crates/astrum-proto/schema/astrum.capnp` | schema to load |
+| Flag | Env fallback | Default | Meaning |
+|---|---|---|---|
+| `--connect` | `ASTRUM_ZENOH_CONNECT`      | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (telemetry + commands) |
+| `--id`      | `ASTRUM_TARGET_ID`         | `1`    | aircraft id to subscribe to / command |
+| `--heading` | `ASTRUM_TARGET_HEADING_DEG`| `0`    | target heading in degrees (0 = due north) |
+| `--alt`     | `ASTRUM_TARGET_ALT_M`      | `1500` | target MSL altitude (m) |
+| `--speed`   | `ASTRUM_TARGET_SPD_MPS`    | `50`   | target airspeed (m/s) |
+| `--mode`    | `ASTRUM_CONTROL_MODE`      | `raw`  | `raw` or `autopilot` |
+| `--schema`  | `ASTRUM_SCHEMA`            | `../../crates/astrum-proto/schema/astrum.capnp` | schema to load |
 
 ## Run (inside the dev container)
 
 ```bash
-python controllers/python/controller.py
+python controllers/python/controller.py --heading 0 --id 1
 ```
 
 Or the whole self-terminating demo (bounded single-ship scenario, auto teardown):
@@ -64,7 +67,7 @@ which is `docker compose --profile python up --exit-code-from sim sim controller
 - The aircraft id lives in the Zenoh **key** (`astrum/telemetry/<id>`), not a topic frame:
   the subscriber declares that key and each sample's `payload` is the whole Cap'n Proto message.
   Key matching is exact, so `astrum/telemetry/1` never matches `astrum/telemetry/10`.
-- This example follows **one** aircraft (`ASTRUM_TARGET_ID`), but the transport is fleet-wide:
+- This example follows **one** aircraft (`--id`), but the transport is fleet-wide:
   subscribe `astrum/telemetry/*` instead of a single id to receive **every** aircraft's telemetry
   over the same session (whole-fleet / swarm awareness). Adding aircraft needs no endpoint or port
   change; the id is just another key.

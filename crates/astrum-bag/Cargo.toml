@@ -23,3 +23,4 @@ path = "src/bin/play.rs"
 astrum-proto = { path = "../astrum-proto" }
 astrum-net = { path = "../astrum-net" }
 capnp = "0.21"
+clap = { workspace = true }

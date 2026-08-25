@@ -85,14 +85,6 @@ impl Scenario {
         Ok(scenario)
     }
 
-    /// Resolve the scenario path from `$ASTRUM_SCENARIO`, falling back to the
-    /// bundled example, and load it.
-    pub fn load_from_env() -> Result<Self, String> {
-        let path = std::env::var("ASTRUM_SCENARIO")
-            .unwrap_or_else(|_| "config/scenario.example.toml".to_string());
-        Self::load(path)
-    }
-
     fn validate(&self) -> Result<(), String> {
         if self.sim.rate_hz <= 0.0 {
             return Err(format!("sim.rate_hz must be > 0, got {}", self.sim.rate_hz));

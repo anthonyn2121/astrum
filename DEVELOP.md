@@ -56,6 +56,59 @@ normal editor**, and build/run/test them in a container. One-off commands:
 docker compose run --rm --no-deps sim bash -lc '<command>'
 ```
 
+## Quick start
+
+The fast path from a fresh checkout to a running sim. Every command below runs
+**inside the dev container** (§2) — nothing is built on your host. Do the one-time
+image build, then open a container shell and run steps 1–3 inside it:
+
+```bash
+make build      # one time — builds the astrum-dev image (compiles JSBSim; slow first run)
+make shell      # open a shell in the container; run the steps below there
+```
+
+**1. Build the Rust code** (the sim + every crate in the workspace):
+
+```bash
+cargo build --workspace              # debug build of every crate
+cargo build --release --workspace    # optimized build (what the demos run)
+```
+
+**2. Build the C++ code** (the example flight controller, built with CMake):
+
+```bash
+cmake -S controllers/cpp -B controllers/cpp/build -DCMAKE_BUILD_TYPE=Release   # configure
+cmake --build controllers/cpp/build -j                                         # compile
+# → produces the binary ./controllers/cpp/build/astrum-controller
+```
+
+**3. Run a scenario from a config** (a `config/*.toml` fleet definition):
+
+```bash
+cargo run -p astrum-sim                                                    # default: config/scenario.example.toml
+cargo run --release -p astrum-sim -- config/scenario.demo.toml             # pick a specific scenario (positional arg)
+cargo run -p astrum-sim -- --help                                          # list every flag + its env fallback
+```
+
+The scenario is a plain positional argument; every binary also still honours its
+old `ASTRUM_*` env var as a fallback (so `docker compose` and `make` keep working
+unchanged). Precedence is **CLI arg > `$ENV` > default** — see `--help`.
+
+The sim loads the fleet from the TOML, spins up one JSBSim model per aircraft
+(the first load takes ~10 s), then publishes telemetry over Zenoh until
+`max_time_s` is reached (or you Ctrl-C). Scenario format + the bundled examples
+are in §5.
+
+Prefer not to keep a shell open? Run any single command in a throwaway container
+instead of `make shell`:
+
+```bash
+docker compose run --rm --no-deps sim bash -lc 'cargo build --workspace'
+```
+
+To see everything working together — sim + controller + the 3-D browser view —
+the demos do it in one command: `make demo` and `make replay` (§7).
+
 ## 3. Repo layout — where files go
 
 ```
@@ -82,7 +135,7 @@ Makefile           # the commands you'll actually type
 |---|---|---|
 | A new Rust library crate | `crates/<name>/` | add it to `members` in the root `Cargo.toml` |
 | A new controller | `controllers/<name>/` | (optional) add a compose service for demos |
-| A new scenario | `config/<name>.toml` | run with `ASTRUM_SCENARIO=config/<name>.toml` |
+| A new scenario | `config/<name>.toml` | run with `cargo run -p astrum-sim -- config/<name>.toml` |
 | A test | `crates/<crate>/tests/<name>.rs` | see §6 |
 
 ## 4. Build & run the sim
@@ -90,16 +143,18 @@ Makefile           # the commands you'll actually type
 Inside a shell (`make shell`) or via `docker compose run`:
 
 ```bash
-cargo build --workspace              # compile everything
-cargo run -p astrum-sim               # run the sim (uses config/scenario.example.toml)
-ASTRUM_SCENARIO=config/scenario.demo.toml cargo run --release -p astrum-sim
+cargo build --workspace                                          # compile everything
+cargo run -p astrum-sim                                          # run the sim (uses config/scenario.example.toml)
+cargo run --release -p astrum-sim -- config/scenario.demo.toml   # pick a scenario (positional)
+cargo run -p astrum-sim -- --listen tcp/0.0.0.0:7447 config/scenario.demo.toml
 ```
 
-Handy environment variables the sim reads:
-| Var | Default | Meaning |
-|---|---|---|
-| `ASTRUM_SCENARIO` | `config/scenario.example.toml` | which scenario to load |
-| `ASTRUM_ZENOH_LISTEN` | `tcp/0.0.0.0:7447` | Zenoh endpoint the sim listens on (telemetry + commands) |
+The sim's flags (run `astrum-sim --help` to see them, each with its `[env: …]`
+fallback shown). Every flag falls back to the env var, then the default:
+| Flag | Env fallback | Default | Meaning |
+|---|---|---|---|
+| *(positional)* `scenario` | `ASTRUM_SCENARIO` | `config/scenario.example.toml` | which scenario to load |
+| `--listen` | `ASTRUM_ZENOH_LISTEN` | `tcp/0.0.0.0:7447` | Zenoh endpoint the sim listens on (telemetry + commands) |
 
 ## 5. Scenarios
 
@@ -217,8 +272,10 @@ ASTRUM_SCENARIO=config/scenario.demo.toml docker compose up -d sim
 # 2. open a shell on the same network (sim resolves by name)
 make shell
 
-# 3. build + run YOUR controller, pointing at the sim; rerun as you iterate
-ASTRUM_ZENOH_CONNECT=tcp/sim:7447 ASTRUM_TARGET_ID=1 <build-and-run-your-controller>
+# 3. build + run YOUR controller, pointing at the sim; rerun as you iterate.
+#    The bundled controllers take flags (env vars still work as a fallback):
+python controllers/python/controller.py --connect tcp/sim:7447 --id 1
+./controllers/cpp/build/astrum-controller --connect tcp/sim:7447 --id 1
 
 # 4. when done
 docker compose down

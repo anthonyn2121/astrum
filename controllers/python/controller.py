@@ -20,16 +20,19 @@ Two modes (env ``ASTRUM_CONTROL_MODE``):
     of telemetry to clear the startup race) and then just monitors, letting the
     sim's built-in inner loop fly it.
 
-Config (env), matching the C++ controller so the compose wiring is shared:
-  ASTRUM_ZENOH_CONNECT      (default tcp/127.0.0.1:7447; tcp/sim:7447 under compose)
-  ASTRUM_TARGET_ID          (default 1)
-  ASTRUM_TARGET_HEADING_DEG (default 0    — due north)
-  ASTRUM_TARGET_ALT_M       (default 1500)
-  ASTRUM_TARGET_SPD_MPS     (default 50)
-  ASTRUM_CONTROL_MODE       (default raw)
-  ASTRUM_SCHEMA             (default: astrum.capnp relative to this file)
+Config is via CLI flags (run with ``--help``); each falls back to its old
+ASTRUM_* env var, then a default, so precedence is CLI arg > env > default and
+the compose wiring keeps working:
+  --connect  ASTRUM_ZENOH_CONNECT      (default tcp/127.0.0.1:7447; tcp/sim:7447 under compose)
+  --id       ASTRUM_TARGET_ID          (default 1)
+  --heading  ASTRUM_TARGET_HEADING_DEG (default 0    — due north, degrees)
+  --alt      ASTRUM_TARGET_ALT_M       (default 1500)
+  --speed    ASTRUM_TARGET_SPD_MPS     (default 50)
+  --mode     ASTRUM_CONTROL_MODE       (default raw)
+  --schema   ASTRUM_SCHEMA             (default: astrum.capnp relative to this file)
 """
 
+import argparse
 import math
 import os
 import sys
@@ -45,6 +48,38 @@ def env_str(key, fallback):
 def env_f64(key, fallback):
     v = os.environ.get(key)
     return float(v) if v is not None else fallback
+
+
+def default_schema_path():
+    """The bundled astrum.capnp, resolved relative to this file."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "crates", "astrum-proto", "schema", "astrum.capnp",
+    )
+
+
+def parse_args():
+    """CLI flags, each falling back to its old ASTRUM_* env var, then a default
+    (so precedence is CLI arg > env > default, and compose keeps working)."""
+    p = argparse.ArgumentParser(
+        description="ASTRUM example flight controller (Python).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--connect", default=env_str("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447"),
+                   help="sim Zenoh endpoint (telemetry + commands)")
+    p.add_argument("--id", type=int, default=int(env_f64("ASTRUM_TARGET_ID", 1)),
+                   help="aircraft id to subscribe to / command")
+    p.add_argument("--heading", type=float, default=env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0),
+                   help="target heading in degrees (0 = due north)")
+    p.add_argument("--alt", type=float, default=env_f64("ASTRUM_TARGET_ALT_M", 1500.0),
+                   help="target MSL altitude (m)")
+    p.add_argument("--speed", type=float, default=env_f64("ASTRUM_TARGET_SPD_MPS", 50.0),
+                   help="target airspeed (m/s)")
+    p.add_argument("--mode", choices=["raw", "autopilot"],
+                   default=env_str("ASTRUM_CONTROL_MODE", "raw"), help="control mode")
+    p.add_argument("--schema", default=env_str("ASTRUM_SCHEMA", default_schema_path()),
+                   help="path to astrum.capnp")
+    return p.parse_args()
 
 
 def wrap_pi(a):
@@ -101,24 +136,20 @@ class HoldLaw:
 
 
 def main():
-    connect = env_str("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447")
-    target_id = int(env_f64("ASTRUM_TARGET_ID", 1))
-    target_hdg = math.radians(env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0))
-    target_alt = env_f64("ASTRUM_TARGET_ALT_M", 1500.0)
-    target_spd = env_f64("ASTRUM_TARGET_SPD_MPS", 50.0)
-    mode = env_str("ASTRUM_CONTROL_MODE", "raw")
+    args = parse_args()
+    connect = args.connect
+    target_id = args.id
+    target_hdg = math.radians(args.heading)
+    target_alt = args.alt
+    target_spd = args.speed
+    mode = args.mode
 
     telemetry_key = f"astrum/telemetry/{target_id}"
     command_key = f"astrum/command/{target_id}"
 
     # Load the shared schema at runtime (no codegen step) — same source of truth
     # the Rust sim and the C++ controller compile against.
-    default_schema = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "crates", "astrum-proto", "schema", "astrum.capnp",
-    )
-    schema_path = env_str("ASTRUM_SCHEMA", default_schema)
-    astrum = capnp.load(schema_path)
+    astrum = capnp.load(args.schema)
 
     # Peer session onto the sim's single Zenoh endpoint. Multicast scouting is
     # off — Docker bridge networks don't pass it, so peers connect explicitly.

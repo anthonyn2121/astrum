@@ -22,6 +22,7 @@ path = "src/bin/export.rs"
 [dependencies]
 astrum-proto = { path = "../astrum-proto" }
 astrum-net = { path = "../astrum-net" }
+clap = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Sync WebSocket (no async runtime — matches the rest of the workspace). We do

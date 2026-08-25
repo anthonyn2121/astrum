@@ -14,11 +14,8 @@
 //! The HTTP upgrade handshake is done by hand and the raw socket handed to
 //! `tungstenite` for framing.
 //!
-//! Config (env):
-//!  * `$ASTRUM_ZENOH_CONNECT` — sim/replay endpoint to subscribe to (default
-//!    `tcp/127.0.0.1:7447`; `tcp/sim:7447` under compose).
-//!  * `$ASTRUM_WEB_BIND` — HTTP/WS listen address (default `0.0.0.0:8080`).
-//!  * `$ASTRUM_WEB_ROOT` — static renderer directory (default `web`).
+//! Config (CLI arg > env > default): see `--help`. Each flag falls back to its
+//! `ASTRUM_*` env var, so compose/CI keep working.
 
 use std::error::Error;
 use std::io::{Read, Write};
@@ -31,6 +28,7 @@ use std::time::Duration;
 
 use astrum_net::{Session, TelemetrySubscriber};
 use astrum_web::FrameJson;
+use clap::Parser;
 use tungstenite::handshake::derive_accept_key;
 use tungstenite::protocol::{Role, WebSocket};
 use tungstenite::Message;
@@ -43,14 +41,29 @@ type Clients = Arc<Mutex<Vec<SyncSender<Arc<String>>>>>;
 /// for it (it just renders the next state) rather than growing memory.
 const CLIENT_QUEUE: usize = 2048;
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// Stream live/replayed telemetry to browsers over WebSocket and serve the
+/// static 3-D renderer, both on one port.
+#[derive(Parser)]
+#[command(name = "astrum-web", version, about)]
+struct Cli {
+    /// Zenoh endpoint to subscribe to (the sim or a replay).
+    #[arg(long, env = "ASTRUM_ZENOH_CONNECT", default_value_t = astrum_net::DEFAULT_CONNECT_ENDPOINT.to_string())]
+    connect: String,
+
+    /// HTTP/WebSocket listen address.
+    #[arg(long, env = "ASTRUM_WEB_BIND", default_value = "0.0.0.0:8080")]
+    bind: String,
+
+    /// Static renderer directory to serve.
+    #[arg(long, env = "ASTRUM_WEB_ROOT", default_value = "web")]
+    root: PathBuf,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let upstream = env_or("ASTRUM_ZENOH_CONNECT", astrum_net::DEFAULT_CONNECT_ENDPOINT);
-    let bind = env_or("ASTRUM_WEB_BIND", "0.0.0.0:8080");
-    let root = PathBuf::from(env_or("ASTRUM_WEB_ROOT", "web"));
+    let cli = Cli::parse();
+    let upstream = cli.connect;
+    let bind = cli.bind;
+    let root = cli.root;
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));
 

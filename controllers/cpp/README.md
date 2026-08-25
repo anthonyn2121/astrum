@@ -9,7 +9,7 @@ to `tcp/sim:7447` (not two ports); the id lives in the key, so there's no topic 
 - **SUB** `astrum/telemetry/<id>` — telemetry for one aircraft.
 - **PUB** `astrum/command/<id>` — commands (target id + raw actuators *or* autopilot targets).
 
-## Modes (`ASTRUM_CONTROL_MODE`)
+## Modes (`--mode`)
 
 - **`raw`** (default) — the controller closes a heading / altitude / airspeed hold loop
   *itself* and sends raw `fcs/*-cmd-norm` deflections every telemetry tick. This is
@@ -23,27 +23,32 @@ to `tcp/sim:7447` (not two ports); the id lives in the key, so there's no topic 
 Both converge a 90° turn to within ~4° while holding altitude to a few metres (see
 the traces in the repo's verification notes).
 
-## Configuration (environment)
+## Configuration (flags)
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `ASTRUM_ZENOH_CONNECT`     | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (telemetry + commands) |
-| `ASTRUM_TARGET_ID`         | `1`    | aircraft id to subscribe to / command |
-| `ASTRUM_TARGET_HEADING_DEG`| `0`    | target heading (0 = due north) |
-| `ASTRUM_TARGET_ALT_M`      | `1500` | target MSL altitude (m) |
-| `ASTRUM_TARGET_SPD_MPS`    | `50`   | target airspeed (m/s) |
-| `ASTRUM_CONTROL_MODE`      | `raw`  | `raw` or `autopilot` |
+Pass config as command-line flags (run `--help` for the list). Each flag falls
+back to its old `ASTRUM_*` env var, then the default, so precedence is
+**CLI arg > `$ENV` > default** and the compose services are unchanged.
+
+| Flag | Env fallback | Default | Meaning |
+|---|---|---|---|
+| `--connect` | `ASTRUM_ZENOH_CONNECT`      | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (telemetry + commands) |
+| `--id`      | `ASTRUM_TARGET_ID`         | `1`    | aircraft id to subscribe to / command |
+| `--heading` | `ASTRUM_TARGET_HEADING_DEG`| `0`    | target heading in degrees (0 = due north) |
+| `--alt`     | `ASTRUM_TARGET_ALT_M`      | `1500` | target MSL altitude (m) |
+| `--speed`   | `ASTRUM_TARGET_SPD_MPS`    | `50`   | target airspeed (m/s) |
+| `--mode`    | `ASTRUM_CONTROL_MODE`      | `raw`  | `raw` or `autopilot` |
 
 ## Build & run (inside the dev container)
 
 ```bash
 cmake -S controllers/cpp -B controllers/cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build controllers/cpp/build -j
-ASTRUM_TARGET_HEADING_DEG=0 ./controllers/cpp/build/astrum-controller
+./controllers/cpp/build/astrum-controller --heading 0 --id 1
 ```
 
-Under compose the `controller` service does exactly this and points at the `sim`
-service by name (`make up`, or `docker compose up sim controller`).
+Under compose the `controller` service does exactly this (via its env vars, which
+the flags fall back to) and points at the `sim` service by name (`make up`, or
+`docker compose up sim controller`).
 
 ## Notes
 
@@ -61,7 +66,7 @@ service by name (`make up`, or `docker compose up sim controller`).
   is copied into a word-aligned buffer before reading.
 - Telemetry carries no body rates, so the raw hold loop estimates roll/pitch rate by
   finite-differencing attitude between frames for damping.
-- This example follows **one** aircraft (`ASTRUM_TARGET_ID`), but the transport is fleet-wide:
+- This example follows **one** aircraft (`--id`), but the transport is fleet-wide:
   subscribe `astrum/telemetry/*` instead of a single id to receive **every** aircraft's telemetry
   over the same session — useful for a controller that reacts to its neighbours. Adding aircraft
   needs no endpoint or port change; the id is just another key.

@@ -16,3 +16,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Shared dependencies are declared here (bevy, zenoh, capnp, ...).
+# clap drives every binary's CLI. The `env` feature lets each flag fall back to
+# its old environment variable (CLI arg > $ENV > default), so docker-compose and
+# the Makefile keep working unchanged.
+clap = { version = "4", features = ["derive", "env"] }
