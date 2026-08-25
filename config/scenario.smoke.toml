@@ -1,4 +1,4 @@
-# Short bounded scenario used to smoke-test forge-sim (spawn -> step -> ENU ->
+# Short bounded scenario used to smoke-test astrum-sim (spawn -> step -> ENU ->
 # clean max-time exit). Two aircraft diverging via different headings/altitudes.
 
 [world]

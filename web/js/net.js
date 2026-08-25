@@ -1,9 +1,9 @@
 // Telemetry sources for the renderer.
 //
-//  * WebSocket — the `forge-web` bridge streams one JSON frame per sample from
-//    the live sim or `forge-bag-play`. Frames arrive continuously; the store
+//  * WebSocket — the `astrum-web` bridge streams one JSON frame per sample from
+//    the live sim or `astrum-bag-play`. Frames arrive continuously; the store
 //    buffers them so you can still scrub back through what's been received.
-//  * File — a `forge-web-export` document (a whole bag baked to JSON). Loaded
+//  * File — a `astrum-web-export` document (a whole bag baked to JSON). Loaded
 //    whole, giving a fully seekable timeline with no running services.
 
 export class Net {
@@ -57,14 +57,14 @@ export function defaultWsUrl() {
   return `${proto}//${host}/telemetry`;
 }
 
-// Parse a forge-web-export document. Returns { frames, meta } or throws.
+// Parse a astrum-web-export document. Returns { frames, meta } or throws.
 export async function loadExportFile(file) {
   const text = await file.text();
   const doc = JSON.parse(text);
-  if (doc && doc.kind === "forge-replay-bag" && Array.isArray(doc.frames)) {
+  if (doc && doc.kind === "astrum-replay-bag" && Array.isArray(doc.frames)) {
     return { frames: doc.frames, meta: doc.meta || null };
   }
   // Tolerate a bare array of frames too.
   if (Array.isArray(doc)) return { frames: doc, meta: null };
-  throw new Error("not a FORGE replay export (expected a forge-web-export JSON document)");
+  throw new Error("not a ASTRUM replay export (expected a astrum-web-export JSON document)");
 }

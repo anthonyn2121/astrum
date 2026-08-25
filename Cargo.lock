@@ -45,6 +45,67 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrum-bag"
+version = "0.1.0"
+dependencies = [
+ "astrum-net",
+ "astrum-proto",
+ "capnp",
+]
+
+[[package]]
+name = "astrum-fdm"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
+name = "astrum-geo"
+version = "0.1.0"
+
+[[package]]
+name = "astrum-net"
+version = "0.1.0"
+dependencies = [
+ "astrum-proto",
+ "zmq",
+]
+
+[[package]]
+name = "astrum-proto"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+]
+
+[[package]]
+name = "astrum-sim"
+version = "0.1.0"
+dependencies = [
+ "astrum-fdm",
+ "astrum-geo",
+ "astrum-net",
+ "astrum-proto",
+ "bevy",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "astrum-web"
+version = "0.1.0"
+dependencies = [
+ "astrum-net",
+ "astrum-proto",
+ "serde",
+ "serde_json",
+ "tungstenite",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -702,67 +763,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "forge-bag"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "forge-net",
- "forge-proto",
-]
-
-[[package]]
-name = "forge-fdm"
-version = "0.1.0"
-dependencies = [
- "cc",
- "pkg-config",
-]
-
-[[package]]
-name = "forge-geo"
-version = "0.1.0"
-
-[[package]]
-name = "forge-net"
-version = "0.1.0"
-dependencies = [
- "forge-proto",
- "zmq",
-]
-
-[[package]]
-name = "forge-proto"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "capnpc",
-]
-
-[[package]]
-name = "forge-sim"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "forge-fdm",
- "forge-geo",
- "forge-net",
- "forge-proto",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "forge-web"
-version = "0.1.0"
-dependencies = [
- "forge-net",
- "forge-proto",
- "serde",
- "serde_json",
- "tungstenite",
-]
 
 [[package]]
 name = "form_urlencoded"

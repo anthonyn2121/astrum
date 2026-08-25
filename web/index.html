@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>FORGE · 3-D Replay</title>
+  <title>ASTRUM · 3-D Replay</title>
   <link rel="stylesheet" href="./style.css" />
   <script type="importmap">
     {
@@ -19,7 +19,7 @@
 
   <!-- Top bar -->
   <header id="topbar">
-    <div class="brand"><span class="mark">◆</span> FORGE <em>Replay</em></div>
+    <div class="brand"><span class="mark">◆</span> ASTRUM <em>Replay</em></div>
     <div class="source">
       <span id="statusPill" class="pill idle">idle</span>
       <span id="sourceLabel" class="muted">no source</span>
@@ -27,7 +27,7 @@
     <div class="source-controls">
       <input id="wsUrl" type="text" spellcheck="false" placeholder="ws://host:8080/telemetry" />
       <button id="connectBtn" title="Connect to a live/replay WebSocket">Connect</button>
-      <button id="openFileBtn" title="Open a forge-web-export JSON bag">Open file…</button>
+      <button id="openFileBtn" title="Open a astrum-web-export JSON bag">Open file…</button>
       <input id="fileInput" type="file" accept=".json,application/json" hidden />
     </div>
   </header>
@@ -85,7 +85,7 @@
     <span id="fps" class="muted">—</span>
   </footer>
 
-  <div id="dropHint">Drop a <code>forge-web-export</code> JSON here</div>
+  <div id="dropHint">Drop a <code>astrum-web-export</code> JSON here</div>
 
   <script type="module" src="./js/main.js"></script>
 </body>

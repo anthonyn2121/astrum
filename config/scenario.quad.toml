@@ -1,9 +1,9 @@
-# Bounded single-quadrotor scenario — FORGE's second vehicle class.
+# Bounded single-quadrotor scenario — ASTRUM's second vehicle class.
 # An F450 quad starts hovering at 100 m, heading east (90°). The demo controller
 # (in `autopilot` mode) commands the sim's built-in multirotor hover-hold to
 # climb to 130 m and yaw to 180°, so telemetry shows a 30 m climb + 90° yaw that
 # then holds. `kind` is inferred from the model (F450 → multirotor); state it
-# explicitly for a model FORGE doesn't recognise.
+# explicitly for a model ASTRUM doesn't recognise.
 
 [world]
 origin_lat_deg = 44.7258

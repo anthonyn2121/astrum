@@ -1,0 +1,25 @@
+[package]
+name = "astrum-bag"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ASTRUM telemetry bag: record the telemetry stream and replay it as another ZMQ publisher."
+
+[lib]
+name = "astrum_bag"
+
+# `record` subscribes to live telemetry and writes a bag; `play` replays a bag
+# as a PUB, feeding any subscriber (controller / replay renderer) exactly as the
+# live sim would.
+[[bin]]
+name = "astrum-bag-record"
+path = "src/bin/record.rs"
+
+[[bin]]
+name = "astrum-bag-play"
+path = "src/bin/play.rs"
+
+[dependencies]
+astrum-proto = { path = "../astrum-proto" }
+astrum-net = { path = "../astrum-net" }
+capnp = "0.21"

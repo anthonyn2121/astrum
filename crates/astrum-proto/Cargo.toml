@@ -1,0 +1,15 @@
+[package]
+name = "astrum-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ASTRUM Cap'n Proto wire schema + generated Rust bindings (telemetry, commands, bag)."
+
+[lib]
+name = "astrum_proto"
+
+[dependencies]
+capnp = "0.21"
+
+[build-dependencies]
+capnpc = "0.21"

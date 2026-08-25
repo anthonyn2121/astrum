@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# FORGE development image.
+# ASTRUM development image.
 #   Stage 1 (jsbsim-builder): compile JSBSim as a shared library from source.
 #   Stage 2 (dev):            full toolchain — Rust, C++/CMake, ZMQ, Cap'n Proto,
 #                             Python — plus the JSBSim lib/headers/data.
@@ -45,7 +45,7 @@ RUN mkdir -p "${JSBSIM_PREFIX}/share/jsbsim" \
     && cp -r aircraft engine systems scripts "${JSBSIM_PREFIX}/share/jsbsim/"
 
 ##############################################################################
-# Stage 2 — FORGE dev toolchain
+# Stage 2 — ASTRUM dev toolchain
 ##############################################################################
 FROM ubuntu:${UBUNTU_VERSION} AS dev
 
@@ -99,7 +99,7 @@ RUN python3 -m venv "${VIRTUAL_ENV}" \
     && pip install --no-cache-dir pyzmq pycapnp
 
 # JSBSim 1.3.1 does not install a pkg-config file, so synthesize one. This lets
-# forge-fdm's build.rs and the C++ controller link JSBSim via `pkg-config JSBSim`
+# astrum-fdm's build.rs and the C++ controller link JSBSim via `pkg-config JSBSim`
 # instead of hardcoded paths. (Headers live under include/JSBSim; rpath baked in
 # so linked binaries run without LD_LIBRARY_PATH.)
 RUN mkdir -p "${JSBSIM_PREFIX}/lib/pkgconfig" && { \
@@ -116,7 +116,7 @@ RUN mkdir -p "${JSBSIM_PREFIX}/lib/pkgconfig" && { \
     } > "${JSBSIM_PREFIX}/lib/pkgconfig/JSBSim.pc"
 
 WORKDIR /workspace
-COPY docker/entrypoint.sh /usr/local/bin/forge-entrypoint
-RUN chmod +x /usr/local/bin/forge-entrypoint
-ENTRYPOINT ["/usr/local/bin/forge-entrypoint"]
+COPY docker/entrypoint.sh /usr/local/bin/astrum-entrypoint
+RUN chmod +x /usr/local/bin/astrum-entrypoint
+ENTRYPOINT ["/usr/local/bin/astrum-entrypoint"]
 CMD ["bash"]

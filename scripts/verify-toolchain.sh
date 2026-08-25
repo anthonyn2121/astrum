@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Verify the FORGE toolchain image end-to-end. Run inside the dev container via
+# Verify the ASTRUM toolchain image end-to-end. Run inside the dev container via
 # `make verify`. Hard checks (compilers, pkg-config libs, python bindings, and a
 # C++ program that links libJSBSim) abort on failure; the JSBSim CLI functional
 # check is best-effort and only prints its output.
@@ -9,7 +9,7 @@ set -euo pipefail
 hr() { printf '%s\n' "============================================================"; }
 
 hr
-echo " FORGE toolchain verification"
+echo " ASTRUM toolchain verification"
 hr
 
 echo "-- compilers & build tools --"

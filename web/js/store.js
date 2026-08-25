@@ -44,7 +44,7 @@ export class Store {
 
   get frameCount() { return this._frameCount; }
 
-  // Append one frame (a plain object matching forge_web::FrameJson). Samples are
+  // Append one frame (a plain object matching astrum_web::FrameJson). Samples are
   // kept sorted by sim time.
   addFrame(f) {
     const id = f.id;

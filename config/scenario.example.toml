@@ -1,5 +1,5 @@
-# FORGE scenario — a geodetic ENU origin plus a fleet of aircraft with initial
-# conditions. `forge-sim` loads this to spawn one ECS entity (each owning its own
+# ASTRUM scenario — a geodetic ENU origin plus a fleet of aircraft with initial
+# conditions. `astrum-sim` loads this to spawn one ECS entity (each owning its own
 # JSBSim FDM) per `[[aircraft]]` entry. Copy to `config/scenario.toml` to customise.
 
 [world]

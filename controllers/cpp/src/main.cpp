@@ -1,26 +1,26 @@
-// FORGE example flight controller (C++).
+// ASTRUM example flight controller (C++).
 //
-// A minimal out-of-sim controller that talks to `forge-sim` purely over ZMQ,
-// using the shared Cap'n Proto schema (`forge.capnp`) for the wire format:
+// A minimal out-of-sim controller that talks to `astrum-sim` purely over ZMQ,
+// using the shared Cap'n Proto schema (`astrum.capnp`) for the wire format:
 //
 //   * SUB  tcp://sim:5555 — telemetry for one aircraft (topic = 4-byte BE id)
 //   * PUSH tcp://sim:5556 — commands (target id + raw actuators | autopilot)
 //
-// Two modes (env `FORGE_CONTROL_MODE`):
+// Two modes (env `ASTRUM_CONTROL_MODE`):
 //   * "raw" (default) — closes a heading/altitude/airspeed hold loop *here*,
 //     in the controller, sending raw `fcs/*-cmd-norm` deflections each tick.
-//     This is FORGE's intended usage: the user owns the control law.
+//     This is ASTRUM's intended usage: the user owns the control law.
 //   * "autopilot" — sends a single high-level target command and then just
 //     monitors, letting the sim's built-in inner loop fly it.
 //
 // Config (env):
-//   FORGE_TELEMETRY_CONNECT  (default tcp://127.0.0.1:5555)
-//   FORGE_COMMAND_CONNECT    (default tcp://127.0.0.1:5556)
-//   FORGE_TARGET_ID          (default 1)
-//   FORGE_TARGET_HEADING_DEG (default 0    — due north)
-//   FORGE_TARGET_ALT_M       (default 1500)
-//   FORGE_TARGET_SPD_MPS     (default 50)
-//   FORGE_CONTROL_MODE       (default raw)
+//   ASTRUM_TELEMETRY_CONNECT  (default tcp://127.0.0.1:5555)
+//   ASTRUM_COMMAND_CONNECT    (default tcp://127.0.0.1:5556)
+//   ASTRUM_TARGET_ID          (default 1)
+//   ASTRUM_TARGET_HEADING_DEG (default 0    — due north)
+//   ASTRUM_TARGET_ALT_M       (default 1500)
+//   ASTRUM_TARGET_SPD_MPS     (default 50)
+//   ASTRUM_CONTROL_MODE       (default raw)
 
 #include <algorithm>
 #include <chrono>
@@ -37,7 +37,7 @@
 #include <kj/array.h>
 #include <zmq.hpp>
 
-#include "forge.capnp.h"
+#include "astrum.capnp.h"
 
 namespace {
 
@@ -53,7 +53,7 @@ double env_f64(const char* key, double fallback) {
   return v ? std::strtod(v, nullptr) : fallback;
 }
 
-// 4-byte big-endian aircraft id — matches forge-net's topic frame.
+// 4-byte big-endian aircraft id — matches astrum-net's topic frame.
 std::string topic_for(uint32_t id) {
   std::string t(4, '\0');
   t[0] = static_cast<char>((id >> 24) & 0xFF);
@@ -126,14 +126,14 @@ struct HoldLaw {
 }  // namespace
 
 int main() {
-  const std::string tlm_endpoint = env_or("FORGE_TELEMETRY_CONNECT", "tcp://127.0.0.1:5555");
-  const std::string cmd_endpoint = env_or("FORGE_COMMAND_CONNECT", "tcp://127.0.0.1:5556");
+  const std::string tlm_endpoint = env_or("ASTRUM_TELEMETRY_CONNECT", "tcp://127.0.0.1:5555");
+  const std::string cmd_endpoint = env_or("ASTRUM_COMMAND_CONNECT", "tcp://127.0.0.1:5556");
   const uint32_t target_id = static_cast<uint32_t>(std::strtoul(
-      env_or("FORGE_TARGET_ID", "1").c_str(), nullptr, 10));
-  const double target_hdg = env_f64("FORGE_TARGET_HEADING_DEG", 0.0) * kPi / 180.0;
-  const double target_alt = env_f64("FORGE_TARGET_ALT_M", 1500.0);
-  const double target_spd = env_f64("FORGE_TARGET_SPD_MPS", 50.0);
-  const std::string mode = env_or("FORGE_CONTROL_MODE", "raw");
+      env_or("ASTRUM_TARGET_ID", "1").c_str(), nullptr, 10));
+  const double target_hdg = env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0) * kPi / 180.0;
+  const double target_alt = env_f64("ASTRUM_TARGET_ALT_M", 1500.0);
+  const double target_spd = env_f64("ASTRUM_TARGET_SPD_MPS", 50.0);
+  const std::string mode = env_or("ASTRUM_CONTROL_MODE", "raw");
 
   zmq::context_t ctx(1);
 

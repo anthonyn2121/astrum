@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(forge_controller CXX)
+project(astrum_controller CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,20 +17,20 @@ pkg_check_modules(ZMQ REQUIRED libzmq)  # cppzmq's zmq.hpp is header-only in /us
 
 # Generate C++ from the ONE shared schema the Rust side uses, guaranteeing the
 # controller and sim are wire-compatible.
-set(SCHEMA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../crates/forge-proto/schema)
-set(SCHEMA ${SCHEMA_DIR}/forge.capnp)
+set(SCHEMA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../crates/astrum-proto/schema)
+set(SCHEMA ${SCHEMA_DIR}/astrum.capnp)
 set(GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/gen)
 file(MAKE_DIRECTORY ${GEN_DIR})
 add_custom_command(
-  OUTPUT ${GEN_DIR}/forge.capnp.c++ ${GEN_DIR}/forge.capnp.h
+  OUTPUT ${GEN_DIR}/astrum.capnp.c++ ${GEN_DIR}/astrum.capnp.h
   COMMAND capnp compile --src-prefix=${SCHEMA_DIR} -oc++:${GEN_DIR} ${SCHEMA}
   DEPENDS ${SCHEMA}
-  COMMENT "Generating C++ bindings from forge.capnp"
+  COMMENT "Generating C++ bindings from astrum.capnp"
   VERBATIM)
 
-add_executable(forge-controller src/main.cpp ${GEN_DIR}/forge.capnp.c++)
-target_include_directories(forge-controller PRIVATE
+add_executable(astrum-controller src/main.cpp ${GEN_DIR}/astrum.capnp.c++)
+target_include_directories(astrum-controller PRIVATE
   ${GEN_DIR} ${CAPNP_INCLUDE_DIRS} ${ZMQ_INCLUDE_DIRS})
-target_link_directories(forge-controller PRIVATE
+target_link_directories(astrum-controller PRIVATE
   ${CAPNP_LIBRARY_DIRS} ${ZMQ_LIBRARY_DIRS})
-target_link_libraries(forge-controller PRIVATE ${CAPNP_LIBRARIES} ${ZMQ_LIBRARIES})
+target_link_libraries(astrum-controller PRIVATE ${CAPNP_LIBRARIES} ${ZMQ_LIBRARIES})

@@ -1,0 +1,29 @@
+[package]
+name = "astrum-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ASTRUM 3-D replay bridge: telemetry → JSON over WebSocket (live/replay) + a bag → JSON exporter for the browser renderer."
+
+[lib]
+name = "astrum_web"
+
+# `astrum-web` streams live/replayed telemetry to the browser over WebSocket and
+# serves the static Three.js renderer; `astrum-web-export` bakes a bag into a
+# single JSON document the renderer can open offline (no running services).
+[[bin]]
+name = "astrum-web"
+path = "src/bin/web.rs"
+
+[[bin]]
+name = "astrum-web-export"
+path = "src/bin/export.rs"
+
+[dependencies]
+astrum-proto = { path = "../astrum-proto" }
+astrum-net = { path = "../astrum-net" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Sync WebSocket (no async runtime — matches the rest of the workspace). We do
+# the HTTP upgrade handshake by hand and hand the raw socket to tungstenite.
+tungstenite = "0.21"

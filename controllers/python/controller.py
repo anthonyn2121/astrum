@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""FORGE example flight controller (Python).
+"""ASTRUM example flight controller (Python).
 
-A minimal out-of-sim controller that talks to ``forge-sim`` purely over ZMQ,
-using the shared Cap'n Proto schema (``forge.capnp``) for the wire format. It is
+A minimal out-of-sim controller that talks to ``astrum-sim`` purely over ZMQ,
+using the shared Cap'n Proto schema (``astrum.capnp``) for the wire format. It is
 the Python twin of ``controllers/cpp`` — same endpoints, same env config, same
 hold-law gains, same framing — proving a controller in any language plugs into
-FORGE with nothing but pyzmq + pycapnp.
+ASTRUM with nothing but pyzmq + pycapnp.
 
   * SUB  tcp://sim:5555 — telemetry for one aircraft (topic = 4-byte BE id)
   * PUSH tcp://sim:5556 — commands (target id + raw actuators | autopilot)
 
-Two modes (env ``FORGE_CONTROL_MODE``):
+Two modes (env ``ASTRUM_CONTROL_MODE``):
   * "raw" (default) — closes a heading/altitude/airspeed hold loop *here*, in
     the controller, sending raw ``fcs/*-cmd-norm`` deflections each tick. This
-    is FORGE's intended usage: the user owns the control law.
+    is ASTRUM's intended usage: the user owns the control law.
   * "autopilot" — sends a single high-level target command and then just
     monitors, letting the sim's built-in inner loop fly it.
 
 Config (env), matching the C++ controller so the compose wiring is shared:
-  FORGE_TELEMETRY_CONNECT  (default tcp://127.0.0.1:5555)
-  FORGE_COMMAND_CONNECT    (default tcp://127.0.0.1:5556)
-  FORGE_TARGET_ID          (default 1)
-  FORGE_TARGET_HEADING_DEG (default 0    — due north)
-  FORGE_TARGET_ALT_M       (default 1500)
-  FORGE_TARGET_SPD_MPS     (default 50)
-  FORGE_CONTROL_MODE       (default raw)
-  FORGE_SCHEMA             (default: forge.capnp relative to this file)
+  ASTRUM_TELEMETRY_CONNECT  (default tcp://127.0.0.1:5555)
+  ASTRUM_COMMAND_CONNECT    (default tcp://127.0.0.1:5556)
+  ASTRUM_TARGET_ID          (default 1)
+  ASTRUM_TARGET_HEADING_DEG (default 0    — due north)
+  ASTRUM_TARGET_ALT_M       (default 1500)
+  ASTRUM_TARGET_SPD_MPS     (default 50)
+  ASTRUM_CONTROL_MODE       (default raw)
+  ASTRUM_SCHEMA             (default: astrum.capnp relative to this file)
 """
 
 import math
@@ -47,7 +47,7 @@ def env_f64(key, fallback):
 
 
 def topic_for(aircraft_id):
-    """4-byte big-endian aircraft id — matches forge-net's topic frame."""
+    """4-byte big-endian aircraft id — matches astrum-net's topic frame."""
     return int(aircraft_id).to_bytes(4, "big")
 
 
@@ -105,22 +105,22 @@ class HoldLaw:
 
 
 def main():
-    tlm_endpoint = env_str("FORGE_TELEMETRY_CONNECT", "tcp://127.0.0.1:5555")
-    cmd_endpoint = env_str("FORGE_COMMAND_CONNECT", "tcp://127.0.0.1:5556")
-    target_id = int(env_f64("FORGE_TARGET_ID", 1))
-    target_hdg = math.radians(env_f64("FORGE_TARGET_HEADING_DEG", 0.0))
-    target_alt = env_f64("FORGE_TARGET_ALT_M", 1500.0)
-    target_spd = env_f64("FORGE_TARGET_SPD_MPS", 50.0)
-    mode = env_str("FORGE_CONTROL_MODE", "raw")
+    tlm_endpoint = env_str("ASTRUM_TELEMETRY_CONNECT", "tcp://127.0.0.1:5555")
+    cmd_endpoint = env_str("ASTRUM_COMMAND_CONNECT", "tcp://127.0.0.1:5556")
+    target_id = int(env_f64("ASTRUM_TARGET_ID", 1))
+    target_hdg = math.radians(env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0))
+    target_alt = env_f64("ASTRUM_TARGET_ALT_M", 1500.0)
+    target_spd = env_f64("ASTRUM_TARGET_SPD_MPS", 50.0)
+    mode = env_str("ASTRUM_CONTROL_MODE", "raw")
 
     # Load the shared schema at runtime (no codegen step) — same source of truth
     # the Rust sim and the C++ controller compile against.
     default_schema = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "crates", "forge-proto", "schema", "forge.capnp",
+        "..", "..", "crates", "astrum-proto", "schema", "astrum.capnp",
     )
-    schema_path = env_str("FORGE_SCHEMA", default_schema)
-    forge = capnp.load(schema_path)
+    schema_path = env_str("ASTRUM_SCHEMA", default_schema)
+    astrum = capnp.load(schema_path)
 
     ctx = zmq.Context.instance()
 
@@ -140,7 +140,7 @@ def main():
 
     # Autopilot mode: send one high-level target, then just monitor.
     if mode == "autopilot":
-        msg = forge.Command.new_message()
+        msg = astrum.Command.new_message()
         msg.targetId = target_id
         ap = msg.control.init("autopilot")
         ap.headingRad = target_hdg
@@ -164,7 +164,7 @@ def main():
         frames = tlm.recv_multipart()
         payload = frames[-1]
 
-        with forge.Telemetry.from_bytes(payload) as tel:
+        with astrum.Telemetry.from_bytes(payload) as tel:
             att = tel.attitude
             phi = att.phiRad
             theta = att.thetaRad
@@ -186,7 +186,7 @@ def main():
 
         aileron, elevator, throttle = law.compute(phi, theta, psi, alt, airspeed, now)
 
-        msg = forge.Command.new_message()
+        msg = astrum.Command.new_message()
         msg.targetId = target_id
         raw = msg.control.init("raw")
         raw.aileron = aileron

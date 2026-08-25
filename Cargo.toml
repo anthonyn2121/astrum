@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/forge-fdm",
-    "crates/forge-geo",
-    "crates/forge-proto",
-    "crates/forge-net",
-    "crates/forge-bag",
-    "crates/forge-sim",
-    "crates/forge-web",
+    "crates/astrum-fdm",
+    "crates/astrum-geo",
+    "crates/astrum-proto",
+    "crates/astrum-net",
+    "crates/astrum-bag",
+    "crates/astrum-sim",
+    "crates/astrum-web",
 ]
 
 [workspace.package]

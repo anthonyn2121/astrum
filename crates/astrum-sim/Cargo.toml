@@ -1,0 +1,25 @@
+[package]
+name = "astrum-sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ASTRUM headless Bevy ECS: the authoritative multi-aircraft state server."
+
+[lib]
+name = "astrum_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astrum-sim"
+path = "src/main.rs"
+
+[dependencies]
+# Headless: no render/winit/audio. default-features = false keeps the GUI/GPU
+# feature stack (and its system-lib deps, absent in the container) out of the build.
+bevy = { version = "0.19", default-features = false }
+astrum-fdm = { path = "../astrum-fdm" }
+astrum-geo = { path = "../astrum-geo" }
+astrum-net = { path = "../astrum-net" }
+astrum-proto = { path = "../astrum-proto" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
