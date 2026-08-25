@@ -18,14 +18,13 @@ namespace astrum {
 // recursion to a fixed point, then K = (R + B'PB)^-1 B'PA. Converges for a
 // stabilizable (A, B) with Q >= 0, R > 0.
 inline Eigen::MatrixXd dlqr(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B,
-                            const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R,
-                            int iters = 1000, double tol = 1e-12) {
+                            const Eigen::MatrixXd& Q, const Eigen::MatrixXd& R, int iters = 1000,
+                            double tol = 1e-12) {
   Eigen::MatrixXd P = Q;
   for (int i = 0; i < iters; ++i) {
     const Eigen::MatrixXd Pn =
         A.transpose() * P * A -
-        A.transpose() * P * B * (R + B.transpose() * P * B).ldlt().solve(B.transpose() * P * A) +
-        Q;
+        A.transpose() * P * B * (R + B.transpose() * P * B).ldlt().solve(B.transpose() * P * A) + Q;
     if ((Pn - P).cwiseAbs().maxCoeff() < tol) {
       P = Pn;
       break;

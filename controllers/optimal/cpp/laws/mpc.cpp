@@ -98,9 +98,8 @@ class ChannelMpc {
 // pitch); `b` the actuator->angular-accel gain (sign encodes actuator polarity).
 Eigen::MatrixXd attitude_A(double couple, double dt) {
   Eigen::Matrix3d A;
-  A << 1.0, couple * dt, 0.0,
-       0.0, 1.0, dt,
-       0.0, 0.0, 1.0 - 2.0 * dt;  // 2.0 = placeholder angular-rate damping
+  A << 1.0, couple * dt, 0.0, 0.0, 1.0, dt, 0.0, 0.0,
+      1.0 - 2.0 * dt;  // 2.0 = placeholder angular-rate damping
   return A;
 }
 
@@ -120,16 +119,15 @@ class MpcLaw : public Law {
     // aileron. State [heading_err, roll, roll_rate], input aileron.
     Eigen::Vector3d B_lat(0.0, 0.0, b * dt);
     Eigen::Vector3d q_lat(6.0, 1.0, 0.1);
-    lat_ = std::make_unique<ChannelMpc>(attitude_A(-g_over_v, dt), B_lat,
-                                        q_lat.asDiagonal(), r1(1.0), N);
+    lat_ = std::make_unique<ChannelMpc>(attitude_A(-g_over_v, dt), B_lat, q_lat.asDiagonal(),
+                                        r1(1.0), N);
 
     // Longitudinal: altitude changes with pitch; pitch is a damped response to
     // elevator (elevator+ pitches DOWN, hence -B). State [alt_err, pitch,
     // pitch_rate], input elevator.
     Eigen::Vector3d B_lon(0.0, 0.0, -b * dt);
     Eigen::Vector3d q_lon(0.02, 1.0, 0.05);
-    lon_ = std::make_unique<ChannelMpc>(attitude_A(-v, dt), B_lon,
-                                        q_lon.asDiagonal(), r1(16.0), N);
+    lon_ = std::make_unique<ChannelMpc>(attitude_A(-v, dt), B_lon, q_lon.asDiagonal(), r1(16.0), N);
 
     // Speed: single integrator; more throttle raises airspeed (reduces error).
     Eigen::MatrixXd A_spd(1, 1);

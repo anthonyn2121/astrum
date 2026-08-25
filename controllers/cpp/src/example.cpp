@@ -29,6 +29,10 @@
 //   --speed    ASTRUM_TARGET_SPD_MPS     (default 50)
 //   --mode     ASTRUM_CONTROL_MODE       (default raw)
 
+#include <capnp/message.h>
+#include <capnp/serialize.h>
+#include <kj/array.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -39,10 +43,6 @@
 #include <iostream>
 #include <string>
 #include <thread>
-
-#include <capnp/message.h>
-#include <capnp/serialize.h>
-#include <kj/array.h>
 #include <zenoh.hxx>
 
 #include "astrum.capnp.h"
@@ -101,8 +101,7 @@ struct HoldLaw {
   bool have_prev = false;
   double prev_phi = 0, prev_theta = 0, prev_t = 0;
 
-  void compute(const Telemetry::Reader& t, double& aileron, double& elevator,
-               double& throttle) {
+  void compute(const Telemetry::Reader& t, double& aileron, double& elevator, double& throttle) {
     auto att = t.getAttitude();
     const double phi = att.getPhiRad();
     const double theta = att.getThetaRad();
@@ -145,8 +144,8 @@ int main(int argc, char** argv) {
   // Seed every knob from its env var (or built-in default), then let CLI flags
   // override — so precedence is CLI arg > env > default, and compose keeps working.
   std::string connect = env_or("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447");
-  uint32_t target_id = static_cast<uint32_t>(
-      std::strtoul(env_or("ASTRUM_TARGET_ID", "1").c_str(), nullptr, 10));
+  uint32_t target_id =
+      static_cast<uint32_t>(std::strtoul(env_or("ASTRUM_TARGET_ID", "1").c_str(), nullptr, 10));
   double heading_deg = env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0);
   double target_alt = env_f64("ASTRUM_TARGET_ALT_M", 1500.0);
   double target_spd = env_f64("ASTRUM_TARGET_SPD_MPS", 50.0);
@@ -219,14 +218,12 @@ int main(int argc, char** argv) {
 
   auto publisher = session.declare_publisher(KeyExpr(command_key));
 
-  std::cerr << "[example] target=" << target_id << " mode=" << mode
-            << " connect=" << connect << " telemetry=" << telemetry_key
-            << " command=" << command_key << "\n";
+  std::cerr << "[example] target=" << target_id << " mode=" << mode << " connect=" << connect
+            << " telemetry=" << telemetry_key << " command=" << command_key << "\n";
 
   if (mode == "autopilot") {
-    std::cerr << "[example] autopilot target hdg=" << target_hdg << "rad alt="
-              << target_alt << "m spd=" << target_spd
-              << "m/s (asserted once telemetry confirms the link)\n";
+    std::cerr << "[example] autopilot target hdg=" << target_hdg << "rad alt=" << target_alt
+              << "m spd=" << target_spd << "m/s (asserted once telemetry confirms the link)\n";
   }
 
   HoldLaw law{target_hdg, target_alt, target_spd};
@@ -263,8 +260,8 @@ int main(int argc, char** argv) {
       }
       if (count % 120 == 0) {
         const double psi = tel.getAttitude().getPsiRad();
-        std::cerr << "[example] t=" << tel.getSimTimeS() << "s hdg="
-                  << psi * 180.0 / kPi << "deg alt=" << tel.getGeo().getAltM() << "m\n";
+        std::cerr << "[example] t=" << tel.getSimTimeS() << "s hdg=" << psi * 180.0 / kPi
+                  << "deg alt=" << tel.getGeo().getAltM() << "m\n";
       }
       return;
     }
@@ -284,9 +281,9 @@ int main(int argc, char** argv) {
 
     if (++n % 120 == 0) {
       const double psi = tel.getAttitude().getPsiRad();
-      std::cerr << "[example] t=" << tel.getSimTimeS() << "s hdg="
-                << psi * 180.0 / kPi << "deg alt=" << tel.getGeo().getAltM()
-                << "m ail=" << aileron << " elev=" << elevator << " thr=" << throttle << "\n";
+      std::cerr << "[example] t=" << tel.getSimTimeS() << "s hdg=" << psi * 180.0 / kPi
+                << "deg alt=" << tel.getGeo().getAltM() << "m ail=" << aileron
+                << " elev=" << elevator << " thr=" << throttle << "\n";
     }
   };
 

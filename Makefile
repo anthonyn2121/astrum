@@ -7,7 +7,10 @@ COMPOSE ?= docker compose
 SERVICE ?= sim
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down demo demo-python demo-quad replay export shell exec verify logs ps clean
+.PHONY: help build up down demo demo-python demo-quad replay export shell exec verify fmt lint logs ps clean
+
+# All hand-written C++ controller sources (excludes generated capnp + build dirs).
+CPP_SRC = find controllers -type f \( -name '*.cpp' -o -name '*.hpp' \) -not -path '*/build/*'
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -52,6 +55,16 @@ exec: ## Exec a shell into an already-running container (SERVICE=sim|controller)
 
 verify: ## Verify the toolchain (versions + JSBSim link + functional run)
 	$(COMPOSE) run --rm --no-deps $(SERVICE) bash scripts/verify-toolchain.sh
+
+# fmt/lint run as the host user so in-place rewrites keep file ownership (not
+# root), and with ruff's cache off so no .ruff_cache lands on the bind mount.
+RUN_USER = $(COMPOSE) run --rm --no-deps --user $$(id -u):$$(id -g) $(SERVICE)
+
+fmt: ## Format the controllers in place (clang-format for C++, ruff for Python)
+	$(RUN_USER) bash -lc 'clang-format -i $$($(CPP_SRC)) && ruff format controllers && ruff check --no-cache --fix controllers'
+
+lint: ## Lint Python (ruff) and check C++ formatting (clang-format --dry-run)
+	$(RUN_USER) bash -lc 'ruff check --no-cache controllers && ruff format --check controllers && clang-format --dry-run --Werror $$($(CPP_SRC))'
 
 logs: ## Follow service logs
 	$(COMPOSE) logs -f

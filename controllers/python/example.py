@@ -54,7 +54,12 @@ def default_schema_path():
     """The bundled astrum.capnp, resolved relative to this file."""
     return os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "crates", "astrum-proto", "schema", "astrum.capnp",
+        "..",
+        "..",
+        "crates",
+        "astrum-proto",
+        "schema",
+        "astrum.capnp",
     )
 
 
@@ -65,20 +70,46 @@ def parse_args():
         description="ASTRUM example flight controller (Python).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--connect", default=env_str("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447"),
-                   help="sim Zenoh endpoint (telemetry + commands)")
-    p.add_argument("--id", type=int, default=int(env_f64("ASTRUM_TARGET_ID", 1)),
-                   help="aircraft id to subscribe to / command")
-    p.add_argument("--heading", type=float, default=env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0),
-                   help="target heading in degrees (0 = due north)")
-    p.add_argument("--alt", type=float, default=env_f64("ASTRUM_TARGET_ALT_M", 1500.0),
-                   help="target MSL altitude (m)")
-    p.add_argument("--speed", type=float, default=env_f64("ASTRUM_TARGET_SPD_MPS", 50.0),
-                   help="target airspeed (m/s)")
-    p.add_argument("--mode", choices=["raw", "autopilot"],
-                   default=env_str("ASTRUM_CONTROL_MODE", "raw"), help="control mode")
-    p.add_argument("--schema", default=env_str("ASTRUM_SCHEMA", default_schema_path()),
-                   help="path to astrum.capnp")
+    p.add_argument(
+        "--connect",
+        default=env_str("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447"),
+        help="sim Zenoh endpoint (telemetry + commands)",
+    )
+    p.add_argument(
+        "--id",
+        type=int,
+        default=int(env_f64("ASTRUM_TARGET_ID", 1)),
+        help="aircraft id to subscribe to / command",
+    )
+    p.add_argument(
+        "--heading",
+        type=float,
+        default=env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0),
+        help="target heading in degrees (0 = due north)",
+    )
+    p.add_argument(
+        "--alt",
+        type=float,
+        default=env_f64("ASTRUM_TARGET_ALT_M", 1500.0),
+        help="target MSL altitude (m)",
+    )
+    p.add_argument(
+        "--speed",
+        type=float,
+        default=env_f64("ASTRUM_TARGET_SPD_MPS", 50.0),
+        help="target airspeed (m/s)",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["raw", "autopilot"],
+        default=env_str("ASTRUM_CONTROL_MODE", "raw"),
+        help="control mode",
+    )
+    p.add_argument(
+        "--schema",
+        default=env_str("ASTRUM_SCHEMA", default_schema_path()),
+        help="path to astrum.capnp",
+    )
     return p.parse_args()
 
 
@@ -212,8 +243,7 @@ def main():
                     pub.put(msg.to_bytes())
                 if n % 120 == 0:
                     print(
-                        f"[example.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
-                        f"alt={alt:.0f}m",
+                        f"[example.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg alt={alt:.0f}m",
                         file=sys.stderr,
                         flush=True,
                     )

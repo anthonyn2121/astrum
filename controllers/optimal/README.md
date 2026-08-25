@@ -37,9 +37,10 @@ You implement one method. In Python:
 ```python
 from astrum_control import Command, Law as BaseLaw, Reference, VehicleState
 
+
 class Law(BaseLaw):
     def control(self, s: VehicleState, ref: Reference) -> Command:
-        aileron = -1.5 * s.roll          # your control law here
+        aileron = -1.5 * s.roll  # your control law here
         return Command.raw(aileron=aileron, elevator=0.0, rudder=0.0, throttle=0.6)
 ```
 

@@ -1,0 +1,11 @@
+# ASTRUM Python style: ruff as both formatter and linter for the controllers
+# (controllers/python, controllers/optimal/python). The Rust side uses
+# rustfmt/clippy; there is no other Python in the tree.
+line-length = 100
+target-version = "py312"
+
+[lint]
+# ruff's default set (pyflakes F + pycodestyle E4/E7/E9) plus warnings (W) and
+# import sorting (I). Code layout / line length is owned by `ruff format`, so the
+# noisy whitespace + line-length rules (E1/E2/E3/E501) stay off.
+select = ["E4", "E7", "E9", "F", "W", "I"]

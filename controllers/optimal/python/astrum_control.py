@@ -30,8 +30,8 @@ from dataclasses import dataclass
 import capnp
 import zenoh
 
-
 # --- CLI / env helpers (precedence: CLI arg > $ENV > default, as everywhere) --
+
 
 def env_str(key, fallback):
     return os.environ.get(key, fallback)
@@ -46,7 +46,13 @@ def default_schema_path():
     """The bundled astrum.capnp, resolved relative to this file."""
     return os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "..", "crates", "astrum-proto", "schema", "astrum.capnp",
+        "..",
+        "..",
+        "..",
+        "crates",
+        "astrum-proto",
+        "schema",
+        "astrum.capnp",
     )
 
 
@@ -54,22 +60,45 @@ def add_common_args(p):
     """Register the flags every control law shares. Each falls back to its old
     ``ASTRUM_*`` env var, so precedence is CLI arg > env > default — consistent
     with the sim and the example controllers, and with the compose wiring."""
-    p.add_argument("--connect", default=env_str("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447"),
-                   help="sim Zenoh endpoint (telemetry + commands)")
-    p.add_argument("--id", type=int, default=int(env_f64("ASTRUM_TARGET_ID", 1)),
-                   help="aircraft id to subscribe to / command")
-    p.add_argument("--heading", type=float, default=env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0),
-                   help="reference heading in degrees (0 = due north)")
-    p.add_argument("--alt", type=float, default=env_f64("ASTRUM_TARGET_ALT_M", 1500.0),
-                   help="reference MSL altitude (m)")
-    p.add_argument("--speed", type=float, default=env_f64("ASTRUM_TARGET_SPD_MPS", 50.0),
-                   help="reference airspeed (m/s)")
-    p.add_argument("--schema", default=env_str("ASTRUM_SCHEMA", default_schema_path()),
-                   help="path to astrum.capnp")
+    p.add_argument(
+        "--connect",
+        default=env_str("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447"),
+        help="sim Zenoh endpoint (telemetry + commands)",
+    )
+    p.add_argument(
+        "--id",
+        type=int,
+        default=int(env_f64("ASTRUM_TARGET_ID", 1)),
+        help="aircraft id to subscribe to / command",
+    )
+    p.add_argument(
+        "--heading",
+        type=float,
+        default=env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0),
+        help="reference heading in degrees (0 = due north)",
+    )
+    p.add_argument(
+        "--alt",
+        type=float,
+        default=env_f64("ASTRUM_TARGET_ALT_M", 1500.0),
+        help="reference MSL altitude (m)",
+    )
+    p.add_argument(
+        "--speed",
+        type=float,
+        default=env_f64("ASTRUM_TARGET_SPD_MPS", 50.0),
+        help="reference airspeed (m/s)",
+    )
+    p.add_argument(
+        "--schema",
+        default=env_str("ASTRUM_SCHEMA", default_schema_path()),
+        help="path to astrum.capnp",
+    )
     return p
 
 
 # --- The data your law sees and returns --------------------------------------
+
 
 @dataclass
 class VehicleState:
@@ -81,25 +110,25 @@ class VehicleState:
     0.0 on the first frame. Angles are radians, distances metres, speeds m/s.
     """
 
-    t: float             # sim time (s)
+    t: float  # sim time (s)
     aircraft_id: int
-    lat_deg: float       # geodetic latitude
-    lon_deg: float       # geodetic longitude
-    alt_m: float         # MSL altitude (m)
-    e: float             # ENU east (m)
-    n: float             # ENU north (m)
-    u: float             # ENU up (m)
-    v_n: float           # NED velocity north (m/s)
-    v_e: float           # NED velocity east (m/s)
-    v_d: float           # NED velocity down (m/s)
-    roll: float          # phi (rad)
-    pitch: float         # theta (rad)
-    yaw: float           # psi / true heading (rad)
-    airspeed: float      # true airspeed (m/s)
-    p: float             # roll rate estimate (rad/s)
-    q: float             # pitch rate estimate (rad/s)
-    r: float             # yaw rate estimate (rad/s)
-    vehicle_kind: str    # "fixed-wing" | "multirotor"
+    lat_deg: float  # geodetic latitude
+    lon_deg: float  # geodetic longitude
+    alt_m: float  # MSL altitude (m)
+    e: float  # ENU east (m)
+    n: float  # ENU north (m)
+    u: float  # ENU up (m)
+    v_n: float  # NED velocity north (m/s)
+    v_e: float  # NED velocity east (m/s)
+    v_d: float  # NED velocity down (m/s)
+    roll: float  # phi (rad)
+    pitch: float  # theta (rad)
+    yaw: float  # psi / true heading (rad)
+    airspeed: float  # true airspeed (m/s)
+    p: float  # roll rate estimate (rad/s)
+    q: float  # pitch rate estimate (rad/s)
+    r: float  # yaw rate estimate (rad/s)
+    vehicle_kind: str  # "fixed-wing" | "multirotor"
 
 
 @dataclass
@@ -151,6 +180,7 @@ class Law:
 
 
 # --- The runtime: wire in, law, wire out -------------------------------------
+
 
 def _clamp(x, lo, hi):
     return max(lo, min(hi, x))

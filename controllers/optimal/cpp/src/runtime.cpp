@@ -8,6 +8,10 @@
 //
 // Laws (laws/*.cpp) never include any of this — only "astrum_control.hpp".
 
+#include <capnp/message.h>
+#include <capnp/serialize.h>
+#include <kj/array.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -17,10 +21,6 @@
 #include <iostream>
 #include <string>
 #include <thread>
-
-#include <capnp/message.h>
-#include <capnp/serialize.h>
-#include <kj/array.h>
 #include <zenoh.hxx>
 
 #include "astrum.capnp.h"
@@ -41,21 +41,20 @@ double env_f64(const char* key, double fallback) {
 }
 
 void print_usage(const char* prog) {
-  std::cerr
-      << "Usage: " << prog << " [options]\n\n"
-      << "ASTRUM optimal-control controller (C++). Runs a control law (LQR/MPC)\n"
-      << "against one aircraft over Zenoh. Each option falls back to its ASTRUM_*\n"
-      << "env var, then a default (precedence: CLI arg > env > default).\n\n"
-      << "Options:\n"
-      << "  --law <lqr|mpc>       control law to run       [env ASTRUM_LAW]\n"
-      << "  --connect <endpoint>  sim Zenoh endpoint        [env ASTRUM_ZENOH_CONNECT]\n"
-      << "  --id <n>              aircraft id               [env ASTRUM_TARGET_ID]\n"
-      << "  --heading <deg>       reference heading, deg    [env ASTRUM_TARGET_HEADING_DEG]\n"
-      << "  --alt <m>             reference MSL altitude, m [env ASTRUM_TARGET_ALT_M]\n"
-      << "  --speed <mps>         reference airspeed, m/s   [env ASTRUM_TARGET_SPD_MPS]\n"
-      << "  --horizon <steps>     MPC prediction horizon    (mpc only, default 30)\n"
-      << "  --horizon-s <s>       MPC look-ahead, seconds   (mpc only, default 3)\n"
-      << "  -h, --help            show this help and exit\n";
+  std::cerr << "Usage: " << prog << " [options]\n\n"
+            << "ASTRUM optimal-control controller (C++). Runs a control law (LQR/MPC)\n"
+            << "against one aircraft over Zenoh. Each option falls back to its ASTRUM_*\n"
+            << "env var, then a default (precedence: CLI arg > env > default).\n\n"
+            << "Options:\n"
+            << "  --law <lqr|mpc>       control law to run       [env ASTRUM_LAW]\n"
+            << "  --connect <endpoint>  sim Zenoh endpoint        [env ASTRUM_ZENOH_CONNECT]\n"
+            << "  --id <n>              aircraft id               [env ASTRUM_TARGET_ID]\n"
+            << "  --heading <deg>       reference heading, deg    [env ASTRUM_TARGET_HEADING_DEG]\n"
+            << "  --alt <m>             reference MSL altitude, m [env ASTRUM_TARGET_ALT_M]\n"
+            << "  --speed <mps>         reference airspeed, m/s   [env ASTRUM_TARGET_SPD_MPS]\n"
+            << "  --horizon <steps>     MPC prediction horizon    (mpc only, default 30)\n"
+            << "  --horizon-s <s>       MPC look-ahead, seconds   (mpc only, default 3)\n"
+            << "  -h, --help            show this help and exit\n";
 }
 
 // Serialise a Command message to an owned Zenoh payload (Zenoh copies it out of
@@ -171,8 +170,7 @@ VehicleState Runtime::decode(const std::uint8_t* data, std::size_t len) {
   s.pitch = att.getThetaRad();
   s.yaw = att.getPsiRad();
   s.airspeed = tel.getAirspeedMps();
-  s.vehicle_kind =
-      tel.getVehicleKind() == VehicleKind::MULTIROTOR ? "multirotor" : "fixed-wing";
+  s.vehicle_kind = tel.getVehicleKind() == VehicleKind::MULTIROTOR ? "multirotor" : "fixed-wing";
 
   // Estimate body rates from attitude differences (no rates on the wire); 0 on
   // the first frame. Yaw difference wrapped to [-pi, pi] before dividing.
@@ -210,9 +208,9 @@ void Runtime::run() {
 
   auto publisher = session.declare_publisher(KeyExpr(command_key));
 
-  std::cerr << "[optimal] law=" << cli_.law << " target=" << cli_.id
-            << " connect=" << cli_.connect << " ref: hdg=" << cli_.heading_deg
-            << "deg alt=" << ref_.alt_m << "m spd=" << ref_.airspeed_mps << "m/s\n";
+  std::cerr << "[optimal] law=" << cli_.law << " target=" << cli_.id << " connect=" << cli_.connect
+            << " ref: hdg=" << cli_.heading_deg << "deg alt=" << ref_.alt_m
+            << "m spd=" << ref_.airspeed_mps << "m/s\n";
 
   std::atomic<std::uint64_t> n{0};
 
@@ -244,8 +242,8 @@ void Runtime::run() {
     publisher.put(command_bytes(message));
 
     if (++n % 120 == 0) {
-      std::cerr << "[optimal] t=" << s.t << "s hdg=" << s.yaw * 180.0 / kPi
-                << "deg alt=" << s.alt_m << "m spd=" << s.airspeed << "m/s\n";
+      std::cerr << "[optimal] t=" << s.t << "s hdg=" << s.yaw * 180.0 / kPi << "deg alt=" << s.alt_m
+                << "m spd=" << s.airspeed << "m/s\n";
     }
   };
 

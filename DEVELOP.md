@@ -221,6 +221,13 @@ cargo clippy --workspace --all-targets -- -D warnings   # must be clean
 cargo fmt --all                                          # format before committing
 ```
 
+The C++ and Python **controllers** have their own formatter + linter (config at
+`.clang-format` and `ruff.toml`), run from the host via make:
+```bash
+make fmt     # clang-format -i (C++) + ruff format + ruff check --fix (Python)
+make lint    # ruff check + ruff format --check (Python) + clang-format --dry-run --Werror (C++)
+```
+
 Two things to know:
 - **Shared test fixtures** go in `tests/common/mod.rs` (a subdirectory with
   `mod.rs` is *not* itself a test binary). Put `#![allow(dead_code)]` at its top,

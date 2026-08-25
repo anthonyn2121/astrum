@@ -120,7 +120,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv "${VIRTUAL_ENV}" \
     && pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir "eclipse-zenoh==${ZENOH_VERSION}" pycapnp numpy scipy
+    && pip install --no-cache-dir "eclipse-zenoh==${ZENOH_VERSION}" pycapnp numpy scipy ruff
 
 # JSBSim 1.3.1 does not install a pkg-config file, so synthesize one. This lets
 # astrum-fdm's build.rs and the C++ controller link JSBSim via `pkg-config JSBSim`
@@ -139,11 +139,13 @@ RUN mkdir -p "${JSBSIM_PREFIX}/lib/pkgconfig" && { \
       echo 'Cflags: -I${includedir}'; \
     } > "${JSBSIM_PREFIX}/lib/pkgconfig/JSBSim.pc"
 
-# Eigen (header-only linear algebra) for the C++ optimal-control controller
-# (controllers/optimal/cpp). Kept in its own late layer so it doesn't invalidate
-# the zenoh/JSBSim/Rust layers above on a rebuild.
+# Dev libraries + tooling in one late layer so it doesn't invalidate the
+# zenoh/JSBSim/Rust layers above on a rebuild:
+#   * libeigen3-dev — header-only linear algebra for controllers/optimal/cpp
+#   * clang-format  — C++ formatter for the controllers (`make fmt` / `make lint`;
+#                     Python's ruff formatter/linter ships via pip above)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libeigen3-dev \
+    && apt-get install -y --no-install-recommends libeigen3-dev clang-format \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

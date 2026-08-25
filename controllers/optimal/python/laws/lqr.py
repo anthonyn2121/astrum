@@ -23,8 +23,8 @@ that's the motivation for ``--law mpc``.
 """
 
 import numpy as np
-
-from astrum_control import Command, Law as BaseLaw, Reference, VehicleState
+from astrum_control import Command, Reference, VehicleState
+from astrum_control import Law as BaseLaw
 
 
 def dlqr(A, B, Q, R):
@@ -61,9 +61,9 @@ class Law(BaseLaw):
     #     K_lat = dlqr(A_lat, B_lat, np.diag([Q_hdg, Q_roll, Q_p]), [[R_ail]])
     #
     # u = -K @ x, with x measured relative to the reference.
-    K_lat = np.array([-1.8, 1.5, 0.3])    # [heading_err, roll, roll_rate] -> aileron
+    K_lat = np.array([-1.8, 1.5, 0.3])  # [heading_err, roll, roll_rate] -> aileron
     K_lon = np.array([0.02, -2.0, -0.5])  # [alt_err, pitch, pitch_rate]  -> elevator
-    K_spd = np.array([-0.02])             # [airspeed_err]                -> (throttle - trim)
+    K_spd = np.array([-0.02])  # [airspeed_err]                -> (throttle - trim)
     THROTTLE_TRIM = 0.6
 
     def control(self, s: VehicleState, ref: Reference) -> Command:

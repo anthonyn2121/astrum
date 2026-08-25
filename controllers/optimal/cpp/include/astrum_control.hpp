@@ -39,9 +39,7 @@ inline double wrap_pi(double a) {
   return a;
 }
 
-inline double clampd(double x, double lo, double hi) {
-  return x < lo ? lo : (x > hi ? hi : x);
-}
+inline double clampd(double x, double lo, double hi) { return x < lo ? lo : (x > hi ? hi : x); }
 
 // --- The data your law sees --------------------------------------------------
 
@@ -50,24 +48,24 @@ inline double clampd(double x, double lo, double hi) {
 // finite-differencing attitude between frames (the stream carries no rates);
 // they are 0 on the first frame. Angles radians, distances metres, speeds m/s.
 struct VehicleState {
-  double t = 0.0;          // sim time (s)
+  double t = 0.0;  // sim time (s)
   std::uint32_t aircraft_id = 0;
-  double lat_deg = 0.0;    // geodetic latitude
-  double lon_deg = 0.0;    // geodetic longitude
-  double alt_m = 0.0;      // MSL altitude (m)
-  double e = 0.0;          // ENU east (m)
-  double n = 0.0;          // ENU north (m)
-  double u = 0.0;          // ENU up (m)
-  double v_n = 0.0;        // NED velocity north (m/s)
-  double v_e = 0.0;        // NED velocity east (m/s)
-  double v_d = 0.0;        // NED velocity down (m/s)
-  double roll = 0.0;       // phi (rad)
-  double pitch = 0.0;      // theta (rad)
-  double yaw = 0.0;        // psi / true heading (rad)
-  double airspeed = 0.0;   // true airspeed (m/s)
-  double p = 0.0;          // roll rate estimate (rad/s)
-  double q = 0.0;          // pitch rate estimate (rad/s)
-  double r = 0.0;          // yaw rate estimate (rad/s)
+  double lat_deg = 0.0;      // geodetic latitude
+  double lon_deg = 0.0;      // geodetic longitude
+  double alt_m = 0.0;        // MSL altitude (m)
+  double e = 0.0;            // ENU east (m)
+  double n = 0.0;            // ENU north (m)
+  double u = 0.0;            // ENU up (m)
+  double v_n = 0.0;          // NED velocity north (m/s)
+  double v_e = 0.0;          // NED velocity east (m/s)
+  double v_d = 0.0;          // NED velocity down (m/s)
+  double roll = 0.0;         // phi (rad)
+  double pitch = 0.0;        // theta (rad)
+  double yaw = 0.0;          // psi / true heading (rad)
+  double airspeed = 0.0;     // true airspeed (m/s)
+  double p = 0.0;            // roll rate estimate (rad/s)
+  double q = 0.0;            // pitch rate estimate (rad/s)
+  double r = 0.0;            // yaw rate estimate (rad/s)
   std::string vehicle_kind;  // "fixed-wing" | "multirotor"
 };
 
@@ -115,21 +113,19 @@ struct Command {
 // (horizon/rate_hz are read only by the MPC law). Populated by Cli::parse.
 struct Cli {
   std::string connect = "tcp/127.0.0.1:7447";  // ASTRUM_ZENOH_CONNECT
-  std::uint32_t id = 1;                         // ASTRUM_TARGET_ID
-  double heading_deg = 0.0;                     // ASTRUM_TARGET_HEADING_DEG
-  double alt_m = 1500.0;                         // ASTRUM_TARGET_ALT_M
-  double speed_mps = 50.0;                       // ASTRUM_TARGET_SPD_MPS
-  std::string law = "lqr";                       // ASTRUM_LAW
-  int horizon = 30;                              // MPC prediction horizon (steps)
-  double horizon_s = 3.0;                         // MPC look-ahead (s); model step = horizon_s / horizon
+  std::uint32_t id = 1;                        // ASTRUM_TARGET_ID
+  double heading_deg = 0.0;                    // ASTRUM_TARGET_HEADING_DEG
+  double alt_m = 1500.0;                       // ASTRUM_TARGET_ALT_M
+  double speed_mps = 50.0;                     // ASTRUM_TARGET_SPD_MPS
+  std::string law = "lqr";                     // ASTRUM_LAW
+  int horizon = 30;                            // MPC prediction horizon (steps)
+  double horizon_s = 3.0;  // MPC look-ahead (s); model step = horizon_s / horizon
 
   // Seed from env (or built-in default), then override from argv. Returns false
   // and sets *exit_code if the program should stop now (--help -> 0, error -> 2).
   static bool parse(int argc, char** argv, Cli& out, int& exit_code);
 
-  Reference reference() const {
-    return Reference{heading_deg * kPi / 180.0, alt_m, speed_mps};
-  }
+  Reference reference() const { return Reference{heading_deg * kPi / 180.0, alt_m, speed_mps}; }
 };
 
 // --- Your law ----------------------------------------------------------------

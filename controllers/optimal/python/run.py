@@ -40,8 +40,11 @@ def main():
         description="ASTRUM optimal-control controller (Python).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--law", default=law_default,
-                   help="control law to run (a module name in laws/, e.g. lqr or mpc)")
+    p.add_argument(
+        "--law",
+        default=law_default,
+        help="control law to run (a module name in laws/, e.g. lqr or mpc)",
+    )
     ac.add_common_args(p)
 
     try:
