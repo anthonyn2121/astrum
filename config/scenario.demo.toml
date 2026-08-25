@@ -1,4 +1,4 @@
-# Bounded single-aircraft scenario for the M5 controller smoke test.
+# Bounded single-aircraft scenario for the controller smoke test.
 # Aircraft 1 starts heading east (90°); the example C++ controller commands it
 # north (0°), so telemetry should show psi converging 90° → 0° over ~25-30 s.
 

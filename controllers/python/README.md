@@ -64,3 +64,7 @@ which is `docker compose --profile python up --exit-code-from sim sim controller
 - The aircraft id lives in the Zenoh **key** (`astrum/telemetry/<id>`), not a topic frame:
   the subscriber declares that key and each sample's `payload` is the whole Cap'n Proto message.
   Key matching is exact, so `astrum/telemetry/1` never matches `astrum/telemetry/10`.
+- This example follows **one** aircraft (`ASTRUM_TARGET_ID`), but the transport is fleet-wide:
+  subscribe `astrum/telemetry/*` instead of a single id to receive **every** aircraft's telemetry
+  over the same session (whole-fleet / swarm awareness). Adding aircraft needs no endpoint or port
+  change; the id is just another key.

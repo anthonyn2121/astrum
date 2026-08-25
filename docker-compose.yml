@@ -8,9 +8,9 @@ name: astrum
 # CONNECTs to tcp/sim:7447. Telemetry (astrum/telemetry/<id>) and commands
 # (astrum/command/<id>) share that single endpoint — no more separate ports.
 #
-#   sim        -> M4  (runs astrum-sim: telemetry out, commands in)
-#   recorder   -> M4  (astrum-bag-record; `--profile record up recorder`)
-#   controller -> M5  (builds & runs controllers/cpp/astrum-controller)
+#   sim        (runs astrum-sim: telemetry out, commands in)
+#   recorder   (astrum-bag-record; `--profile record up recorder`)
+#   controller (builds & runs controllers/cpp/astrum-controller)
 
 services:
   sim:

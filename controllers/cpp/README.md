@@ -61,3 +61,7 @@ service by name (`make up`, or `docker compose up sim controller`).
   is copied into a word-aligned buffer before reading.
 - Telemetry carries no body rates, so the raw hold loop estimates roll/pitch rate by
   finite-differencing attitude between frames for damping.
+- This example follows **one** aircraft (`ASTRUM_TARGET_ID`), but the transport is fleet-wide:
+  subscribe `astrum/telemetry/*` instead of a single id to receive **every** aircraft's telemetry
+  over the same session — useful for a controller that reacts to its neighbours. Adding aircraft
+  needs no endpoint or port change; the id is just another key.

@@ -29,6 +29,14 @@ a controller's `open()` non-fatal if the sim isn't up yet: it returns at once an
 connection in the background, so a controller started alongside the sim just attaches once the sim
 finishes its ~10 s JSBSim load (a Zenoh `client` would instead abort `open()` on that cold start).
 
+Each entity is addressed by its id *in the key* — not a socket or a port — so **one endpoint serves
+the whole fleet no matter how many aircraft you add** (there are no ports to manage per entity), and
+any client can subscribe to a single aircraft (`astrum/telemetry/<id>`) or the entire fleet
+(`astrum/telemetry/*`). That makes cross-entity state sharing free: a controller can watch its
+neighbours' telemetry as easily as its own, with no extra wiring. The sim is the one authoritative
+hub (a star: it `listen`s, everyone else `connect`s), and telemetry is best-effort streaming, not an
+on-demand query — Zenoh's mesh routing and queryable/storage are available but unused today.
+
 ## 2. The golden rule: everything runs in Docker
 
 Nothing (Rust, JSBSim, Zenoh, Cap'n Proto) is installed on the host — it all lives

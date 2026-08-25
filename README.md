@@ -18,18 +18,17 @@ live or from an exported bag — `make replay`, then open http://localhost:8080.
 
 ## Status
 
-Under active construction. Milestones:
+Everything below is built and working; here's what lives where:
 
-| # | Milestone | State |
-|---|---|---|
-| M0 | Docker toolchain environment | **done** ✓ |
-| M1 | JSBSim FFI (`astrum-fdm`) | **done** ✓ |
-| M2 | Coordinate mapping (`astrum-geo`) | **done** ✓ |
-| M3 | Bevy ECS core (`astrum-sim`) | **done** ✓ |
-| M4 | Wire schema + Zenoh transport + bag replay (`astrum-proto`, `astrum-net`, `astrum-bag`) | **done** ✓ |
-| M5 | C++ example flight controller (`controllers/cpp`) | **done** ✓ |
-| M6 | Integration demo (`make demo`) + docs | **done** ✓ |
-| M7 | Browser 3-D replay renderer (`astrum-web` + `web/`) | **done** ✓ |
+| Component | Responsibility |
+|---|---|
+| `astrum-fdm` | JSBSim 6-DOF flight dynamics via a thin Rust FFI shim |
+| `astrum-geo` | WGS84 geodetic ↔ ECEF ↔ ENU coordinate mapping |
+| `astrum-sim` | headless Bevy ECS state server — one JSBSim FDM per entity |
+| `astrum-proto` + `astrum-net` | Cap'n Proto wire schema + Zenoh transport (telemetry + commands) |
+| `astrum-bag` | record / replay telemetry to a bag |
+| `controllers/cpp`, `controllers/python` | out-of-sim example flight controllers |
+| `astrum-web` + `web/` | browser 3-D replay renderer |
 
 The engine is end-to-end functional: `make demo` brings up the sim and a C++ controller that
 flies an aircraft to a commanded heading/altitude over Zenoh (`make demo-python` runs the equivalent
@@ -185,6 +184,20 @@ other process (`mode=peer`, connect-out only) **connects** to it:
 
 Endpoints are overridable via `$ASTRUM_ZENOH_LISTEN` (sim / replay) and `$ASTRUM_ZENOH_CONNECT`
 (controllers / recorder / web). Zenoh endpoint syntax is `proto/host:port` (a single `/`, not `://`).
+
+**One endpoint, key-addressed entities.** Every aircraft is addressed by its id *in the key
+expression*, not by a socket or a port, so the transport needs **no per-entity configuration** —
+there are no ports to allocate or manage as the fleet grows. Adding aircraft to a scenario changes
+nothing about the endpoints: the sim simply publishes on `astrum/telemetry/<newid>` and any
+`astrum/telemetry/*` subscriber picks it up automatically. This also makes **fleet-wide /
+entity-to-entity state sharing** a one-line subscribe: any process — a controller, a monitor, a
+swarm coordinator — takes one aircraft (`astrum/telemetry/<id>`) or the whole fleet
+(`astrum/telemetry/*`) and receives every entity's state with no new socket, port, or handshake, so
+a per-aircraft controller can react to its neighbours' telemetry as easily as its own. State flows
+through the sim, which stays the single authoritative hub — a **star** topology (the sim `listen`s,
+everyone else `connect`s), not a peer mesh, and telemetry is best-effort streaming re-sent every
+tick rather than an on-demand query. Zenoh's peer-mesh routing and queryable/storage would enable
+direct entity-to-entity links or pull-the-latest-state semantics, but ASTRUM does not use them today.
 
 The schema (`crates/astrum-proto/schema/astrum.capnp`) defines: `Telemetry` (`aircraftId`, `simTimeS`,
 `geo` = `Geodetic` lat/lon/alt, `enu` = `Vec3` E/N/U, `velNed`, `attitude` = `Euler` φ/θ/ψ,

@@ -1,4 +1,4 @@
-# ASTRUM — Docker-based dev environment (M0)
+# ASTRUM — Docker-based dev environment
 #
 # Everything runs inside the `astrum-dev` image so nothing is installed on the host.
 # Run `make` (or `make help`) for the target list.
