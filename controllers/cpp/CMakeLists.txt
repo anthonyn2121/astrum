@@ -35,7 +35,7 @@ add_custom_command(
   COMMENT "Generating C++ bindings from astrum.capnp"
   VERBATIM)
 
-add_executable(astrum-controller src/main.cpp ${GEN_DIR}/astrum.capnp.c++)
+add_executable(astrum-controller src/example.cpp ${GEN_DIR}/astrum.capnp.c++)
 target_compile_definitions(astrum-controller PRIVATE ZENOHCXX_ZENOHC)
 target_include_directories(astrum-controller PRIVATE
   ${GEN_DIR} ${CAPNP_INCLUDE_DIRS})

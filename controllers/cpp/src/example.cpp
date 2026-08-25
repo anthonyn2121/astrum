@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
     auto value = [&]() -> std::string {
       if (has_inline) return inline_val;
       if (i + 1 < argc) return argv[++i];
-      std::cerr << "[controller] missing value for " << key << "\n";
+      std::cerr << "[example] missing value for " << key << "\n";
       std::exit(2);
     };
 
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
     } else if (key == "--mode") {
       mode = value();
     } else {
-      std::cerr << "[controller] unknown argument: " << arg << "\n";
+      std::cerr << "[example] unknown argument: " << arg << "\n";
       print_usage(argv[0]);
       return 2;
     }
@@ -219,12 +219,12 @@ int main(int argc, char** argv) {
 
   auto publisher = session.declare_publisher(KeyExpr(command_key));
 
-  std::cerr << "[controller] target=" << target_id << " mode=" << mode
+  std::cerr << "[example] target=" << target_id << " mode=" << mode
             << " connect=" << connect << " telemetry=" << telemetry_key
             << " command=" << command_key << "\n";
 
   if (mode == "autopilot") {
-    std::cerr << "[controller] autopilot target hdg=" << target_hdg << "rad alt="
+    std::cerr << "[example] autopilot target hdg=" << target_hdg << "rad alt="
               << target_alt << "m spd=" << target_spd
               << "m/s (asserted once telemetry confirms the link)\n";
   }
@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
       }
       if (count % 120 == 0) {
         const double psi = tel.getAttitude().getPsiRad();
-        std::cerr << "[controller] t=" << tel.getSimTimeS() << "s hdg="
+        std::cerr << "[example] t=" << tel.getSimTimeS() << "s hdg="
                   << psi * 180.0 / kPi << "deg alt=" << tel.getGeo().getAltM() << "m\n";
       }
       return;
@@ -284,7 +284,7 @@ int main(int argc, char** argv) {
 
     if (++n % 120 == 0) {
       const double psi = tel.getAttitude().getPsiRad();
-      std::cerr << "[controller] t=" << tel.getSimTimeS() << "s hdg="
+      std::cerr << "[example] t=" << tel.getSimTimeS() << "s hdg="
                 << psi * 180.0 / kPi << "deg alt=" << tel.getGeo().getAltM()
                 << "m ail=" << aileron << " elev=" << elevator << " thr=" << throttle << "\n";
     }

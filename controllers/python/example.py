@@ -169,7 +169,7 @@ def main():
         pub = session.declare_publisher(command_key)
 
         print(
-            f"[controller.py] target={target_id} mode={mode} connect={connect} "
+            f"[example.py] target={target_id} mode={mode} connect={connect} "
             f"telemetry={telemetry_key} command={command_key}",
             file=sys.stderr,
             flush=True,
@@ -212,7 +212,7 @@ def main():
                     pub.put(msg.to_bytes())
                 if n % 120 == 0:
                     print(
-                        f"[controller.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
+                        f"[example.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
                         f"alt={alt:.0f}m",
                         file=sys.stderr,
                         flush=True,
@@ -233,7 +233,7 @@ def main():
             n += 1
             if n % 120 == 0:
                 print(
-                    f"[controller.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
+                    f"[example.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
                     f"alt={alt:.0f}m ail={aileron:.3f} elev={elevator:.3f} thr={throttle:.3f}",
                     file=sys.stderr,
                     flush=True,

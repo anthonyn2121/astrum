@@ -143,7 +143,7 @@ services:
     command:
       - bash
       - -lc
-      - "exec python controllers/python/controller.py"
+      - "exec python controllers/python/example.py"
 
   controller-quad:
     # Flies the F450 quadrotor (ASTRUM's second vehicle class) via the built-in
@@ -173,7 +173,7 @@ services:
     command:
       - bash
       - -lc
-      - "exec python controllers/python/controller.py"
+      - "exec python controllers/python/example.py"
 
 networks:
   astrum:

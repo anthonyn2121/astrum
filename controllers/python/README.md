@@ -43,7 +43,7 @@ shared and unchanged.
 ## Run (inside the dev container)
 
 ```bash
-python controllers/python/controller.py --heading 0 --id 1
+python controllers/python/example.py --heading 0 --id 1
 ```
 
 Or the whole self-terminating demo (bounded single-ship scenario, auto teardown):

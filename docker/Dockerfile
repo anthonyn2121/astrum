@@ -114,10 +114,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 # Python venv for the Python controller and tooling. eclipse-zenoh is pinned to
 # the same release as the Rust crate / C bindings for protocol compatibility.
+# numpy + scipy back the optimal-control controllers (controllers/optimal): numpy
+# for the LQR/MPC linear algebra, scipy for solve_discrete_are (the DARE solver
+# behind dlqr).
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv "${VIRTUAL_ENV}" \
     && pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir "eclipse-zenoh==${ZENOH_VERSION}" pycapnp
+    && pip install --no-cache-dir "eclipse-zenoh==${ZENOH_VERSION}" pycapnp numpy scipy
 
 # JSBSim 1.3.1 does not install a pkg-config file, so synthesize one. This lets
 # astrum-fdm's build.rs and the C++ controller link JSBSim via `pkg-config JSBSim`
@@ -135,6 +138,13 @@ RUN mkdir -p "${JSBSIM_PREFIX}/lib/pkgconfig" && { \
       echo 'Libs: -L${libdir} -Wl,-rpath,${libdir} -lJSBSim'; \
       echo 'Cflags: -I${includedir}'; \
     } > "${JSBSIM_PREFIX}/lib/pkgconfig/JSBSim.pc"
+
+# Eigen (header-only linear algebra) for the C++ optimal-control controller
+# (controllers/optimal/cpp). Kept in its own late layer so it doesn't invalidate
+# the zenoh/JSBSim/Rust layers above on a rebuild.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libeigen3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 COPY docker/entrypoint.sh /usr/local/bin/astrum-entrypoint

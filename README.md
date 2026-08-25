@@ -155,7 +155,7 @@ cargo run --release -p astrum-sim -- config/scenario.demo.toml &     # aircraft 
 cmake -S controllers/cpp -B controllers/cpp/build && cmake --build controllers/cpp/build -j
 ./controllers/cpp/build/astrum-controller --heading 0               # commands it north
 # ...or the Python controller, no build step:
-python controllers/python/controller.py --heading 0
+python controllers/python/example.py --heading 0
 ```
 
 The controller's target aircraft and setpoints are `--id` / `--heading` / `--alt` / `--speed`
@@ -163,6 +163,12 @@ flags (defaults: id 1, heading 0°/north, 1500 m, 50 m/s) and `--mode raw` (defa
 `--mode autopilot`; run `controller --help` for the full list. Each flag also honours its old
 `ASTRUM_TARGET_*` / `ASTRUM_CONTROL_MODE` env var as a fallback, so the compose services are
 unchanged.
+
+Those two are deliberately minimal examples. For developing real control laws there's
+[`controllers/optimal/`](controllers/optimal) (C++ and Python): a **runtime + law split** where a
+reusable runtime owns Zenoh/Cap'n Proto and hands your law a clean `VehicleState` + `Reference`, so
+you write only the control law. It ships runnable **LQR** and **MPC** skeletons (`--law lqr|mpc`) to
+grow from.
 
 ## Wire protocol, telemetry & commands
 

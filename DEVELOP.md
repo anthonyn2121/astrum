@@ -274,7 +274,7 @@ make shell
 
 # 3. build + run YOUR controller, pointing at the sim; rerun as you iterate.
 #    The bundled controllers take flags (env vars still work as a fallback):
-python controllers/python/controller.py --connect tcp/sim:7447 --id 1
+python controllers/python/example.py --connect tcp/sim:7447 --id 1
 ./controllers/cpp/build/astrum-controller --connect tcp/sim:7447 --id 1
 
 # 4. when done
