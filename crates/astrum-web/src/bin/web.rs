@@ -3,20 +3,20 @@
 //!
 //! One process, two jobs, on a single TCP port:
 //!  * **`GET /telemetry`** (WebSocket) — every connected browser gets one JSON
-//!    [`astrum_web::FrameJson`] per telemetry sample. The upstream is a ZMQ
-//!    telemetry `SUB`, so the source is either the live sim or `astrum-bag-play`
-//!    — the renderer can't tell the difference.
+//!    [`astrum_web::FrameJson`] per telemetry sample. The upstream is a Zenoh
+//!    telemetry subscriber, so the source is either the live sim or
+//!    `astrum-bag-play` — the renderer can't tell the difference.
 //!  * **`GET /…`** — static files from the renderer root (`web/`).
 //!
-//! It's deliberately synchronous (no async runtime, matching the rest of the
-//! workspace): a background thread runs the blocking ZMQ `SUB` and fans each
-//! frame out to per-client channels; one thread per browser drains its channel
-//! to the socket. The HTTP upgrade handshake is done by hand and the raw socket
-//! handed to `tungstenite` for framing.
+//! It's deliberately synchronous (Zenoh embeds its own runtime; we drive none):
+//! a background thread runs the blocking subscriber and fans each frame out to
+//! per-client channels; one thread per browser drains its channel to the socket.
+//! The HTTP upgrade handshake is done by hand and the raw socket handed to
+//! `tungstenite` for framing.
 //!
 //! Config (env):
-//!  * `$ASTRUM_TELEMETRY_CONNECT` — telemetry `PUB` to subscribe to (default
-//!    `tcp://127.0.0.1:5555`; `tcp://sim:5555` under compose).
+//!  * `$ASTRUM_ZENOH_CONNECT` — sim/replay endpoint to subscribe to (default
+//!    `tcp/127.0.0.1:7447`; `tcp/sim:7447` under compose).
 //!  * `$ASTRUM_WEB_BIND` — HTTP/WS listen address (default `0.0.0.0:8080`).
 //!  * `$ASTRUM_WEB_ROOT` — static renderer directory (default `web`).
 
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use astrum_net::{context, TelemetrySubscriber};
+use astrum_net::{Session, TelemetrySubscriber};
 use astrum_web::FrameJson;
 use tungstenite::handshake::derive_accept_key;
 use tungstenite::protocol::{Role, WebSocket};
@@ -48,13 +48,13 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let upstream = env_or("ASTRUM_TELEMETRY_CONNECT", "tcp://127.0.0.1:5555");
+    let upstream = env_or("ASTRUM_ZENOH_CONNECT", astrum_net::DEFAULT_CONNECT_ENDPOINT);
     let bind = env_or("ASTRUM_WEB_BIND", "0.0.0.0:8080");
     let root = PathBuf::from(env_or("ASTRUM_WEB_ROOT", "web"));
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));
 
-    // Background: blocking ZMQ SUB → JSON → fan out to every browser.
+    // Background: blocking Zenoh subscriber → JSON → fan out to every browser.
     {
         let clients = Arc::clone(&clients);
         let upstream = upstream.clone();
@@ -92,8 +92,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Subscribe to the telemetry stream and broadcast each sample as JSON to every
 /// connected browser, pruning clients whose channel has closed.
 fn pump_telemetry(upstream: &str, clients: &Clients) -> Result<(), Box<dyn Error>> {
-    let ctx = context();
-    let sub = TelemetrySubscriber::connect(&ctx, upstream)?;
+    let session = Session::connect(upstream)?;
+    let mut sub = TelemetrySubscriber::connect(&session)?;
     sub.subscribe_all()?;
     loop {
         let sample = sub.recv()?;

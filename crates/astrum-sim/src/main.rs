@@ -1,43 +1,43 @@
 //! `astrum-sim` binary entrypoint.
 //!
 //! Loads a scenario, builds the headless simulation app ([`astrum_sim::build_app`]),
-//! binds the ZMQ telemetry/command sockets, and runs the loop. All the app-building
-//! and system logic lives in the `astrum_sim` library; the integration tests in
-//! `tests/` exercise it there. This file is only the process wiring: scenario load,
-//! socket bind, `run()`.
+//! opens the Zenoh session (telemetry out + commands in), and runs the loop. All
+//! the app-building and system logic lives in the `astrum_sim` library; the
+//! integration tests in `tests/` exercise it there. This file is only the process
+//! wiring: scenario load, session open, `run()`.
 
-use astrum_net::{CommandReceiver, TelemetryPublisher};
+use astrum_net::{CommandReceiver, Session, TelemetryPublisher};
 use astrum_sim::build_app;
 use astrum_sim::scenario::Scenario;
 use bevy::prelude::*;
 
-/// Bind the telemetry `PUB` and command `PULL` sockets and install them as
-/// `NonSend` resources, activating the bridge systems. Endpoints come from
-/// `$ASTRUM_TELEMETRY_BIND` / `$ASTRUM_COMMAND_BIND` (defaults in `astrum_net`).
-/// A bind failure is logged, not fatal — the bridge systems stay inert.
+/// Open the Zenoh session (LISTEN endpoint from `$ASTRUM_ZENOH_LISTEN`, default
+/// in `astrum_net`) and install the telemetry publisher + command receiver as
+/// `NonSend` resources, activating the bridge systems. Telemetry and commands
+/// share the one session. A failure to open is logged, not fatal — the bridge
+/// systems stay inert.
 fn install_net(app: &mut App) {
-    let tlm = std::env::var("ASTRUM_TELEMETRY_BIND")
-        .unwrap_or_else(|_| astrum_net::DEFAULT_TELEMETRY_ENDPOINT.to_string());
-    let cmd = std::env::var("ASTRUM_COMMAND_BIND")
-        .unwrap_or_else(|_| astrum_net::DEFAULT_COMMAND_ENDPOINT.to_string());
+    let listen = std::env::var("ASTRUM_ZENOH_LISTEN")
+        .unwrap_or_else(|_| astrum_net::DEFAULT_LISTEN_ENDPOINT.to_string());
 
-    let ctx = astrum_net::context();
-    match TelemetryPublisher::bind(&ctx, &tlm) {
-        Ok(p) => {
-            app.insert_non_send(p);
-            println!("[astrum-sim] telemetry PUB bound: {tlm}");
+    let session = match Session::listen(&listen) {
+        Ok(s) => {
+            println!("[astrum-sim] zenoh session listening: {listen}");
+            s
         }
-        Err(e) => eprintln!("[astrum-sim] telemetry bind {tlm} failed: {e}"),
-    }
-    match CommandReceiver::bind(&ctx, &cmd) {
+        Err(e) => {
+            eprintln!("[astrum-sim] zenoh listen {listen} failed: {e}");
+            return;
+        }
+    };
+
+    app.insert_non_send(TelemetryPublisher::new(&session));
+    match CommandReceiver::bind(&session) {
         Ok(r) => {
             app.insert_non_send(r);
-            println!("[astrum-sim] command PULL bound: {cmd}");
         }
-        Err(e) => eprintln!("[astrum-sim] command bind {cmd} failed: {e}"),
+        Err(e) => eprintln!("[astrum-sim] command subscribe failed: {e}"),
     }
-    // Keep the context alive for the app's lifetime (sockets reference it).
-    app.insert_non_send(ctx);
 }
 
 fn main() {

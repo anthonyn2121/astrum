@@ -2,7 +2,7 @@
 #
 # ASTRUM development image.
 #   Stage 1 (jsbsim-builder): compile JSBSim as a shared library from source.
-#   Stage 2 (dev):            full toolchain — Rust, C++/CMake, ZMQ, Cap'n Proto,
+#   Stage 2 (dev):            full toolchain — Rust, C++/CMake, Zenoh, Cap'n Proto,
 #                             Python — plus the JSBSim lib/headers/data.
 #
 # Nothing here is installed on the host; everything lives in this image.
@@ -51,6 +51,9 @@ FROM ubuntu:${UBUNTU_VERSION} AS dev
 
 ARG JSBSIM_PREFIX=/opt/jsbsim
 ARG RUST_CHANNEL=stable
+# Zenoh release version — the C/C++ bindings (debs) and the Python wheel are all
+# pinned here so they stay protocol-compatible with the Rust `zenoh` crate.
+ARG ZENOH_VERSION=1.10.0
 ENV DEBIAN_FRONTEND=noninteractive
 
 # System toolchain + libraries (confirmed noble package names).
@@ -62,8 +65,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         curl \
         ca-certificates \
-        libzmq3-dev \
-        cppzmq-dev \
         capnproto \
         libcapnp-dev \
         python3 \
@@ -73,6 +74,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         less \
         vim-tiny \
     && rm -rf /var/lib/apt/lists/*
+
+# Zenoh C/C++ bindings for the C++ controller. The Rust sim uses the pure-Rust
+# `zenoh` crate and Python uses the eclipse-zenoh wheel, but the C++ controller
+# links libzenohc (zenoh-c) through the zenoh-cpp header wrapper — both ship as
+# prebuilt debs from the Eclipse Zenoh releases (zipped). Install runtime lib +
+# dev bits (headers, cmake/pkgconfig, static lib) + the C++ headers, then
+# ldconfig so libzenohc.so resolves from /usr/lib.
+RUN cd /tmp \
+    && curl -fsSL -o zenoh-c.zip \
+       "https://github.com/eclipse-zenoh/zenoh-c/releases/download/${ZENOH_VERSION}/libzenohc-${ZENOH_VERSION}-x86_64-unknown-linux-gnu-debian.zip" \
+    && curl -fsSL -o zenoh-cpp.zip \
+       "https://github.com/eclipse-zenoh/zenoh-cpp/releases/download/${ZENOH_VERSION}/zenohcpp-${ZENOH_VERSION}-debian.zip" \
+    && python3 -m zipfile -e zenoh-c.zip . \
+    && python3 -m zipfile -e zenoh-cpp.zip . \
+    && dpkg -i "libzenohc_${ZENOH_VERSION}_amd64.deb" \
+               "libzenohc-dev_${ZENOH_VERSION}_amd64.deb" \
+               "libzenohcpp-dev_${ZENOH_VERSION}_all.deb" \
+    && ldconfig \
+    && rm -f /tmp/zenoh-c.zip /tmp/zenoh-cpp.zip /tmp/*.deb
 
 # JSBSim (headers, libJSBSim.so, JSBSim.pc, JSBSim exe, data) from the builder stage.
 COPY --from=jsbsim-builder ${JSBSIM_PREFIX} ${JSBSIM_PREFIX}
@@ -92,11 +112,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup component add rustfmt clippy \
     && chmod -R a+rwX "${CARGO_HOME}" "${RUSTUP_HOME}"
 
-# Python venv for the (later) Python controller and tooling.
+# Python venv for the Python controller and tooling. eclipse-zenoh is pinned to
+# the same release as the Rust crate / C bindings for protocol compatibility.
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv "${VIRTUAL_ENV}" \
     && pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir pyzmq pycapnp
+    && pip install --no-cache-dir "eclipse-zenoh==${ZENOH_VERSION}" pycapnp
 
 # JSBSim 1.3.1 does not install a pkg-config file, so synthesize one. This lets
 # astrum-fdm's build.rs and the C++ controller link JSBSim via `pkg-config JSBSim`

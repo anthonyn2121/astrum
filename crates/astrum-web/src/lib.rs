@@ -5,7 +5,7 @@
 //! project supports:
 //!
 //! * **live / replay stream** — the `astrum-web` binary subscribes to the
-//!   telemetry `PUB` (the live sim *or* `astrum-bag-play`) and pushes one
+//!   telemetry stream (the live sim *or* `astrum-bag-play`) and pushes one
 //!   [`FrameJson`] per sample to every connected browser over WebSocket, while
 //!   also serving the static renderer over HTTP.
 //! * **offline export** — the `astrum-web-export` binary reads a bag and bakes it

@@ -2,9 +2,9 @@
 //!
 //! Every test builds a real app with [`astrum_sim::build_app`] and advances it with
 //! [`bevy::app::App::update`] — i.e. it drives the same `Startup` + `Update`
-//! schedule the binary's main loop runs, just without binding real sockets (or
-//! over inproc ZMQ). These helpers construct scenarios and read entity state back
-//! out of the world.
+//! schedule the binary's main loop runs, just without opening a real session (or
+//! over an in-process Zenoh session). These helpers construct scenarios and read
+//! entity state back out of the world.
 #![allow(dead_code)] // each test binary uses only a subset of these helpers
 
 use astrum_fdm::prop;
@@ -142,7 +142,7 @@ pub fn snapshot(app: &mut App) -> Vec<(u32, Vec3, f64)> {
 }
 
 /// Force an aircraft's autopilot on with the given targets (as if an autopilot
-/// command had arrived), so a test can exercise the inner loop without ZMQ.
+/// command had arrived), so a test can exercise the inner loop without a session.
 pub fn engage_ap(app: &mut App, id: u32, heading_rad: f64, alt_msl_m: f64, airspeed_mps: f64) {
     let mut q = app.world_mut().query::<(&Aircraft, &mut AutopilotState)>();
     let world = app.world_mut();

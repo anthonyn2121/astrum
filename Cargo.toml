@@ -15,4 +15,4 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# Shared dependencies are added here as milestones land (bevy, zmq, capnp, ...).
+# Shared dependencies are added here as milestones land (bevy, zenoh, capnp, ...).

@@ -1,10 +1,14 @@
 name: astrum
 
 # ASTRUM runtime topology: an authoritative `sim` service (Bevy ECS state server)
-# and one or more `controller` services (flight controllers), talking over ZMQ on
-# a shared network. Both share one dev image built from docker/Dockerfile.
+# and one or more `controller` services (flight controllers), talking over Zenoh
+# on a shared network. Both share one dev image built from docker/Dockerfile.
 #
-#   sim        -> M4  (runs astrum-sim: PUB telemetry, PULL commands)
+# The sim LISTENs on one Zenoh endpoint (tcp/0.0.0.0:7447); every other service
+# CONNECTs to tcp/sim:7447. Telemetry (astrum/telemetry/<id>) and commands
+# (astrum/command/<id>) share that single endpoint — no more separate ports.
+#
+#   sim        -> M4  (runs astrum-sim: telemetry out, commands in)
 #   recorder   -> M4  (astrum-bag-record; `--profile record up recorder`)
 #   controller -> M5  (builds & runs controllers/cpp/astrum-controller)
 
@@ -20,15 +24,13 @@ services:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-target:/workspace/target
     environment:
-      # The sim BINDS these; controllers connect to tcp://sim:5555 / :5556.
-      ASTRUM_TELEMETRY_BIND: tcp://0.0.0.0:5555
-      ASTRUM_COMMAND_BIND: tcp://0.0.0.0:5556
+      # The sim LISTENs here; every other service connects to tcp/sim:7447.
+      ASTRUM_ZENOH_LISTEN: tcp/0.0.0.0:7447
       # Overridable from the host env (e.g. `make demo` injects the bounded
       # single-ship scenario); defaults to the multi-aircraft fleet.
       ASTRUM_SCENARIO: ${ASTRUM_SCENARIO:-config/scenario.example.toml}
     ports:
-      - "5555:5555"   # telemetry PUB
-      - "5556:5556"   # command PULL
+      - "7447:7447"   # Zenoh (telemetry + commands)
     networks:
       - astrum
     command:
@@ -47,7 +49,7 @@ services:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-target:/workspace/target
     environment:
-      ASTRUM_TELEMETRY_CONNECT: tcp://sim:5555
+      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
       ASTRUM_BAG: /workspace/recordings/session.bag
       ASTRUM_BAG_SECONDS: "0" # record until stopped
     depends_on:
@@ -74,7 +76,7 @@ services:
       - cargo-target:/workspace/target
     environment:
       # Subscribe to the sim's telemetry; serve the renderer on :8080.
-      ASTRUM_TELEMETRY_CONNECT: tcp://sim:5555
+      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
       ASTRUM_WEB_BIND: 0.0.0.0:8080
       ASTRUM_WEB_ROOT: /workspace/web
     ports:
@@ -98,16 +100,15 @@ services:
       - cargo-target:/workspace/target
     environment:
       # The controller CONNECTS to the sim service by name.
-      ASTRUM_TELEMETRY_CONNECT: tcp://sim:5555
-      ASTRUM_COMMAND_CONNECT: tcp://sim:5556
+      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
       # Command aircraft 1 to fly north at 1500 m / 50 m/s, closing the loop in
-      # the controller (raw actuators). Set ASTRUM_CONTROL_MODE=autopilot to hand
-      # the target to the sim's built-in inner loop instead.
+      # the controller (raw actuators). Run with ASTRUM_CONTROL_MODE=autopilot to
+      # hand the target to the sim's built-in inner loop instead.
       ASTRUM_TARGET_ID: "1"
       ASTRUM_TARGET_HEADING_DEG: "0"
       ASTRUM_TARGET_ALT_M: "1500"
       ASTRUM_TARGET_SPD_MPS: "50"
-      ASTRUM_CONTROL_MODE: raw
+      ASTRUM_CONTROL_MODE: ${ASTRUM_CONTROL_MODE:-raw}
     depends_on:
       - sim
     networks:
@@ -129,8 +130,7 @@ services:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-target:/workspace/target
     environment:
-      ASTRUM_TELEMETRY_CONNECT: tcp://sim:5555
-      ASTRUM_COMMAND_CONNECT: tcp://sim:5556
+      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
       ASTRUM_TARGET_ID: "1"
       ASTRUM_TARGET_HEADING_DEG: "0"
       ASTRUM_TARGET_ALT_M: "1500"
@@ -160,8 +160,7 @@ services:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-target:/workspace/target
     environment:
-      ASTRUM_TELEMETRY_CONNECT: tcp://sim:5555
-      ASTRUM_COMMAND_CONNECT: tcp://sim:5556
+      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
       ASTRUM_TARGET_ID: "1"
       ASTRUM_TARGET_HEADING_DEG: "180"  # yaw from the initial 90° to 180°
       ASTRUM_TARGET_ALT_M: "130"        # climb from 100 m to 130 m and hold

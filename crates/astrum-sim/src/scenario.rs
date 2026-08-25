@@ -49,7 +49,7 @@ fn default_realtime() -> bool {
 /// One aircraft entity's initial conditions.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AircraftSpec {
-    /// Unique id — ZMQ telemetry topic and command target.
+    /// Unique id — Zenoh telemetry key and command target.
     pub id: u32,
     /// JSBSim model name under `<root>/aircraft/<model>/`.
     pub model: String,

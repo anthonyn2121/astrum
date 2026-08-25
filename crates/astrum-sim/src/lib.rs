@@ -3,7 +3,7 @@
 //! Stands up a headless Bevy app (`MinimalPlugins`, no render/winit) that spawns
 //! one entity per scenario aircraft — each owning an independent JSBSim FDM — and
 //! advances them one deterministic step per loop, deriving a Cartesian ENU pose
-//! from each aircraft's geodetic state, with a ZMQ telemetry/command bridge.
+//! from each aircraft's geodetic state, with a Zenoh telemetry/command bridge.
 //!
 //! The app-building logic lives here (rather than in `main.rs`) so the binary and
 //! the integration tests in `tests/` share the exact same [`build_app`]; tests

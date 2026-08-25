@@ -3,7 +3,7 @@ name = "astrum-bag"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "ASTRUM telemetry bag: record the telemetry stream and replay it as another ZMQ publisher."
+description = "ASTRUM telemetry bag: record the telemetry stream and replay it as another Zenoh publisher."
 
 [lib]
 name = "astrum_bag"

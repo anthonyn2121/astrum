@@ -1,33 +1,40 @@
-//! ZMQ bridge integration test. Drives the full ECS over an inproc ZMQ context —
-//! the same PUB (telemetry) / PULL (commands) path the binary uses over TCP —
-//! pushing commands in and subscribing to telemetry out, then asserting the
-//! commands reached the right aircraft and telemetry came back for the fleet.
+//! Zenoh bridge integration test. Drives the full ECS over a single in-process
+//! Zenoh session — the same telemetry-out / commands-in path the binary uses over
+//! TCP — publishing commands in and subscribing to telemetry out, then asserting
+//! the commands reached the right aircraft and telemetry came back for the fleet.
+//!
+//! The test's pub/sub share the sim's [`Session`], so same-session delivery is
+//! synchronous (no slow-joiner race like ZMQ PUB/SUB): a `publish` lands in the
+//! subscriber's channel inline, and a `send` lands in the receiver's before the
+//! next `app.update()` drains it.
 
 mod common;
 
-use astrum_net::{CommandReceiver, CommandSender, TelemetryPublisher, TelemetrySubscriber};
+use astrum_net::{
+    CommandReceiver, CommandSender, Session, TelemetryPublisher, TelemetrySubscriber,
+};
 use astrum_proto::{CommandMsg, Control};
 use astrum_sim::build_app;
 use common::{aircraft_probe, fdm_guard, two_ship};
 
 #[test]
-fn zmq_bridge_telemetry_out_and_commands_in() {
+fn net_bridge_telemetry_out_and_commands_in() {
     let _fdm = fdm_guard();
-    // Shared context so the test's sockets can meet the sim's over inproc.
-    let ctx = astrum_net::context();
-    let publisher = TelemetryPublisher::bind(&ctx, "inproc://bridge-tlm").unwrap();
-    let receiver = CommandReceiver::bind(&ctx, "inproc://bridge-cmd").unwrap();
+    // One shared session so the test's sockets meet the sim's in-process.
+    let session = Session::in_process().unwrap();
+    let publisher = TelemetryPublisher::new(&session);
+    let receiver = CommandReceiver::bind(&session).unwrap();
 
     let mut app = build_app(two_ship());
     app.insert_non_send(publisher);
     app.insert_non_send(receiver);
 
-    // Subscriber + command sender on the same context.
-    let sub = TelemetrySubscriber::connect(&ctx, "inproc://bridge-tlm").unwrap();
+    // Subscriber + command sender on the same session.
+    let mut sub = TelemetrySubscriber::connect(&session).unwrap();
     sub.subscribe_all().unwrap();
-    let sender = CommandSender::connect(&ctx, "inproc://bridge-cmd").unwrap();
+    let sender = CommandSender::connect(&session);
 
-    // Spawn the fleet and pump a few ticks so the SUB finishes connecting.
+    // Spawn the fleet and pump a few ticks.
     for _ in 0..5 {
         app.update();
     }
@@ -46,7 +53,7 @@ fn zmq_bridge_telemetry_out_and_commands_in() {
         })
         .unwrap();
 
-    // Collect telemetry across several ticks (PUB/SUB has a slow-joiner race).
+    // Collect telemetry across several ticks.
     let mut seen_ids = std::collections::HashSet::new();
     let mut last_ac1 = None;
     for _ in 0..60 {

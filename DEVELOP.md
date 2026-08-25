@@ -5,26 +5,33 @@ design, see [README.md](README.md); this doc is the *how*.
 
 ## 1. The mental model (read this first)
 
-ASTRUM is **one server + many clients** talking over ZMQ.
+ASTRUM is **one server + many clients** talking over Zenoh.
 
 - **The sim** (`astrum-sim`) is the authoritative state server. It's a headless
   [Bevy](https://bevyengine.org/) ECS: one *entity* per aircraft, each owning its
   own [JSBSim](https://github.com/JSBSim-Team/jsbsim) flight-dynamics model. Every
-  tick it steps physics, then **PUB**lishes telemetry and **PULL**s commands.
+  tick it **publishes** telemetry (`astrum/telemetry/<id>`) and drains **subscribed**
+  commands (`astrum/command/**`).
 - **Controllers** (`controllers/*`) are separate processes — the flight-control
-  logic. They **SUB**scribe to telemetry and **PUSH** commands. They never touch
-  the sim's memory; only bytes over ZMQ.
+  logic. They **subscribe** to telemetry and **publish** commands. They never touch
+  the sim's memory; only bytes over Zenoh.
 - **The wire** is [Cap'n Proto](https://capnproto.org/), one schema
   (`crates/astrum-proto/schema/astrum.capnp`) shared by Rust, C++, and Python.
 
 ```
-controllers ──PUSH commands──►  sim (binds :5556 PULL)
-controllers ◄──PUB telemetry──  sim (binds :5555 PUB, topic = aircraft id)
+controllers ──put astrum/command/<id>─────►  sim (subscribes astrum/command/**)
+controllers ◄──put astrum/telemetry/<id>───  sim (publishes per aircraft; id in the key)
 ```
+
+Both key spaces ride **one** Zenoh session on a single endpoint (`tcp/…:7447`) — the sim (and bag
+replay) `mode=peer` **listen** there, everyone else `mode=peer` **connects** to it. Peer mode makes
+a controller's `open()` non-fatal if the sim isn't up yet: it returns at once and Zenoh retries the
+connection in the background, so a controller started alongside the sim just attaches once the sim
+finishes its ~10 s JSBSim load (a Zenoh `client` would instead abort `open()` on that cold start).
 
 ## 2. The golden rule: everything runs in Docker
 
-Nothing (Rust, JSBSim, ZMQ, Cap'n Proto) is installed on the host — it all lives
+Nothing (Rust, JSBSim, Zenoh, Cap'n Proto) is installed on the host — it all lives
 in the `astrum-dev` image. You run commands *inside* a container.
 
 ```bash
@@ -48,7 +55,7 @@ crates/            # Rust workspace (one crate per responsibility)
   astrum-fdm/       #   JSBSim FFI: safe `Fdm` wrapper over the C++ engine
   astrum-geo/       #   WGS84 geodetic ↔ ECEF ↔ ENU coordinate math
   astrum-proto/     #   the Cap'n Proto schema + encode/decode helpers
-  astrum-net/       #   ZMQ transport (PUB/SUB telemetry, PUSH/PULL commands)
+  astrum-net/       #   Zenoh transport (telemetry + command key exprs, one session)
   astrum-bag/       #   record/replay telemetry to a file ("bag")
   astrum-web/       #   WebSocket+HTTP bridge (astrum-web) + bag→JSON exporter (astrum-web-export)
   astrum-sim/       #   the Bevy ECS app — the sim binary
@@ -84,8 +91,7 @@ Handy environment variables the sim reads:
 | Var | Default | Meaning |
 |---|---|---|
 | `ASTRUM_SCENARIO` | `config/scenario.example.toml` | which scenario to load |
-| `ASTRUM_TELEMETRY_BIND` | `tcp://0.0.0.0:5555` | telemetry PUB endpoint |
-| `ASTRUM_COMMAND_BIND` | `tcp://0.0.0.0:5556` | command PULL endpoint |
+| `ASTRUM_ZENOH_LISTEN` | `tcp/0.0.0.0:7447` | Zenoh endpoint the sim listens on (telemetry + commands) |
 
 ## 5. Scenarios
 
@@ -180,7 +186,7 @@ make demo-quad     # F450 quadrotor climbs + yaws under the built-in multirotor 
 **Watch it in 3-D.** `make replay` starts the fleet sim + the `astrum-web` bridge; open
 http://localhost:8080 to see every aircraft on the ENU grid (orbit/follow cameras, trails,
 playback transport). It works against a *live* sim or a bag being replayed by `astrum-bag-play`
-(both PUB on the telemetry endpoint the bridge subscribes to). For an offline, service-free view,
+(both publish on the telemetry endpoint the bridge subscribes to). For an offline, service-free view,
 bake a bag to JSON and drag it onto the page (or use "Open file…"):
 
 ```bash
@@ -204,8 +210,7 @@ ASTRUM_SCENARIO=config/scenario.demo.toml docker compose up -d sim
 make shell
 
 # 3. build + run YOUR controller, pointing at the sim; rerun as you iterate
-ASTRUM_TELEMETRY_CONNECT=tcp://sim:5555 ASTRUM_COMMAND_CONNECT=tcp://sim:5556 \
-ASTRUM_TARGET_ID=1 <build-and-run-your-controller>
+ASTRUM_ZENOH_CONNECT=tcp/sim:7447 ASTRUM_TARGET_ID=1 <build-and-run-your-controller>
 
 # 4. when done
 docker compose down
@@ -214,13 +219,14 @@ docker compose down
 Compose services (`controller`, `controller-python`) are just **canned demo
 presets** — add one only when you want a controller to be a permanent part of the
 topology. See `controllers/cpp/README.md` and `controllers/python/README.md` for
-how a controller subscribes, decodes telemetry, and pushes commands.
+how a controller subscribes, decodes telemetry, and publishes commands.
 
 ## 8. Cap'n Proto wire quick reference
 
 The schema (`crates/astrum-proto/schema/astrum.capnp`) defines three messages:
-- **`Telemetry`** — sim → subscribers (topic = aircraft id as 4 big-endian bytes). Carries
-  `vehicleKind` (fixed-wing | multirotor) so a subscriber knows the class without the scenario.
+- **`Telemetry`** — sim → subscribers (published on `astrum/telemetry/<id>`; the id is in the key,
+  no topic frame). Carries `vehicleKind` (fixed-wing | multirotor) so a subscriber knows the class
+  without the scenario.
 - **`Command`** — controllers → sim; a union of **`raw`** actuator setpoints
   (`fcs/*-cmd-norm`) *or* high-level **`autopilot`** targets.
 - **`BagFrame`** — one recorded telemetry sample + timestamp (for record/replay).

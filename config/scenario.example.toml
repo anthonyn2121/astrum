@@ -21,7 +21,7 @@ max_time_s = 0.0
 realtime = true
 
 # --- Fleet -------------------------------------------------------------------
-# One entity per entry. `id` is the ZMQ telemetry topic / command target id and
+# One entity per entry. `id` is the Zenoh telemetry key / command target id and
 # must be unique. Initial conditions map to JSBSim `ic/*` properties.
 
 [[aircraft]]

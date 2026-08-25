@@ -1,20 +1,24 @@
 # ASTRUM example flight controller (C++)
 
-A minimal out-of-sim flight controller that talks to `astrum-sim` **only over ZMQ**,
+A minimal out-of-sim flight controller that talks to `astrum-sim` **only over Zenoh**,
 using the shared Cap'n Proto schema (`crates/astrum-proto/schema/astrum.capnp`) for the
 wire format. It is the reference for how a real controller (C++ or, later, Python)
-plugs into ASTRUM:
+plugs into ASTRUM. Telemetry and commands ride **one** `mode=peer` Zenoh session connecting
+to `tcp/sim:7447` (not two ports); the id lives in the key, so there's no topic frame:
 
-- **SUB** `tcp://sim:5555` — telemetry for one aircraft (topic = 4-byte big-endian id).
-- **PUSH** `tcp://sim:5556` — commands (target id + raw actuators *or* autopilot targets).
+- **SUB** `astrum/telemetry/<id>` — telemetry for one aircraft.
+- **PUB** `astrum/command/<id>` — commands (target id + raw actuators *or* autopilot targets).
 
 ## Modes (`ASTRUM_CONTROL_MODE`)
 
 - **`raw`** (default) — the controller closes a heading / altitude / airspeed hold loop
   *itself* and sends raw `fcs/*-cmd-norm` deflections every telemetry tick. This is
   ASTRUM's intended usage: **you own the control law**.
-- **`autopilot`** — the controller sends a single high-level target and then just
-  monitors; the sim's built-in proportional inner loop flies the aircraft.
+- **`autopilot`** — the controller sends one high-level target (reasserted over the first
+  second of telemetry) and then just monitors; the sim's built-in proportional inner loop flies
+  the aircraft. Resending briefly clears the Zenoh startup race: Zenoh drops a `put` with no
+  matching subscriber yet (unlike ZMQ PUSH, which queued it), so a single shot at t=0 would be
+  lost while the sim loads JSBSim — receiving telemetry proves the link is up.
 
 Both converge a 90° turn to within ~4° while holding altitude to a few metres (see
 the traces in the repo's verification notes).
@@ -23,8 +27,7 @@ the traces in the repo's verification notes).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ASTRUM_TELEMETRY_CONNECT` | `tcp://127.0.0.1:5555` | sim telemetry PUB endpoint |
-| `ASTRUM_COMMAND_CONNECT`   | `tcp://127.0.0.1:5556` | sim command PULL endpoint |
+| `ASTRUM_ZENOH_CONNECT`     | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (telemetry + commands) |
 | `ASTRUM_TARGET_ID`         | `1`    | aircraft id to subscribe to / command |
 | `ASTRUM_TARGET_HEADING_DEG`| `0`    | target heading (0 = due north) |
 | `ASTRUM_TARGET_ALT_M`      | `1500` | target MSL altitude (m) |
@@ -44,13 +47,17 @@ service by name (`make up`, or `docker compose up sim controller`).
 
 ## Notes
 
-- The build uses **pkg-config** (`capnp`, `libzmq`) rather than `find_package(CapnProto)`:
+- Zenoh links via **zenoh-cpp**: include `<zenoh.hxx>`, compile with the `ZENOHCXX_ZENOHC`
+  define (selects the zenoh-c backend) and link `-lzenohc`. Do **not** use pkg-config for
+  Zenoh — the shipped `zenohc.pc` has a stale `/usr/local` prefix; rely on the default
+  include/lib paths instead.
+- Cap'n Proto still uses **pkg-config** (`capnp`) rather than `find_package(CapnProto)`:
   the CapnProto CMake config on this image has a spuriously fatal libatomic probe
   (8-byte atomics are lock-free compiler builtins on x86-64, so no libatomic is
   actually needed). pkg-config gives the same libs without that check.
 - C++ bindings are generated from the **same** `astrum.capnp` the Rust side uses, so
   the controller and sim are wire-compatible by construction. Framing is Cap'n Proto's
-  flat serialization (`messageToFlatArray` / `FlatArrayMessageReader`); the zmq payload
+  flat serialization (`messageToFlatArray` / `FlatArrayMessageReader`); the Zenoh payload
   is copied into a word-aligned buffer before reading.
 - Telemetry carries no body rates, so the raw hold loop estimates roll/pitch rate by
   finite-differencing attitude between frames for damping.

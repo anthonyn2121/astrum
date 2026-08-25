@@ -2,10 +2,10 @@
 //!
 //! A bag is a flat sequence of `BagFrame` Cap'n Proto messages (see
 //! `astrum-proto`): each is a wall-clock receive timestamp plus one
-//! [`TelemetrySample`]. Recording and replay are deliberately *just another ZMQ
-//! client* — the recorder is a `SUB`, and replay is a `PUB` — so a replayed bag
-//! reaches any subscriber (a controller, the future replay renderer) byte-for-
-//! byte identically to the live sim.
+//! [`TelemetrySample`]. Recording and replay are deliberately *just another Zenoh
+//! peer* — the recorder subscribes to the telemetry keys, and replay publishes on
+//! them — so a replayed bag reaches any subscriber (a controller, the replay
+//! renderer) byte-for-byte identically to the live sim.
 //!
 //! This library provides the [`BagWriter`] append helper; reading is
 //! [`astrum_proto::BagReader`], re-exported here as [`BagReader`].

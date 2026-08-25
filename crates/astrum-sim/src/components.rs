@@ -5,8 +5,8 @@ use astrum_geo::LocalFrame;
 use bevy::prelude::*;
 use serde::Deserialize;
 
-/// Marks an entity as an aircraft and carries its stable id (ZMQ topic / command
-/// target).
+/// Marks an entity as an aircraft and carries its stable id (Zenoh telemetry key
+/// / command target).
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Aircraft {
     pub id: u32,

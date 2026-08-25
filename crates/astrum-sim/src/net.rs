@@ -1,12 +1,12 @@
-//! ZMQ bridge: telemetry out (`PUB`) and commands in (`PULL`), plus the optional
-//! in-sim autopilot inner loop that services high-level [`Control::Autopilot`]
-//! targets.
+//! Zenoh bridge: telemetry out and commands in, plus the optional in-sim
+//! autopilot inner loop that services high-level [`Control::Autopilot`] targets.
 //!
-//! The socket wrappers live in [`astrum_net`]; because `zmq::Socket` is `!Send`
-//! they are held as Bevy **`NonSend`** resources. All three bridge systems take
-//! their socket as `Option<NonSend<..>>` and no-op when it's absent, so the
-//! physics-only `build_app` (and its tests) run unchanged without binding any
-//! sockets — networking is switched on purely by inserting the resources.
+//! The transport wrappers live in [`astrum_net`]. They're held as Bevy
+//! **`NonSend`** resources (the sim runs single-threaded under
+//! `ScheduleRunnerPlugin`); all three bridge systems take theirs as
+//! `Option<NonSend<..>>` and no-op when it's absent, so the physics-only
+//! `build_app` (and its tests) run unchanged without opening a session —
+//! networking is switched on purely by inserting the resources.
 
 use astrum_fdm::{prop, Fdm, FT_TO_M};
 use astrum_net::{CommandReceiver, TelemetryPublisher};
@@ -186,8 +186,8 @@ fn multirotor_autopilot(f: &mut Fdm, ap: &AutopilotState) {
     f.set(prop::THROTTLE_CMD, throttle);
 }
 
-/// Encode each aircraft's post-step state and publish it on the telemetry `PUB`
-/// socket (topic = aircraft id). Runs after `sync_geo_transform`.
+/// Encode each aircraft's post-step state and publish it on the telemetry key
+/// `astrum/telemetry/<id>`. Runs after `sync_geo_transform`.
 pub fn publish_telemetry(
     publisher: Option<NonSend<TelemetryPublisher>>,
     q: Query<(&Aircraft, &GeoState, &Transform, &VehicleKind)>,

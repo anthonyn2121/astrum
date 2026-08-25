@@ -13,7 +13,14 @@ endif()
 # pkg-config gives us the same capnp/kj libs without that broken check.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(CAPNP REQUIRED capnp) # Requires: kj → pulls in libkj too
-pkg_check_modules(ZMQ REQUIRED libzmq)  # cppzmq's zmq.hpp is header-only in /usr/include
+find_package(Threads REQUIRED)
+
+# Zenoh transport: the zenoh-cpp headers (header-only, /usr/include/zenoh.hxx)
+# wrap the zenoh-c runtime (libzenohc.so). Both ship as debs installed in the
+# image (see docker/Dockerfile). zenoh-cpp needs a backend selected at compile
+# time — ZENOHCXX_ZENOHC picks the zenoh-c backend. Headers and libzenohc.so
+# live in the default include/lib paths, so no -I/-L is needed (the shipped
+# zenohc.pc has a stale /usr/local prefix, so we don't use pkg-config for it).
 
 # Generate C++ from the ONE shared schema the Rust side uses, guaranteeing the
 # controller and sim are wire-compatible.
@@ -29,8 +36,9 @@ add_custom_command(
   VERBATIM)
 
 add_executable(astrum-controller src/main.cpp ${GEN_DIR}/astrum.capnp.c++)
+target_compile_definitions(astrum-controller PRIVATE ZENOHCXX_ZENOHC)
 target_include_directories(astrum-controller PRIVATE
-  ${GEN_DIR} ${CAPNP_INCLUDE_DIRS} ${ZMQ_INCLUDE_DIRS})
-target_link_directories(astrum-controller PRIVATE
-  ${CAPNP_LIBRARY_DIRS} ${ZMQ_LIBRARY_DIRS})
-target_link_libraries(astrum-controller PRIVATE ${CAPNP_LIBRARIES} ${ZMQ_LIBRARIES})
+  ${GEN_DIR} ${CAPNP_INCLUDE_DIRS})
+target_link_directories(astrum-controller PRIVATE ${CAPNP_LIBRARY_DIRS})
+target_link_libraries(astrum-controller PRIVATE
+  ${CAPNP_LIBRARIES} zenohc Threads::Threads)

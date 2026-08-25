@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """ASTRUM example flight controller (Python).
 
-A minimal out-of-sim controller that talks to ``astrum-sim`` purely over ZMQ,
+A minimal out-of-sim controller that talks to ``astrum-sim`` purely over Zenoh,
 using the shared Cap'n Proto schema (``astrum.capnp``) for the wire format. It is
-the Python twin of ``controllers/cpp`` — same endpoints, same env config, same
-hold-law gains, same framing — proving a controller in any language plugs into
-ASTRUM with nothing but pyzmq + pycapnp.
+the Python twin of ``controllers/cpp`` — same key expressions, same env config,
+same hold-law gains, same framing — proving a controller in any language plugs
+into ASTRUM with nothing but eclipse-zenoh + pycapnp.
 
-  * SUB  tcp://sim:5555 — telemetry for one aircraft (topic = 4-byte BE id)
-  * PUSH tcp://sim:5556 — commands (target id + raw actuators | autopilot)
+  * SUB  astrum/telemetry/<id> — telemetry for one aircraft
+  * PUB  astrum/command/<id>   — commands (target id + raw actuators | autopilot)
+
+Both share one Zenoh session (one TCP endpoint) instead of ZMQ's two ports.
 
 Two modes (env ``ASTRUM_CONTROL_MODE``):
   * "raw" (default) — closes a heading/altitude/airspeed hold loop *here*, in
     the controller, sending raw ``fcs/*-cmd-norm`` deflections each tick. This
     is ASTRUM's intended usage: the user owns the control law.
-  * "autopilot" — sends a single high-level target command and then just
-    monitors, letting the sim's built-in inner loop fly it.
+  * "autopilot" — sends one high-level target (reasserted over the first second
+    of telemetry to clear the startup race) and then just monitors, letting the
+    sim's built-in inner loop fly it.
 
 Config (env), matching the C++ controller so the compose wiring is shared:
-  ASTRUM_TELEMETRY_CONNECT  (default tcp://127.0.0.1:5555)
-  ASTRUM_COMMAND_CONNECT    (default tcp://127.0.0.1:5556)
+  ASTRUM_ZENOH_CONNECT      (default tcp/127.0.0.1:7447; tcp/sim:7447 under compose)
   ASTRUM_TARGET_ID          (default 1)
   ASTRUM_TARGET_HEADING_DEG (default 0    — due north)
   ASTRUM_TARGET_ALT_M       (default 1500)
@@ -31,10 +33,9 @@ Config (env), matching the C++ controller so the compose wiring is shared:
 import math
 import os
 import sys
-import time
 
 import capnp
-import zmq
+import zenoh
 
 
 def env_str(key, fallback):
@@ -44,11 +45,6 @@ def env_str(key, fallback):
 def env_f64(key, fallback):
     v = os.environ.get(key)
     return float(v) if v is not None else fallback
-
-
-def topic_for(aircraft_id):
-    """4-byte big-endian aircraft id — matches astrum-net's topic frame."""
-    return int(aircraft_id).to_bytes(4, "big")
 
 
 def wrap_pi(a):
@@ -105,13 +101,15 @@ class HoldLaw:
 
 
 def main():
-    tlm_endpoint = env_str("ASTRUM_TELEMETRY_CONNECT", "tcp://127.0.0.1:5555")
-    cmd_endpoint = env_str("ASTRUM_COMMAND_CONNECT", "tcp://127.0.0.1:5556")
+    connect = env_str("ASTRUM_ZENOH_CONNECT", "tcp/127.0.0.1:7447")
     target_id = int(env_f64("ASTRUM_TARGET_ID", 1))
     target_hdg = math.radians(env_f64("ASTRUM_TARGET_HEADING_DEG", 0.0))
     target_alt = env_f64("ASTRUM_TARGET_ALT_M", 1500.0)
     target_spd = env_f64("ASTRUM_TARGET_SPD_MPS", 50.0)
     mode = env_str("ASTRUM_CONTROL_MODE", "raw")
+
+    telemetry_key = f"astrum/telemetry/{target_id}"
+    command_key = f"astrum/command/{target_id}"
 
     # Load the shared schema at runtime (no codegen step) — same source of truth
     # the Rust sim and the C++ controller compile against.
@@ -122,87 +120,93 @@ def main():
     schema_path = env_str("ASTRUM_SCHEMA", default_schema)
     astrum = capnp.load(schema_path)
 
-    ctx = zmq.Context.instance()
+    # Peer session onto the sim's single Zenoh endpoint. Multicast scouting is
+    # off — Docker bridge networks don't pass it, so peers connect explicitly.
+    # Peer mode makes open non-fatal when the sim isn't listening yet (it spends
+    # ~10s loading JSBSim before it binds): open returns immediately and Zenoh
+    # retries the connection in the background, so a controller started alongside
+    # the sim just attaches once it comes up — mirroring ZMQ's lazy connect. A
+    # client would instead abort open() on a cold start. listen/endpoints=[] keeps
+    # this peer purely connect-out (the link to the sim carries pub/sub both ways).
+    conf = zenoh.Config()
+    conf.insert_json5("mode", '"peer"')
+    conf.insert_json5("connect/endpoints", f'["{connect}"]')
+    conf.insert_json5("listen/endpoints", "[]")
+    conf.insert_json5("scouting/multicast/enabled", "false")
 
-    tlm = ctx.socket(zmq.SUB)
-    tlm.connect(tlm_endpoint)
-    tlm.setsockopt(zmq.SUBSCRIBE, topic_for(target_id))
+    with zenoh.open(conf) as session:
+        pub = session.declare_publisher(command_key)
 
-    cmd = ctx.socket(zmq.PUSH)
-    cmd.connect(cmd_endpoint)
-
-    print(
-        f"[controller.py] target={target_id} mode={mode} "
-        f"telemetry={tlm_endpoint} command={cmd_endpoint}",
-        file=sys.stderr,
-        flush=True,
-    )
-
-    # Autopilot mode: send one high-level target, then just monitor.
-    if mode == "autopilot":
-        msg = astrum.Command.new_message()
-        msg.targetId = target_id
-        ap = msg.control.init("autopilot")
-        ap.headingRad = target_hdg
-        ap.altMslM = target_alt
-        ap.airspeedMps = target_spd
-        # PUSH connect is async; give it a moment to establish before the send.
-        time.sleep(0.2)
-        cmd.send(msg.to_bytes())
         print(
-            f"[controller.py] sent autopilot target hdg={target_hdg:.3f}rad "
-            f"alt={target_alt}m spd={target_spd}m/s",
+            f"[controller.py] target={target_id} mode={mode} connect={connect} "
+            f"telemetry={telemetry_key} command={command_key}",
             file=sys.stderr,
             flush=True,
         )
 
-    law = HoldLaw(target_hdg, target_alt, target_spd)
-    n = 0
+        law = HoldLaw(target_hdg, target_alt, target_spd)
+        n = 0
 
-    while True:
-        # PUB frames arrive as [topic, payload]; the payload is the last frame.
-        frames = tlm.recv_multipart()
-        payload = frames[-1]
+        # The default subscriber handler is a FIFO channel; iterating blocks for
+        # the next telemetry sample, so there's no busy-poll.
+        sub = session.declare_subscriber(telemetry_key)
+        for sample in sub:
+            payload = bytes(sample.payload)
 
-        with astrum.Telemetry.from_bytes(payload) as tel:
-            att = tel.attitude
-            phi = att.phiRad
-            theta = att.thetaRad
-            psi = att.psiRad
-            alt = tel.geo.altM
-            airspeed = tel.airspeedMps
-            now = tel.simTimeS
+            with astrum.Telemetry.from_bytes(payload) as tel:
+                att = tel.attitude
+                phi = att.phiRad
+                theta = att.thetaRad
+                psi = att.psiRad
+                alt = tel.geo.altM
+                airspeed = tel.airspeedMps
+                now = tel.simTimeS
 
-        if mode != "raw":
+            if mode != "raw":
+                n += 1
+                # Autopilot mode: reassert the one high-level target over the first
+                # second of telemetry, then just monitor. Receiving telemetry proves
+                # the bidirectional peer link is up, so the command now reaches the
+                # sim; resending briefly guarantees delivery despite the startup race
+                # — Zenoh drops a put with no matching subscriber (unlike ZMQ PUSH,
+                # which queues it), so a single shot at t=0 would be lost while the
+                # sim spends ~10 s loading JSBSim before it subscribes.
+                if n <= 120:
+                    msg = astrum.Command.new_message()
+                    msg.targetId = target_id
+                    ap = msg.control.init("autopilot")
+                    ap.headingRad = target_hdg
+                    ap.altMslM = target_alt
+                    ap.airspeedMps = target_spd
+                    pub.put(msg.to_bytes())
+                if n % 120 == 0:
+                    print(
+                        f"[controller.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
+                        f"alt={alt:.0f}m",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+
+            aileron, elevator, throttle = law.compute(phi, theta, psi, alt, airspeed, now)
+
+            msg = astrum.Command.new_message()
+            msg.targetId = target_id
+            raw = msg.control.init("raw")
+            raw.aileron = aileron
+            raw.elevator = elevator
+            raw.rudder = 0.0
+            raw.throttle = throttle
+            pub.put(msg.to_bytes())
+
             n += 1
             if n % 120 == 0:
                 print(
                     f"[controller.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
-                    f"alt={alt:.0f}m",
+                    f"alt={alt:.0f}m ail={aileron:.3f} elev={elevator:.3f} thr={throttle:.3f}",
                     file=sys.stderr,
                     flush=True,
                 )
-            continue
-
-        aileron, elevator, throttle = law.compute(phi, theta, psi, alt, airspeed, now)
-
-        msg = astrum.Command.new_message()
-        msg.targetId = target_id
-        raw = msg.control.init("raw")
-        raw.aileron = aileron
-        raw.elevator = elevator
-        raw.rudder = 0.0
-        raw.throttle = throttle
-        cmd.send(msg.to_bytes())
-
-        n += 1
-        if n % 120 == 0:
-            print(
-                f"[controller.py] t={now:.1f}s hdg={math.degrees(psi):.1f}deg "
-                f"alt={alt:.0f}m ail={aileron:.3f} elev={elevator:.3f} thr={throttle:.3f}",
-                file=sys.stderr,
-                flush=True,
-            )
 
 
 if __name__ == "__main__":
