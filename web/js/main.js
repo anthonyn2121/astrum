@@ -32,6 +32,9 @@ const scene = new Scene(document.getElementById("view"), {
   onSelect: (id) => selectAircraft(id),
 });
 
+// The idle splash logo; hidden as soon as any telemetry is buffered.
+const splashEl = document.getElementById("splash");
+
 const ui = new UI({
   onPlayToggle: () => {
     state.playing = !state.playing;
@@ -171,6 +174,7 @@ function tick(now) {
   last = now;
 
   const b = store.bounds();
+  splashEl.classList.toggle("hidden", !b.empty);
 
   if (!b.empty) {
     if (state.followLive) {

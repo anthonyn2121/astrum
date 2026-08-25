@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ASTRUM · 3-D Replay</title>
+  <link rel="icon" type="image/png" href="./img/favicon.png" />
   <link rel="stylesheet" href="./style.css" />
   <script type="importmap">
     {
@@ -17,9 +18,12 @@
 <body>
   <div id="view"></div>
 
+  <!-- Idle splash: the full logo greets you until telemetry starts streaming. -->
+  <div id="splash"><img src="./img/astrum-logo.png" alt="ASTRUM — Aerospace Simulation" /></div>
+
   <!-- Top bar -->
   <header id="topbar">
-    <div class="brand"><span class="mark">◆</span> ASTRUM <em>Replay</em></div>
+    <div class="brand"><img class="mark" src="./img/astrum-mark.png" alt="ASTRUM" /> ASTRUM <em>Replay</em></div>
     <div class="source">
       <span id="statusPill" class="pill idle">idle</span>
       <span id="sourceLabel" class="muted">no source</span>
