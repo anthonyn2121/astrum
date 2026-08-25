@@ -271,6 +271,24 @@ The renderer is static files under `web/` (Three.js vendored in `web/vendor/`; t
 lives in `web/js/`); the bridge and exporter are the two binaries in `crates/astrum-web/`, both
 projecting telemetry through the one `astrum_web::FrameJson` shape.
 
+**Ground map.** For **fixed-wing** fleets — which fly a real geographic route — the renderer lays a
+slippy-map (XYZ / Web-Mercator) aerial layer flat under the aircraft, centred on the scenario's ENU
+datum. Multirotor and idle views keep the plain ENU grid. Tiles are served by `astrum-web` at
+`/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every tile under
+`tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling, and an area
+viewed once while online works **offline** afterward; a tile that 404s (offline + uncached) is
+skipped and the grid shows through. The upstream is configurable:
+
+```bash
+# Default: Esri World Imagery (global aerial, no key). Point elsewhere with:
+ASTRUM_TILE_URL='https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}' make replay  # public-domain, US-only
+ASTRUM_TILE_URL='' make replay        # cache-only: serve tiles already cached, never fetch
+ASTRUM_TILE_CACHE=/path/to/tiles      # relocate the on-disk cache (default ./tilecache)
+```
+
+Imagery is © its provider (the page footer credits the Esri default); mind the tile source's terms
+of service if you redistribute or use it beyond evaluation.
+
 **To develop your own controller**, don't add a compose service — treat it as a
 process you run in a dev shell against a running sim:
 

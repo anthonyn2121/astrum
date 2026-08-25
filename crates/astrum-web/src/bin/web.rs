@@ -21,6 +21,7 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -57,13 +58,38 @@ struct Cli {
     /// Static renderer directory to serve.
     #[arg(long, env = "ASTRUM_WEB_ROOT", default_value = "web")]
     root: PathBuf,
+
+    /// Upstream slippy-map tile template (`{z}`/`{x}`/`{y}` placeholders); the
+    /// renderer's ground map is proxied + cached through `/tiles/`. Default: Esri
+    /// World Imagery (global aerial, no key). Set empty to serve cache only.
+    #[arg(
+        long,
+        env = "ASTRUM_TILE_URL",
+        default_value = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    )]
+    tile_url: String,
+
+    /// On-disk cache directory for proxied map tiles (created on first miss). A
+    /// tile fetched once while online is served from here forever after (offline).
+    #[arg(long, env = "ASTRUM_TILE_CACHE", default_value = "tilecache")]
+    tile_cache: PathBuf,
 }
+
+/// Shared, read-only server config handed to every connection thread.
+struct ServerCfg {
+    root: PathBuf,
+    tile_url: String,
+    tile_cache: PathBuf,
+    agent: ureq::Agent,
+}
+
+/// Unique-suffix counter for atomic tile-cache writes (temp file → rename).
+static TILE_TMP: AtomicU64 = AtomicU64::new(0);
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let upstream = cli.connect;
     let bind = cli.bind;
-    let root = cli.root;
 
     let clients: Clients = Arc::new(Mutex::new(Vec::new()));
 
@@ -78,9 +104,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         })?;
     }
 
+    // Blocking HTTPS client for the tile proxy: bounded timeouts so an offline
+    // upstream fails fast (the browser then falls back to the plain grid).
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(15))
+        .user_agent(concat!("astrum-web/", env!("CARGO_PKG_VERSION")))
+        .build();
+    let cfg = Arc::new(ServerCfg {
+        root: cli.root,
+        tile_url: cli.tile_url,
+        tile_cache: cli.tile_cache,
+        agent,
+    });
+
     let listener = TcpListener::bind(&bind)?;
-    println!("[astrum-web] serving {} on http://{bind}", root.display());
+    println!("[astrum-web] serving {} on http://{bind}", cfg.root.display());
     println!("[astrum-web] telemetry WebSocket at ws://{bind}/telemetry (upstream {upstream})");
+    if cfg.tile_url.is_empty() {
+        println!("[astrum-web] map tiles: cache-only ({})", cfg.tile_cache.display());
+    } else {
+        println!("[astrum-web] map tiles: {} → cache {}", cfg.tile_url, cfg.tile_cache.display());
+    }
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -91,9 +136,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
         let clients = Arc::clone(&clients);
-        let root = root.clone();
+        let cfg = Arc::clone(&cfg);
         thread::spawn(move || {
-            if let Err(e) = handle_conn(stream, clients, &root) {
+            if let Err(e) = handle_conn(stream, clients, &cfg) {
                 // A dropped browser tab is routine — only note it at debug level.
                 let _ = e;
             }
@@ -142,7 +187,7 @@ impl Head {
     }
 }
 
-fn handle_conn(mut stream: TcpStream, clients: Clients, root: &Path) -> std::io::Result<()> {
+fn handle_conn(mut stream: TcpStream, clients: Clients, cfg: &ServerCfg) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     let Some(head) = read_head(&mut stream)? else { return Ok(()) };
 
@@ -160,7 +205,101 @@ fn handle_conn(mut stream: TcpStream, clients: Clients, root: &Path) -> std::io:
             "connect a WebSocket to /telemetry",
         );
     }
-    serve_static(&mut stream, root, &head.path)
+    let path = head.path.split(['?', '#']).next().unwrap_or("/");
+    if let Some(rest) = path.strip_prefix("/tiles/") {
+        return serve_tile(&mut stream, cfg, rest);
+    }
+    serve_static(&mut stream, &cfg.root, &head.path)
+}
+
+/// Serve one slippy-map tile, fetching + caching from the upstream tile server on
+/// a cache miss. `rest` is the `<z>/<x>/<y>.jpg` path after `/tiles/`. A miss with
+/// no reachable upstream is a 404, so the renderer falls back to the plain grid.
+fn serve_tile(stream: &mut TcpStream, cfg: &ServerCfg, rest: &str) -> std::io::Result<()> {
+    let Some((z, x, y)) = parse_tile(rest) else {
+        return write_simple(stream, 400, "Bad Request", "bad tile path");
+    };
+    let cache_path =
+        cfg.tile_cache.join(z.to_string()).join(x.to_string()).join(format!("{y}.jpg"));
+
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        return write_tile(stream, &bytes);
+    }
+    if let Some(bytes) = fetch_tile(cfg, z, x, y) {
+        let _ = cache_tile(&cache_path, &bytes); // best-effort: a failed write just re-fetches
+        return write_tile(stream, &bytes);
+    }
+    write_simple(stream, 404, "Not Found", "tile unavailable")
+}
+
+/// Parse + validate a `<z>/<x>/<y>[.jpg]` tile path. Rejects anything non-numeric
+/// or out of the zoom's range (so the coords can't escape the cache directory).
+fn parse_tile(rest: &str) -> Option<(u32, u32, u32)> {
+    let mut it = rest.split('/');
+    let z: u32 = it.next()?.parse().ok()?;
+    let x: u32 = it.next()?.parse().ok()?;
+    let y_str = it.next()?;
+    if it.next().is_some() {
+        return None; // no extra path components
+    }
+    let y: u32 = y_str.strip_suffix(".jpg").unwrap_or(y_str).parse().ok()?;
+    if z > 22 {
+        return None;
+    }
+    let max = 1u32 << z;
+    if x >= max || y >= max {
+        return None;
+    }
+    Some((z, x, y))
+}
+
+/// Fetch a tile from the upstream server. `None` on any error (offline, non-200,
+/// oversized), which the caller turns into a 404.
+fn fetch_tile(cfg: &ServerCfg, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
+    if cfg.tile_url.is_empty() {
+        return None;
+    }
+    let url = cfg
+        .tile_url
+        .replace("{z}", &z.to_string())
+        .replace("{x}", &x.to_string())
+        .replace("{y}", &y.to_string());
+    let resp = cfg.agent.get(&url).call().ok()?;
+    if resp.status() != 200 {
+        return None;
+    }
+    let mut buf = Vec::new();
+    resp.into_reader().take(8 * 1024 * 1024).read_to_end(&mut buf).ok()?;
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
+/// Write `bytes` to the cache at `path` via a unique temp file + atomic rename,
+/// so a concurrent reader never sees a half-written tile.
+fn cache_tile(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let n = TILE_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("part-{n}"));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn write_tile(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: image/jpeg\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: public, max-age=604800\r\n\
+         Connection: close\r\n\r\n",
+        bytes.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(bytes)
 }
 
 /// Complete the WebSocket handshake by hand, then drain this client's channel to
@@ -258,6 +397,7 @@ fn content_type(path: &Path) -> &'static str {
         Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg", // the bundled map raster under the fleet
         Some("ico") => "image/x-icon",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",

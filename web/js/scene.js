@@ -9,12 +9,39 @@ import { buildAircraft, enuToThree, attitudeToQuaternion, MODEL_SCALE } from "./
 const TRAIL_MAX = 240;      // points per trail
 const TRAIL_MIN_STEP = 1.0; // metres between recorded trail points
 
+// Ground map: a slippy-map tile layer laid flat under the fleet, centred on the
+// scenario datum. Tiles come from astrum-web at /tiles/{z}/{x}/{y}.jpg, which
+// proxies + disk-caches an upstream tile server — so any geolocated datum gets a
+// crisp aerial map, and an area seen once works offline afterwards. A tile that
+// 404s (offline + uncached) is simply skipped, so the grid shows through.
+const MAP = {
+  url: (z, x, y) => `./tiles/${z}/${x}/${y}.jpg`,
+  zoom: 14,    // ~7.5 m/px at mid-latitudes; one tile ≈ 1.9 km there
+  radius: 3,   // tiles each way from centre → a (2·radius+1)² block ≈ 13.5 km wide
+  y: -0.5,     // metres below the grid so the map never z-fights the gridlines
+};
+const M_PER_DEG_LAT = 111320; // metres per degree of latitude (spherical approx)
+const DEG2RAD = Math.PI / 180;
+
+// Web-Mercator (XYZ) tile <-> WGS84 helpers. `n` is the tiles-per-axis (2**zoom).
+function lon2tileX(lon, n) { return ((lon + 180) / 360) * n; }
+function lat2tileY(lat, n) {
+  const r = lat * DEG2RAD;
+  return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * n;
+}
+function tileX2lon(x, n) { return (x / n) * 360 - 180; }
+function tileY2lat(y, n) { return Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n))) / DEG2RAD; }
+
 export class Scene {
   constructor(container, { onSelect } = {}) {
     this.container = container;
     this.onSelect = onSelect || (() => {});
     this.fleet = new Map(); // id -> { group, trail, kind }
     this.selectedId = null;
+
+    // Ground map tile layer (built lazily once the fleet's datum is known).
+    this._mapGroup = null;
+    this._mapTried = false;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -39,8 +66,11 @@ export class Scene {
 
     this._raycaster = new THREE.Raycaster();
     this._pointer = new THREE.Vector2();
-    this.renderer.domElement.addEventListener("pointerdown", (e) => this._onPointerDown(e));
-    window.addEventListener("resize", () => this.resize());
+    // Keep handler refs so dispose() can detach them on a renderer swap.
+    this._onPointer = (e) => this._onPointerDown(e);
+    this._onResize = () => this.resize();
+    this.renderer.domElement.addEventListener("pointerdown", this._onPointer);
+    window.addEventListener("resize", this._onResize);
   }
 
   _addLights() {
@@ -54,13 +84,15 @@ export class Scene {
   _addGround() {
     const size = 12000, divisions = 60;
     const grid = new THREE.GridHelper(size, divisions, 0x2a5a8a, 0x18324a);
-    grid.material.opacity = 0.5;
+    // Kept faint: it's a scale/heading overlay above the map raster, not the floor.
+    grid.material.opacity = 0.28;
     grid.material.transparent = true;
+    grid.position.y = 0.2; // sit just above the map plane to avoid z-fighting
     this.scene.add(grid);
 
     // Faint origin disc + N/E/S/W markers. Grid lies in the X(East)–Z plane with
     // North = -Z (see meshes.js).
-    const originMat = new THREE.MeshBasicMaterial({ color: 0x22374d, transparent: true, opacity: 0.35 });
+    const originMat = new THREE.MeshBasicMaterial({ color: 0x22374d, transparent: true, opacity: 0.2 });
     const disc = new THREE.Mesh(new THREE.CircleGeometry(60, 48), originMat);
     disc.rotation.x = -Math.PI / 2;
     this.scene.add(disc);
@@ -84,6 +116,91 @@ export class Scene {
     this.scene.add(sprite);
   }
 
+  // Once we've seen a geolocated sample, derive the scenario's ENU datum (the
+  // lat/lon where enu = 0) and lay a block of map tiles flat under the fleet,
+  // centred on it. Runs at most once per loaded source.
+  //
+  // Scoped to fixed-wing fleets: those fly a real geographic route where an
+  // aerial map reads well. Multirotor (and any other kind) keep the plain ENU
+  // grid, so the kind check comes before we mark the map as tried — a mixed
+  // fleet still builds the map for its fixed-wing members.
+  _tryBuildMap(s, kind) {
+    if (kind !== "fixed-wing") return;
+    if (!Number.isFinite(s.lat_deg) || (s.lat_deg === 0 && s.lon_deg === 0)) return;
+    this._mapTried = true;
+
+    // Datum: the lat/lon where enu = 0 (any sample yields the same point).
+    const lat0 = s.lat_deg - s.enu_n / M_PER_DEG_LAT;
+    const mPerDegLon = M_PER_DEG_LAT * Math.cos(lat0 * DEG2RAD);
+    const lon0 = s.lon_deg - s.enu_e / mPerDegLon;
+
+    const { zoom, radius } = MAP;
+    const n = 2 ** zoom;
+    const cx = Math.floor(lon2tileX(lon0, n));
+    const cy = Math.floor(lat2tileY(lat0, n));
+
+    const group = new THREE.Group();
+    group.renderOrder = -1; // paint under the grid, trails and aircraft
+    this.scene.add(group);
+    this._mapGroup = group;
+
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    const loader = new THREE.TextureLoader();
+
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const tx = cx + dx, ty = cy + dy;
+        if (tx < 0 || ty < 0 || tx >= n || ty >= n) continue;
+
+        // Tile geographic bounds → ENU metres relative to the datum. Over a few
+        // km the local scale is effectively constant, so this stays rectilinear.
+        const west = tileX2lon(tx, n), east = tileX2lon(tx + 1, n);
+        const north = tileY2lat(ty, n), south = tileY2lat(ty + 1, n);
+        const eW = (west - lon0) * mPerDegLon, eE = (east - lon0) * mPerDegLon;
+        const nN = (north - lat0) * M_PER_DEG_LAT, nS = (south - lat0) * M_PER_DEG_LAT;
+        const width = eE - eW, depth = nN - nS;
+        const eCentre = (eW + eE) / 2, nCentre = (nN + nS) / 2;
+
+        // Texture loads async; default UVs + flipY put the tile's north edge at
+        // -Z, west at -X — matching the ENU grid (see meshes.js enuToThree). A
+        // 404 (offline + uncached) just leaves a gap where the grid shows through.
+        loader.load(
+          MAP.url(zoom, tx, ty),
+          (tex) => {
+            if (this._mapGroup !== group) { tex.dispose(); return; } // superseded
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.anisotropy = maxAniso;
+            tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+            const mesh = new THREE.Mesh(
+              new THREE.PlaneGeometry(width, depth),
+              new THREE.MeshBasicMaterial({ map: tex }),
+            );
+            mesh.rotation.x = -Math.PI / 2;        // XY plane -> flat XZ (normal +Y)
+            mesh.position.set(eCentre, MAP.y, -nCentre);
+            group.add(mesh);
+          },
+          undefined,
+          () => {},
+        );
+      }
+    }
+  }
+
+  _clearMap() {
+    if (this._mapGroup) {
+      this.scene.remove(this._mapGroup);
+      this._mapGroup.traverse((o) => {
+        if (o.isMesh) {
+          o.geometry.dispose();
+          o.material.map?.dispose();
+          o.material.dispose();
+        }
+      });
+    }
+    this._mapGroup = null;
+    this._mapTried = false;
+  }
+
   clearFleet() {
     for (const { group, trail } of this.fleet.values()) {
       this.scene.remove(group);
@@ -92,6 +209,7 @@ export class Scene {
     }
     this.fleet.clear();
     this.selectedId = null;
+    this._clearMap(); // a new source may sit at a different datum
   }
 
   setSelected(id) {
@@ -150,6 +268,8 @@ export class Scene {
       seen.add(id);
       const a = this._ensure(id, track.kind);
       const { s, inRange } = res;
+
+      if (!this._mapTried) this._tryBuildMap(s, track.kind);
 
       enuToThree(s.enu_e, s.enu_n, s.enu_u, _p);
       a.group.position.copy(_p);
@@ -231,6 +351,17 @@ export class Scene {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+  }
+
+  // Tear down for a renderer swap: drop the fleet, detach listeners, release the
+  // GL context and remove the canvas so the container is clean for the next scene.
+  dispose() {
+    this.clearFleet();
+    window.removeEventListener("resize", this._onResize);
+    this.renderer.domElement.removeEventListener("pointerdown", this._onPointer);
+    this.renderer.dispose();
+    const canvas = this.renderer.domElement;
+    if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
   }
 
   _onPointerDown(e) {

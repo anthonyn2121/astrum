@@ -143,6 +143,14 @@ button.live.active { background: var(--live); border-color: var(--live); color: 
 #scrub { flex: 1; accent-color: var(--accent); cursor: pointer; }
 #fps { min-width: 58px; text-align: right; }
 
+/* ---- Map attribution (bottom-right, above the transport) ---- */
+#mapAttribution {
+  position: fixed; right: 10px; bottom: 64px; z-index: 5;
+  font-size: 11px; color: rgba(200,214,230,0.6);
+  background: rgba(10,14,20,0.5); padding: 2px 7px; border-radius: 5px;
+  pointer-events: none; user-select: none;
+}
+
 /* ---- Drop hint ---- */
 #dropHint {
   position: fixed; inset: 0; display: none; place-items: center;

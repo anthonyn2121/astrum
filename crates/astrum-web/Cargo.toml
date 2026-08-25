@@ -28,3 +28,6 @@ serde_json = "1"
 # Sync WebSocket (no async runtime — matches the rest of the workspace). We do
 # the HTTP upgrade handshake by hand and hand the raw socket to tungstenite.
 tungstenite = "0.21"
+# Blocking HTTPS client for the map-tile proxy (rustls TLS with bundled roots, so
+# no system certs are needed). Only used to fetch-and-cache slippy-map tiles.
+ureq = { version = "2", default-features = false, features = ["tls"] }

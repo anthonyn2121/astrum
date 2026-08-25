@@ -22,6 +22,9 @@ docker-compose.override.yml
 /recordings/
 *.bag
 
+# Cached map tiles (fetched on demand by astrum-web's tile proxy)
+/tilecache/
+
 # JSBSim CLI output (default `JSBout<model>.csv`, written to the CWD)
 JSBout*.csv
 

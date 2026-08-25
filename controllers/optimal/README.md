@@ -99,7 +99,10 @@ feedforward (see `FixedWingGains::f16` in `astrum-sim`) hold altitude through th
 hard lobes — and the followers hold their slots to ~15 m mean / ~23 m peak. Watch
 it live with `make replay` in a second shell, or record it and scrub the replay
 offline (`make export`, then drag the exported JSON onto the renderer — see
-DEVELOP.md §7).
+DEVELOP.md §7). Because the formation is fixed-wing, the replay lays a real aerial
+map under the ground track (centred on the scenario datum, ~37.62 N, −122.38 E
+over the SF Bay), so the figure-eight reads against actual geography — see the
+ground-map note in DEVELOP.md §7.
 
 ## Run (inside the dev container)
 
