@@ -7,7 +7,7 @@ COMPOSE ?= docker compose
 SERVICE ?= sim
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down demo demo-python demo-quad replay export shell exec verify fmt lint logs ps clean
+.PHONY: help build up down demo demo-python demo-quad demo-formation replay export shell exec verify fmt lint logs ps clean
 
 # All hand-written C++ controller sources (excludes generated capnp + build dirs).
 CPP_SRC = find controllers -type f \( -name '*.cpp' -o -name '*.hpp' \) -not -path '*/build/*'
@@ -36,6 +36,11 @@ demo-python: ## Same demo, but the Python controller flies aircraft 1
 demo-quad: ## Quadrotor demo: an F450 hovers/climbs under the built-in multirotor autopilot
 	-ASTRUM_SCENARIO=config/scenario.quad.toml $(COMPOSE) --profile quad up --exit-code-from sim sim controller-quad
 	$(COMPOSE) --profile quad down
+
+demo-formation: ## Formation demo: a leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
+	-ASTRUM_SCENARIO=config/scenario.formation.toml $(COMPOSE) --profile formation up --exit-code-from sim \
+	  sim controller-lead controller-wing-left controller-wing-right controller-trail
+	$(COMPOSE) --profile formation down
 
 replay: ## Start the fleet sim + the 3-D replay renderer, then open http://localhost:8080
 	$(COMPOSE) up -d sim replay

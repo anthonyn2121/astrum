@@ -5,7 +5,10 @@ everything you shouldn't have to think about while developing an LQR or MPC
 controller:
 
   * opens the one peer-mode Zenoh session and connects to the sim,
-  * subscribes to a single aircraft's telemetry (``astrum/telemetry/<id>``),
+  * subscribes to a single aircraft's telemetry (``astrum/telemetry/<id>``) —
+    or, for a law that sets ``needs_world = True``, to the whole fleet
+    (``astrum/telemetry/*``) so it can watch its neighbours (e.g. a formation
+    follower tracking the leader),
   * decodes each Cap'n Proto ``Telemetry`` frame into a plain :class:`VehicleState`
     (SI units; body rates estimated by finite-differencing attitude, since the
     stream carries none),
@@ -199,30 +202,42 @@ class Runtime:
         self.target_id = args.id
         self.ref = Reference(math.radians(args.heading), args.alt, args.speed)
         self._astrum = capnp.load(args.schema)
-        # (t, roll, pitch, yaw) of the previous frame, for body-rate estimation.
-        self._prev = None
+        # (t, roll, pitch, yaw) of each aircraft's previous frame, keyed by id,
+        # for body-rate estimation (per-entity so a world-view law estimates
+        # rates for every aircraft it sees, not just its own).
+        self._prev = {}
+        # A law that sets ``needs_world = True`` (e.g. formation) is driven off a
+        # fleet-wide subscription: ``self.world`` holds the latest VehicleState
+        # per aircraft id, and the law reads its neighbours (the leader) from it.
+        self.needs_world = getattr(law, "needs_world", False)
+        self.world = {}
+        if self.needs_world:
+            law.world = self.world
 
     def _decode(self, payload: bytes) -> VehicleState:
         with self._astrum.Telemetry.from_bytes(payload) as tel:
             att = tel.attitude
             roll, pitch, yaw = att.phiRad, att.thetaRad, att.psiRad
             t = tel.simTimeS
+            aid = tel.aircraftId
 
-            # Estimate body rates from attitude differences (no rates on the wire).
+            # Estimate body rates from attitude differences (no rates on the
+            # wire), keyed per aircraft so a world-view law tracks every entity.
             p = q = r = 0.0
-            if self._prev is not None:
-                pt, proll, ppitch, pyaw = self._prev
+            prev = self._prev.get(aid)
+            if prev is not None:
+                pt, proll, ppitch, pyaw = prev
                 dt = t - pt
                 if dt > 0.0:
                     p = (roll - proll) / dt
                     q = (pitch - ppitch) / dt
                     r = _wrap_pi(yaw - pyaw) / dt
-            self._prev = (t, roll, pitch, yaw)
+            self._prev[aid] = (t, roll, pitch, yaw)
 
             kind = "multirotor" if str(tel.vehicleKind) == "multirotor" else "fixed-wing"
             return VehicleState(
                 t=t,
-                aircraft_id=tel.aircraftId,
+                aircraft_id=aid,
                 lat_deg=tel.geo.latDeg,
                 lon_deg=tel.geo.lonDeg,
                 alt_m=tel.geo.altM,
@@ -264,8 +279,13 @@ class Runtime:
         import sys
 
         connect = self.args.connect
-        telemetry_key = f"astrum/telemetry/{self.target_id}"
         command_key = f"astrum/command/{self.target_id}"
+        # A world-view law needs every aircraft's telemetry (to see the leader),
+        # so it subscribes fleet-wide and acts only on its own frames; a normal
+        # law subscribes to just its own aircraft.
+        telemetry_key = (
+            "astrum/telemetry/*" if self.needs_world else f"astrum/telemetry/{self.target_id}"
+        )
 
         # Peer session onto the sim's single Zenoh endpoint. Multicast scouting is
         # off (Docker bridge networks don't pass it), so peers connect explicitly;
@@ -294,6 +314,12 @@ class Runtime:
             n = 0
             for sample in sub:
                 s = self._decode(bytes(sample.payload))
+                if self.needs_world:
+                    # Keep the fleet snapshot fresh, but only run our own law when
+                    # our aircraft's frame arrives (that sets the control cadence).
+                    self.world[s.aircraft_id] = s
+                    if s.aircraft_id != self.target_id:
+                        continue
                 cmd = self.law.control(s, self.ref)
                 pub.put(self._encode(cmd))
                 n += 1

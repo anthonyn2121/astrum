@@ -21,7 +21,9 @@ controllers/optimal/
 │   ├── run.py              # entry point: `--law <name>` selects a law
 │   └── laws/
 │       ├── lqr.py          # LQR law   (edit me)
-│       └── mpc.py          # MPC law   (edit me)
+│       ├── mpc.py          # MPC law + reusable ChannelMPC (edit me)
+│       ├── figure8.py      # leader guidance: fly a figure-eight
+│       └── formation.py    # follower: decentralized formation-keeping MPC
 └── cpp/
     ├── include/            # astrum_control.hpp (clean API), laws.hpp, optimal_math.hpp
     ├── src/runtime.cpp     # the runtime + main + law factory
@@ -74,6 +76,28 @@ Both `lqr` and `mpc` are **runnable skeletons** that fly out of the box:
 
 These are starting points, not tuned autopilots. The point is the API and the
 machinery; the control theory is yours to fill in.
+
+## Formation demo
+
+`figure8` and `formation` compose into a 4-ship, fully **decentralized** formation
+— `make demo-formation` (scenario `config/scenario.formation.toml`):
+
+- **`figure8`** flies the *leader*: pure guidance that traces a horizontal
+  figure-eight (a Gerono lemniscate). It emits heading/alt/airspeed targets and
+  paces its reference point by *arc length flown*, so the ground track keeps its
+  shape at whatever speed the sim's throttle loop settles at.
+- **`formation`** flies each of the 3 *followers*, independently. A follower
+  watches only the leader's broadcast telemetry, places its slot (left / right /
+  trail) in the leader's heading frame, and drives its slot error to zero with a
+  per-axis receding-horizon MPC (`ChannelMPC`, shared from `mpc.py`). No follower
+  talks to another and there is no central optimizer — the only coupling is that
+  one broadcast state.
+
+In a full JSBSim run the leader holds an 18 km × 9 km pattern at ~19° bank (under
+the sim's 25° limit) and the followers capture in ~5 s, then hold their slots to
+~20 m (≈35 m at the tightest lobe tip). Watch it live with `make replay` in a
+second shell, or record it and scrub the replay offline (`make export`, then drag
+the exported JSON onto the renderer — see DEVELOP.md §7).
 
 ## Run (inside the dev container)
 

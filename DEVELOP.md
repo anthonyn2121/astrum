@@ -184,6 +184,7 @@ airspeed_kts = 100.0         # a multirotor initialises at hover: airspeed_kts =
 
 Bundled examples: `scenario.example.toml` (2-ship fleet), `scenario.demo.toml`
 (bounded single fixed-wing for the demo), `scenario.quad.toml` (single F450 quad),
+`scenario.formation.toml` (4-ship: a figure-eight leader + 3 MPC followers),
 `scenario.smoke.toml` (fast, for tests).
 
 **Vehicle classes.** Each aircraft is a fixed-wing or a multirotor (`VehicleKind`),
@@ -248,9 +249,10 @@ so any test binary that builds a `Fdm`/aircraft must serialize construction with
 The demos are one-command, self-terminating, and tear themselves down:
 
 ```bash
-make demo          # C++ controller flies aircraft 1 in the bounded scenario
-make demo-python   # same, with the Python controller
-make demo-quad     # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
+make demo           # C++ controller flies aircraft 1 in the bounded scenario
+make demo-python    # same, with the Python controller
+make demo-quad      # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
+make demo-formation # leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
 ```
 
 **Watch it in 3-D.** `make replay` starts the fleet sim + the `astrum-web` bridge; open

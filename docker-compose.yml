@@ -11,6 +11,25 @@ name: astrum
 #   sim        (runs astrum-sim: telemetry out, commands in)
 #   recorder   (astrum-bag-record; `--profile record up recorder`)
 #   controller (builds & runs controllers/cpp/astrum-controller)
+#   formation  (leader figure-eight + 3 decentralized MPC followers; `make demo-formation`)
+
+# Shared base for the four formation controllers — all run the Python optimal
+# runtime against the sim, differing only in their law/slot args (`command`).
+x-formation-controller: &formation-controller
+  image: astrum-dev:latest
+  working_dir: /workspace
+  profiles: ["formation"]
+  volumes:
+    - ./:/workspace
+    - cargo-registry:/usr/local/cargo/registry
+    - cargo-target:/workspace/target
+  environment:
+    # Each controller CONNECTS to the sim by name (run.py reads this as --connect).
+    ASTRUM_ZENOH_CONNECT: tcp/sim:7447
+  depends_on:
+    - sim
+  networks:
+    - astrum
 
 services:
   sim:
@@ -174,6 +193,45 @@ services:
       - bash
       - -lc
       - "exec python controllers/python/example.py"
+
+  # --- Formation demo: 1 leader + 3 decentralized MPC followers ---------------
+  # Opt-in via the `formation` profile (`make demo-formation`), paired with
+  # config/scenario.formation.toml. The leader flies a figure-eight; each
+  # follower independently watches the leader's telemetry and MPC-tracks its
+  # slot. Altitude 4572 m (15000 ft). The --speed 100 command settles ~120 m/s
+  # through the throttle loop; the speed-synced carrot and the 18 km x 9 km
+  # pattern keep the required bank ~19 deg (under the sim's 25-deg limit).
+  controller-lead:
+    <<: *formation-controller
+    command:
+      - bash
+      - -lc
+      - "exec python controllers/optimal/python/run.py --law figure8 --id 1
+         --alt 4572 --speed 100 --fig-rx 18000 --fig-ry 9000"
+
+  controller-wing-left:
+    <<: *formation-controller
+    command:
+      - bash
+      - -lc
+      - "exec python controllers/optimal/python/run.py --law formation --id 2
+         --leader 1 --slot left --alt 4572"
+
+  controller-wing-right:
+    <<: *formation-controller
+    command:
+      - bash
+      - -lc
+      - "exec python controllers/optimal/python/run.py --law formation --id 3
+         --leader 1 --slot right --alt 4572"
+
+  controller-trail:
+    <<: *formation-controller
+    command:
+      - bash
+      - -lc
+      - "exec python controllers/optimal/python/run.py --law formation --id 4
+         --leader 1 --slot trail --alt 4572"
 
 networks:
   astrum:
