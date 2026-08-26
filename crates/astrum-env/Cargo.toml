@@ -1,0 +1,27 @@
+[package]
+name = "astrum-env"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for the embedded ASTRUM RL dogfight environment"
+
+[lib]
+# The importable Python extension module is `astrum_env`. It's a cdylib only —
+# `test = false` / `doctest = false` keep `cargo test --workspace` from building a
+# test harness for it, which would fail to link (the `extension-module` build
+# deliberately leaves libpython symbols undefined, resolved by the interpreter at
+# import time). The seam is exercised from Rust in `astrum-sim/tests/env.rs` and
+# from Python via `python/smoke.py`.
+name = "astrum_env"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+astrum-sim = { path = "../astrum-sim" }
+
+[dependencies.pyo3]
+version = "0.22"
+# abi3-py38: build one forward-compatible wheel/.so against the stable ABI (no
+# python3-dev headers, no libpython link). extension-module: don't link libpython.
+features = ["extension-module", "abi3-py38"]

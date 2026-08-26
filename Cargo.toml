@@ -8,6 +8,7 @@ members = [
     "crates/astrum-bag",
     "crates/astrum-sim",
     "crates/astrum-web",
+    "crates/astrum-env",
 ]
 
 [workspace.package]

@@ -6,6 +6,7 @@ use astrum_geo::Geodetic;
 use bevy::prelude::*;
 use std::time::{Duration, Instant};
 
+use crate::combat::{Gun, Health, Team, Trigger};
 use crate::components::{Aircraft, FdmInstance, GeoState, SimParams, VehicleKind, WorldFrame};
 use crate::net::{AutopilotState, FixedWingGains};
 use crate::scenario::Scenario;
@@ -55,6 +56,9 @@ pub fn spawn_fleet(mut commands: Commands, scenario: Res<Scenario>, params: Res<
         }
         fdm.set_dt(params.dt);
 
+        // Every aircraft is a combat participant: a team, a health pool, and a
+        // (default-off) trigger. Same-team craft never damage each other, so a
+        // single-team scenario behaves exactly as before combat existed.
         let mut ent = commands.spawn((
             Aircraft { id: spec.id },
             FdmInstance(fdm),
@@ -62,12 +66,21 @@ pub fn spawn_fleet(mut commands: Commands, scenario: Res<Scenario>, params: Res<
             GeoState::default(),
             Transform::default(),
             AutopilotState::default(),
+            Team(spec.team),
+            Health::full(spec.health),
+            Trigger::default(),
         ));
         // Fixed-wing entities carry a per-airframe gain set for the built-in
         // autopilot inner loop (a fighter turns far harder than a trainer);
-        // multirotors use a separate hover-hold law and need none.
+        // multirotors use a separate hover-hold law and need none. They also carry
+        // the gun — multirotors are unarmed in this environment.
         if kind == VehicleKind::FixedWing {
             ent.insert(FixedWingGains::for_model(&spec.model));
+            let mut gun = Gun::m61a1();
+            if let Some(ammo) = spec.ammo {
+                gun.ammo = ammo;
+            }
+            ent.insert(gun);
         }
         spawned += 1;
     }
@@ -80,8 +93,10 @@ pub fn spawn_fleet(mut commands: Commands, scenario: Res<Scenario>, params: Res<
     );
 }
 
-/// Advance every aircraft's flight dynamics by one fixed timestep.
-pub fn step_fdm(mut q: Query<&mut FdmInstance>) {
+/// Advance every *living* aircraft's flight dynamics by one fixed timestep. A
+/// `Dead` aircraft is skipped, freezing its FDM so the wreck holds its final
+/// pose (combat decision §12.5).
+pub fn step_fdm(mut q: Query<&mut FdmInstance, Without<crate::combat::Dead>>) {
     for mut inst in &mut q {
         inst.0.step();
     }

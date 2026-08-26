@@ -158,6 +158,14 @@ pub mod prop {
     pub const P_RAD_S: &str = "velocities/p-rad_sec";
     pub const Q_RAD_S: &str = "velocities/q-rad_sec";
     pub const R_RAD_S: &str = "velocities/r-rad_sec";
+    /// Angle of attack α (rad). Aerodynamic incidence — pairs with `Nz` for the
+    /// stall/energy awareness an RL policy needs (design doc §8).
+    pub const ALPHA_RAD: &str = "aero/alpha-rad";
+    /// Sideslip angle β (rad); `0` in coordinated flight.
+    pub const BETA_RAD: &str = "aero/beta-rad";
+    /// Normal load factor Nz (g), body −z. ≈ +1 in level flight; the corner-speed /
+    /// g-limit signal for BFM. (JSBSim exposes it dimensionless in g.)
+    pub const NZ_G: &str = "accelerations/Nz";
     pub const SIM_TIME: &str = "simulation/sim-time-sec";
 
     // --- initial conditions (RW; set before RunIC) ---

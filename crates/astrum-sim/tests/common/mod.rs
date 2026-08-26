@@ -37,7 +37,7 @@ pub fn fdm_guard() -> MutexGuard<'static, ()> {
 pub fn single_ship() -> Scenario {
     Scenario {
         world: World { origin_lat_deg: 37.6188, origin_lon_deg: -122.3756, origin_alt_m: 0.0 },
-        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false },
+        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false, seed: 0 },
         aircraft: vec![AircraftSpec {
             id: 1,
             model: "c172x".into(),
@@ -47,6 +47,9 @@ pub fn single_ship() -> Scenario {
             alt_ft: 5000.0,
             heading_deg: 90.0,
             airspeed_kts: 100.0,
+            team: 0,
+            health: 100.0,
+            ammo: None,
         }],
     }
 }
@@ -56,7 +59,7 @@ pub fn single_ship() -> Scenario {
 pub fn single_quad() -> Scenario {
     Scenario {
         world: World { origin_lat_deg: 44.7258, origin_lon_deg: -93.0759, origin_alt_m: 0.0 },
-        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false },
+        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false, seed: 0 },
         aircraft: vec![AircraftSpec {
             id: 1,
             model: "F450".into(),
@@ -66,6 +69,9 @@ pub fn single_quad() -> Scenario {
             alt_ft: 1000.0,
             heading_deg: 90.0,
             airspeed_kts: 0.0,
+            team: 0,
+            health: 100.0,
+            ammo: None,
         }],
     }
 }
@@ -75,7 +81,7 @@ pub fn single_quad() -> Scenario {
 pub fn two_ship() -> Scenario {
     Scenario {
         world: World { origin_lat_deg: 37.6188, origin_lon_deg: -122.3756, origin_alt_m: 0.0 },
-        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false },
+        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false, seed: 0 },
         aircraft: vec![
             AircraftSpec {
                 id: 1,
@@ -86,6 +92,9 @@ pub fn two_ship() -> Scenario {
                 alt_ft: 5000.0,
                 heading_deg: 90.0,
                 airspeed_kts: 100.0,
+                team: 0,
+                health: 100.0,
+                ammo: None,
             },
             AircraftSpec {
                 id: 2,
@@ -96,6 +105,9 @@ pub fn two_ship() -> Scenario {
                 alt_ft: 5000.0,
                 heading_deg: 270.0,
                 airspeed_kts: 100.0,
+                team: 0,
+                health: 100.0,
+                ammo: None,
             },
         ],
     }
@@ -121,12 +133,15 @@ pub fn mixed_fleet(n: u32) -> Scenario {
                 alt_ft: if quad { 1000.0 } else { 5000.0 },
                 heading_deg: (id as f64 * 30.0) % 360.0,
                 airspeed_kts: if quad { 0.0 } else { 100.0 },
+                team: 0,
+                health: 100.0,
+                ammo: None,
             }
         })
         .collect();
     Scenario {
         world: World { origin_lat_deg: base_lat, origin_lon_deg: base_lon, origin_alt_m: 0.0 },
-        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false },
+        sim: Sim { rate_hz: 120.0, max_time_s: 0.0, realtime: false, seed: 0 },
         aircraft,
     }
 }

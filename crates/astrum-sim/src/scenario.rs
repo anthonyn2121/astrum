@@ -40,10 +40,18 @@ pub struct Sim {
     /// number of steps and their fixed dt — is identical.
     #[serde(default = "default_realtime")]
     pub realtime: bool,
+    /// Seed for the deterministic combat RNG (gun dispersion); any fixed value
+    /// makes an engagement reproducible. Default `0`.
+    #[serde(default)]
+    pub seed: u64,
 }
 
 fn default_realtime() -> bool {
     true
+}
+
+fn default_health() -> f32 {
+    100.0
 }
 
 /// One aircraft entity's initial conditions.
@@ -63,6 +71,18 @@ pub struct AircraftSpec {
     pub alt_ft: f64,
     pub heading_deg: f64,
     pub airspeed_kts: f64,
+    /// Combat side (design doc §2.2). Aircraft on the same team never damage each
+    /// other, and the episode ends when only one team is left alive. Default `0`;
+    /// a single-team scenario is non-combat and never self-terminates.
+    #[serde(default)]
+    pub team: u8,
+    /// Starting (and maximum) hit points. Default 100.
+    #[serde(default = "default_health")]
+    pub health: f32,
+    /// Gun ammunition override (rounds). Applies to armed (fixed-wing) aircraft;
+    /// `None` (default) keeps the gun's own magazine (see `Gun::m61a1`).
+    #[serde(default)]
+    pub ammo: Option<u16>,
 }
 
 impl AircraftSpec {
@@ -79,8 +99,15 @@ impl Scenario {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("reading scenario {}: {e}", path.display()))?;
-        let scenario: Scenario = toml::from_str(&text)
-            .map_err(|e| format!("parsing scenario {}: {e}", path.display()))?;
+        Self::from_toml_str(&text)
+    }
+
+    /// Parse (and validate) a scenario from a TOML string. Lets an embedded
+    /// caller — e.g. the RL env ([`crate::env`]) or its Python binding — build a
+    /// scenario without touching the filesystem.
+    pub fn from_toml_str(text: &str) -> Result<Self, String> {
+        let scenario: Scenario =
+            toml::from_str(text).map_err(|e| format!("parsing scenario: {e}"))?;
         scenario.validate()?;
         Ok(scenario)
     }

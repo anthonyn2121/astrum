@@ -1,0 +1,231 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1140" viewBox="0 0 1600 1140" font-family="DejaVu Sans, sans-serif">
+  <defs>
+    <style>
+      .title{font-weight:700;font-size:42px;fill:#F5F7FA}
+      .sub{font-size:16px;fill:#9AA6B2}
+      .tag{font-size:13px;fill:#7E8A99}
+      .chip{font-weight:700;font-size:14px;fill:#0F1420}
+      .psub{font-size:13px;fill:#94A0AE}
+      .cName{font-family:'DejaVu Sans Mono',monospace;font-weight:700;font-size:15px;fill:#E6EDF3}
+      .cDesc{font-size:12.5px;fill:#9AA6B2}
+      .boxT{font-weight:700;font-size:14.5px;fill:#E9EEF4}
+      .boxD{font-size:12.5px;fill:#9AA6B2}
+      .mono{font-family:'DejaVu Sans Mono',monospace;font-size:13px;fill:#AEB9C7}
+      .monoK{font-family:'DejaVu Sans Mono',monospace;font-weight:700;font-size:13px;fill:#C4B5FD}
+      .busT{font-weight:700;font-size:20px;fill:#F5F7FA;letter-spacing:1px}
+      .busS{font-size:13px;fill:#D3DAE4}
+      .aLbl{font-weight:700;font-size:11.5px}
+      .legend{font-size:13px;fill:#AEB9C7}
+      .foot{font-size:13px;fill:#8A96A4}
+      .panel{fill:#131A26;stroke:#26324A;stroke-width:1.5}
+      .box{fill:#1B2333;stroke:#31405A;stroke-width:1.2}
+      .chipT{font-weight:700;font-size:14px}
+    </style>
+    <marker id="mGreen" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#34D399"/></marker>
+    <marker id="mOrange" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#FB923C"/></marker>
+    <marker id="mBlue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#38BDF8"/></marker>
+    <marker id="mGray" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6B7688"/></marker>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#000000" flood-opacity="0.45"/></filter>
+    <pattern id="grid" width="42" height="42" patternUnits="userSpaceOnUse"><path d="M42 0 L0 0 0 42" fill="none" stroke="#FFFFFF" stroke-opacity="0.022" stroke-width="1"/></pattern>
+    <linearGradient id="busGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2B2350"/><stop offset="0.5" stop-color="#3A2F63"/><stop offset="1" stop-color="#2B2350"/>
+    </linearGradient>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1600" height="1140" fill="#0F1420"/>
+  <rect x="0" y="0" width="1600" height="1140" fill="url(#grid)"/>
+
+  <!-- title -->
+  <text class="title" x="58" y="60">ASTRUM</text>
+  <text class="sub" x="60" y="90">Aerospace Simulator for Tactical Robotics &amp; Unmanned Multi-agents</text>
+  <text class="tag" x="1542" y="48" text-anchor="end">headless multi-agent flight simulator</text>
+  <text class="tag" x="1542" y="70" text-anchor="end">Rust · Bevy ECS · JSBSim · Zenoh · Cap'n Proto</text>
+  <text class="tag" x="1542" y="92" text-anchor="end">runtime: astrum-dev Docker image</text>
+  <line x1="58" y1="110" x2="1542" y2="110" stroke="#26324A" stroke-width="1.4"/>
+
+  <!-- ============ TOP ROW ============ -->
+
+  <!-- LEFT: workspace crates -->
+  <rect class="panel" x="40" y="128" width="372" height="364" rx="14" filter="url(#sh)"/>
+  <rect x="56" y="142" width="236" height="30" rx="8" fill="#2DD4BF"/>
+  <text class="chip" x="70" y="163">RUST WORKSPACE · crates/</text>
+
+  <g>
+    <circle cx="66" cy="205" r="5" fill="#F5B301"/>
+    <text class="cName" x="80" y="210">astrum-sim</text><text class="cDesc" x="80" y="226">headless Bevy 0.19 ECS state server</text>
+    <circle cx="66" cy="246" r="5" fill="#F97316"/>
+    <text class="cName" x="80" y="251">astrum-fdm</text><text class="cDesc" x="80" y="267">JSBSim C-shim FFI · one FDM per entity</text>
+    <circle cx="66" cy="287" r="5" fill="#22D3EE"/>
+    <text class="cName" x="80" y="292">astrum-geo</text><text class="cDesc" x="80" y="308">WGS84 ↔ ECEF ↔ ENU frames</text>
+    <circle cx="66" cy="328" r="5" fill="#A78BFA"/>
+    <text class="cName" x="80" y="333">astrum-proto</text><text class="cDesc" x="80" y="349">Cap'n Proto wire schema (shared)</text>
+    <circle cx="66" cy="369" r="5" fill="#34D399"/>
+    <text class="cName" x="80" y="374">astrum-net</text><text class="cDesc" x="80" y="390">Zenoh transport · sync · Bevy NonSend</text>
+    <circle cx="66" cy="410" r="5" fill="#FB7185"/>
+    <text class="cName" x="80" y="415">astrum-bag</text><text class="cDesc" x="80" y="431">telemetry bag record / replay</text>
+    <circle cx="66" cy="451" r="5" fill="#38BDF8"/>
+    <text class="cName" x="80" y="456">astrum-web</text><text class="cDesc" x="80" y="472">SUB→WebSocket bridge + static HTTP</text>
+  </g>
+
+  <!-- dependency bracket crates -> sim -->
+  <line x1="412" y1="308" x2="436" y2="308" stroke="#6B7688" stroke-width="2" marker-end="url(#mGray)"/>
+
+  <!-- CENTER: simulation engine -->
+  <rect class="panel" x="436" y="128" width="728" height="364" rx="14" filter="url(#sh)"/>
+  <rect x="452" y="142" width="316" height="30" rx="8" fill="#F5B301"/>
+  <text class="chip" x="466" y="163">SIMULATION ENGINE · astrum-sim</text>
+  <text class="psub" x="452" y="194">Headless Bevy 0.19 ECS · steps every FDM once per loop · 120 Hz fixed step (Pacer)</text>
+
+  <!-- pipeline boxes -->
+  <rect class="box" x="468" y="210" width="664" height="38" rx="8"/>
+  <rect x="468" y="210" width="5" height="38" rx="2.5" fill="#22D3EE"/>
+  <text class="boxT" x="800" y="234" text-anchor="middle">Scenario loader   ·   config/*.toml → fleet spec</text>
+  <line x1="800" y1="248" x2="800" y2="260" stroke="#6B7688" stroke-width="2" marker-end="url(#mGray)"/>
+
+  <rect class="box" x="468" y="262" width="664" height="38" rx="8"/>
+  <rect x="468" y="262" width="5" height="38" rx="2.5" fill="#F97316"/>
+  <text class="boxT" x="800" y="286" text-anchor="middle">spawn_fleet   ·   1 JSBSim FGFDMExec + VehicleKind per aircraft</text>
+  <line x1="800" y1="300" x2="800" y2="312" stroke="#6B7688" stroke-width="2" marker-end="url(#mGray)"/>
+
+  <rect class="box" x="468" y="314" width="664" height="92" rx="8"/>
+  <text class="boxD" x="480" y="332">ECS World   ·   entity · components · systems</text>
+  <rect x="480" y="342" width="316" height="52" rx="7" fill="#12202A" stroke="#2C4657" stroke-width="1.1"/>
+  <text class="boxT" x="638" y="366" text-anchor="middle">physics step</text>
+  <text class="boxD" x="638" y="384" text-anchor="middle">astrum-fdm ▸ JSBSim dynamics</text>
+  <rect x="804" y="342" width="320" height="52" rx="7" fill="#12202A" stroke="#2C4657" stroke-width="1.1"/>
+  <text class="boxT" x="964" y="366" text-anchor="middle">inner-loop autopilots</text>
+  <text class="boxD" x="964" y="384" text-anchor="middle">fixed-wing · multirotor</text>
+  <line x1="800" y1="406" x2="800" y2="418" stroke="#6B7688" stroke-width="2" marker-end="url(#mGray)"/>
+
+  <rect class="box" x="468" y="420" width="664" height="40" rx="8"/>
+  <rect x="468" y="420" width="5" height="40" rx="2.5" fill="#34D399"/>
+  <text class="boxT" x="800" y="445" text-anchor="middle">Net bridge   ·   ingest_commands · autopilot_step · publish_telemetry</text>
+
+  <!-- RIGHT: wire schema -->
+  <rect class="panel" x="1188" y="128" width="372" height="364" rx="14" filter="url(#sh)"/>
+  <rect x="1204" y="142" width="270" height="30" rx="8" fill="#A78BFA"/>
+  <text class="chip" x="1218" y="163">WIRE SCHEMA · astrum.capnp</text>
+
+  <text class="monoK" x="1206" y="200">struct Telemetry {</text>
+  <text class="mono"  x="1206" y="220">  id · simTime · geo(lat,lon,alt)</text>
+  <text class="mono"  x="1206" y="240">  enu · velNed · attitude</text>
+  <text class="mono"  x="1206" y="260">  airspeed · vehicleKind }</text>
+  <text class="monoK" x="1206" y="294">struct Command {</text>
+  <text class="mono"  x="1206" y="314">  targetId ·</text>
+  <text class="mono"  x="1206" y="334">  raw | autopilot }</text>
+  <text class="monoK" x="1206" y="368">struct BagFrame {</text>
+  <text class="mono"  x="1206" y="388">  recvWallNs · telemetry }</text>
+  <line x1="1206" y1="410" x2="1542" y2="410" stroke="#26324A" stroke-width="1.2"/>
+  <text class="cDesc" x="1206" y="432">One schema shared by the Rust sim and</text>
+  <text class="cDesc" x="1206" y="450">the C++ / Python controllers.</text>
+  <line x1="1374" y1="492" x2="1374" y2="514" stroke="#5B4B86" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text class="tag" x="1374" y="508" text-anchor="middle">payload</text>
+
+  <!-- sim <-> bus arrows -->
+  <line x1="772" y1="492" x2="772" y2="514" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
+  <line x1="830" y1="514" x2="830" y2="492" stroke="#FB923C" stroke-width="3" marker-end="url(#mOrange)"/>
+  <text class="aLbl" x="766" y="507" text-anchor="end" fill="#34D399">telemetry</text>
+  <text class="aLbl" x="836" y="507" fill="#FB923C">commands</text>
+
+  <!-- ============ ZENOH BUS ============ -->
+  <rect x="40" y="516" width="1520" height="62" rx="14" fill="url(#busGrad)" stroke="#A78BFA" stroke-width="1.6" filter="url(#sh)"/>
+  <text class="busT" x="800" y="544" text-anchor="middle">ZENOH 1.10.0  ·  TRANSPORT BUS</text>
+  <text class="busS" x="800" y="566" text-anchor="middle">single TCP endpoint :7447  ·  Cap'n Proto payload  ·  keys astrum/telemetry/&lt;id&gt; + astrum/command/&lt;id&gt;  ·  sim LISTENs, all others CONNECT (peer)</text>
+
+  <!-- bus -> controllers -->
+  <line x1="392" y1="578" x2="392" y2="604" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
+  <line x1="450" y1="604" x2="450" y2="578" stroke="#FB923C" stroke-width="3" marker-end="url(#mOrange)"/>
+  <text class="aLbl" x="386" y="596" text-anchor="end" fill="#34D399">telemetry</text>
+  <text class="aLbl" x="456" y="596" fill="#FB923C">commands</text>
+
+  <!-- bus -> observation -->
+  <line x1="1150" y1="578" x2="1150" y2="604" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
+  <line x1="1230" y1="604" x2="1230" y2="578" stroke="#34D399" stroke-width="2.4" stroke-dasharray="6 5" marker-end="url(#mGreen)"/>
+  <text class="aLbl" x="1144" y="596" text-anchor="end" fill="#34D399">telemetry</text>
+  <text class="aLbl" x="1236" y="596" fill="#8FE9C6">replay re-pub</text>
+
+  <!-- ============ BOTTOM ROW ============ -->
+
+  <!-- LEFT: controllers -->
+  <rect class="panel" x="40" y="606" width="760" height="452" rx="14" filter="url(#sh)"/>
+  <rect x="56" y="620" width="372" height="30" rx="8" fill="#38BDF8"/>
+  <text class="chip" x="70" y="641">FLIGHT CONTROLLERS · external processes</text>
+  <text class="psub" x="56" y="672">C++ / Python · connect to :7447 · you write only the control law</text>
+
+  <rect class="box" x="64" y="686" width="712" height="50" rx="8"/>
+  <rect x="64" y="686" width="5" height="50" rx="2.5" fill="#38BDF8"/>
+  <text class="cName" x="82" y="708">controllers/cpp</text>
+  <text class="cDesc" x="82" y="726">example hold law · raw | autopilot modes (cppzmq→zenoh-cpp + capnp)</text>
+
+  <rect class="box" x="64" y="742" width="712" height="50" rx="8"/>
+  <rect x="64" y="742" width="5" height="50" rx="2.5" fill="#38BDF8"/>
+  <text class="cName" x="82" y="764">controllers/python</text>
+  <text class="cDesc" x="82" y="782">example hold law · eclipse-zenoh + pycapnp (no codegen)</text>
+
+  <rect class="box" x="64" y="798" width="712" height="128" rx="8"/>
+  <rect x="64" y="798" width="5" height="128" rx="2.5" fill="#F5B301"/>
+  <text class="cName" x="82" y="820">controllers/optimal   —   clean-API scaffold (LQR / MPC)</text>
+  <text class="cDesc" x="82" y="842">runtime ▸ Zenoh session · Cap'n Proto codec · state decode · body-rate estimate · clamp</text>
+  <text class="cDesc" x="82" y="862">laws (the only files you write) ▸</text>
+  <g font-family="DejaVu Sans Mono, monospace" font-weight="700" font-size="13">
+    <rect x="86" y="876" width="70" height="30" rx="15" fill="#23304a" stroke="#3A4C6E"/><text x="121" y="896" text-anchor="middle" fill="#CFE0FF">lqr</text>
+    <rect x="166" y="876" width="76" height="30" rx="15" fill="#23304a" stroke="#3A4C6E"/><text x="204" y="896" text-anchor="middle" fill="#CFE0FF">mpc</text>
+    <rect x="252" y="876" width="108" height="30" rx="15" fill="#23304a" stroke="#3A4C6E"/><text x="306" y="896" text-anchor="middle" fill="#CFE0FF">figure8</text>
+    <rect x="370" y="876" width="120" height="30" rx="15" fill="#3a2f1a" stroke="#7a5c1e"/><text x="430" y="896" text-anchor="middle" fill="#FFD98A">formation</text>
+  </g>
+
+  <!-- formation callout -->
+  <rect x="64" y="936" width="712" height="104" rx="10" fill="#1E1A10" stroke="#7a5c1e" stroke-width="1.4"/>
+  <rect x="64" y="936" width="5" height="104" rx="2.5" fill="#F5B301"/>
+  <text class="boxT" x="82" y="962" fill="#FFD98A">Formation MPC demo   ·   make demo-formation</text>
+  <text class="cDesc" x="82" y="986">Leader (aircraft 1) flies a figure-8 (Gerono lemniscate). Three F-16 followers</text>
+  <text class="cDesc" x="82" y="1006">each run an independent per-follower MPC to hold their left / right / trail slot</text>
+  <text class="cDesc" x="82" y="1026">— fully decentralized: every follower watches only the leader's telemetry.</text>
+
+  <!-- RIGHT: recording & visualization -->
+  <rect class="panel" x="820" y="606" width="740" height="452" rx="14" filter="url(#sh)"/>
+  <rect x="836" y="620" width="336" height="30" rx="8" fill="#FB7185"/>
+  <text class="chip" x="850" y="641">RECORDING &amp; VISUALIZATION</text>
+  <text class="psub" x="836" y="672">telemetry subscribers · offline &amp; live playback</text>
+
+  <rect class="box" x="844" y="686" width="692" height="50" rx="8"/>
+  <rect x="844" y="686" width="5" height="50" rx="2.5" fill="#FB7185"/>
+  <text class="cName" x="862" y="708">recorder   ·   astrum-bag</text>
+  <text class="cDesc" x="862" y="726">subscribes telemetry → .bag stream (ROS-style, Cap'n Proto BagFrames)</text>
+
+  <rect class="box" x="844" y="742" width="692" height="50" rx="8"/>
+  <rect x="844" y="742" width="5" height="50" rx="2.5" fill="#FB7185"/>
+  <text class="cName" x="862" y="764">replay   ·   astrum-bag</text>
+  <text class="cDesc" x="862" y="782">.bag → re-publish onto the bus, paced ~real-time</text>
+
+  <rect class="box" x="844" y="798" width="692" height="66" rx="8"/>
+  <rect x="844" y="798" width="5" height="66" rx="2.5" fill="#38BDF8"/>
+  <text class="cName" x="862" y="820">astrum-web   ·   bridge</text>
+  <text class="cDesc" x="862" y="840">Zenoh SUB → WebSocket :8080 + static HTTP server</text>
+  <text class="cDesc" x="862" y="857">astrum-web-export ▸ bag → JSON (offline load)</text>
+
+  <line x1="1190" y1="864" x2="1190" y2="882" stroke="#38BDF8" stroke-width="3" marker-end="url(#mBlue)"/>
+  <text class="aLbl" x="1200" y="877" fill="#38BDF8">WebSocket</text>
+
+  <rect class="box" x="844" y="882" width="692" height="104" rx="8"/>
+  <rect x="844" y="882" width="5" height="104" rx="2.5" fill="#38BDF8"/>
+  <text class="cName" x="862" y="908">Browser   ·   vanilla ES-module Three.js</text>
+  <text class="cDesc" x="862" y="932">procedural F-16 / F450 meshes chosen by VehicleKind · ENU↔three math</text>
+  <text class="cDesc" x="862" y="952">orbit &amp; follow cameras · flight trails · entity pick</text>
+  <text class="cDesc" x="862" y="972">timeline keyed on sim_time_s with interpolation · HUD overlay</text>
+
+  <!-- ============ FOOTER ============ -->
+  <line x1="40" y1="1078" x2="1560" y2="1078" stroke="#26324A" stroke-width="1.2"/>
+  <g transform="translate(58,1104)">
+    <line x1="0" y1="-4" x2="34" y2="-4" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
+    <text class="legend" x="42" y="0">telemetry: sim → subscribers</text>
+    <line x1="252" y1="-4" x2="286" y2="-4" stroke="#FB923C" stroke-width="3" marker-end="url(#mOrange)"/>
+    <text class="legend" x="294" y="0">command: controller → sim</text>
+    <line x1="512" y1="-4" x2="546" y2="-4" stroke="#38BDF8" stroke-width="3" marker-end="url(#mBlue)"/>
+    <text class="legend" x="554" y="0">WebSocket → browser</text>
+    <line x1="742" y1="-4" x2="776" y2="-4" stroke="#34D399" stroke-width="2.4" stroke-dasharray="6 5" marker-end="url(#mGreen)"/>
+    <text class="legend" x="784" y="0">replay re-publish</text>
+  </g>
+  <text class="foot" x="1542" y="1104" text-anchor="end">all services in the astrum-dev image · orchestrated by docker-compose</text>
+</svg>

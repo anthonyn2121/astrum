@@ -9,7 +9,9 @@
 //! the integration tests in `tests/` share the exact same [`build_app`]; tests
 //! simulate the real main loop by pumping [`bevy::app::App::update`].
 
+pub mod combat;
 pub mod components;
+pub mod env;
 pub mod net;
 pub mod scenario;
 pub mod systems;
@@ -19,6 +21,8 @@ use bevy::prelude::*;
 use std::time::Duration;
 
 use astrum_geo::{Geodetic, LocalFrame};
+use combat::systems::{apply_damage, end_on_elimination, fire_guns, resolve_hits, step_bullets};
+use combat::{CombatParams, CombatRng, CombatState};
 use components::{SimParams, WorldFrame};
 use net::{autopilot_step, ingest_commands, publish_telemetry};
 use scenario::Scenario;
@@ -51,6 +55,17 @@ pub fn build_app(scenario: Scenario) -> App {
         scenario.world.origin_lat_deg, scenario.world.origin_lon_deg, scenario.world.origin_alt_m
     );
 
+    // Combat: the seeded dispersion RNG plus the initial team count that gates
+    // termination. `end_on_elimination` only stops the sim when ≥ 2 teams started
+    // and ≤ 1 remains, so a single-team (non-combat) scenario runs unchanged.
+    let combat_seed = scenario.sim.seed;
+    let initial_living_teams = {
+        let mut teams: Vec<u8> = scenario.aircraft.iter().map(|a| a.team).collect();
+        teams.sort_unstable();
+        teams.dedup();
+        teams.len() as u8
+    };
+
     // Physics steps exactly once per runner loop; the `pace` system throttles the
     // loop (we drive the runner unthrottled — Bevy's own sleep is a no-op here).
     // Pacing only changes wall-clock timing, never the number of steps or their
@@ -62,16 +77,25 @@ pub fn build_app(scenario: Scenario) -> App {
         .insert_resource(frame)
         .insert_resource(Diag::new())
         .insert_resource(Pacer::new(dt, params.realtime))
+        .insert_resource(CombatParams::default())
+        .insert_resource(CombatRng::seeded(combat_seed))
+        .insert_resource(CombatState { initial_living_teams })
         .add_systems(Startup, spawn_fleet)
         .add_systems(
             Update,
             (
                 // Commands first (they set this tick's inputs), then physics,
-                // then derive pose, then publish the fresh state.
+                // then derive pose, then run combat on that fresh pose, then
+                // publish the resulting state.
                 ingest_commands,
                 autopilot_step,
                 step_fdm,
                 sync_geo_transform,
+                fire_guns,
+                step_bullets,
+                resolve_hits,
+                apply_damage,
+                end_on_elimination,
                 publish_telemetry,
                 report_progress,
                 stop_at_max_time,
