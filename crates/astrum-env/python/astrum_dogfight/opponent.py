@@ -15,7 +15,7 @@ vertical states (Split-S, yo-yos).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import atan2, cos, hypot, pi, radians
+from math import atan2, cos, hypot, pi, radians, sin
 
 from . import constants as C
 from .geometry import AState, body_bearing, lead_point, relative
@@ -37,17 +37,23 @@ def _course(s: AState) -> float:
     return s.psi
 
 
-def _corner_limited_pull(elev_cmd: float, s: AState) -> float:
+def _corner_limited_pull(elev_cmd: float, s: AState, *, ease_speed: bool = True) -> float:
     """Ease off a pull command (negative = aft stick) to hold energy near corner
     speed and stay below the AoA soft cap — the §8.5 "corner speed ← Nz" note.
 
     The FLCS already prevents *departure* (~30° AoA / 9 g hard limits); this keeps
     the *scripted* opponent from bleeding to a mush by over-pulling when slow.
+
+    `ease_speed=False` keeps ONLY the AoA soft-cap (departure protection) and drops
+    the airspeed easing, so a *max-performance* break rides the alpha limit and bleeds
+    down toward corner speed for the tightest turn — trading energy for turn rate the
+    way a defender fighting for its life does, instead of preserving energy in a wide
+    turn. The alpha cap still prevents a mush/departure.
     """
     mag = -elev_cmd  # pull magnitude in (0, 1]
     if mag <= 0.0:
         return elev_cmd  # not a pull — leave push/neutral untouched
-    if s.airspeed < C.V_CORNER_MPS:
+    if ease_speed and s.airspeed < C.V_CORNER_MPS:
         mag *= _clamp(s.airspeed / C.V_CORNER_MPS, 0.3, 1.0)
     if s.alpha > C.ALPHA_SOFT_RAD:
         mag *= _clamp(C.ALPHA_SOFT_RAD / max(s.alpha, 1e-3), 0.3, 1.0)
@@ -313,7 +319,29 @@ def wez_fire(me: AState, target: AState) -> bool:
     if me.ammo <= 0 or not me.alive or not target.alive:
         return False
     rg = relative(me, target)
-    return rg.in_range and rg.lead_error < C.FIRE_LEAD_RAD
+    # `naive_lead_error`, NOT the corrected `lead_error`: curriculum-86 made `lead_error` the
+    # velocity-inheritance-corrected lay ([[gun-lay-velocity-inheritance]]), which would have
+    # silently changed this bot's trigger. The scripted T3 IS the benchmark the whole
+    # curriculum-01→85 history is measured against, so a learner-side aim fix must leave it
+    # byte-identical. (`lead_pursuit`'s steering already uses the naive `lead_point`.)
+    return rg.in_range and rg.naive_lead_error < C.FIRE_LEAD_RAD
+
+
+def lead_pursuit(s: AState, target: AState, g: F16Gains, *, tgt_spd: float = C.V_PURSUIT) -> list:
+    """Lead-pursuit control law → raw `[ail, elev, rud, thr]`: roll the lift vector onto
+    the gun-lead point, pull onto it (corner-limited), and hold `tgt_spd` (§8.5).
+
+    Extracted from `Tier3Opponent._pursue` so the exploration-only `PursuitExpert` can
+    reuse the exact, sim-sign-correct law without duplicating it. `tgt_spd` defaults to
+    `V_PURSUIT` (Tier-3's tuned hold, unchanged); the expert overrides it upward so it
+    outruns — and thus closes on — a fleeing target instead of decelerating below it."""
+    off, bank_err, _ = body_bearing(s, lead_point(s, target))
+    roll_gate = min(off / C.PURSUE_ROLL_DEADBAND, 1.0)  # don't roll once on the nose
+    ail = _clamp(C.K_PURSUE_ROLL * bank_err * roll_gate - g.k_roll_rate * s.p, -1.0, 1.0)
+    aligned = max(cos(bank_err), 0.0)  # pull hardest once rolled onto the target
+    elev = _corner_limited_pull(_clamp(-C.K_PURSUE_PULL * off * aligned, -1.0, 0.0), s)
+    thr = _clamp(g.throttle_trim + g.k_spd_to_thr * (tgt_spd - s.airspeed), 0.0, 1.0)
+    return [ail, elev, 0.0, thr]
 
 
 class Tier3Opponent:
@@ -331,10 +359,12 @@ class Tier3Opponent:
         self._min_dwell = int(C.FSM_MIN_DWELL_S / dt)
         self._state = _NEUTRAL
         self._dwell = 0
+        self._break_sign = 0.0  # 0 = unlatched; `_break` picks a direction on first use
 
     def reset(self, s: AState) -> None:
         self._state = _NEUTRAL
         self._dwell = 0
+        self._break_sign = 0.0
 
     @property
     def state(self) -> str:
@@ -390,26 +420,45 @@ class Tier3Opponent:
     def _pursue(self, s: AState, target: AState):
         """Lead pursuit: put the lift vector on the lead point, pull onto it, hold
         pursuit speed."""
-        off, bank_err, _ = body_bearing(s, lead_point(s, target))
-        roll_gate = min(off / C.PURSUE_ROLL_DEADBAND, 1.0)  # don't roll once on the nose
-        ail = _clamp(C.K_PURSUE_ROLL * bank_err * roll_gate - self.g.k_roll_rate * s.p, -1.0, 1.0)
-        aligned = max(cos(bank_err), 0.0)  # pull hardest once rolled onto the target
-        elev = _corner_limited_pull(_clamp(-C.K_PURSUE_PULL * off * aligned, -1.0, 0.0), s)
-        thr = _clamp(
-            self.g.throttle_trim + self.g.k_spd_to_thr * (C.V_PURSUIT - s.airspeed), 0.0, 1.0
-        )
-        return [ail, elev, 0.0, thr]
+        return lead_pursuit(s, target, self.g)
 
     def _break(self, s: AState, target: AState):
         """Hard defensive break into the attacker (continuous, unlike Tier-2's timed
-        maneuver): roll to the break bank and pull a corner-limited high-g turn."""
-        sign = 1.0 if relative(s, target).ata_az >= 0.0 else -1.0
-        ail = _clamp(
-            self.g.k_roll_to_ail * (sign * C.BREAK_BANK_RAD - s.phi) - self.g.k_roll_rate * s.p,
-            -1.0,
-            1.0,
-        )
-        return [ail, _corner_limited_pull(-0.95, s), 0.0, 1.0]
+        maneuver): roll the lift vector nearly onto him (85° bank) and pull to the AoA
+        limit — a max-performance turn that bleeds energy for turn rate, NOT the old
+        energy-preserving corner-hold. `ease_speed=False` keeps only the departure cap.
+
+        The pull is ROLL-GATED by `cos(bank_err)`, the same way `lead_pursuit` gates its own
+        ("pull hardest once rolled onto the target") and Tier-2's break gates its 0.9 pull behind
+        `abs(phi) >= 0.9 * BREAK_BANK_RAD`. Without the gate this law held max aft stick while
+        rolling, and since it also recomputed its roll direction from `ata_az` every tick with no
+        hysteresis, every reversal rolled 85° -> 0 -> -85° at max g: near wings-level the whole
+        max-g demand became PITCH, so a "level break" turned into a zoom climb (measured at spawn
+        aspect 55: theta +7 -> +42° and gamma +3 -> +28° in 4 s, then a locked gamma +38° climbing
+        spiral to 8261 m at the 16° alpha ceiling, bleeding 218 -> 138 m/s). Both jets ended
+        alpha-saturated at ~150 m/s where NEITHER can point a gun, which is the regime the chase
+        curriculum spent ~20 ceilings failing to solve. Gated, the break holds 84° of bank, keeps
+        its speed (V 158 -> 203 m/s) and turns in-plane as intended.
+
+        NOTE: unlike `wez_fire` — deliberately pinned to the naive lead angle so a learner-side aim
+        fix could not move the benchmark — this DOES move the benchmark, knowingly: scores here are
+        not comparable to the curriculum-01→93 chain, which was measured against the ungated break.
+        """
+        # Latched roll direction with a deadband, so the break commits to a turn instead of
+        # chattering when the attacker sits near the nose (`ata_az` ~ 0). Reversals are legitimate
+        # BFM, so they are allowed — the threat just has to cross meaningfully to the other side.
+        az = relative(s, target).ata_az
+        if self._break_sign == 0.0:
+            self._break_sign = 1.0 if az >= 0.0 else -1.0
+        elif az * self._break_sign < -C.BREAK_REVERSE_DEADBAND_RAD:
+            self._break_sign = -self._break_sign
+
+        bank_err = self._break_sign * C.BREAK_BANK_RAD - s.phi
+        ail = _clamp(self.g.k_roll_to_ail * bank_err - self.g.k_roll_rate * s.p, -1.0, 1.0)
+        # max(..., 0) keeps the scale non-negative when the commanded bank is more than 90° away
+        # (mid-reversal) — precisely the window that used to convert max g into pitch.
+        aligned = max(cos(bank_err), 0.0)
+        return [ail, _corner_limited_pull(-aligned, s, ease_speed=False), 0.0, 1.0]
 
     def _high_yoyo(self, s: AState, target: AState):
         """Pitch up out of plane at idle to dump closure/energy and avoid overshoot."""
@@ -442,3 +491,58 @@ class Tier3Opponent:
             act4 = self._pursue(s, opponent)
 
         return act4 + [1.0 if wez_fire(s, opponent) else 0.0]
+
+
+# ---------------------------------------------------------------------------
+# Exploration guide (NOT an opponent): a pure-offensive lead-pursuit gun expert.
+# ---------------------------------------------------------------------------
+
+
+class PursuitExpert:
+    """Relentless lead-pursuit gun expert — an EXPLORATION guide for the RL learner, not
+    an opponent it fights.
+
+    Always flies Tier-3's proven OFFENSIVE law (`lead_pursuit`) and fires whenever the
+    target sits in the WEZ (`wez_fire`), with none of Tier-3's defensive / energy / yoyo
+    states: it presses to guns and shoots even when the learner's own prior stalls at
+    standoff. The RL collector (`train_parallel`) runs whole episodes under this expert
+    with an annealing probability early in a stage — a DAgger-style seed that fills the
+    replay buffer with complete close→kill trajectories the stalled prior cannot generate
+    on the long-range rungs (where the fire-override is impotent: `gun_quality ≡ 0` beyond
+    the gun's effective range, so it can't trigger until the jet has already closed).
+
+    Reads full state ("godmode"), like every scripted law here. `act` returns
+    `[aileron, elevator, rudder, throttle, trigger]` in the RAW env action space (the
+    `_LinearActionWrapper` inverts it back to the agent's `[-1,1]` space for storage)."""
+
+    def __init__(self, gains: F16Gains | None = None):
+        self.g = gains or F16Gains()
+
+    def reset(self, s: AState) -> None:  # stateless — defined for interface symmetry
+        pass
+
+    def act(self, me: AState, target: AState) -> list:
+        # Proportional range-keeper (see constants): chase at the target's speed + a commanded
+        # closure that is max far out and tapers to zero as we reach a stable guns-trail. This
+        # both closes from standoff (the bare V_PURSUIT hold is slower than a cruising bandit, so
+        # it would open range forever) AND avoids the overshoot a fixed high chase speed causes
+        # (blaze past → can't re-solve).
+        rg = relative(me, target)
+        closure = _clamp(C.K_CHASE_RANGE * (rg.rng - C.R_CHASE_TRAIL), 0.0, C.V_CHASE_MARGIN)
+        act4 = lead_pursuit(me, target, self.g, tgt_spd=target.airspeed + closure)
+        return act4 + [1.0 if self._fire(me, target, rg) else 0.0]
+
+    @staticmethod
+    def _fire(me: AState, target: AState, rg) -> bool:
+        """Point-blank fire discipline: shoot only when the aim point falls inside the target's
+        hit sphere (predicted lateral miss `rng·sin(naive_lead_error)` ≤ `GUN_FIRE_MISS_M`), so the
+        finite magazine is spent on rounds that connect — not hosed at long range where the
+        dispersion footprint and any lead error dwarf the 8 m target (see constants).
+
+        Uses `naive_lead_error` (the pre-curriculum-86 nose-to-aim-point angle) on purpose: this
+        expert is a fixed REFERENCE bot whose numbers appear all over the run history, so it must
+        not shift under the learner-side aim fix ([[gun-lay-velocity-inheritance]]). Its steering
+        (`lead_pursuit` → `lead_point`) is naive too, so gate and stick stay consistent."""
+        if me.ammo <= 0 or not me.alive or not target.alive or not rg.in_range:
+            return False
+        return rg.rng * sin(rg.naive_lead_error) <= C.GUN_FIRE_MISS_M

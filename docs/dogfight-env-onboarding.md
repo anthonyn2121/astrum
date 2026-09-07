@@ -46,7 +46,7 @@ minimal sanity check:
 docker compose run --rm --no-deps sim bash -lc 'bash crates/astrum-env/python/run_smoke.sh'
 ```
 
-**Step 1 — run the adapter's own test suite** (9 tests, no gymnasium required):
+**Step 1 — run the adapter's own test suite** (10 tests, no gymnasium required):
 
 ```bash
 docker compose run --rm --no-deps sim bash -lc 'bash crates/astrum-env/python/run_gym_test.sh'
@@ -113,18 +113,32 @@ compass directions.
 Computed by `reward.py`. Dense terms accrue every step; terminal events have strict
 precedence:
 
+Values below are **reward-v4** (see design doc §8.3 for the v1→v4 rationale):
+
 | Event | Reward | Flag | `info["event"]` |
 |-------|-------:|------|-----------------|
 | Hard-deck bust (< 300 m AGL) | −200 | terminated | `hard_deck` |
-| Kill (bandit dies) | +100 | terminated | `kill` (or `trade`) |
-| Death (learner dies) | −100 | terminated | `killed` |
+| Kill (bandit dies) | +150 | terminated | `kill` (or `trade`) |
+| Death (learner dies) | −60 | terminated | `killed` |
+| Mutual kill (both die same tick) | −25 | terminated | `trade` |
 | Bubble exit (> 15 km, or over ceiling) | −50 | truncated | `left_bubble` |
 | Damage dealt / taken | ±0.5 / HP | — | `damage_dealt` / `damage_taken` |
-| Geometry shaping | `K_GEOM·(γΦ′−Φ)` | — | — |
-| Time | small negative each step | — | — |
+| Dense tracking (nose-on × range-closeness, in TRACK_RANGE) | `+K_TRACK·track·range_factor` | — | — |
+| Dense gun-solution (in-WEZ quality) | `+K_SOLUTION·gun_quality` | — | — |
+| ↳ cap: cumulative dense tracking / episode | `≤ TRACK_BUDGET (50 ≈ R_KILL/3)` | — | `info["track_used"]` |
+| Fire a round in / out of solution | `+0.05` / `−0.005` per round | — | — |
+| Time | −0.001 each step | — | — |
 
 `info["event"]` tells you which terminal fired; `info["phi"]` is the current
 geometry potential. Hard-deck wins over everything, then kill/death, then bubble.
+Reward-v2 replaced the old potential-based `K_GEOM·(γΦ′−Φ)` shaping (which telescoped
+to nothing and let the policy park at a passive draw) with the non-telescoping dense
+tracking terms above; reward-v3 then raised the in-WEZ fire bonus so the policy
+actually pulls the trigger. reward-v4 caps the *cumulative* tracking at `TRACK_BUDGET`
+(≈`R_KILL`/3) per episode — v2/v3 left it unbounded (`≈2·R_KILL` over a full episode),
+so a nose-on track-draw could out-earn a kill and the passive-draw trap reincarnated at
+a higher reward level. The cap is enforced in `DogfightGymEnv.step` (`reward.compute`
+stays stateless); `K_GEOM` still lives in `constants.py` but is unused.
 
 ### Picking the opponent (difficulty tier)
 
@@ -157,8 +171,10 @@ first tasks, in order:
    to learn from is `Tier3Opponent._pursue` and `wez_fire` in `opponent.py`.
 2. **A random-action sanity harness** — confirm episodes terminate for the right
    reasons (watch `info["event"]`), and that reward is finite every step.
-3. **Only then, learning.** This needs a dev-image change (see §5) before you can
-   `import stable_baselines3`.
+3. **Only then, learning.** A from-scratch PPO baseline now lives in
+   `controllers/rl/` (its own uv env with torch/GPU — **no** stable-baselines3).
+   Build the env and train with `make rl-env` then `make rl-train`; see that
+   directory's README.
 
 ---
 
@@ -168,11 +184,12 @@ first tasks, in order:
    and **not thread-safe**, so `DogfightEnv` is `#[pyclass(unsendable)]` — pinned to
    its creating thread. Scale training with `SubprocVecEnv` / `AsyncVectorEnv`, one
    env per process. Using OS threads will corrupt the FDM.
-2. **gymnasium and stable-baselines3 are not in the dev image yet.** The adapter is
-   numpy-only and subclasses `gymnasium.Env` *only if it's importable*, so it runs
-   offline today, but you cannot actually train until the image gains those deps.
-   Adding gymnasium + SB3 to the image is the gating next step before any learning
-   milestone.
+2. **Training deps are split across two envs.** The base `astrum-dev` image now has
+   pure-Python `gymnasium` (so the adapter uses a real `spaces.Box` / `gymnasium.Env`)
+   plus `uv`. The heavy, GPU-specific bits (torch + CUDA) live in a **separate uv
+   env** under `controllers/rl/` — not the base image — built on demand with
+   `make rl-env`. We train with our own PPO, so stable-baselines3 is intentionally
+   absent.
 
 ---
 

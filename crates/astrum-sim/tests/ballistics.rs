@@ -123,3 +123,51 @@ fn acceleration_terms_compose() {
     assert!(a.x.abs() < 1e-12 && a.y.abs() < 1e-12, "no drag/Coriolis at rest");
     assert!((a.z + G0).abs() < 1e-12, "gravity should be −g, got {}", a.z);
 }
+
+/// Golden trajectory shared with the Python mirror in
+/// `crates/astrum-env/python/astrum_dogfight/gunlay.py`.
+///
+/// The RL reward and observation need a gun-lay model, and a gun-lay model is only
+/// worth anything if it agrees with *this* integrator — the one the sim actually
+/// flies rounds with. `gunlay.step_projectile` re-implements `step_projectile` in
+/// NumPy so lays can be scored offline in Python; these are the numbers that keep
+/// the two honest. The same constants are asserted from the Python side in
+/// `crates/astrum-env/python/test_gunlay.py::test_matches_the_rust_golden_trajectory`,
+/// so any drift in either implementation breaks one of the two suites.
+///
+/// Case: a 20 mm M61A1 round at 15 kft, fired due North at 1230 m/s (= 1030 muzzle
+/// + 200 m/s of inherited own velocity, i.e. the forward shot the learner takes),
+/// integrated 120 steps of 1/120 s at latitude 37° N.
+#[test]
+fn golden_trajectory_pins_the_python_mirror() {
+    let b = Ballistics::new(0.3, std::f64::consts::PI * 0.010 * 0.010, 0.10);
+    let omega = earth_rate_enu(37f64.to_radians());
+    let (pos, vel) = fly(
+        DVec3::new(0.0, 0.0, 4572.0),
+        DVec3::new(0.0, 1230.0, 0.0),
+        0.0, // work in MSL directly: base_alt 0 with pos.z = altitude
+        &b,
+        omega,
+    );
+
+    // Derived constants (drag_factor = Cd·A/m, ISA density at the test altitude).
+    assert!((b.drag_factor - 9.424_777_960_769_38e-4).abs() < 1e-15, "drag_factor {}", b.drag_factor);
+    assert!((air_density(4572.0) - 0.770_815_982_717_405).abs() < 1e-12);
+    assert!((omega.y - 5.823_741_982_348_514e-5).abs() < 1e-18, "omega N {}", omega.y);
+    assert!((omega.z - 4.388_504_357_552_398e-5).abs() < 1e-18, "omega U {}", omega.z);
+
+    // Position and velocity after exactly 1.0 s of flight.
+    for (label, got, want) in [
+        ("pos.x", pos.x, 0.042_459_845_373),
+        ("pos.y", pos.y, 1014.656_328_395_519),
+        ("pos.z", pos.z, 4567.605_753_963_890),
+        ("vel.x", vel.x, 0.075_225_316_681),
+        ("vel.y", vel.y, 849.305_371_114_120),
+        ("vel.z", vel.z, -8.301_833_271_160),
+    ] {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "{label}: Rust {got:.12} != Python mirror {want:.12} — gunlay.py has drifted"
+        );
+    }
+}

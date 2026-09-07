@@ -409,27 +409,92 @@ observation aid, **never** auto-fire):
 
 ### 8.3 Reward function
 
-Hierarchy: potential-based geometry shaping ≪ damage ≪ terminal kill/death, with
-the floor the single worst outcome. Magnitudes below are the locked starting
-point (all tunable).
+Hierarchy: dense tracking / fire discipline ≪ damage ≪ terminal kill/death, with
+the hard-deck floor the single worst outcome. The table below is **reward-v3**
+(env-side only — the TD-MPC2 learner is untouched); see the v1→v3 evolution note
+for why it looks the way it does. All magnitudes are tunable wrapper constants
+(`astrum_dogfight/constants.py`).
 
 | event | reward | kind |
 |---|---|---|
-| hard-deck bust (< deck AGL) | **−200** | terminal |
-| killed (own hp → 0) | **−100** | terminal |
-| kill (bandit hp → 0) | **+100** | terminal |
-| leave engagement bubble | **−50** | truncate |
+| hard-deck bust (< deck AGL) | **−200** (`R_DECK`) | terminal |
+| killed (own hp → 0) | **−60** (`R_DEATH`) | terminal |
+| kill (bandit hp → 0) | **+150** (`R_KILL`) | terminal |
+| mutual kill (both die same tick) | **−25** (`R_TRADE`) | terminal |
+| leave engagement bubble | **−50** (`R_BUBBLE_EXIT`) | truncate |
 | timeout (max_time) | 0 | truncate |
-| damage dealt | **+0.5 / HP** (a 2-HP hit = +1.0) | dense |
-| damage taken | **−0.5 / HP** | dense |
-| geometry shaping | **k_geom·(γΦ′ − Φ)**, k_geom ≈ 0.05–0.1 | dense |
-| per step | **−0.001** | dense |
+| damage dealt / taken | **±0.5 / HP** (`DMG_PER_HP`; a 2-HP hit = ±1.0) | dense |
+| dense tracking (nose-on × range-closeness), within TRACK_RANGE (3 km) | **+`K_TRACK`(0.01) · track · range_factor** | dense, per sim tick |
+| dense gun-solution (in-WEZ quality) | **+`K_SOLUTION`(0.03) · gun_quality** | dense, per sim tick |
+| ↳ cap: cumulative dense tracking per episode | **≤ `TRACK_BUDGET`(50 ≈ R_KILL/3)** | per-episode clamp (reward-v4) |
+| fire a round **in** a gun solution | **+`R_FIRE_WEZ`(0.05)** / round | dense |
+| fire a round **out** of solution | **−`R_FIRE_WASTE`(0.005)** / round | dense |
+| per step | **−0.001** (`TIME_PENALTY`) | dense |
 
-Floor (−200) ≥ death (−100): flying into the ground is at best as bad as losing
-the fight. Damage is inherently zero-sum in self-play.
+Floor (−200) ≥ death (−60): flying into the ground stays the single worst
+outcome, and death was *softened* from −100 so a still-learning policy isn't
+taught that committing to offense is nearly as bad as a deck bust. Kill raised to
++150 to reward closing the fight. Mutual kill (−25) is net-negative (never prefer
+a suicidal trade to a clean kill) yet softer than a lone death (don't fear taking
+the bandit down with you). Damage is inherently zero-sum in self-play. The dense
+terms are computed **per sim tick** (~7200/episode; the ActionRepeat wrapper sums
+them per control step).
 
-**Potential-based shaping** (Ng et al. — `γΦ(s′) − Φ(s)` telescopes over an
-episode, so it can't distort the optimal policy or swamp the +100 kill). Φ ∈
+**Why reward-v4 caps the cumulative tracking (2026-08-26).** The dense tracking
+term was *intended* to stay well under `R_KILL` so it guides toward the kill without
+substituting for one — **but as written in v2/v3 it was unbounded**: `(K_TRACK +
+K_SOLUTION)·7200 ≈ 288 ≈ 2·R_KILL`, so a full-episode nose-on track could out-earn a
+kill, and because a kill *ends* the episode (cutting off the tracking stream) the
+agent had little pressure to close the deal. curriculum-03 hit exactly this: ret(20)
+climbed 40 → 110 while the Tier-1 kill-rate stayed pinned at ~2 % for 300k updates
+(reward-v3's fire fix bought the first kills but never conversion — the passive-draw
+trap had simply reincarnated at a higher reward level). reward-v4 **clamps the
+cumulative tracking sub-total at `TRACK_BUDGET = 50 ≈ R_KILL/3` per episode**: the
+per-tick tracking payoff is surfaced in `info["track_reward"]` and `DogfightGymEnv.step`
+subtracts any portion that would push the running total past the budget (`reward.compute`
+stays stateless; the accumulator lives in the env, which owns episode state). A
+track-draw now tops out at ≈ `TRACK_BUDGET` − time-penalty ≈ **+43**, while a kill
+banks that same tracking **plus** ~50 damage **plus** +150 ≈ **+240** — a kill
+strictly and ~6× dominates any draw. The full-rate tracking gradient is preserved for
+the first ~9 s of good pursuit each episode (a strong early "learn to point" signal),
+after which only damage → kill pays. The fire bonus is *not* capped — it self-limits
+at `511·R_FIRE_WEZ ≈ 25` (finite ammo), so trigger discovery keeps its incentive all
+episode — and damage is *not* capped either, since dealing 100 HP simply *is* a kill.
+curriculum-04 then showed the cap was **necessary but not sufficient**: with the draw
+capped at ~+50 the policy still parked there rather than shooting (a safe +50 beats the
+EV of an imperfect self-initiated shot), an *exploration/commitment* bottleneck the
+reward can't fix on its own. That is addressed **trainer-side**, not here, by an annealed
+**guided-fire exploration override** that seeds the buffer with fire-in-WEZ transitions
+(TD-MPC2 design §8.6); the reward contract above is unchanged by it.
+
+**Why reward-v2 replaced the potential-based shaping (2026-08-26).** reward-v1
+shaped geometry with a *potential-based* term `k_geom·(γΦ′ − Φ)` (Ng et al.). By
+construction that telescopes to ~0 over an episode — it is **policy-invariant**
+(provably cannot change the optimal policy) and so earned the agent **nothing
+cumulatively** for pointing at the bandit. With the kill a rare sparse event and
+the death/deck penalties making imperfect offense EV-negative against a competent
+bot, gradient descent parked at the ≈−7.2 pure-time-penalty **draw**
+(survive-to-timeout). curriculum-01 confirmed this empirically: over ~1M Tier-3
+steps the return never sustained above the draw floor. reward-v2 discards the
+telescoping term for a **non-telescoping standing reward** — `K_TRACK·(nose-on ×
+range-closeness)` inside TRACK_RANGE plus `K_SOLUTION·(in-WEZ gun-quality)`, paid
+every tick — and rebalanced terminal risk (kill +100→+150, death −100→−60, trade
+−25 added).
+
+**Why reward-v3 (the fire fix, 2026-08-26).** Under reward-v2 the policy learned
+to *close* (median range 1822 m → 856 m over training) but **never fired** —
+telemetry showed it holding a gun solution ~40 % of the episode with zero shots.
+The in-solution fire bonus (v2: +0.005/round) was negligible next to the
+tracking reward it already banked risk-free every tick, while the waste penalty
+(v2: −0.02/round) made any exploratory trigger-pull scary. v3 makes firing in the
+WEZ genuinely pay (**+0.05/round**) so the trigger mean crosses the fire threshold
+and the damage/kill rewards can take over, and softens the waste penalty
+(**−0.005/round**) so exploratory shots aren't suppressed (ammo is finite — 511
+rds — so waste self-limits). Charged per round actually fired (ammo decrement), so
+it needs no extra action plumbing. *Live validation: with v3 the first kills
+appeared ~150k learner updates into curriculum-03, where v2 had produced none.*
+
+**Gun-solution geometry (Φ factors, retained for `gun_quality`/`track`):** Φ ∈
 [0, 1] is the product of three "clean gun-kill geometry" factors, so *all* must be
 good:
 
@@ -473,6 +538,22 @@ envelope protection (§2.4) keeps the bot from departing regardless.
 | **1 — Target dummy** | straight & level, constant Mach/alt (e.g. M0.6, 15 kft) | flight-control acquisition, WEZ alignment, ammo conservation, basic intercept geometry |
 | **2 — Predictable defense** | fixed high-g maneuvers on detecting an attacker in its rear hemisphere: hard level turn, break turn, Split-S | energy management, corner-speed hold, lead/pure pursuit without overshoot or stall |
 | **3 — Rule-based tactician** | a 4-state FSM on standard BFM rules-of-thumb (below) + a "fire when attacker in my WEZ" trigger | non-cooperative dynamic geometry & counter-attacks before self-play's non-stationarity |
+
+**Advancement is competence-gated, not step-gated (2026-08-26; distance-ladder
+2026-08-27).** The curriculum is a ladder of **(tier, separation, gate-metric) stages**,
+not a bare tier schedule — separation is what actually gates the skill and its meaning
+flips between the offensive tiers (how far to *close*) and the defensive Tier 3 (how close
+the threat opens on our six). A stage clears only on **sustained** mastery of its metric
+over a recent window (`--gate-window` 100 episodes, `--gate-min-episodes` 120 floor; a big
+window at a high bar so a lucky streak can't promote), with a per-stage step **backstop** so
+the gate leads. The metric is **per-stage**: a *kill* (`event=="kill"`) on the offensive and
+Tier-3-conversion rungs, mere **survival** (any non-loss terminal) on the point-blank
+defensive rungs where a kill may not be physically reachable. This exists because
+curriculum-01 was *step*-gated (advance at fixed step counts) and got promoted to Tier 2/3
+with **zero** real kills — it had only learned to draw — then got slaughtered. The gate
+guarantees the kill-chain (close → point → fire in the WEZ → land the hits) actually works
+before difficulty rises. The full ladder, bars, and resume mechanics live in the agent doc
+(`docs/dogfight-tdmpc2-design.md` §8.7).
 
 **Status (2026-08-25):** Tiers 1 & 2 implemented in
 `crates/astrum-env/python/astrum_dogfight` (`Tier1Opponent`; `Tier2Opponent` with
