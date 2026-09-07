@@ -1,0 +1,49 @@
+# astrum-rl — the from-scratch RL training environment for the dogfight learner.
+#
+# This is a *separate* uv-managed env from the image's /opt/venv on purpose: torch
+# + the CUDA runtime are multi-GB and GPU-specific, and we don't want them bloating
+# the base dev image every controller shares. uv owns this env; the base image only
+# ships `uv` itself (plus pure-Python gymnasium).
+#
+# The learner's policy is built here from scratch — no stable-baselines3. We depend
+# only on torch (the autodiff/GPU engine), gymnasium (real Box/vector-env/wrappers),
+# and numpy. The env under training (`astrum_dogfight` + the `astrum_env` pyo3 .so)
+# is NOT a pip dependency — it's put on sys.path at import time by `astrum_rl._paths`
+# (build the .so with `make rl-env`). See README.md.
+[project]
+name = "astrum-rl"
+version = "0.1.0"
+description = "From-scratch RL training for the ASTRUM WVR gun-dogfight learner"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # torch pulls the bundled CUDA 12.8 runtime from the cu128 index below, so no
+    # CUDA base image is needed — only the host NVIDIA driver + nvidia-container
+    # -toolkit and `--gpus all`. >=2.7 is the first stable line with Blackwell
+    # (sm_120 / RTX 50-series) kernels.
+    "torch>=2.7",
+    # Real gymnasium: seeded spaces, AsyncVectorEnv (the mandated one-env-per-process
+    # scaling path — JSBSim is process-global), TimeLimit/RecordEpisodeStatistics.
+    "gymnasium>=1.0",
+    "numpy>=1.26,<3",
+]
+
+# pytest drives the tdmpc2/env unit suites (`make rl-test`). uv installs this
+# group by default under `uv run`, so no extra flag is needed.
+[dependency-groups]
+dev = ["pytest>=8"]
+
+# We run code straight from the source tree (`uv run python -m astrum_rl.train`),
+# so uv should manage the dependency env without trying to build/install this
+# project as a wheel.
+[tool.uv]
+package = false
+
+# Route torch (and its CUDA wheels) to PyTorch's Blackwell-capable cu128 index.
+# `explicit = true` keeps every *other* package coming from PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

@@ -1,0 +1,11 @@
+
+# training runs: checkpoints + logs (large, not source)
+runs/
+
+# Probe/verdict stdout captures. ~540 MB of them at the top level plus ~80 MB under
+# _refute_skeptic/, all regenerable by re-running the `_diag_*`/`_refute_*` script that
+# produced them. The durable numbers live in docs/bfm-program-handoff.md §9 — that file is
+# the record, these are the raw dumps behind it.
+*.txt
+
+.pytest_cache/
