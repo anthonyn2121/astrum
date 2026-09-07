@@ -3,6 +3,8 @@
 target
 **/target
 controllers/cpp/build
+controllers/rl/vendor
+controllers/rl/.venv
 *.log
 .env
 docker-compose.override.yml

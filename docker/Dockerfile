@@ -116,11 +116,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # the same release as the Rust crate / C bindings for protocol compatibility.
 # numpy + scipy back the optimal-control controllers (controllers/optimal): numpy
 # for the LQR/MPC linear algebra, scipy for solve_discrete_are (the DARE solver
-# behind dlqr).
+# behind dlqr). gymnasium is pure-Python and gives the astrum_dogfight adapter a
+# real `spaces.Box`/`gymnasium.Env` (seeded sampling, vector envs, wrappers)
+# instead of its offline shim. uv manages the *separate*, GPU-heavy RL training
+# env under controllers/rl (torch etc. live there, not in this base venv).
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv "${VIRTUAL_ENV}" \
     && pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir "eclipse-zenoh==${ZENOH_VERSION}" pycapnp numpy scipy ruff
+    && pip install --no-cache-dir "eclipse-zenoh==${ZENOH_VERSION}" pycapnp numpy scipy ruff uv gymnasium
 
 # JSBSim 1.3.1 does not install a pkg-config file, so synthesize one. This lets
 # astrum-fdm's build.rs and the C++ controller link JSBSim via `pkg-config JSBSim`

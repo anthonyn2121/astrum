@@ -194,6 +194,48 @@ services:
       - -lc
       - "exec python controllers/python/example.py"
 
+  dogfight-train:
+    # From-scratch RL training for the dogfight learner (controllers/rl). The env
+    # is EMBEDDED — astrum_env runs a headless sim in-process — so this needs
+    # neither the `sim` service nor Zenoh. Opt-in via the `rl` profile:
+    #   docker compose --profile rl run --rm dogfight-train
+    # (or `make rl-smoke` / `make rl-train`, which override the command).
+    #
+    # uv manages a SEPARATE, GPU-heavy env (torch + CUDA) under controllers/rl. It
+    # lives on the `uv-envs` volume (UV_PROJECT_ENVIRONMENT) so the multi-GB install
+    # stays off the bind-mounted source and persists across runs. The GPU is granted
+    # via CDI below — requires nvidia-container-toolkit on the host (the cu128 torch
+    # wheel bundles its own CUDA runtime; no CUDA base image needed).
+    image: astrum-dev:latest
+    working_dir: /workspace
+    profiles: ["rl"]
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+      - uv-envs:/opt/uv
+    environment:
+      UV_PROJECT_ENVIRONMENT: /opt/uv/dogfight
+      UV_CACHE_DIR: /opt/uv/cache
+      # curriculum-97's obs width, forwarded from the host so `ASTRUM_C97_VERTICAL=0 make ...`
+      # reaches the trainer AND its worker subprocesses. Defaults to the 45-float treatment; 0 is
+      # the 41-float null control (see `astrum_dogfight.constants.OBS_DIM`). It must be declared
+      # here — `docker compose run` does NOT forward arbitrary host env vars, so without this line
+      # the control would silently train the treatment ([[outcome-reward-invisible-switch]]).
+      ASTRUM_C97_VERTICAL: ${ASTRUM_C97_VERTICAL:-1}
+    # GPU via CDI (Container Device Interface). The host has nvidia-container-toolkit
+    # with a generated CDI spec (/etc/cdi or /var/run/cdi/nvidia.yaml) but no `nvidia`
+    # Docker *runtime* registered in daemon.json, so the older
+    # `deploy.resources.reservations.devices: {driver: nvidia}` syntax can't resolve.
+    # CDI needs neither a daemon runtime nor a restart. To grant a subset instead of
+    # all GPUs, use e.g. "nvidia.com/gpu=0".
+    devices:
+      - "nvidia.com/gpu=all"
+    command:
+      - bash
+      - -lc
+      - "cd controllers/rl && uv run python -m astrum_rl.smoke_gpu"
+
   # --- Formation demo: 1 leader + 3 decentralized MPC followers ---------------
   # Opt-in via the `formation` profile (`make demo-formation`), paired with
   # config/scenario.formation.toml. The leader flies a figure-eight; each
@@ -243,3 +285,5 @@ networks:
 volumes:
   cargo-registry:
   cargo-target:
+  # uv's RL training env + download cache (torch/CUDA) — kept off the bind mount.
+  uv-envs:

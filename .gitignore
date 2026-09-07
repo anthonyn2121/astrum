@@ -7,6 +7,14 @@
 controllers/cpp/build/
 controllers/optimal/cpp/build/
 
+# RL training env (controllers/rl): staged pyo3 .so + uv's local project venv
+controllers/rl/vendor/
+controllers/rl/.venv/
+# uv download cache (shared across local CPU dev runs; the GPU compose env uses a volume)
+/.uv-cache/
+# saved policy checkpoints
+controllers/rl/checkpoints/
+
 # Python bytecode
 __pycache__/
 *.pyc
@@ -22,11 +30,21 @@ docker-compose.override.yml
 /recordings/
 *.bag
 
+# Replay JSON dumped by the dogfight env for astrum-web (~2-3 MB per episode).
+# Regenerable from a checkpoint; the fight is the artifact, not the file.
+/replays/
+
 # Cached map tiles (fetched on demand by astrum-web's tile proxy)
 /tilecache/
 
 # JSBSim CLI output (default `JSBout<model>.csv`, written to the CWD)
 JSBout*.csv
+
+# A COPY of the container's JSBSim data root carrying experimental aircraft variants
+# (`make jsbsim-variants`). The stock root is a third-party asset outside the repo, so an
+# in-place edit would be invisible to git and would silently void every prior measurement;
+# variants go here instead and are selected with JSBSIM_ROOT. Regenerable, so not tracked.
+/.jsbsim-variants/
 
 # Editor / OS
 *.log
