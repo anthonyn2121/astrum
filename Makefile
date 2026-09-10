@@ -7,10 +7,13 @@ COMPOSE ?= docker compose
 SERVICE ?= sim
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down demo demo-python demo-quad demo-formation replay export shell exec verify fmt lint logs ps clean
+.PHONY: help build up down demo demo-python demo-quad demo-formation race race-offline race-course replay export shell exec verify fmt lint logs ps clean
 
-# All hand-written C++ controller sources (excludes generated capnp + build dirs).
-CPP_SRC = find controllers -type f \( -name '*.cpp' -o -name '*.hpp' \) -not -path '*/build/*'
+# All hand-written C++ controller sources (excludes generated capnp, build dirs, and
+# virtualenvs — a pip-installed torch ships read-only .cpp templates that clang-format
+# -i would try, and fail, to rewrite).
+CPP_SRC = find controllers -type f \( -name '*.cpp' -o -name '*.hpp' \) \
+          -not -path '*/build/*' -not -path '*/.venv/*'
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -41,6 +44,26 @@ demo-formation: ## Formation demo: a leader flies a figure-eight; 3 F-16s MPC-tr
 	-ASTRUM_SCENARIO=config/scenario.formation.toml $(COMPOSE) --profile formation up --exit-code-from sim \
 	  sim controller-lead controller-wing-left controller-wing-right controller-trail
 	$(COMPOSE) --profile formation down
+
+# The racing environment is its own app rather than a compose service, so it runs as a
+# one-off container. It speaks the same Zenoh wire as the sim plus astrum/race/** for
+# the course and gate progress, so `race` publishes the service's port
+# (--service-ports) and takes the `sim` network alias (--use-aliases) — a controller
+# reaches it at tcp/sim:7447 exactly as it reaches the fleet sim. That means it also
+# collides with a running sim: use `race LISTEN=...` or `make down` first.
+#
+# SEED=n draws a different course; GATES=n resizes it; LISTEN=tcp/0.0.0.0:7448 moves
+# the endpoint. All override config/race.toml.
+RACE_ARGS = $(if $(SEED),--seed $(SEED)) $(if $(GATES),--gates $(GATES)) $(if $(LISTEN),--listen $(LISTEN))
+
+race: ## Drone racing: an F450 on a randomized gate course, on the wire (SEED=n GATES=n LISTEN=ep)
+	$(COMPOSE) run --rm --no-deps --service-ports --use-aliases sim bash -lc 'cargo run --release -p astrum-race -- $(RACE_ARGS)'
+
+race-offline: ## Fly a race with no transport at all — physics only, nothing published
+	$(COMPOSE) run --rm --no-deps sim bash -lc 'cargo run --release -p astrum-race -- --no-net $(RACE_ARGS)'
+
+race-course: ## Print the gate course a seed draws, without flying it (SEED=n GATES=n)
+	$(COMPOSE) run --rm --no-deps sim bash -lc 'cargo run --release -p astrum-race -- --dump-course $(RACE_ARGS)'
 
 replay: ## Start the fleet sim + the 3-D replay renderer, then open http://localhost:8080
 	$(COMPOSE) up -d sim replay

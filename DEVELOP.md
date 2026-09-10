@@ -29,6 +29,20 @@ a controller's `open()` non-fatal if the sim isn't up yet: it returns at once an
 connection in the background, so a controller started alongside the sim just attaches once the sim
 finishes its ~10 s JSBSim load (a Zenoh `client` would instead abort `open()` on that cold start).
 
+**`astrum-race`** (§5b) — the drone-racing environment, kept a separate app so a racing change can't
+disturb the WVR combat environment — speaks the *same* wire on the same two key spaces, plus two of
+its own for the racing task:
+
+```
+controllers ◄──put astrum/race/course/<id>──  astrum-race (the gates, republished ~1 Hz)
+controllers ◄──put astrum/race/state/<id>───  astrum-race (gate progress, every tick)
+```
+
+It publishes `Telemetry` and takes `Command` unchanged, because a quadrotor's four normalized
+channels are the same four channels — only the *task* state needed new messages (§8). It listens on
+the same default endpoint as the sim, so run one or the other, or give one `--listen` a different
+port. Everything else in this section is about the sim.
+
 Each entity is addressed by its id *in the key* — not a socket or a port — so **one endpoint serves
 the whole fleet no matter how many aircraft you add** (there are no ports to manage per entity), and
 any client can subscribe to a single aircraft (`astrum/telemetry/<id>`) or the entire fleet
@@ -119,7 +133,8 @@ crates/            # Rust workspace (one crate per responsibility)
   astrum-net/       #   Zenoh transport (telemetry + command key exprs, one session)
   astrum-bag/       #   record/replay telemetry to a file ("bag")
   astrum-web/       #   WebSocket+HTTP bridge (astrum-web) + bag→JSON exporter (astrum-web-export)
-  astrum-sim/       #   the Bevy ECS app — the sim binary
+  astrum-sim/       #   the Bevy ECS app — the sim binary (fleet + WVR gun combat)
+  astrum-race/      #   the drone-racing environment: a SEPARATE Bevy app (F450 + gates)
 controllers/       # flight controllers (clients), one dir per language
   cpp/  python/
 web/               # browser 3-D replay renderer (Three.js, vendored; static app served by astrum-web)
@@ -194,6 +209,66 @@ deflections on a fixed-wing but body-rate + collective demands on a multirotor.
 doesn't know. A fleet can mix classes freely. A multirotor entity also needs its
 stability-augmentation loop engaged (`fcs/ScasEngage = 1`); `spawn_fleet` does this
 automatically for the multirotor class — without it roll/pitch/yaw commands are inert.
+
+## 5b. The drone-racing environment (`astrum-race`)
+
+A **second, separate** Bevy app: a DJI F450 and a course of racing gates randomized
+per seed. It is not a mode of `astrum-sim` — that crate hosts the WVR gun-combat
+environment, and the two share only the task-neutral crates: `astrum-fdm` (JSBSim),
+`astrum-geo` (coordinates) and `astrum-proto`/`astrum-net` (the wire). Design notes:
+`docs/racing-environment-design.md`.
+
+```bash
+make race-course SEED=42 GATES=10       # print the gates a seed draws, without flying
+make race SEED=42                       # fly it, publishing on tcp/…:7447
+make race LISTEN=tcp/0.0.0.0:7448       # …on another endpoint (a sim already has 7447)
+make race-offline SEED=42               # physics only: no transport, no port bound
+cargo run -p astrum-race -- --help      # the flags, inside a shell
+```
+
+Its scenario is `config/race.toml` — a different schema from a fleet scenario:
+`[world]` / `[sim]` as above, plus a single `[drone]` and a `[course]` table that is
+the **randomization envelope** (gate count, leg lengths, turn and climb limits,
+clearances, flight volume). Every `[course]` field has a default, so an absent table
+is still a valid course. Course generation is fallible before the app is built, so an
+unsatisfiable envelope is a clear error rather than an app that spins.
+
+A run ends in exactly one way: something writes an `Outcome` onto the `RaceProgress`
+resource and `stop_when_finished` exits the app. The outcomes are `Complete` (every gate,
+in order — the only way to win), `CrashedGround`, `CrashedGate`, `TimedOut` and
+`SpawnFailed`, and the one that ended the run goes out on `astrum/race/state/<id>` so an
+off-process controller learns *why* it stopped rather than just that telemetry ceased.
+
+Crashing is real, not cosmetic. The F450's hull is built from its own JSBSim model files
+(four 9.4″ rotor discs on 0.1651 m arms over a core box from the gear feet to the rotor
+plane), and it has **10.92 cm of clearance per side** in the 31″ opening — 4.08 cm at the
+worst heading, where the drone presents a corner and reaches 0.35287 m rather than
+0.28448 m.
+
+The opening is 31″ and not the 25″ of the original brief. 25″ passed the airframe only
+within **±13° of the gate's normal**, while a gate's normal bisects a turn of up to 120°
+and so can be crossed 60° off — the geometry and the envelope contradicted each other.
+27.78″ is the exact size at which heading stops mattering; 31″ is the first whole inch past
+it. §2 of the design doc has the crab table and the before/after clearances.
+
+Two numbers to know before writing a controller. The **lateral corridor is ±0.109 m inside
+a ±0.394 m hole**: the scorer credits a pass on where the CG pierced the plane, so a
+crossing it would credit can still be a crash — that ordering is deliberate. And the
+vertical **headroom is 0.249 m**, not the 0.394 m the opening looks like it offers, because
+what reaches the top bar is a blade tip at the rotor plane. §4b of the design doc has the
+derivation and why the hull is five parts rather than one box.
+
+The drone launches holding station on gate 0's approach. **Nothing flies the course
+yet**, but both seams for a controller that will are in place:
+
+* **In-process** — write the `FlightCommand` component (target altitude, heading,
+  horizontal velocity); see §7 of the design doc.
+* **Off-process** — subscribe to `astrum/telemetry/<id>` for the drone's state and
+  `astrum/race/{course,state}/<id>` for the track and gate progress, then publish
+  `Command` on `astrum/command/<id>`: `Control::Raw` to fly the four channels
+  yourself, `Control::Autopilot` to drive the inner loop. Raw control here is a
+  **lease** — unrefreshed for 0.5 s it lapses and the inner loop resumes station
+  keeping, because a quadrotor with a frozen collective and a dead controller falls.
 
 ## 6. Tests — the convention that matters
 
@@ -315,13 +390,27 @@ how a controller subscribes, decodes telemetry, and publishes commands.
 
 ## 8. Cap'n Proto wire quick reference
 
-The schema (`crates/astrum-proto/schema/astrum.capnp`) defines three messages:
+The schema (`crates/astrum-proto/schema/astrum.capnp`) defines these messages:
 - **`Telemetry`** — sim → subscribers (published on `astrum/telemetry/<id>`; the id is in the key,
   no topic frame). Carries `vehicleKind` (fixed-wing | multirotor) so a subscriber knows the class
   without the scenario.
 - **`Command`** — controllers → sim; a union of **`raw`** actuator setpoints
   (`fcs/*-cmd-norm`) *or* high-level **`autopilot`** targets.
 - **`BagFrame`** — one recorded telemetry sample + timestamp (for record/replay).
+- **`RaceCourse`** / **`RaceState`** — `astrum-race` → subscribers, on
+  `astrum/race/course/<id>` and `astrum/race/state/<id>`: the gate list (centre, normal heading,
+  hardware dimensions) and the run's progress, including how it ended (`finished` + `outcome`).
+  These are separate top-level messages rather than fields on `Telemetry`, which means "one
+  aircraft's authoritative state" and would otherwise carry a dead course column in every combat
+  recording and replay frame.
+
+Two properties of the racing pair are worth knowing before you write a subscriber. Every progress
+figure is a **cumulative counter, not an event** (`passed`, `missed`, `pendingGate`), so a subscriber
+that skips messages loses nothing — which is why both channels publish with `CongestionControl::Drop`
+and why a read returns the *latest* sample and discards the backlog. And the course is **republished
+~1 Hz** even though it never changes, because Zenoh pub/sub has no late-joiner replay and the normal
+case is a controller started after the environment. An `outcome` your build does not recognise decodes
+as `running`, so an old controller against a new environment degrades rather than misreads.
 
 Change the schema in **one** place; Rust regenerates on build, C++ regenerates via
 its CMake step, and Python loads it at runtime (`capnp.load(...)`). Keeping one

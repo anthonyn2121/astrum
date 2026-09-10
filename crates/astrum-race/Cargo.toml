@@ -1,0 +1,29 @@
+[package]
+name = "astrum-race"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ASTRUM drone-racing environment: an F450 quadrotor and a Monte-Carlo randomized gate course."
+
+[lib]
+name = "astrum_race"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astrum-race"
+path = "src/main.rs"
+
+[dependencies]
+# Headless, like the dogfight sim: no render/winit/audio, so the GUI/GPU feature
+# stack (and its system libs) stays out of the build.
+bevy = { version = "0.19", default-features = false }
+# Shared infrastructure only — the JSBSim wrapper, the coordinate math, and the
+# wire/transport stack. None of these depend on `astrum-sim`, so this environment
+# still shares no code with its combat world.
+astrum-fdm = { path = "../astrum-fdm" }
+astrum-geo = { path = "../astrum-geo" }
+astrum-net = { path = "../astrum-net" }
+astrum-proto = { path = "../astrum-proto" }
+clap = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

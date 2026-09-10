@@ -12,6 +12,13 @@
 //! * **Commands** — controllers publish each [`CommandMsg`] on
 //!   `astrum/command/<target-id>`; the sim subscribes `astrum/command/**` and
 //!   drains them non-blockingly each tick (fan-in from every controller).
+//! * **Racing task state** — the drone-racing environment adds a third key space,
+//!   `astrum/race/course/<drone-id>` and `astrum/race/state/<drone-id>`
+//!   ([`RacePublisher`] / [`RaceSubscriber`]), for the gates and the run's
+//!   progress. It flies on the two channels above unchanged: a quadrotor's
+//!   telemetry is a [`TelemetrySample`] and its controls are a [`CommandMsg`].
+//!   These two are **state** channels, so they use a ring of one rather than a FIFO
+//!   queue: reads are latest-wins, and an idle reader can never block the sim.
 //!
 //! The bag recorder is just another subscriber, and replay just another
 //! publisher, so replay feeds any subscriber byte-for-byte identically to the
@@ -29,7 +36,9 @@ use std::fmt;
 use std::time::Duration;
 
 use astrum_proto::{
-    decode_command, decode_telemetry, encode_command, encode_telemetry, CommandMsg, TelemetrySample,
+    decode_command, decode_race_course, decode_race_state, decode_telemetry, encode_command,
+    encode_race_course, encode_race_state, encode_telemetry, CommandMsg, RaceCourseMsg,
+    RaceStateMsg, TelemetrySample,
 };
 use zenoh::qos::CongestionControl;
 use zenoh::Wait;
@@ -41,6 +50,10 @@ pub use zenoh;
 const TELEMETRY_PREFIX: &str = "astrum/telemetry";
 /// Key-expression prefix for commands (`astrum/command/<target-id>`).
 const COMMAND_PREFIX: &str = "astrum/command";
+/// Key-expression prefix for a racing course (`astrum/race/course/<drone-id>`).
+const RACE_COURSE_PREFIX: &str = "astrum/race/course";
+/// Key-expression prefix for racing progress (`astrum/race/state/<drone-id>`).
+const RACE_STATE_PREFIX: &str = "astrum/race/state";
 
 /// Default endpoint the sim (and bag replay) LISTENS on — clients connect here.
 /// Zenoh endpoints use `proto/host:port` (note: `/`, not `://`).
@@ -58,6 +71,18 @@ fn telemetry_key(aircraft_id: u32) -> String {
 #[inline]
 fn command_key(target_id: u32) -> String {
     format!("{COMMAND_PREFIX}/{target_id}")
+}
+
+/// The course key for one racing drone.
+#[inline]
+fn race_course_key(drone_id: u32) -> String {
+    format!("{RACE_COURSE_PREFIX}/{drone_id}")
+}
+
+/// The progress key for one racing drone.
+#[inline]
+fn race_state_key(drone_id: u32) -> String {
+    format!("{RACE_STATE_PREFIX}/{drone_id}")
 }
 
 /// The concrete subscriber type: a Zenoh subscriber with the default FIFO channel
@@ -308,5 +333,141 @@ impl CommandSender {
             .congestion_control(CongestionControl::Block)
             .wait()
             .map_err(zerr)
+    }
+}
+
+// --- Drone racing: course + progress ----------------------------------------
+//
+// The racing environment (`astrum-race`) publishes the drone's own state as plain
+// [`TelemetrySample`]s on the telemetry key and takes [`CommandMsg`]s on the
+// command key, exactly like the fleet sim. Only the *task* state needs its own
+// channel, and it gets its own key space (`astrum/race/**`) so nothing above
+// changes.
+
+/// A racing subscriber's channel: a **ring of one**, not a FIFO queue.
+///
+/// Both racing channels carry **state**, not events: the course is a static
+/// snapshot republished on a timer, and progress figures are cumulative counters.
+/// So a backlog is pure staleness — the newest message subsumes every one behind
+/// it, and a reader that falls behind should skip rather than crawl through
+/// history. A ring of one makes that a property of the transport: the handler keeps
+/// the latest sample and drops what it superseded, so `try_recv` is inherently
+/// latest-wins and needs no drain loop.
+///
+/// It also removes a foot-gun. Zenoh's default FIFO handler **blocks the
+/// publisher** when its channel fills and nobody reads — `CongestionControl::Drop`
+/// governs the network queues, not a local handler — so a same-process subscriber
+/// that stops draining would stall the 120 Hz physics loop after a couple of
+/// hundred ticks. A ring cannot do that to anyone.
+type RingSubscriber =
+    zenoh::pubsub::Subscriber<zenoh::handlers::RingChannelHandler<zenoh::sample::Sample>>;
+
+/// Environment-side publisher for the racing task state: the course on
+/// `astrum/race/course/<drone-id>` and progress on `astrum/race/state/<drone-id>`.
+///
+/// Both go out best-effort (`Drop`), like telemetry: this runs inside the physics
+/// loop, and blocking a 120 Hz step on a slow subscriber would be worse than
+/// losing a frame. That is safe for progress because it is counters rather than
+/// events, and safe for the course because the environment **republishes** it
+/// periodically — a lost or late-joined course arrives on the next cycle.
+pub struct RacePublisher {
+    session: Session,
+}
+
+impl RacePublisher {
+    /// Build a publisher on `session`.
+    pub fn new(session: &Session) -> Self {
+        Self { session: session.clone() }
+    }
+
+    /// Publish the course on `astrum/race/course/<course.drone_id>`.
+    pub fn publish_course(&self, course: &RaceCourseMsg) -> Result<()> {
+        self.put(race_course_key(course.drone_id), encode_race_course(course))
+    }
+
+    /// Publish one progress sample on `astrum/race/state/<state.drone_id>`.
+    pub fn publish_state(&self, state: &RaceStateMsg) -> Result<()> {
+        self.put(race_state_key(state.drone_id), encode_race_state(state))
+    }
+
+    fn put(&self, key: String, payload: Vec<u8>) -> Result<()> {
+        self.session
+            .z
+            .put(key, payload)
+            .congestion_control(CongestionControl::Drop)
+            .wait()
+            .map_err(zerr)
+    }
+}
+
+/// Controller-side reader for the racing task state — the counterpart to
+/// [`RacePublisher`]. One type holds both channels, because a racing controller
+/// wants both: the course tells it where the gates are, the progress tells it
+/// which one it is flying at.
+///
+/// Construction mirrors [`TelemetrySubscriber`]: [`connect`](Self::connect) opens
+/// the reader, then [`subscribe`](Self::subscribe) / [`subscribe_all`](Self::subscribe_all)
+/// declares the two Zenoh subscribers.
+pub struct RaceSubscriber {
+    session: Session,
+    course: Option<RingSubscriber>,
+    state: Option<RingSubscriber>,
+}
+
+impl RaceSubscriber {
+    /// Prepare a reader on `session`. Nothing is delivered until you subscribe.
+    pub fn connect(session: &Session) -> Result<Self> {
+        Ok(Self { session: session.clone(), course: None, state: None })
+    }
+
+    /// Subscribe to one racing drone's course and progress.
+    pub fn subscribe(&mut self, drone_id: u32) -> Result<()> {
+        self.declare(race_course_key(drone_id), race_state_key(drone_id))
+    }
+
+    /// Subscribe to every racing drone's course and progress.
+    pub fn subscribe_all(&mut self) -> Result<()> {
+        self.declare(format!("{RACE_COURSE_PREFIX}/*"), format!("{RACE_STATE_PREFIX}/*"))
+    }
+
+    fn declare(&mut self, course_key: String, state_key: String) -> Result<()> {
+        self.course = Some(self.declare_ring(course_key)?);
+        self.state = Some(self.declare_ring(state_key)?);
+        Ok(())
+    }
+
+    /// Declare one [`RingSubscriber`]. Capacity **1**: these are state channels, so
+    /// the only sample worth holding is the newest.
+    fn declare_ring(&self, key: String) -> Result<RingSubscriber> {
+        self.session
+            .z
+            .declare_subscriber(key)
+            .with(zenoh::handlers::RingChannel::new(1))
+            .wait()
+            .map_err(zerr)
+    }
+
+    /// Non-blocking read of the latest course, or `Ok(None)` if none has arrived
+    /// since the last call. Because the environment republishes the course on a
+    /// timer, a controller can simply poll this until it returns `Some`.
+    pub fn try_recv_course(&self) -> Result<Option<RaceCourseMsg>> {
+        let sub = self.course.as_ref().ok_or(NetError::NotSubscribed)?;
+        match sub.try_recv().map_err(|_| NetError::Disconnected)? {
+            Some(s) => {
+                Ok(Some(decode_race_course(&s.payload().to_bytes()).map_err(|_| NetError::Decode)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Non-blocking read of the latest progress sample.
+    pub fn try_recv_state(&self) -> Result<Option<RaceStateMsg>> {
+        let sub = self.state.as_ref().ok_or(NetError::NotSubscribed)?;
+        match sub.try_recv().map_err(|_| NetError::Disconnected)? {
+            Some(s) => {
+                Ok(Some(decode_race_state(&s.payload().to_bytes()).map_err(|_| NetError::Decode)?))
+            }
+            None => Ok(None),
+        }
     }
 }

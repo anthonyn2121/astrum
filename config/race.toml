@@ -1,0 +1,56 @@
+# Drone-racing scenario — ASTRUM's second environment (`astrum-race`).
+#
+# An F450 quad starts lined up 10 m upstream of gate 0 and has to fly a course of
+# randomized racing gates: a 31" square opening (a 37x3" top bar on two 31x3"
+# uprights). The track is drawn by a Monte-Carlo sampler from `sim.seed`, inside the
+# `[course]` envelope below — change the seed and you get a different course from
+# the same envelope; keep the seed and the course is identical every run.
+#
+#   cargo run -p astrum-race -- config/race.toml --seed 7 --dump-course
+
+[world]
+origin_lat_deg = 44.7258
+origin_lon_deg = -93.0759
+origin_alt_m = 0.0        # the ENU origin plane is field level: gate alts are AGL
+
+[sim]
+rate_hz = 120.0
+max_time_s = 120.0
+realtime = true
+seed = 1                  # the course seed
+
+[drone]
+id = 1
+model = "F450"            # kind is inferred: F450 -> multirotor
+start_behind_m = 10.0     # launch this far up gate 0's approach
+
+# The randomization envelope. Every field is optional; these are the defaults,
+# spelled out because they are what keeps a sampled track physically flyable.
+[course]
+gates = 8
+
+# Flyability: how far apart gates are, and how hard the course may turn or climb.
+leg_min_m = 8.0           # gate-to-gate, 3-D
+leg_max_m = 20.0
+max_turn_deg = 120.0      # heading change at a gate; its normal bisects the turn,
+                          # so no crossing is worse than 60 deg off the opening --
+                          # and a 31" opening passes the airframe at any heading
+max_climb_deg = 20.0      # flight-path angle of a leg, up or down
+
+# Containment: the flight volume. alt_min_m must keep the gate sill (half an
+# opening below the centre, ~0.39 m) off the ground.
+alt_min_m = 1.5
+alt_max_m = 4.0
+course_radius_m = 60.0    # horizontal radius about gate 0
+
+# Non-overlap: what makes a track topologically flyable instead of a knot.
+min_gate_gap_m = 6.0      # between gate centres
+min_leg_gate_gap_m = 1.5  # from a leg to a frame it is *not* flying through
+min_leg_leg_gap_m = 2.0   # between non-adjacent legs
+
+# Sampler budget. Raise these before loosening the limits above if a dense course
+# comes back infeasible.
+tries_per_gate = 200
+max_backtracks = 200
+
+start_heading_deg = 0.0   # the entry leg's heading (0 = North), fixed across seeds

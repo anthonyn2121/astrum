@@ -255,6 +255,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrum-race"
+version = "0.1.0"
+dependencies = [
+ "astrum-fdm",
+ "astrum-geo",
+ "astrum-net",
+ "astrum-proto",
+ "bevy",
+ "clap",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "astrum-sim"
 version = "0.1.0"
 dependencies = [
