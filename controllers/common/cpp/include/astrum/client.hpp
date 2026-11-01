@@ -7,6 +7,7 @@
 //     overwrites one slot (never decodes, never throws), and decoding plus the control
 //     law run on the caller's thread, so a slow law skips stale samples instead of
 //     queueing them or stalling Zenoh's receive thread;
+//   * session: client of the sim, asking for Zenoh's low-latency transport;
 //   * commands `astrum/command/<id>`: declared publisher with CongestionControl DROP,
 //     express, priority INTERACTIVE_HIGH; one command per telemetry sample (the raw
 //     lease), each with seq (strictly increasing from 1) and telemetryTick;

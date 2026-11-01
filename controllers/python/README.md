@@ -11,7 +11,7 @@ Python controller (this example and [`controllers/optimal`](../optimal)) builds 
 | Module | What it does |
 |---|---|
 | `astrum_client.wire` | `load_schema()`, `decode_telemetry()` → `VehicleState` (every v2 field), `encode_command()`; bad payloads raise `DecodeError` (framing checked, trailing bytes rejected) |
-| `astrum_client.transport` | `open_session()` (client mode, no multicast scouting, waits up to the startup timeout for the sim), `subscribe_telemetry()` (latest-value, per aircraft or fleet-wide), `CommandPublisher` (DROP / express / INTERACTIVE_HIGH, `seq` 1, 2, … and `telemetryTick`) |
+| `astrum_client.transport` | `open_session()` (client mode, no multicast scouting, Zenoh's low-latency transport, waits up to the startup timeout for the sim), `subscribe_telemetry()` (latest-value, per aircraft or fleet-wide), `CommandPublisher` (DROP / express / INTERACTIVE_HIGH, `seq` 1, 2, … and `telemetryTick`) |
 | `astrum_client.loop` | `run_control_loop()`: one command per telemetry tick, startup/staleness timeouts, vehicle-kind refusal, output saturation |
 | `astrum_client.cli` | shared flags with `ASTRUM_*` env fallbacks |
 | `astrum_client.mathutil` | `wrap_pi` (→ `[-pi, pi)`, NaN for non-finite input), `clamp`, anti-windup integrator step |

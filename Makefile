@@ -15,7 +15,7 @@ export UID GID
 .DEFAULT_GOAL := help
 .PHONY: help build up down demo demo-python demo-quad demo-formation smoke replay export \
         shell exec verify fmt fmt-check lint test test-rust test-cpp test-python \
-        wire-fixtures deny bench ci logs ps clean
+        wire-fixtures deny bench sweep ci logs ps clean
 
 # One-off command in a fresh container (no deps, no TTY): $(IN) '<bash script>'.
 IN = $(COMPOSE) run --rm --no-deps -T $(SERVICE) bash -c
@@ -118,6 +118,10 @@ deny: ## Dependency audit: licenses, advisories, bans, sources (cargo deny)
 
 bench: ## Headless sim throughput (µs/tick, × real time) for fixed fleets and thread counts
 	$(IN) 'cargo run --release --locked -q -p astrum-sim --example throughput 2>/dev/null | grep "^|"'
+
+sweep: ## Fly a sweep of scenario variants, many at once (SWEEP=config/sweep.demo.toml, ARGS="--jobs 8 --overwrite")
+	$(IN) 'set -euo pipefail; bash scripts/build-release.sh >/dev/null; \
+	  target/release/astrum-sweep $(or $(SWEEP),config/sweep.demo.toml) $(ARGS)'
 
 ci: fmt-check lint test deny ## Full gate: fmt-check + lint + all tests + deny (fails on any failure)
 

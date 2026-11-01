@@ -18,6 +18,7 @@ use crate::components::{
 use crate::pilot::{FixedWingGains, Pilot};
 use crate::scenario::{AircraftClass, AircraftSpec, Scenario};
 use crate::step_pool::ShardPool;
+use crate::RunMode;
 
 /// JSBSim data root (`aircraft/`, `engine/`, `systems/`).
 pub fn jsbsim_root() -> PathBuf {
@@ -133,6 +134,7 @@ pub fn spawn_fleet(
     params: Res<SimParams>,
     frame: Res<WorldFrame>,
     pool: Res<StepPool>,
+    mode: Res<RunMode>,
     mut status: ResMut<SimStatus>,
 ) {
     let mut index = AircraftIndex::default();
@@ -176,12 +178,14 @@ pub fn spawn_fleet(
         }
         index.0.insert(spec.id, ent.id());
     }
-    println!(
-        "[astrum-sim] spawned {} aircraft @ {:.1} Hz (dt={:.6}s)",
-        scenario.aircraft.len(),
-        params.rate_hz,
-        params.dt
-    );
+    if *mode == RunMode::Server {
+        println!(
+            "[astrum-sim] spawned {} aircraft @ {:.1} Hz (dt={:.6}s)",
+            scenario.aircraft.len(),
+            params.rate_hz,
+            params.dt
+        );
+    }
     commands.insert_resource(index);
 }
 
@@ -372,10 +376,13 @@ pub fn pace(mut pacer: ResMut<Pacer>) {
 pub fn stop_at_max_time(
     params: Res<SimParams>,
     clock: Res<SimClock>,
+    mode: Res<RunMode>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if params.max_time_s > 0.0 && clock.time_s(&params) >= params.max_time_s {
-        println!("[astrum-sim] reached max_time_s={:.1} — exiting", params.max_time_s);
+        if *mode == RunMode::Server {
+            println!("[astrum-sim] reached max_time_s={:.1} — exiting", params.max_time_s);
+        }
         exit.write(AppExit::Success);
     }
 }
@@ -394,11 +401,12 @@ impl StopRequested {
 /// Exit once a stop has been requested.
 pub fn exit_on_signal(
     stop: Option<Res<StopRequested>>,
+    mode: Res<RunMode>,
     mut exit: MessageWriter<AppExit>,
     mut reported: Local<bool>,
 ) {
     if stop.is_some_and(|s| s.requested()) {
-        if !*reported {
+        if !*reported && *mode == RunMode::Server {
             println!("[astrum-sim] stop requested — exiting");
             *reported = true;
         }

@@ -25,6 +25,11 @@ zenoh::Config session_config(const std::string& connect, double timeout_s) {
   zenoh::Config config = zenoh::Config::create_default();
   config.insert_json5("mode", "\"client\"");
   config.insert_json5("scouting/multicast/enabled", "false");
+  // Low-latency transport to the sim (no batching, no QoS lanes): telemetry and
+  // commands are small, latest-value samples, and every round trip counts in
+  // lockstep. A sim that doesn't offer it falls back to the default transport.
+  config.insert_json5("transport/unicast/lowlatency", "true");
+  config.insert_json5("transport/unicast/qos/enabled", "false");
   config.insert_json5("connect/endpoints", "[\"" + connect + "\"]");
   config.insert_json5("connect/timeout_ms",
                       std::to_string(static_cast<long long>(timeout_s * 1000.0)));

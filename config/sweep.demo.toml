@@ -1,0 +1,23 @@
+# Process-mode sweep: the C++ hold controller flies aircraft 1 to four target
+# headings from three start speeds = 12 runs of the 40 s demo, in lockstep and
+# as fast as possible. Each run gets its own sim on its own Zenoh endpoint
+# (exported to the controller as $ASTRUM_ZENOH_CONNECT).
+#
+#   make sweep SWEEP=config/sweep.demo.toml
+#
+# Results: runs/sweep.demo/summary.csv, plus per run its scenario (.toml), bag
+# (.mcap) and the sim's and controller's logs.
+
+base = "config/scenario.demo.toml"
+
+controllers = [
+  "build/controllers/cpp/astrum-controller --id 1 --heading {param.heading} --alt 1500 --speed 50",
+]
+
+[set]
+"sim.lockstep" = true
+"aircraft.1.lockstep" = true
+
+[vary]
+"param.heading" = [0, 90, 180, 270]
+"aircraft.1.tas_mps" = [50.0, 55.0, 60.0]

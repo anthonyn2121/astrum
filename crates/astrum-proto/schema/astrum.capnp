@@ -10,7 +10,8 @@
 #   * Scenario  : the sim answers `get astrum/scenario` with its scenario TOML (UTF-8 text)
 # Both streams are latest-value state: publish with CongestionControl::DROP, express,
 # priority INTERACTIVE_HIGH, and read with a latest-value (ring) handler — a stale
-# sample is worse than a dropped one.
+# sample is worse than a dropped one. Controllers may ask for Zenoh's low-latency
+# transport (the sim offers it).
 #
 # Framing: one unpacked flat message per Zenoh payload (Rust write_message /
 # C++ messageToFlatArray / pycapnp to_bytes).

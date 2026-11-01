@@ -22,6 +22,10 @@
 //! QoS ([`qos`]) is the same for both streams: they carry latest-value state, so a
 //! congested link drops the older sample (`CongestionControl::Drop`), samples are
 //! not batched (`express`), and they ride above bulk data (`InteractiveHigh`).
+//! The sim's router also offers Zenoh's low-latency transport (no batching, no
+//! QoS lanes), which the C++ and Python controller clients ask for: every
+//! lockstep round trip counts. Clients that don't ask (the recorder, the web
+//! bridge) get the default transport, with fragmentation for large replies.
 //!
 //! Every call uses Zenoh's synchronous `.wait()` resolver; Zenoh runs its own
 //! runtime internally, so these wrappers drop into synchronous code as-is.
@@ -138,6 +142,11 @@ impl Session {
             ("scouting/multicast/enabled", "false".into()),
             ("mode", r#""router""#.into()),
             ("listen/endpoints", format!(r#"["{endpoint}"]"#)),
+            // Low-latency transport (no batching or QoS lanes) to every client
+            // that asks for it — the controllers do; measured ~14 % more lockstep
+            // throughput. Clients that don't (recorder, web) get the default.
+            ("transport/unicast/lowlatency", "true".into()),
+            ("transport/unicast/qos/enabled", "false".into()),
         ])
     }
 

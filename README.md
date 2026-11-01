@@ -240,17 +240,54 @@ One JSBSim F-16 step is ~5.3 µs on its own; the rest of a 1-aircraft tick is th
 aircraft as the fleet outgrows the caches (5.3 µs alone, 8.5 µs per aircraft in a 16-ship, 14 µs in
 a 64-ship, on one thread).
 
-End to end through the binary and Zenoh (lockstep, unpaced):
+End to end through the binary and Zenoh (lockstep, unpaced, low-latency transport):
 
 | Run | × real time |
 |---|---|
-| 1 × c172x + C++ raw controller, control at 120 Hz | 130× |
-| same, `control_rate_hz` = 30 / 20 | 293× / 365× |
+| 1 × c172x + C++ raw controller, control at 120 Hz | 148× |
+| same, `control_rate_hz` = 30 / 20 | 330× / 373× |
+| 1 × c172x + Python raw controller, control at 120 Hz | 67× |
 | formation demo (4 F-16s, 4 Python controllers), 30 Hz control, `--threads 4 --record` | 79× |
 
 Embedded env reset: 6.0 ms (a fresh build is 10.4 ms); most of it is the JSBSim trim, which
 `trim = false` per aircraft skips. Cap'n Proto telemetry is ~170 B with ~0.1 µs encode/decode — not
 a bottleneck.
+
+### Sweeps (`astrum-sweep`)
+
+Many runs of one scenario — a parameter study, a Monte Carlo set, a regression suite — are faster
+side by side than one at a time: `astrum-sweep` flies a grid of scenario variants, many at once,
+and collects every run.
+
+```bash
+make sweep SWEEP=config/sweep.demo.toml                 # 12 runs: C++ controller, 4 headings × 3 speeds
+cargo run --release -p astrum-sim --bin astrum-sweep -- config/sweep.trim.toml --jobs 8
+astrum-sweep config/sweep.demo.toml --dry-run           # list the planned runs, fly nothing
+```
+
+A sweep file names a `base` scenario, fixed overrides (`[set]`) and a grid (`[vary]`: every
+combination is a run, × `repeats`, repeat `r` with seed `sim.seed + r`). Keys are
+`sim.<field>`, `world.<field>`, `aircraft.<id>.<field>`, or `param.<name>` (a free value for
+controller commands). Every run's scenario is built and validated before anything flies.
+
+- **Without `controllers`** the runs fly in-process, one thread each (for scenarios that need no
+  external control — trim, initial-condition and physics studies).
+- **With `controllers`** each run is an `astrum-sim` process on its own endpoint
+  (`tcp/127.0.0.1:<--base-port + run − 1>`, also exported as `$ASTRUM_ZENOH_CONNECT`) plus the
+  listed controller processes. Commands are split like a shell would, but not run through one;
+  `{endpoint}`, `{run}`, `{seed}` and `{param.<name>}` are filled in. Unpaced runs with controllers
+  must be lockstep, so they are reproducible.
+
+Results land in `runs/<sweep name>/`: per run its scenario, bag and logs, and `summary.csv` (run,
+status, seed, the varied values, sim time, wall time, speed, bag). Ctrl-C stops starting runs and
+ends the running ones cleanly; the summary marks them. Exit status 0 means every run was ok.
+Bundled sweeps: `sweep.trim.toml` (in-process), `sweep.demo.toml` (C++ controller),
+`sweep.formation.toml` (four Python controllers at a 30 Hz control rate).
+
+Measured on the 24-core host while it ran other jobs: 24 concurrent single-aircraft in-process runs
+total ~11,800× real time (one alone: ~1,180×); the 12-run C++ demo sweep takes 1.3 s; the 9-run
+formation sweep (four Python controllers per run) totals 128 / 163 / 176 sim-seconds per
+wall-second with 3 / 5 / 9 runs at once, against 65–79× for one run alone.
 
 ## Flight controllers
 
@@ -323,6 +360,10 @@ whole fleet (`astrum/telemetry/*`); key matching is exact, so `.../1` never matc
 visualisation are **latest-value** (one slot per aircraft that the newest sample overwrites —
 `astrum_net::LatestTelemetry` in Rust), never a FIFO that queues stale state. A dropped message is
 harmless because the next tick supersedes it; the lease turns a silent controller into a safe hold.
+The sim also offers Zenoh's **low-latency transport** (no batching, no QoS lanes) and the C++ and
+Python clients ask for it (`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 %
+more lockstep throughput. A client that doesn't ask, or a sim that doesn't offer it, falls back to
+the default transport.
 
 **Topology.** The sim (or `astrum-bag-play`) **listens as a Zenoh router** on
 `tcp/0.0.0.0:7447`; every other process — recorder, web bridge, C++ and Python controllers —
@@ -450,7 +491,8 @@ fixed-wing, `autopilot_profile`. A scenario can mix classes freely.
    subscribe latest-value to `astrum/telemetry/<id>` (or `astrum/telemetry/*`).
 3. For every telemetry sample, check `vehicleKind`, compute your control, and put a `Command` on
    `astrum/command/<id>` with `targetId == <id>`, the next `seq`, `telemetryTick` = the sample's
-   `tick`, using Drop / express / InteractiveHigh on a declared publisher.
+   `tick`, using Drop / express / InteractiveHigh on a declared publisher. Optionally ask for the
+   low-latency transport (above) to shorten each lockstep round trip.
 
 `controllers/common` + `controllers/cpp` and `controllers/python/astrum_client` are worked
 references. New controllers can run as extra compose services on the `astrum` network or as any

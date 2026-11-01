@@ -9,9 +9,11 @@ use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 
 use astrum_net::{CommandReceiver, ScenarioServer, Session, TelemetryPublisher};
+use astrum_sim::components::{SimClock, SimParams};
 use astrum_sim::scenario::Scenario;
+use astrum_sim::sweep::stopped_line;
 use astrum_sim::systems::StopRequested;
-use astrum_sim::{build_app, record, RunMode};
+use astrum_sim::{build_app, record, run_to_exit, RunMode};
 use bevy::prelude::*;
 use clap::Parser;
 
@@ -119,12 +121,16 @@ fn main() -> ExitCode {
     if let Some(r) = recorder {
         app.insert_resource(r);
     }
-    // The runner owns (and on return drops) the app, recorder included, which
-    // closes the recording queue so `finish` can complete the bag.
-    let mut code = match app.run() {
+    let started = std::time::Instant::now();
+    let mut code = match run_to_exit(&mut app) {
         AppExit::Success => ExitCode::SUCCESS,
         AppExit::Error(code) => ExitCode::from(code.get()),
     };
+    let sim_s = app.world().resource::<SimClock>().time_s(app.world().resource::<SimParams>());
+    let wall_s = started.elapsed().as_secs_f64();
+    println!("{}", stopped_line(app.world().resource::<SimClock>().tick, sim_s, wall_s));
+    // Dropping the app drops the recorder, closing the queue `finish` waits on.
+    drop(app);
     if let Some(recording) = recording {
         let path = recording.path().display().to_string();
         match recording.finish() {

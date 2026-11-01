@@ -15,6 +15,11 @@ path = "src/lib.rs"
 name = "astrum-sim"
 path = "src/main.rs"
 
+# Fly a sweep of scenario variants, many at once (see `sweep` in the library).
+[[bin]]
+name = "astrum-sweep"
+path = "src/bin/sweep.rs"
+
 [dependencies]
 # Headless: no render/winit/audio, and no Bevy task pools: the tick is a strict
 # chain, and FDM stepping runs on the sim's own shard pool (`sim.threads`).
@@ -30,6 +35,9 @@ toml = { workspace = true }
 astrum-bag = { path = "../astrum-bag" }
 # SIGINT/SIGTERM end a run cleanly (a recording is finished, not truncated).
 ctrlc = { workspace = true }
+# astrum-sweep: signal a child process (SIGTERM) and split controller commands.
+libc = "0.2"
+shlex = "2"
 
 [dev-dependencies]
 tempfile = "3"

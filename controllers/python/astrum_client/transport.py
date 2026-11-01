@@ -2,8 +2,10 @@
 latest-value telemetry, and command publishers with the contract QoS.
 
 * Session: ``mode=client`` of the sim, which is a Zenoh router (the hub every
-  process connects to, so it routes between them); multicast scouting off.
-  ``open`` waits up to the startup timeout for a sim that is still starting.
+  process connects to, so it routes between them); multicast scouting off;
+  Zenoh's low-latency transport (no batching, no QoS lanes: every lockstep
+  round trip counts, and the samples are small). ``open`` waits up to the
+  startup timeout for a sim that is still starting.
 * Telemetry: a callback overwrites the latest decoded sample per aircraft, so a
   slow control law always acts on the freshest state; nothing is ever queued.
 * Commands: declared publisher, CongestionControl DROP, express, priority
@@ -61,6 +63,8 @@ def session_config(connect: str, timeout_s: float) -> zenoh.Config:
     conf.insert_json5("connect/endpoints", json.dumps([connect]))
     conf.insert_json5("connect/timeout_ms", str(int(timeout_s * 1000)))
     conf.insert_json5("scouting/multicast/enabled", "false")
+    conf.insert_json5("transport/unicast/lowlatency", "true")
+    conf.insert_json5("transport/unicast/qos/enabled", "false")
     return conf
 
 

@@ -1,10 +1,11 @@
 //! `astrum-sim` — the ASTRUM headless Bevy ECS state server, as a library.
 //!
-//! [`build_app`] stands up a headless Bevy app (only the schedule runner) that spawns one
+//! [`build_app`] stands up a headless Bevy app (no plugins) that spawns one
 //! entity per scenario aircraft — each owning an independent JSBSim FDM — and
 //! advances them one deterministic step per update, deriving the world-grid
-//! state from each aircraft's geodetic state. The binary adds the Zenoh bridge;
-//! tests and the embedded RL env ([`env`]) pump the same app without it.
+//! state from each aircraft's geodetic state. The binary adds the Zenoh bridge
+//! and drives it with [`run_to_exit`], as the sweep runner ([`sweep`]) does for
+//! many runs at once; tests and the embedded RL env ([`env`]) pump the same app.
 //!
 //! # One update == one tick, in this order
 //! `ingest_commands` → `expire_leases` → `autopilot_step` → `fire_guns` (rounds
@@ -22,11 +23,10 @@ pub mod pilot;
 pub mod record;
 pub mod scenario;
 pub mod step_pool;
+pub mod sweep;
 pub mod systems;
 
-use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
-use std::time::Duration;
 
 use astrum_geo::{Geodetic, LocalFrame};
 use combat::systems::{apply_damage, end_on_elimination, fire_guns, resolve_hits, step_bullets};
@@ -76,15 +76,37 @@ pub fn world_frame(scenario: &Scenario) -> WorldFrame {
 /// How the app is driven.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
-    /// The `astrum-sim` binary: progress reports, real-time pacing, and an
+    /// The `astrum-sim` binary: progress reports, `sim.speed` pacing, and an
     /// exit request when the episode ends (time cap or engagement decided).
     Server,
+    /// One run of a sweep: pacing and exit requests, but no progress reports
+    /// (many run at once).
+    Batch,
     /// Stepped by a caller (tests, the RL env): none of the above.
     Embedded,
 }
 
 fn is_server(mode: Res<RunMode>) -> bool {
     *mode == RunMode::Server
+}
+
+/// Runs that end themselves: paced, and stopped at their time cap or decision.
+fn runs_to_exit(mode: Res<RunMode>) -> bool {
+    matches!(*mode, RunMode::Server | RunMode::Batch)
+}
+
+/// Drive `app` one update (= one tick) at a time until it requests an exit, as
+/// the `astrum-sim` binary and the sweep runner do (tests and the RL env step it
+/// themselves). The caller keeps the app, so the final world can be inspected.
+pub fn run_to_exit(app: &mut App) -> AppExit {
+    app.finish();
+    app.cleanup();
+    loop {
+        app.update();
+        if let Some(exit) = app.should_exit() {
+            return exit;
+        }
+    }
 }
 
 /// Build the headless simulation app from a validated scenario (does not run
@@ -99,12 +121,12 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
     .min(scenario.aircraft.len());
 
     let mut app = App::new();
-    // Only the runner: physics steps exactly once per loop and `pace` throttles
-    // wall time. `MinimalPlugins`' task pools, `Time` and frame counter are unused
+    // No plugins: physics steps exactly once per update and `pace` throttles wall
+    // time. `MinimalPlugins`' task pools, `Time` and frame counter are unused
     // (FDM threads are our own `StepPool`; the clock is `SimClock`) and cost
-    // ~1.9 µs of every update (measured), so they are left out.
-    app.add_plugins(ScheduleRunnerPlugin::run_loop(Duration::ZERO))
-        .insert_resource(params)
+    // ~1.9 µs of every update (measured), so they are left out; `run_to_exit`
+    // is the run loop.
+    app.insert_resource(params)
         .insert_resource(world_frame(&scenario))
         .insert_resource(SimClock::default())
         .insert_resource(SimStatus::default())
@@ -136,14 +158,14 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
                     step_bullets,
                     resolve_hits,
                     apply_damage,
-                    end_on_elimination.run_if(is_server),
+                    end_on_elimination.run_if(runs_to_exit),
                     publish_telemetry,
                     report_progress.run_if(is_server),
-                    stop_at_max_time.run_if(is_server),
+                    stop_at_max_time.run_if(runs_to_exit),
                 )
                     .chain()
                     .distributive_run_if(SimStatus::running),
-                pace.run_if(is_server),
+                pace.run_if(runs_to_exit),
                 exit_on_signal,
                 exit_on_fatal,
             )

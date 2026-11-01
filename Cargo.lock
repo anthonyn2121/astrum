@@ -235,7 +235,9 @@ dependencies = [
  "bevy",
  "clap",
  "ctrlc",
+ "libc",
  "serde",
+ "shlex",
  "tempfile",
  "toml",
 ]

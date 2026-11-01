@@ -41,7 +41,8 @@ must equal `Command.targetId`; the sim refuses mismatches.
 Rules every client follows (the shared C++ and Python clients implement them for you):
 
 - QoS for both streams: CongestionControl `Drop`, express, priority `InteractiveHigh`, declared
-  publishers.
+  publishers; controller sessions ask for Zenoh's low-latency transport
+  (`transport/unicast/lowlatency = true`, `transport/unicast/qos/enabled = false`).
 - Telemetry subscriptions are **latest-value** (one slot per aircraft), never a FIFO.
 - **One command per telemetry sample**, carrying `seq` (strictly increasing from 1 per process)
   and `telemetryTick` (the `Telemetry.tick` it answers). Raw commands are a **lease**: stop sending
@@ -178,7 +179,8 @@ fallback). Every flag falls back to the env var, then the default:
 
 SIGINT/SIGTERM end the run cleanly at the end of the tick (a `--record` bag is finished); a
 second signal exits at once. `make bench` measures the headless tick cost for a few fleet sizes
-and thread counts.
+and thread counts. To fly many variants of a scenario at once, write a sweep file and run
+`make sweep SWEEP=config/sweep.<name>.toml` (`ARGS="--jobs 8 --overwrite"`; README §Sweeps).
 
 ## 5. Scenarios
 

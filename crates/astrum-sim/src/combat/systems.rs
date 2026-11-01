@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use astrum_geo::Geodetic;
 
 use crate::components::{Aircraft, AircraftState, SimParams, WorldFrame};
+use crate::RunMode;
 
 use super::ballistics::{earth_rate_enu, grid_altitude, step_projectile, DVec3};
 use super::components::{Bullet, Dead, Gun, Health, Team, Trigger};
@@ -181,11 +182,14 @@ pub fn engagement_decided<'a>(state: &CombatState, living: impl Iterator<Item = 
 /// End the run once the engagement is decided.
 pub fn end_on_elimination(
     state: Res<CombatState>,
+    mode: Option<Res<RunMode>>,
     living: Query<&Team, (With<Health>, Without<Dead>)>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if engagement_decided(&state, living.iter()) {
-        println!("[astrum-sim] engagement decided — exiting");
+        if mode.is_some_and(|m| *m == RunMode::Server) {
+            println!("[astrum-sim] engagement decided — exiting");
+        }
         exit.write(AppExit::Success);
     }
 }
