@@ -22,40 +22,45 @@ to understand:
 
 | Layer | File | What it is | Do you touch it? |
 |-------|------|-----------|------------------|
-| **1. Rust sim seam** | `astrum-sim/src/env.rs` (`SimEnv`) → pyo3 wrapper `astrum-env/src/lib.rs` (`DogfightEnv`) | A pure **state-in / state-out** physics sim. One `step()` = one JSBSim tick. Knows nothing about rewards or observations. | Rarely — it's the stable floor. |
+| **1. Rust sim seam** | `astrum-sim/src/env.rs` (`SimEnv`) → PyO3 binding `astrum-env/src/lib.rs` (`astrum_env.Env`, `astrum_env.BatchEnv`) | A pure **state-in / state-out** physics sim. One `step()` = one JSBSim tick. Knows nothing about rewards or observations. | Rarely — it's the stable floor. |
 | **2. Python trainer adapter** | `crates/astrum-env/python/astrum_dogfight/` | Adds everything RL needs: the **observation vector**, the **reward**, the **episode boundaries**, and the **scripted opponent**. | **Yes — this is where you live.** Pure numpy Python. |
 
 The key idea: the Rust sim hands you *raw absolute state* (positions, attitudes,
-health, ammo). Turning that into "am I on his six, inside gun range, with a lead
+hit points, ammo). Turning that into "am I on his six, inside gun range, with a lead
 solution?" is the **trainer's** job, done in `geometry.py`. The sim deliberately
 omits reward and observation shaping so the physics stays reusable and testable
 from `cargo test` with no Python involved.
 
 Read `crates/astrum-env/README.md` first — it is the crispest statement of this
-split and the build/toolchain notes.
+split, the binding API, and the build/threading notes.
 
 ---
 
 ## 2. First 30 minutes: build it and watch an episode
 
-**Step 0 — build the extension and run the smoke test.** `astrum_env` is a
-compiled Rust `.so`; this script builds it, stages it on `PYTHONPATH`, and runs a
-minimal sanity check:
+**Step 0 — build the extension.** `astrum_env` is a compiled Rust `.so`;
+`scripts/build-astrum-env.sh` builds it (`cargo build --release -p astrum-env`)
+and prints the staging directory to put on `PYTHONPATH`.
+
+**Step 1 — run the Python tests** (controllers + the adapter's 15 tests + the
+binding smoke check, no gymnasium required):
 
 ```bash
-docker compose run --rm --no-deps sim bash -lc 'bash crates/astrum-env/python/run_smoke.sh'
+make test-python
 ```
 
-**Step 1 — run the adapter's own test suite** (9 tests, no gymnasium required):
+or, by hand in a dev shell:
 
 ```bash
-docker compose run --rm --no-deps sim bash -lc 'bash crates/astrum-env/python/run_gym_test.sh'
+S=$(bash scripts/build-astrum-env.sh)
+export PYTHONPATH="$S:crates/astrum-env/python:$PYTHONPATH"
+pytest -q crates/astrum-env/python && python crates/astrum-env/python/smoke.py
 ```
 
-If both pass, the whole stack works. `test_dogfight_env.py` is also the best
-worked example in the repo: **`test_live_rollout`** is a complete minimal episode
-you can copy verbatim, and the `test_tier3_*` tests show the shooting opponent
-end-to-end.
+If they pass, the whole stack works. `test_dogfight_env.py` is also the best
+worked example in the repo: `_rollout` / **`test_seeded_rollouts_are_identical`**
+is a complete minimal episode you can copy, and the `test_tier3_*` tests show the
+shooting opponent end-to-end.
 
 ---
 
@@ -86,8 +91,7 @@ while not done:
 - **These are FLCS commands, not raw control-surface deflections.** `elevator = -1`
   commands a full **+9 g pull**; `aileron` is a **roll-rate** command (~188°/s at
   full). The flight-control system enforces the ~30° AoA / 9 g envelope so you
-  can't depart the jet. This trips up everyone once — see the design doc §8 and the
-  `f16-raw-is-flcs-nrt` note.
+  can't depart the jet. This trips up everyone once — see the design doc §2.4 and §8.
 - `trigger` is a **learned fire gate**, thresholded at `≥ 0.5` into a real M61A1
   gun burst. The policy learns *when* to shoot; there is **no auto-aim**.
 
@@ -97,11 +101,11 @@ Egocentric and normalized (built by `geometry.build_observation`). You do **not*
 assemble this by hand — the env returns it — but know the layout so you know what
 the policy sees:
 
-- **14 own-state** — airspeed, altitude-above-deck, `sin/cos(φ)`, `sin/cos(θ)`,
-  body rates p/q/r, α, β, load factor Nz, health, ammo.
+- **14 own-state** — true airspeed, height above the hard deck (HAE), `sin/cos(φ)`,
+  `sin/cos(θ)`, body rates p/q/r, α, β, load factor Nz, hit points, ammo.
 - **14 relative-geometry** — range, `sin/cos` of the bandit's bearing off your nose
   (azimuth + elevation), aspect angle, heading-crossing angle, closure, relative
-  altitude, bandit airspeed / health / alive-flag.
+  altitude, bandit airspeed / hit points / alive-flag.
 - **3 WEZ / gun aids** — in-range flag, gun-solution quality ∈ [0,1], and the
   cosine of the lead error.
 
@@ -115,7 +119,7 @@ precedence:
 
 | Event | Reward | Flag | `info["event"]` |
 |-------|-------:|------|-----------------|
-| Hard-deck bust (< 300 m AGL) | −200 | terminated | `hard_deck` |
+| Hard-deck bust (< 300 m HAE; there is no terrain model) | −200 | terminated | `hard_deck` |
 | Kill (bandit dies) | +100 | terminated | `kill` (or `trade`) |
 | Death (learner dies) | −100 | terminated | `killed` |
 | Bubble exit (> 15 km, or over ceiling) | −50 | truncated | `left_bubble` |
@@ -139,8 +143,8 @@ any:
 | `make_tier3_env(posture="offensive"\|"defensive")` | `Tier3Opponent` | 5-state BFM FSM that **shoots back** through the real gun pipeline. `"offensive"` starts it on your six; `"defensive"` starts it ahead of you. |
 
 All three accept scenario keyword args, e.g. `make_tier1_env(separation_m=1500.0,
-alt_ft=18000.0, airspeed_kts=380.0, max_time_s=45.0)` (see `scenario.py` for the
-full list).
+alt_hae_m=5500.0, tas_mps=200.0, max_time_s=45.0)` (SI units, height above the
+ellipsoid, true airspeed; see `scenario.py` for the full list).
 
 ---
 
@@ -157,22 +161,23 @@ first tasks, in order:
    to learn from is `Tier3Opponent._pursue` and `wez_fire` in `opponent.py`.
 2. **A random-action sanity harness** — confirm episodes terminate for the right
    reasons (watch `info["event"]`), and that reward is finite every step.
-3. **Only then, learning.** This needs a dev-image change (see §5) before you can
-   `import stable_baselines3`.
+3. **Only then, learning.** This needs a training framework installed (see §5)
+   before you can `import stable_baselines3`.
 
 ---
 
-## 5. Two hard constraints — read before you scale
+## 5. Two things to know before you scale
 
-1. **Parallelism must be multiprocessing, never threads.** JSBSim is process-global
-   and **not thread-safe**, so `DogfightEnv` is `#[pyclass(unsendable)]` — pinned to
-   its creating thread. Scale training with `SubprocVecEnv` / `AsyncVectorEnv`, one
-   env per process. Using OS threads will corrupt the FDM.
-2. **gymnasium and stable-baselines3 are not in the dev image yet.** The adapter is
-   numpy-only and subclasses `gymnasium.Env` *only if it's importable*, so it runs
-   offline today, but you cannot actually train until the image gains those deps.
-   Adding gymnasium + SB3 to the image is the gating next step before any learning
-   milestone.
+1. **Parallelism: threads are fine, `BatchEnv` is cheapest.** The JSBSim wrapper
+   (`astrum-fdm`) owns a process-wide lock around JSBSim's global initialisation,
+   so `astrum_env.Env` is `Send` and releases the GIL during construction, `reset`
+   and `step` — several envs can run on Python threads concurrently.
+   `astrum_env.BatchEnv` steps K envs in parallel (rayon) inside one call.
+   Process-level vectorisation (`SubprocVecEnv` / `AsyncVectorEnv`) also works.
+2. **gymnasium and stable-baselines3 are not in the dev image**
+   (`docker/requirements.txt` ships numpy/scipy only). The adapter is numpy-only
+   and subclasses `gymnasium.Env` *only if it's importable*, so it runs offline
+   today, but training needs those deps added to the image first.
 
 ---
 
@@ -180,12 +185,13 @@ first tasks, in order:
 
 | File | What's in it |
 |------|--------------|
-| `astrum-env/README.md` | The two-layer seam, build/toolchain, parallelism rule. |
+| `astrum-env/README.md` | The two-layer seam, binding API, build and threading notes. |
 | `python/astrum_dogfight/env.py` | `DogfightGymEnv` + the `make_tierN_env` factories. |
 | `python/astrum_dogfight/geometry.py` | `AState`, relative geometry (`relative`), lead-pursuit helpers, and `build_observation`. |
 | `python/astrum_dogfight/reward.py` | The reward table + episode-boundary predicates. |
 | `python/astrum_dogfight/opponent.py` | Scripted Tier-1/2/3 opponents; `wez_fire`. |
 | `python/astrum_dogfight/scenario.py` | TOML scenario builders (`tier1_scenario`, `tier3_scenario`). |
 | `python/astrum_dogfight/constants.py` | Every tunable: reward magnitudes, WEZ ranges, FSM thresholds, normalizers. |
-| `python/test_dogfight_env.py` | 9 tests — and the best worked examples of the API. |
+| `python/test_dogfight_env.py` | 15 tests — and the best worked examples of the API. |
+| `python/smoke.py` | Binding smoke check (`Env`, `BatchEnv`, autopilots, fire control). |
 | `docs/dogfight-environment-design.md` | The full design rationale (§8 covers the RL seam). |

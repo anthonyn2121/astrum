@@ -3,13 +3,22 @@ name = "astrum-proto"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "ASTRUM Cap'n Proto wire schema + generated Rust bindings (telemetry, commands, bag)."
+rust-version.workspace = true
+publish.workspace = true
+description = "ASTRUM Cap'n Proto wire schema + generated Rust bindings (telemetry, commands)."
 
 [lib]
 name = "astrum_proto"
 
 [dependencies]
-capnp = "0.21"
+astrum-geo = { path = "../astrum-geo" }
+# `unaligned`: decode straight from a Zenoh payload slice, whose alignment is not
+# guaranteed, without first copying it into word-aligned segments.
+capnp = { workspace = true, features = ["unaligned"] }
 
 [build-dependencies]
-capnpc = "0.21"
+capnpc = { workspace = true }
+
+[dev-dependencies]
+# Reads the cross-language fixture values (tests/fixtures/values.json).
+serde_json = { workspace = true }

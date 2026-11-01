@@ -1,93 +1,138 @@
 """Egocentric dogfight geometry and the observation vector (design doc §8.2).
 
-All frame math is grounded in the two authoritative sources:
+Frames:
 
-- **ENU world frame** (`crates/astrum-geo`): East=+X, North=+Y, Up=+Z.
-- **Body attitude DCM** (`web/js/meshes.js` `attitudeToQuaternion`): aerospace
-  3-2-1 Euler (φ roll, θ pitch, ψ yaw/true-heading); body axes nose=+X,
-  starboard=+Y, down=+Z. That file emits the body→NED columns; here we express
-  the same axes directly in ENU via (E, N, U) = (e, n, −d).
+- **World grid ENU** (`pos_*`, `vel_e/vel_n/vel_u` columns): East=+X, North=+Y,
+  Up=+Z at the scenario origin. Every relative-geometry computation (LOS, range,
+  closure, aspect) happens here.
+- **Body axes** (x nose, y starboard, z down): an `AState` carries its three body
+  axes expressed in the grid, obtained from the sim's own `Env.body_to_grid`
+  (which includes the local-level tilt away from the grid origin). Nothing here
+  re-derives an attitude matrix.
+- **Local level NED** (`vel_ned_*`, `psi`): only where local-level is meant —
+  ground course for the autopilot heading targets.
 
-`AState` is a plain, fabricable snapshot of one aircraft (so reward/geometry unit
-tests need no live sim). Everything downstream operates on `AState`, never on the
-pyo3 `Observation` directly.
+Gun fire control is the sim's (`Env.gun_solution`: drag, gravity, velocity
+inheritance, muzzle offset); this module only consumes a `GunSolution`.
+
+`AState` is a zero-copy view of one row of the env's observation matrix plus
+its body axes, so per-tick snapshotting builds no per-field Python objects.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import atan2, cos, hypot, sin
+from math import atan2, cos, exp, hypot, sin
 
+import astrum_env
 import numpy as np
 
 from . import constants as C
 
+COL = {name: i for i, name in enumerate(astrum_env.OBS_FIELDS)}
+_POS = slice(COL["pos_e"], COL["pos_u"] + 1)
+_VEL = slice(COL["vel_e"], COL["vel_u"] + 1)
+_BODY_UNIT = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
 
-@dataclass
+
 class AState:
-    """A plain snapshot of one aircraft, in ENU. Fabricable for tests."""
+    """One aircraft: a view of its observation row + body axes in the grid.
 
-    id: int
-    team: int
-    alive: bool
-    pos: np.ndarray  # ENU (E, N, U) metres
-    vel: np.ndarray  # ENU velocity (m/s)
-    phi: float
-    theta: float
-    psi: float
-    p: float
-    q: float
-    r: float
-    alpha: float
-    beta: float
-    nz: float
-    airspeed: float
-    alt: float  # MSL/ellipsoidal metres (== GeoState alt)
-    health: float
-    ammo: int
+    `axes` is a (3, 3) array whose rows are the nose, starboard and down unit
+    vectors in grid ENU.
+    """
+
+    __slots__ = ("row", "axes")
+
+    def __init__(self, row: np.ndarray, axes: np.ndarray):
+        self.row = row
+        self.axes = axes
 
     @staticmethod
-    def from_obs(o) -> "AState":
-        """Convert a pyo3 `astrum_env.Observation` into an `AState`.
+    def from_env(env, row: np.ndarray) -> AState:
+        """Snapshot the aircraft of `row` (an `env.step`/`env.reset` row)."""
+        i = int(row[COL["id"]])
+        return AState(row, np.array([env.body_to_grid(i, e) for e in _BODY_UNIT]))
 
-        NED velocity → ENU: (E, N, U) = (vel_e, vel_n, −vel_d).
-        """
-        return AState(
-            id=int(o.id),
-            team=int(o.team),
-            alive=bool(o.alive),
-            pos=np.array([o.pos_e, o.pos_n, o.pos_u], dtype=np.float64),
-            vel=np.array([o.vel_e, o.vel_n, -o.vel_d], dtype=np.float64),
-            phi=float(o.phi),
-            theta=float(o.theta),
-            psi=float(o.psi),
-            p=float(o.p),
-            q=float(o.q),
-            r=float(o.r),
-            alpha=float(o.alpha_rad),
-            beta=float(o.beta_rad),
-            nz=float(o.nz_g),
-            airspeed=float(o.airspeed_mps),
-            alt=float(o.alt_m),
-            health=float(o.health),
-            ammo=int(o.ammo),
+    @staticmethod
+    def fabricate(axes, **cols: float) -> AState:
+        """A synthetic state for tests: unspecified columns are 0, except
+        `alive=1`, `hit_points=hit_points_max=100` and `ammo=GUN_AMMO`."""
+        row = np.zeros(len(astrum_env.OBS_FIELDS))
+        defaults = {
+            "alive": 1.0,
+            "hit_points": 100.0,
+            "hit_points_max": 100.0,
+            "ammo": float(astrum_env.GUN_AMMO),
+        }
+        for name, value in {**defaults, **cols}.items():
+            row[COL[name]] = value
+        return AState(row, np.asarray(axes, dtype=np.float64))
+
+    def __getattr__(self, name: str) -> float:
+        try:
+            return float(self.row[COL[name]])
+        except KeyError:
+            raise AttributeError(name) from None
+
+    @property
+    def id(self) -> int:
+        return int(self.row[COL["id"]])
+
+    @property
+    def alive(self) -> bool:
+        return self.row[COL["alive"]] >= 0.5
+
+    @property
+    def ammo(self) -> int:
+        return int(self.row[COL["ammo"]])
+
+    @property
+    def pos(self) -> np.ndarray:
+        """Grid ENU position (m)."""
+        return self.row[_POS]
+
+    @property
+    def vel(self) -> np.ndarray:
+        """Grid ENU velocity (m/s)."""
+        return self.row[_VEL]
+
+    @property
+    def nose(self) -> np.ndarray:
+        return self.axes[0]
+
+    def course_local(self) -> float:
+        """Local-level ground course (rad, 0 = N, +E). Gimbal-free through the
+        vertical, unlike Euler ψ (a Split-S flips ψ); falls back to ψ when slow."""
+        n, e = self.row[COL["vel_ned_n"]], self.row[COL["vel_ned_e"]]
+        return atan2(e, n) if hypot(n, e) > 1.0 else self.psi
+
+
+@dataclass(frozen=True)
+class GunSolution:
+    """The sim's ballistic fire control for one shooter→target pair."""
+
+    miss_m: float
+    tof_s: float
+    hit: bool
+    aim_dir: np.ndarray  # grid unit vector the boresight must point along
+    aim_error_rad: float
+    in_range: bool
+
+    @staticmethod
+    def query(env, shooter: int, target: int) -> GunSolution | None:
+        """`env.gun_solution` as a `GunSolution`; None if the shooter is unarmed."""
+        d = env.gun_solution(shooter, target)
+        if d is None:
+            return None
+        return GunSolution(
+            miss_m=d["miss_m"],
+            tof_s=d["tof_s"],
+            hit=d["hit"],
+            aim_dir=np.asarray(d["aim_dir"], dtype=np.float64),
+            aim_error_rad=d["aim_error_rad"],
+            in_range=d["in_range"],
         )
-
-
-def body_axes_enu(phi: float, theta: float, psi: float):
-    """Return (nose, starboard, down) unit vectors in ENU for an attitude.
-
-    Derived from the body→NED DCM in `web/js/meshes.js:40-42`, mapped to ENU by
-    (E, N, U) = (e, n, −d). Verified level (φ=θ=0, ψ=0): nose=+N, starboard=+E,
-    down=−U.
-    """
-    cph, sph = cos(phi), sin(phi)
-    cth, sth = cos(theta), sin(theta)
-    cps, sps = cos(psi), sin(psi)
-    nose = np.array([cth * sps, cth * cps, sth])
-    starboard = np.array([sph * sth * sps + cph * cps, sph * sth * cps - cph * sps, -sph * cth])
-    down = np.array([cph * sth * sps - sph * cps, cph * sth * cps + sph * sps, -cph * cth])
-    return nose, starboard, down
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -106,58 +151,36 @@ class RelGeom:
     aspect: float  # angle at bandit, tail→LOS-to-me (rad); LOW = his 6 o'clock
     hca: float  # heading-crossing angle of the two flight paths (rad)
     closure: float  # +closing / −opening (m/s)
-    rel_alt: float  # bandit_alt − my_alt (m)
-    lead_error: float  # nose vs required TOF-lead direction (rad); LOW = solution
-    in_range: bool
-    gun_quality: float  # ∈[0,1]: in-range × tracking Gaussian
-    range_factor: float  # ∈[0,1]: 1 at point-blank → 0 at R_eff
+    rel_alt: float  # bandit_hae − my_hae (m)
+    range_factor: float  # ∈[0,1]: 1 at point-blank → 0 at R_MAX (shaping only)
+    aim_error: float  # sim fire control: boresight vs required aim (rad); π if unarmed
+    in_range: bool  # sim fire control: aim solution reaches the target in time
+    gun_quality: float  # ∈[0,1]: in-range × tracking Gaussian on aim_error
 
 
-def relative(me: AState, bandit: AState) -> RelGeom:
-    los = bandit.pos - me.pos  # ENU, me → bandit
+def relative(me: AState, bandit: AState, gun: GunSolution | None) -> RelGeom:
+    """Geometry of `bandit` from `me`; `gun` = the sim's solution me→bandit."""
+    los = bandit.pos - me.pos
     rng = float(np.linalg.norm(los))
     los_hat = _unit(los)
 
-    nose, starboard, down = body_axes_enu(me.phi, me.theta, me.psi)
-    lx = float(np.dot(los_hat, nose))  # forward component
-    ly = float(np.dot(los_hat, starboard))  # right component
-    lz = float(np.dot(los_hat, down))  # down component
-    ata = atan2(hypot(ly, lz), lx)  # total angle off the nose
+    lx, ly, lz = (float(c) for c in me.axes @ los_hat)  # LOS in my body axes
+    ata = atan2(hypot(ly, lz), lx)
     ata_az = atan2(ly, lx)
     ata_el = atan2(-lz, hypot(lx, ly))
 
-    # Aspect: at the bandit, angle between its tail and the LOS to me. With
-    # LOS = me→bandit and nose_b the bandit's forward, cos(aspect) = nose_b · LOS_hat
-    # (=+1 when I sit on his 6, nose pointing away from me).
-    nose_b, _, _ = body_axes_enu(bandit.phi, bandit.theta, bandit.psi)
-    aspect = atan2(
-        float(np.linalg.norm(np.cross(nose_b, los_hat))),
-        float(np.dot(nose_b, los_hat)),
-    )
+    # cos(aspect) = nose_b · LOS_hat (=+1 when I sit on his 6).
+    nose_b = bandit.nose
+    aspect = atan2(float(np.linalg.norm(np.cross(nose_b, los_hat))), float(np.dot(nose_b, los_hat)))
 
-    # HCA from flight-path courses (falls back to heading when nearly stationary).
-    def course(s: AState) -> float:
-        if hypot(s.vel[0], s.vel[1]) > 1.0:
-            return atan2(s.vel[0], s.vel[1])  # atan2(E, N)
-        return s.psi
+    hca = _wrap_pi(_grid_course(bandit) - _grid_course(me))
+    closure = -float(np.dot(bandit.vel - me.vel, los_hat))
 
-    hca = _wrap_pi(course(bandit) - course(me))
-
-    v_rel = bandit.vel - me.vel
-    closure = -float(np.dot(v_rel, los_hat))  # + = closing
-    rel_alt = bandit.alt - me.alt
-
-    # Gun solution: lead the bandit by its travel over the round's time-of-flight
-    # (drag-free approximation), then measure my boresight error to that aim point.
-    tof = rng / C.MUZZLE_MPS if rng > 1e-6 else 0.0
-    aim = bandit.pos + bandit.vel * tof
-    aim_dir = _unit(aim - me.pos)
-    lead_cos = float(np.clip(np.dot(aim_dir, nose), -1.0, 1.0))
-    lead_error = atan2(float(np.linalg.norm(np.cross(aim_dir, nose))), lead_cos)
-    in_range = rng <= C.R_EFF
-    range_factor = float(np.clip((C.R_EFF - rng) / C.R_EFF, 0.0, 1.0))
-    track = float(np.exp(-0.5 * (lead_error / C.LEAD_SIGMA) ** 2))
-    gun_quality = (range_factor * track) if in_range else 0.0
+    if gun is None:
+        aim_error, in_range, quality = np.pi, False, 0.0
+    else:
+        aim_error, in_range = gun.aim_error_rad, gun.in_range
+        quality = exp(-0.5 * (aim_error / C.LEAD_SIGMA) ** 2) if in_range else 0.0
 
     return RelGeom(
         rng=rng,
@@ -167,67 +190,58 @@ def relative(me: AState, bandit: AState) -> RelGeom:
         aspect=aspect,
         hca=hca,
         closure=closure,
-        rel_alt=rel_alt,
-        lead_error=lead_error,
+        rel_alt=bandit.alt_hae_m - me.alt_hae_m,
+        range_factor=float(np.clip(1.0 - rng / C.R_MAX, 0.0, 1.0)),
+        aim_error=aim_error,
         in_range=in_range,
-        gun_quality=gun_quality,
-        range_factor=range_factor,
+        gun_quality=quality,
     )
 
 
-def lead_point(me: AState, bandit: AState) -> np.ndarray:
-    """Drag-free gun-lead aim point (ENU): where to point the nose so a round fired
-    now meets the bandit, using its travel over the round's time-of-flight (§8.2)."""
-    rng = float(np.linalg.norm(bandit.pos - me.pos))
-    tof = rng / C.MUZZLE_MPS if rng > 1e-6 else 0.0
-    return bandit.pos + bandit.vel * tof
+def _grid_course(s: AState) -> float:
+    if hypot(s.vel[0], s.vel[1]) > 1.0:
+        return atan2(s.vel[0], s.vel[1])  # atan2(E, N)
+    return s.psi
 
 
-def body_bearing(me: AState, point: np.ndarray):
-    """Direction to an ENU `point` expressed in `me`'s body frame → `(off, bank_err,
-    forward)`.
+def body_bearing(me: AState, direction: np.ndarray):
+    """A grid `direction` expressed in `me`'s body frame → `(off, bank_err, forward)`.
 
-    - `off` — total angle between the nose and the point (rad; 0 = on boresight).
-    - `bank_err` — roll (rad, + = roll right) that would bring the point into the
-      vertical plane *above* the nose, i.e. put the lift vector on it.
-    - `forward` — nose-alignment cosine (dot of the direction with the nose axis).
+    - `off` — angle between the nose and the direction (rad; 0 = on boresight).
+    - `bank_err` — roll (rad, + = right) that puts the direction in the plane
+      above the nose, i.e. puts the lift vector on it.
+    - `forward` — nose-alignment cosine.
     """
-    d = _unit(point - me.pos)
-    nose, starboard, down = body_axes_enu(me.phi, me.theta, me.psi)
-    lx = float(np.dot(d, nose))
-    ly = float(np.dot(d, starboard))
-    lz = float(np.dot(d, down))
-    off = atan2(hypot(ly, lz), lx)
-    bank_err = atan2(ly, -lz)  # 0 when the point is straight up out of the canopy
-    return off, bank_err, lx
+    lx, ly, lz = (float(c) for c in me.axes @ _unit(np.asarray(direction, dtype=np.float64)))
+    return atan2(hypot(ly, lz), lx), atan2(ly, -lz), lx
 
 
-def potential(me: AState, bandit: AState, rg: RelGeom | None = None) -> float:
-    """Shaping potential Φ ∈ [0, 1] = nose-on ∧ rear-hemisphere ∧ in-WEZ (§8.3).
+def aim_direction(me: AState, target: AState, gun: GunSolution | None) -> np.ndarray:
+    """Where to point the nose: the sim's lead (`gun.aim_dir`) when armed, else
+    the line of sight."""
+    return gun.aim_dir if gun is not None else _unit(target.pos - me.pos)
 
-    Product form: all three factors must be good for a clean gun-kill geometry. 0
-    when either aircraft is dead (no live advantage to bank).
+
+def potential(me: AState, bandit: AState, rg: RelGeom) -> float:
+    """Shaping potential Φ ∈ [0, 1] = nose-on ∧ rear-hemisphere ∧ close (§8.3).
+
+    0 when either aircraft is dead (no live advantage to bank).
     """
     if not me.alive or not bandit.alive:
         return 0.0
-    rg = rg or relative(me, bandit)
-    f_ata = (1.0 + cos(rg.ata)) * 0.5
-    f_aspect = (1.0 + cos(rg.aspect)) * 0.5
-    return f_ata * f_aspect * rg.range_factor
+    return (1.0 + cos(rg.ata)) * 0.5 * (1.0 + cos(rg.aspect)) * 0.5 * rg.range_factor
 
 
-def build_observation(me: AState, bandit: AState, ground_alt: float = 0.0) -> np.ndarray:
+def build_observation(me: AState, bandit: AState, rg: RelGeom) -> np.ndarray:
     """The egocentric, normalized observation vector (design doc §8.2).
 
     Layout (31 floats): 14 own frame-invariant + 14 relative-geometry + 3 WEZ.
     Absolute heading ψ is deliberately dropped.
     """
-    rg = relative(me, bandit)
-    alt_agl = me.alt - ground_alt
     feats = [
         # --- own state (frame-invariant), 14 ---
-        me.airspeed / C.V_REF,
-        (alt_agl - C.DECK_AGL) / C.ALT_REF,
+        me.tas / C.V_REF,
+        (me.alt_hae_m - C.DECK_HAE_M) / C.ALT_REF,
         sin(me.phi),
         cos(me.phi),
         sin(me.theta),
@@ -238,7 +252,7 @@ def build_observation(me: AState, bandit: AState, ground_alt: float = 0.0) -> np
         me.alpha / C.ALPHA_REF,
         me.beta / C.BETA_REF,
         (me.nz - 1.0) / C.NZ_SCALE,
-        me.health / C.HP_MAX,
+        me.hit_points / C.HP_MAX,
         me.ammo / C.AMMO_MAX,
         # --- relative geometry (bandit in my body frame), 14 ---
         min(rg.rng / C.R_MAX, 2.0),
@@ -252,19 +266,17 @@ def build_observation(me: AState, bandit: AState, ground_alt: float = 0.0) -> np
         cos(rg.hca),
         rg.closure / C.V_REF,
         rg.rel_alt / C.ALT_REF,
-        bandit.airspeed / C.V_REF,
-        bandit.health / C.HP_MAX,
+        bandit.tas / C.V_REF,
+        bandit.hit_points / C.HP_MAX,
         1.0 if bandit.alive else 0.0,
-        # --- WEZ / gun-solution aids, 3 ---
+        # --- WEZ / gun-solution aids (sim fire control), 3 ---
         1.0 if rg.in_range else 0.0,
         rg.gun_quality,
-        cos(rg.lead_error),
+        cos(rg.aim_error),
     ]
     assert len(feats) == C.OBS_DIM, f"obs dim {len(feats)} != {C.OBS_DIM}"
     return np.asarray(feats, dtype=np.float32)
 
 
 def _wrap_pi(a: float) -> float:
-    from math import pi
-
-    return (a + pi) % (2.0 * pi) - pi
+    return astrum_env.wrap_pi(a)

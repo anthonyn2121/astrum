@@ -1,89 +1,122 @@
 //! ECS components and resources for the ASTRUM state server.
 
-use astrum_fdm::Fdm;
-use astrum_geo::LocalFrame;
-use bevy::prelude::*;
-use serde::Deserialize;
+use std::collections::HashMap;
 
-/// Marks an entity as an aircraft and carries its stable id (Zenoh telemetry key
-/// / command target).
+use astrum_fdm::{Fdm, FdmState};
+use astrum_geo::{Enu, LocalFrame};
+use bevy::platform::cell::SyncCell;
+use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
+
+/// Marks an entity as an aircraft and carries its stable id.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Aircraft {
     pub id: u32,
 }
 
-/// Which flight-vehicle class an entity is. Selects the JSBSim initialization
-/// (multirotors engage `fcs/ScasEngage`) and which built-in autopilot law
-/// [`crate::net::autopilot_step`] applies. The raw actuator path is identical for
-/// both — only the *meaning* of the four `fcs/*-cmd-norm` inputs differs
-/// (aerodynamic surfaces vs. body-rate + collective demands).
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+/// Which flight-vehicle class an entity is. Selects the JSBSim initialisation and
+/// the built-in autopilot law. The four `fcs/*-cmd-norm` inputs mean surfaces +
+/// throttle on a fixed-wing, body-rate demands + collective on a multirotor.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VehicleKind {
-    /// Aerodynamic fixed-wing (e.g. `c172x`): control surfaces + throttle.
-    #[default]
     FixedWing,
-    /// Multirotor / quadrotor (e.g. `F450`): the FCS turns `aileron/elevator/
-    /// rudder` into body roll/pitch/yaw **rate** demands and `throttle` into
-    /// **collective** thrust.
     Multirotor,
 }
 
-impl VehicleKind {
-    /// Best-effort inference from a JSBSim model name, for scenarios that don't
-    /// state `kind` explicitly. Known multirotors are matched; everything else is
-    /// treated as fixed-wing.
-    pub fn infer_from_model(model: &str) -> Self {
-        match model {
-            "F450" => VehicleKind::Multirotor,
-            _ => VehicleKind::FixedWing,
+impl From<VehicleKind> for astrum_proto::VehicleKind {
+    fn from(k: VehicleKind) -> Self {
+        match k {
+            VehicleKind::FixedWing => astrum_proto::VehicleKind::FixedWing,
+            VehicleKind::Multirotor => astrum_proto::VehicleKind::Multirotor,
         }
     }
 }
 
-/// Owns this entity's independent JSBSim flight-dynamics instance.
-///
-/// `Fdm` is `Send + Sync` (see `astrum-fdm`); Bevy only ever grants one system
-/// exclusive `&mut` access at a time, so stepping it from systems is sound.
-#[derive(Component)]
-pub struct FdmInstance(pub Fdm);
+/// Gain set of the built-in fixed-wing autopilot.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutopilotProfile {
+    /// Gentle trainer (c172x): 25° bank, 10° pitch.
+    Trainer,
+    /// Fighter (f16): 60° bank, 24° pitch, load-factor feedforward.
+    Fighter,
+}
 
-/// The authoritative per-aircraft state, read out of JSBSim each tick. This is
-/// the source of truth telemetry is encoded from; `Transform` is a derived
-/// Cartesian convenience view.
-#[derive(Component, Debug, Clone, Copy, Default)]
-pub struct GeoState {
-    /// Geodetic latitude (deg).
-    pub lat_deg: f64,
-    /// Longitude (deg).
-    pub lon_deg: f64,
-    /// Altitude above the ellipsoid (m).
-    pub alt_m: f64,
-    /// Roll / pitch / yaw (rad).
-    pub phi_rad: f64,
-    pub theta_rad: f64,
-    pub psi_rad: f64,
-    /// Local NED velocity (m/s).
-    pub vel_north_mps: f64,
-    pub vel_east_mps: f64,
-    pub vel_down_mps: f64,
-    /// True airspeed (m/s).
-    pub airspeed_mps: f64,
-    /// Simulation time reported by JSBSim (s).
-    pub sim_time_s: f64,
+/// This entity's JSBSim instance. [`Fdm`] is `Send` but deliberately not
+/// `Sync`; `SyncCell` makes the component `Sync` by only ever handing out
+/// exclusive access, which is all the systems need.
+#[derive(Component)]
+pub struct FdmInstance(pub SyncCell<Fdm>);
+
+impl FdmInstance {
+    pub fn new(fdm: Fdm) -> Self {
+        Self(SyncCell::new(fdm))
+    }
+
+    pub fn fdm(&mut self) -> &mut Fdm {
+        self.0.get()
+    }
+}
+
+/// The authoritative per-aircraft state after the latest step, read from
+/// JSBSim and mapped onto the world grid (all `f64`).
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq)]
+pub struct AircraftState {
+    /// JSBSim's state (geodetic position, attitude, local-level NED velocity,
+    /// body rates, aero angles, true airspeed).
+    pub fdm: FdmState,
+    /// World-grid position (m).
+    pub pos_enu: Enu,
+    /// World-grid position before the latest step (for swept hit tests).
+    pub prev_pos_enu: Enu,
+    /// Velocity relative to the Earth in the world grid (m/s).
+    pub vel_enu: Enu,
 }
 
 /// The shared local-tangent ENU frame all aircraft positions are expressed in.
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct WorldFrame(pub LocalFrame);
 
-/// Resolved fixed-step timing / termination parameters.
+/// Resolved timing / termination / command parameters.
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct SimParams {
     pub rate_hz: f64,
     pub dt: f64,
     /// Stop after this many simulated seconds; `0` runs indefinitely.
     pub max_time_s: f64,
-    /// Throttle each step to real-time (see [`crate::scenario::Sim::realtime`]).
     pub realtime: bool,
+    /// Command lease in ticks; `None` disables it.
+    pub lease_ticks: Option<u64>,
+    pub lockstep: bool,
+    pub lockstep_timeout_s: f64,
 }
+
+/// The sim's clock: the number of completed physics steps. The authoritative
+/// time is `tick * dt`, independent of any one aircraft's FDM.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SimClock {
+    pub tick: u64,
+}
+
+impl SimClock {
+    pub fn time_s(&self, params: &SimParams) -> f64 {
+        self.tick as f64 * params.dt
+    }
+}
+
+/// A fatal error stops all further simulation (the app exits with an error).
+#[derive(Resource, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimStatus {
+    pub fatal: Option<String>,
+}
+
+impl SimStatus {
+    pub fn running(status: Res<SimStatus>) -> bool {
+        status.fatal.is_none()
+    }
+}
+
+/// Aircraft id → entity, built at spawn.
+#[derive(Resource, Debug, Clone, Default)]
+pub struct AircraftIndex(pub HashMap<u32, Entity>);

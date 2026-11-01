@@ -42,8 +42,8 @@ export class UI {
     };
     // Cache the readout value spans (ro-id, ro-lat, …) once.
     this.ro = {};
-    for (const k of ["id", "kind", "time", "lat", "lon", "alt", "e", "n", "u",
-      "hdg", "pitch", "roll", "as", "gs", "vs"]) {
+    for (const k of ["id", "kind", "mode", "time", "lat", "lon", "alt", "e", "n", "u",
+      "hdg", "pitch", "roll", "tas", "gs", "vs", "mach", "aoa", "nz", "team", "hp", "ammo"]) {
       this.ro[k] = $(`ro-${k}`);
     }
 
@@ -146,6 +146,7 @@ export class UI {
   }
 
   // items: [{ id, kind, color }]. Rebuilds only when the fleet/selection changes.
+  // Frame data only ever reaches the DOM through textContent.
   setFleet(items, selectedId) {
     this.selectedId = selectedId;
     this.el.fleetCount.textContent = String(items.length);
@@ -155,14 +156,19 @@ export class UI {
 
     const list = this.el.fleetList;
     list.textContent = "";
+    const span = (cls, text) => {
+      const el = document.createElement("span");
+      el.className = cls;
+      if (text != null) el.textContent = text;
+      return el;
+    };
     for (const it of items) {
       const li = document.createElement("li");
       if (it.id === selectedId) li.className = "sel";
-      li.innerHTML =
-        `<span class="swatch" style="background:${it.color}"></span>` +
-        `<span class="fid">${it.id}</span>` +
-        `<span class="glyph">${KIND_GLYPH[it.kind] || "•"}</span>` +
-        `<span class="fmeta">${it.kind}</span>`;
+      const swatch = span("swatch");
+      swatch.style.background = it.color;
+      li.append(swatch, span("fid", String(it.id)),
+        span("glyph", KIND_GLYPH[it.kind] || "•"), span("fmeta", it.kind));
       li.addEventListener("click", () => this.h.onSelect?.(it.id));
       list.appendChild(li);
     }
@@ -173,21 +179,31 @@ export class UI {
     if (!data) { this.el.readout.classList.add("hidden"); return; }
     this.el.readout.classList.remove("hidden");
     const r = this.ro;
-    r.id.textContent = data.id;
+    r.id.textContent = String(data.id);
     r.kind.textContent = data.kind;
+    r.mode.textContent = data.control_mode;
+    r.mode.className = `mode-tag ${data.control_mode}`;
     r.time.textContent = data.t.toFixed(2);
     r.lat.textContent = data.lat_deg.toFixed(6);
     r.lon.textContent = data.lon_deg.toFixed(6);
-    r.alt.textContent = data.alt_m.toFixed(1);
+    r.alt.textContent = data.alt_hae_m.toFixed(1);
     r.e.textContent = data.enu_e.toFixed(1);
     r.n.textContent = data.enu_n.toFixed(1);
     r.u.textContent = data.enu_u.toFixed(1);
     r.hdg.textContent = data.heading_deg.toFixed(1);
     r.pitch.textContent = data.pitch_deg.toFixed(1);
     r.roll.textContent = data.roll_deg.toFixed(1);
-    r.as.textContent = data.airspeed_mps.toFixed(1);
+    r.tas.textContent = data.tas_mps.toFixed(1);
     r.gs.textContent = data.ground_speed_mps.toFixed(1);
     r.vs.textContent = data.vertical_speed_mps.toFixed(1);
+    r.mach.textContent = data.mach.toFixed(2);
+    r.aoa.textContent = data.alpha_deg.toFixed(1);
+    r.nz.textContent = data.nz_g.toFixed(2);
+    r.team.textContent = String(data.team);
+    r.hp.textContent = data.alive
+      ? `${data.hit_points.toFixed(0)} / ${data.hit_points_max.toFixed(0)}`
+      : "destroyed";
+    r.ammo.textContent = String(data.ammo);
   }
 
   setWsUrl(url) {

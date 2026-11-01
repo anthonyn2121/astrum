@@ -63,8 +63,8 @@ impl Health {
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Team(pub u8);
 
-/// Per-aircraft firing intent for this tick — set by command ingest (or directly
-/// by tests in Phase 1, which has no wire), read by `fire_guns`.
+/// Per-aircraft firing intent for this tick — set by a command's `trigger`,
+/// released by the failsafe, read by `fire_guns`.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Trigger(pub bool);
 
@@ -74,14 +74,16 @@ pub struct Trigger(pub bool);
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Dead;
 
-/// One in-flight round — a lightweight entity, and **never** an FDM entity
-/// (JSBSim is process-global and not thread-safe; §2.3). Its ENU position lives
-/// on the entity's `Transform` (metres, `f32`, like every other object);
-/// velocity and ballistics are `f64` here for integration accuracy.
+/// One in-flight round — a lightweight point-mass entity, never an FDM.
+/// Position and velocity are `f64` in the world grid.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct Bullet {
-    /// Velocity in the ENU world frame (m/s).
-    pub vel_enu: DVec3,
+    /// World-grid position (m) after the latest step.
+    pub pos: DVec3,
+    /// World-grid position before the latest step (the swept hit test's start).
+    pub prev_pos: DVec3,
+    /// World-grid velocity (m/s).
+    pub vel: DVec3,
     /// Drag properties handed to the integrator.
     pub ballistics: Ballistics,
     /// Firing aircraft id and team — excluded from this round's hit tests.

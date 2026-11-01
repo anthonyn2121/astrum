@@ -1,6 +1,8 @@
-# ASTRUM Python style: ruff as both formatter and linter for the controllers
-# (controllers/python, controllers/optimal/python). The Rust side uses
-# rustfmt/clippy; there is no other Python in the tree.
+# ASTRUM Python style: ruff as both formatter and linter for every tracked
+# Python file — controllers/python, controllers/optimal/python and the
+# astrum-env adapter (crates/astrum-env/python). The Rust side uses
+# rustfmt/clippy. `make fmt` / `make fmt-check` / `make lint` pass the file list
+# from `git ls-files`, so untracked local workspaces are never touched.
 line-length = 100
 target-version = "py312"
 

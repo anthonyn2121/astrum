@@ -1,77 +1,68 @@
-// LQR control law (skeleton).
+// LQR control law.
 //
-// Full-state feedback u = -K (x - x_ref) on a linearized model of the aircraft.
-// This file is where *your* control-theory work goes; the runtime
-// (astrum_control) hands you a decoded VehicleState each frame and publishes
-// whatever Command you return.
+// Cascade (see include/attitude_axes.hpp for the models):
+//   outer  astrum::OuterLoops: heading PI -> bank target (|bank| <= --max-bank-deg),
+//          altitude PI -> pitch target (|pitch| <= --max-pitch-deg), airspeed PI ->
+//          throttle; integrators with anti-windup.
+//   inner  discrete LQR per attitude axis, u = -K x with x = [angle - target, rate]:
+//          roll  [phi - bank_t,    p] -> aileron
+//          pitch [theta - pitch_t, q] -> elevator
+//          K = dlqr(A, B, Q, R) of the axis model discretized at the control period
+//          (--rate-hz), computed once at startup; a Riccati recursion that does not
+//          converge aborts startup instead of flying an unconverged gain.
+// Every output is saturated to its actuator range. LQR itself cannot honour hard limits
+// beyond that clamp; --law mpc plans with the actuator bounds.
 //
-// The channels are kept decoupled for clarity (each is a small SISO loop):
-//
-//   lateral      x_lat = [heading_err, roll,  roll_rate ]   -> aileron
-//   longitudinal x_lon = [alt_err,     pitch, pitch_rate]   -> elevator
-//   speed        x_spd = [airspeed_err]                     -> throttle
-//
-// What to do: replace the hand-tuned placeholder gains below with the LQR
-// solution of your own model. Linearize the aircraft about trim to get each
-// channel's (A, B), choose weights (Q, R), and call astrum::dlqr (optimal_math.hpp)
-// to get K. The placeholder gains reproduce the proven example controller's hold
-// law so `--law lqr` flies out of the box while you develop the real thing.
-//
-// Note LQR is *unconstrained*: it can't respect a bank-angle or actuator limit
-// except by weighting. When you need hard limits (max bank, elevator
-// saturation), that's the motivation for `--law mpc`.
+// What to do: identify your aircraft's roll / pitch dynamics, put them in
+// attitude_axes.hpp, and tune Q / R there.
 
-#include <Eigen/Dense>
+#include <memory>
+#include <stdexcept>
+#include <string>
 
-#include "astrum_control.hpp"
-#include "optimal_math.hpp"  // astrum::dlqr — for when you swap in a real model
+#include "attitude_axes.hpp"
+#include "laws.hpp"
 
 namespace astrum {
 namespace {
 
+Eigen::RowVector2d synthesize(const AxisDesign& axis, double dt) {
+  const LinearModel m = axis.model(dt);
+  const DlqrResult r = dlqr(m.A, m.B, axis.Q, axis.R);
+  if (!r.converged) {
+    throw std::runtime_error(std::string("dlqr for the ") + axis.name +
+                             " axis did not converge after " + std::to_string(r.iterations) +
+                             " iterations");
+  }
+  return r.K;
+}
+
 class LqrLaw : public Law {
  public:
+  explicit LqrLaw(const LawConfig& config)
+      : outer_(config.limits),
+        k_roll_(synthesize(roll_axis(), config.dt)),
+        k_pitch_(synthesize(pitch_axis(), config.dt)) {}
+
   Command control(const VehicleState& s, const Reference& ref) override {
-    // Errors relative to the reference (heading wrapped to [-pi, pi]).
-    const double heading_err = wrap_pi(ref.heading_rad - s.yaw);
-    const double alt_err = ref.alt_m - s.alt_m;
-    const double airspeed_err = ref.airspeed_mps - s.airspeed;
-
-    // State vectors, then u = -K x per channel. Signs of K already fold in the
-    // error convention above (positive heading_err -> roll right, etc.).
-    const Eigen::Vector3d x_lat(heading_err, s.roll, s.p);
-    const Eigen::Vector3d x_lon(alt_err, s.pitch, s.q);
-
-    const double aileron = -k_lat_.dot(x_lat);
-    const double elevator = -k_lon_.dot(x_lon);
-    const double throttle = kThrottleTrim - k_spd_ * airspeed_err;
-    const double rudder = 0.0;  // coordinated-turn assumption; not modeled here
-
-    return Command::raw(aileron, elevator, rudder, throttle);
+    const AttitudeTargets target = outer_.update(s, ref);
+    const Eigen::Vector2d x_roll(s.roll - target.bank_rad, s.p);
+    const Eigen::Vector2d x_pitch(s.pitch - target.pitch_rad, s.q);
+    const double aileron = clamp(-k_roll_.dot(x_roll), -1.0, 1.0);
+    const double elevator = clamp(-k_pitch_.dot(x_pitch), -1.0, 1.0);
+    return Command::raw(aileron, elevator, /*rudder=*/0.0, target.throttle);
   }
 
  private:
-  // --- PLACEHOLDER GAINS ---------------------------------------------------
-  // Hand-tuned to match the example controller's proven hold law so the loop
-  // flies today. Replace each with astrum::dlqr(A, B, Q, R) for your linearized
-  // model — e.g. for the lateral channel:
-  //
-  //     const double dt = 1.0 / 120.0;                 // sim rate
-  //     Eigen::Matrix3d A_lat; A_lat << 1, -V*dt, 0,    // heading_err, roll, roll_rate
-  //                                     0,  1,    dt,
-  //                                     0,  0,    1 - a*dt;
-  //     Eigen::Vector3d B_lat(0, 0, b*dt);             // aileron -> roll accel
-  //     Eigen::RowVector3d K_lat = dlqr(A_lat, B_lat, Q_lat, R_ail);
-  //
-  // u = -K x, with x measured relative to the reference.
-  const Eigen::RowVector3d k_lat_{-1.8, 1.5, 0.3};    // [hdg_err, roll, roll_rate] -> aileron
-  const Eigen::RowVector3d k_lon_{0.02, -2.0, -0.5};  // [alt_err, pitch, pitch_rate] -> elevator
-  const double k_spd_ = -0.02;                        // [airspeed_err] -> (throttle - trim)
-  static constexpr double kThrottleTrim = 0.6;
+  OuterLoops outer_;
+  Eigen::RowVector2d k_roll_;
+  Eigen::RowVector2d k_pitch_;
 };
 
 }  // namespace
 
-std::unique_ptr<Law> make_lqr_law(const Cli&) { return std::make_unique<LqrLaw>(); }
+std::unique_ptr<Law> make_lqr_law(const LawConfig& config) {
+  return std::make_unique<LqrLaw>(config);
+}
 
 }  // namespace astrum

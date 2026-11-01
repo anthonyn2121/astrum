@@ -1,0 +1,122 @@
+"""Cross-language wire fixtures (``crates/astrum-proto/tests/fixtures``).
+
+``values.json`` holds canonical values; each language writes
+``<kind>.<lang>.bin`` and every language's test decodes every file present and
+compares it to ``values.json`` exactly. Write the Python files with::
+
+    python -m astrum_client.wire_fixture [--dir DIR] [--schema PATH]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+from astrum_client.wire import (
+    AutopilotTargets,
+    Command,
+    ControlMode,
+    RawActuators,
+    VehicleKind,
+    VehicleState,
+    encode_command,
+    encode_telemetry,
+    load_schema,
+)
+
+KINDS = ("telemetry", "command_raw", "command_autopilot")
+LANGS = ("rust", "cpp", "python")
+
+_VEHICLE_KINDS = {"fixed-wing": VehicleKind.FIXED_WING, "multirotor": VehicleKind.MULTIROTOR}
+_CONTROL_MODES = {m.name.lower(): m for m in ControlMode}
+
+
+def default_fixtures_dir() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normpath(
+        os.path.join(here, "..", "..", "..", "crates", "astrum-proto", "tests", "fixtures")
+    )
+
+
+def load_values(fixtures_dir: str) -> dict:
+    with open(os.path.join(fixtures_dir, "values.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def expected_telemetry(v: dict) -> VehicleState:
+    pos, venu, vned = v["pos_enu"], v["vel_enu"], v["vel_ned"]
+    att, rates, aero, combat = v["attitude"], v["rates"], v["aero"], v["combat"]
+    return VehicleState(
+        aircraft_id=v["aircraft_id"],
+        tick=v["tick"],
+        t=v["sim_time_s"],
+        lat_deg=v["lat_deg"],
+        lon_deg=v["lon_deg"],
+        alt_m=v["alt_hae_m"],
+        e=pos["e"],
+        n=pos["n"],
+        u=pos["u"],
+        vel_ned_n=vned["n"],
+        vel_ned_e=vned["e"],
+        vel_ned_d=vned["d"],
+        vel_enu_e=venu["e"],
+        vel_enu_n=venu["n"],
+        vel_enu_u=venu["u"],
+        roll=att["phi_rad"],
+        pitch=att["theta_rad"],
+        yaw=att["psi_rad"],
+        p=rates["p_rad_s"],
+        q=rates["q_rad_s"],
+        r=rates["r_rad_s"],
+        airspeed=v["tas_mps"],
+        alpha=aero["alpha_rad"],
+        beta=aero["beta_rad"],
+        nz_g=aero["nz_g"],
+        mach=aero["mach"],
+        fault_flags=v["fault_flags"],
+        vehicle_kind=_VEHICLE_KINDS[v["vehicle_kind"]],
+        control_mode=_CONTROL_MODES[v["control_mode"]],
+        team=combat["team"],
+        hit_points=float(combat["hit_points"]),
+        hit_points_max=float(combat["hit_points_max"]),
+        alive=combat["alive"],
+        ammo=combat["ammo"],
+    )
+
+
+def expected_command(v: dict) -> Command:
+    ctrl = v["control"]
+    if "raw" in ctrl:
+        r = ctrl["raw"]
+        control = RawActuators(r["aileron"], r["elevator"], r["rudder"], r["throttle"])
+    else:
+        a = ctrl["autopilot"]
+        control = AutopilotTargets(a["heading_rad"], a["alt_hae_m"], a["tas_mps"])
+    return Command(v["target_id"], v["seq"], v["telemetry_tick"], v["trigger"], control)
+
+
+def encode_kind(schema, kind: str, values: dict) -> bytes:
+    if kind == "telemetry":
+        return encode_telemetry(schema, expected_telemetry(values[kind]))
+    return encode_command(schema, expected_command(values[kind]))
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="Write the Python wire fixtures (<kind>.python.bin).")
+    p.add_argument("--dir", default=default_fixtures_dir(), help="fixtures directory")
+    p.add_argument("--schema", default=None, help="path to astrum.capnp")
+    args = p.parse_args(argv)
+    schema = load_schema(args.schema)
+    values = load_values(args.dir)
+    for kind in KINDS:
+        path = os.path.join(args.dir, f"{kind}.python.bin")
+        with open(path, "wb") as f:
+            f.write(encode_kind(schema, kind, values))
+        print(f"wrote {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,66 +1,110 @@
 # astrum-env
 
-Python bindings for the embedded ASTRUM reinforcement-learning **dogfight
-environment** (design doc §8). A thin [pyo3](https://pyo3.rs) marshalling layer
-over the plain-Rust seam [`astrum_sim::env::SimEnv`] — all the ECS/JSBSim work
-lives in `astrum-sim`; this crate only converts types across the FFI boundary.
-
-## Two layers
+Python bindings (`astrum_env`) for the embedded ASTRUM multi-agent environment,
+plus the numpy-only Gymnasium dogfight adapter (`python/astrum_dogfight`). The
+binding is a thin [PyO3](https://pyo3.rs) marshalling layer over
+[`astrum_sim::env::SimEnv`]: all ECS/JSBSim work lives in `astrum-sim`; this crate
+moves observations and actions as NumPy arrays and runs the sim with the GIL
+released.
 
 | Layer | Where | What |
 |-------|-------|------|
-| 1. Rust seam | `astrum-sim/src/env.rs` (`SimEnv`, `Action`, `AgentObs`, `StepResult`) | Multi-agent `reset`/`step`/`observe` over one headless sim. No pyo3; tested by `astrum-sim/tests/env.rs`. |
-| 2. Python binding | this crate (`DogfightEnv`, `Observation`, `StepInfo`) | `#[pyclass]` wrappers; validated by `python/smoke.py`. |
+| Rust seam | `astrum-sim/src/env.rs` (`SimEnv`) | Multi-agent `reset`/`step`/`observe`, fire control, attitude rotations. Tested by `cargo test`. |
+| Python binding | `src/lib.rs` (`Env`, `BatchEnv`, `StepInfo`, `FixedWingAutopilot`, `MultirotorAutopilot`) | NumPy in/out; validated by `python/smoke.py`. |
+| Gym adapter | `python/astrum_dogfight` | Observation vector, reward, episode boundaries, scripted Tier-1/2/3 opponents. Tested by `python/test_dogfight_env.py`. |
 
-Keeping the sim logic in layer 1 means it stays exercisable from `cargo test`
-(no Python), and the binding stays a trivial, low-risk shim.
+## API
 
-## Environment shape (PettingZoo-style, multi-agent)
+```python
+import astrum_env, numpy as np
 
-- **Action** per agent: `[aileron, elevator, rudder, throttle, trigger]`.
-  Continuous channels are clamped (surfaces `[-1,1]`, throttle `[0,1]`); `trigger`
-  is a **learned** fire gate (thresholded at `>= 0.5`) — the policy learns *when*
-  to shoot, it is not auto-aimed (design doc §8).
-- **Observation** per agent (`Observation`): id, team, alive, ENU position, NED
-  velocity, attitude (φ/θ/ψ), body rates (p/q/r), airspeed, altitude, health,
-  ammo, sim time. Relative geometry / gun-solution / normalisation are the
-  trainer's job, computed from these absolute fields.
-- **Episode flags** (`StepInfo`): `terminated` (engagement decided — ≥2 teams
-  started, ≤1 alive), `truncated` (hit `sim.max_time_s`).
+env = astrum_env.Env(scenario_toml)          # scenario TOML v2
+env.agent_ids                                # sorted ids = row order of every array
+env.dt                                       # physics step (s) = 1 / sim.rate_hz
+obs = env.reset(seed=3)                      # (n, len(OBS_FIELDS)) float64; tick 1
+obs = env.reset(scenario_toml=other_toml)    # next episode in a new scenario, same Env
+obs, info = env.step(actions)                # actions (n, 5); info: StepInfo
+obs, info = env.step(actions, autopilot=ap, commanded=mask)
+env.observe()                                # latest obs without stepping
+env.gun_solution(shooter, target)            # sim fire control, dict or None (unarmed)
+env.body_to_grid(id, v); env.grid_to_body(id, v)
 
-One `step()` is exactly one physics tick (`dt = 1/rate_hz`; the sim has no
-`FixedUpdate`). `reset()` is deterministic for a fixed scenario + `sim.seed`.
-
-## Parallelism (hard constraint)
-
-JSBSim is process-global and **not thread-safe**, so `DogfightEnv` is
-`#[pyclass(unsendable)]` — pinned to its creating thread. Scale training with
-**separate processes** (Gymnasium `AsyncVectorEnv` / SB3 `SubprocVecEnv`), one
-env per worker — **never** OS threads. Within a process the env is inherently
-multi-agent (N aircraft step together on one FDM-sequential app), which is what
-self-play / NvN needs.
-
-## Build & run (inside the dev container)
-
-```bash
-# Build the extension module + run the Python smoke test:
-bash crates/astrum-env/python/run_smoke.sh
+batch = astrum_env.BatchEnv([scenario_toml] * 16)
+obs = batch.reset(seeds=list(range(16)))     # (K, n, F)
+obs, terminated, truncated, tick = batch.step(actions)   # actions (K, n, 5)
 ```
 
-`run_smoke.sh` runs `cargo build -p astrum-env --release`, then stages the
-resulting `target/release/libastrum_env.so` as `astrum_env.so` on `PYTHONPATH`
-and runs `python/smoke.py`.
+- **Actions** `(n, 5)`: `[aileron, elevator, rudder, throttle, trigger]` per row
+  (surfaces `[-1, 1]`, throttle `[0, 1]`, trigger fires at `>= 0.5` — a learned
+  fire gate, not auto-aim). Optional `autopilot` `(n, 4)` =
+  `[engage, heading_rad, alt_hae_m, tas_mps]` replaces the raw channels where
+  `engage >= 0.5`. Rows with `commanded[i] == False` send nothing (the aircraft
+  keeps its last command until the raw-command lease expires).
+- **Observations** `(n, F)`, columns `astrum_env.OBS_FIELDS`: `id`, `team`,
+  `alive`, `vehicle_kind` / `control_mode` (codes index `VEHICLE_KINDS` /
+  `CONTROL_MODES`), `tick`, `sim_time_s`, `lat_deg`, `lon_deg`, `alt_hae_m`,
+  world-grid ENU position `pos_e/n/u` and velocity `vel_e/n/u`, local-level NED
+  velocity `vel_ned_n/e/d`, attitude `phi/theta/psi`, body rates `p/q/r`,
+  `alpha`, `beta`, `nz`, `mach`, `tas` (true airspeed), `hit_points`,
+  `hit_points_max`, `ammo`. SI units, radians. Use the grid columns for relative
+  geometry and the NED columns only where local level is meant.
+- **`StepInfo`**: `terminated` (≥ 2 teams started, ≤ 1 has a living aircraft),
+  `truncated` (`sim.max_time_s` reached), `tick`, `sim_time_s`, `done()`.
+- **`gun_solution`** is the sim's own round model (drag, gravity, velocity
+  inheritance, muzzle offset): `miss_m`, `tof_s` (boresight round), `hit`,
+  `aim_dir` (grid unit vector), `aim_error_rad`, `in_range`. Gun/combat constants
+  are exported: `HIT_RADIUS_M`, `BULLET_TTL_S`, `DAMAGE_PER_HIT`,
+  `MUZZLE_SPEED_MPS`, `GUN_RATE_HZ`, `GUN_AMMO`.
+- **`body_to_grid` / `grid_to_body`** rotate between body axes (x nose,
+  y starboard, z down) and the world grid, including the local-level tilt away
+  from the grid origin.
+- **Autopilot laws**: `FixedWingAutopilot("trainer" | "fighter", env.dt)` and
+  `MultirotorAutopilot(env.dt)` are the sim's built-in laws, `step(obs_row, ...)`
+  → `[aileron, elevator, rudder, throttle]`. They are stateful (PI integrators):
+  one instance per aircraft, `reset()` between episodes. `wrap_pi` is the sim's
+  angle wrap.
+
+One `step()` is one physics tick. `reset(seed=s)` is deterministic: the same
+scenario and seed reproduce the episode bit-for-bit (also across `BatchEnv`).
+
+## Gym adapter (`astrum_dogfight`)
+
+`DogfightGymEnv` (and `make_tier1_env` / `make_tier2_env` / `make_tier3_env`)
+is single-agent from the trainer's view against a scripted opponent. It follows
+Gymnasium seeding (`reset(seed=s)` reseeds `np_random`, which draws each
+episode's sim seed) and changes scenario per episode with
+`reset(options={"scenario_toml": toml})`. Lead, range and fire decisions use
+`Env.gun_solution`; attitude uses `Env.body_to_grid`; the opponents' level hold is
+`FixedWingAutopilot("fighter", env.dt)`. The hard deck and ceiling are heights
+above the ellipsoid — the env has no terrain model. It subclasses
+`gymnasium.Env` when gymnasium is installed and runs without it otherwise.
+
+## Threading and parallelism
+
+`Env` is thread-safe and releases the GIL during construction, `reset` and
+`step`, so several `Env`s can be driven from Python threads concurrently.
+`BatchEnv` steps its K envs in parallel (rayon) inside one call — the cheapest
+way to vectorize. Process-level parallelism (Gymnasium `AsyncVectorEnv`, SB3
+`SubprocVecEnv`) works as well.
+
+## Build & test (inside the dev image)
+
+```bash
+S=$(bash scripts/build-astrum-env.sh)        # builds the cdylib, prints the stage dir
+export PYTHONPATH=$S:crates/astrum-env/python
+python crates/astrum-env/python/smoke.py     # binding smoke
+pytest -q crates/astrum-env/python           # adapter tests
+make test-python                             # all Python suites, incl. the two above
+```
+
+`scripts/build-astrum-env.sh` runs `cargo build --release -p astrum-env` and
+copies `target/release/libastrum_env.so` to `<stage>/astrum_env.so`
+(default `target/python`, override with `ASTRUM_ENV_STAGE`).
 
 ### Toolchain notes
 
-- The pyo3 features `extension-module` + `abi3-py38` mean the build needs **no
-  `python3-dev` headers and no `maturin`** and does **not** link libpython — the
-  interpreter resolves those symbols at import time. Plain `cargo build` + a
-  rename to `astrum_env.so` is enough for the seam. (The dev image has `python3`
-  on `PATH`, which pyo3's build script probes for the ABI config.)
+- PyO3's `extension-module` + `abi3` features mean the build needs no
+  `python3-dev` headers and no `maturin`, and does not link libpython — the
+  interpreter resolves those symbols at import time.
 - `[lib] test = false` keeps `cargo test --workspace` from building a test
   harness for this cdylib (which would fail to link, libpython being undefined).
-- For a real install/packaging step later, `maturin develop` / `maturin build`
-  would produce a proper wheel that names the `.so` correctly and installs it
-  into the venv — not required to use the seam, but the natural next step for
-  distribution. (`maturin` is not yet in the dev image.)

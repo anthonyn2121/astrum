@@ -54,12 +54,13 @@ export function attitudeToQuaternion(phi, theta, psi, out = new THREE.Quaternion
   return out.setFromRotationMatrix(_m);
 }
 
-// Deterministic, distinct-per-aircraft colour within a per-class hue band.
+// Deterministic, distinct-per-aircraft colour within a per-class hue band; an
+// unknown vehicle class (a newer sim) renders as a desaturated jet.
 export function aircraftColor(kind, id) {
   const baseHue = kind === "multirotor" ? 32 : 205; // amber vs. steel blue
   const jitter = ((id * 47) % 70) - 35;             // ±35° spread across the fleet
   const c = new THREE.Color();
-  c.setHSL((((baseHue + jitter) % 360) + 360) % 360 / 360, 0.62, 0.58);
+  c.setHSL((((baseHue + jitter) % 360) + 360) % 360 / 360, kind === "unknown" ? 0.08 : 0.62, 0.58);
   return c;
 }
 

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astrum-client"
+version = "2.0.0"
+description = "Shared Python client for ASTRUM controllers: Zenoh session, latest-value telemetry, Cap'n Proto wire (schema v2)."
+requires-python = ">=3.12"
+# Versions are pinned by the dev image (docker/Dockerfile); eclipse-zenoh must
+# match the Rust zenoh crate's protocol version.
+dependencies = ["eclipse-zenoh", "pycapnp"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["astrum_client"]

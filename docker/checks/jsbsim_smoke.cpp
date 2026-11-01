@@ -12,7 +12,7 @@
 #include <iostream>
 
 int main() {
-    JSBSim::FGFDMExec fdm;
-    std::cout << "[jsbsim-smoke] libJSBSim linked and FGFDMExec constructed OK\n";
-    return 0;
+  JSBSim::FGFDMExec fdm;
+  std::cout << "[jsbsim-smoke] libJSBSim linked and FGFDMExec constructed OK\n";
+  return 0;
 }

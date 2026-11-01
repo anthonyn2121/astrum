@@ -1,6 +1,7 @@
-# ASTRUM C++ style: Google, widened to 100 columns to match the hand-written
-# controllers. Applies to controllers/cpp and controllers/optimal/cpp; the Rust
-# side is formatted by rustfmt (see rustfmt.toml).
+# ASTRUM C++ style: Google, widened to 100 columns. Applies to every tracked
+# C++ file (controllers, the astrum-fdm JSBSim shim, docker/checks) via
+# `make fmt` / `make fmt-check`; the Rust side is formatted by rustfmt
+# (see rustfmt.toml).
 BasedOnStyle: Google
 ColumnLimit: 100
 DerivePointerAlignment: false

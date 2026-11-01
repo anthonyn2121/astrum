@@ -201,15 +201,35 @@ export class Scene {
     this._mapTried = false;
   }
 
+  // Drop every aircraft and free all of its GPU resources: geometries,
+  // materials (shared ones once) and textures (the canvas label sprites).
+  // Sprites share one three.js-owned quad geometry, which stays.
   clearFleet() {
+    const geometries = new Set(), materials = new Set();
+    const collect = (o) => {
+      if (o.geometry && !o.isSprite) geometries.add(o.geometry);
+      if (o.material) for (const m of [].concat(o.material)) materials.add(m);
+    };
     for (const { group, trail } of this.fleet.values()) {
       this.scene.remove(group);
       this.scene.remove(trail.line);
-      trail.geom.dispose();
+      group.traverse(collect);
+      collect(trail.line);
     }
+    for (const g of geometries) g.dispose();
+    for (const m of materials) { m.map?.dispose(); m.dispose(); }
     this.fleet.clear();
     this.selectedId = null;
     this._clearMap(); // a new source may sit at a different datum
+  }
+
+  // Forget every trail (after a seek, so no chord joins the old and new spot).
+  resetTrails() {
+    for (const { trail } of this.fleet.values()) {
+      trail.count = 0;
+      trail.last.set(NaN, NaN, NaN);
+      trail.geom.setDrawRange(0, 0);
+    }
   }
 
   setSelected(id) {
@@ -277,8 +297,8 @@ export class Scene {
       a.group.quaternion.copy(_q);
       a.group.visible = true;
 
-      // Stale (outside this track's window) → ghost it.
-      const opacity = inRange ? 1.0 : 0.28;
+      // Stale (outside this track's window) or destroyed → ghost it.
+      const opacity = inRange && s.alive ? 1.0 : 0.28;
       for (const m of a.group.userData.mats) {
         m.transparent = opacity < 1;
         m.opacity = opacity;

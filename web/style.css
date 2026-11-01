@@ -76,8 +76,10 @@ input[type="text"] { background: rgba(0,0,0,0.35); cursor: text; min-width: 220p
 .pill.closed, .pill.error { color: var(--live); border-color: #ff5a4d55; }
 
 /* ---- Side panels ---- */
+/* Bottom 110px stay clear for the transport (58px) and the toggle row above it,
+   so a tall readout never runs under the toggles on a laptop-height window. */
 aside {
-  position: fixed; width: 230px; max-height: calc(100vh - 130px);
+  position: fixed; width: 230px; max-height: calc(100vh - 170px);
   background: var(--panel); backdrop-filter: blur(8px);
   border: 1px solid var(--line); border-radius: 12px;
   overflow: hidden auto;
@@ -108,21 +110,25 @@ aside {
 #fleetList .fmeta { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
 #fleetList .glyph { font-size: 12px; opacity: 0.8; }
 
-.kind-tag {
-  margin: 10px 12px 4px; padding: 3px 8px; display: inline-block;
+.tags { margin: 10px 12px 4px; display: flex; gap: 6px; }
+.kind-tag, .mode-tag {
+  padding: 3px 8px; display: inline-block;
   border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase;
   letter-spacing: 0.5px; background: var(--accent-dim); color: var(--accent);
 }
+.mode-tag.raw, .mode-tag.autopilot { color: var(--ok); }
+.mode-tag.failsafe { color: var(--live); }
+.mode-tag.uncommanded, .mode-tag.unknown { color: var(--muted); }
 #readout dl { margin: 6px 12px 14px; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
 #readout dt { color: var(--muted); }
 #readout dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 #readout dt.sep { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
 #readout dt.sep + dd { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
 
-/* ---- Toggles ---- */
+/* ---- Toggles (one row, bottom-right, above the transport) ---- */
 #toggles {
   position: fixed; right: 12px; bottom: 66px;
-  display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+  display: flex; gap: 6px; align-items: center;
 }
 #toggles label {
   background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
@@ -143,9 +149,9 @@ button.live.active { background: var(--live); border-color: var(--live); color: 
 #scrub { flex: 1; accent-color: var(--accent); cursor: pointer; }
 #fps { min-width: 58px; text-align: right; }
 
-/* ---- Map attribution (bottom-right, above the transport) ---- */
+/* ---- Map attribution (bottom-left, above the transport; the toggles hold the right) ---- */
 #mapAttribution {
-  position: fixed; right: 10px; bottom: 64px; z-index: 5;
+  position: fixed; left: 10px; bottom: 64px; z-index: 5;
   font-size: 11px; color: rgba(200,214,230,0.6);
   background: rgba(10,14,20,0.5); padding: 2px 7px; border-radius: 5px;
   pointer-events: none; user-select: none;

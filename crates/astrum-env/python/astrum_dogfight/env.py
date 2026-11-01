@@ -1,10 +1,14 @@
 """`DogfightGymEnv` — the Gymnasium-compatible training adapter (design doc §8).
 
-Single-agent from the trainer's view: the learner flies one f16, a **scripted**
-opponent (`opponent.Tier1Opponent` by default) flies the other, driven internally
-through the same raw action interface. Wraps `astrum_env.DogfightEnv` and adds the
-observation vector (§8.2), reward/penalties (§8.3), and the wrapper-enforced
-boundaries (§8.4).
+Single-agent from the trainer's view: the learner flies one f16, a scripted
+opponent (`opponent.Tier1Opponent` by default) flies the other through the same
+raw action matrix. Wraps `astrum_env.Env` and adds the observation vector
+(§8.2), reward/penalties (§8.3) and the wrapper-enforced boundaries (§8.4).
+
+Seeding follows Gymnasium: `reset(seed=s)` reseeds `self.np_random`; every reset
+draws the episode's sim seed from it and passes it to `Env.reset(seed=...)`, so a
+seeded first reset fixes the whole sequence of episodes. A new scenario for the
+next episode is `reset(options={"scenario_toml": toml})` (same env, no rebuild).
 
 numpy-only: subclasses `gymnasium.Env` iff gymnasium is importable, else exposes
 the identical surface over a tiny space shim so it runs in the offline container.
@@ -17,7 +21,7 @@ import numpy as np
 
 from . import constants as C
 from . import reward as _reward
-from .geometry import AState, build_observation
+from .geometry import AState, GunSolution, build_observation, relative
 from .opponent import Tier1Opponent, Tier2Opponent, Tier3Opponent
 from .scenario import tier1_scenario, tier3_scenario
 
@@ -27,9 +31,11 @@ try:  # Gymnasium is optional — present it if installed, shim it otherwise.
 
     _Base = _gym.Env
     _HAS_GYM = True
-except Exception:  # pragma: no cover - exercised only in the minimal container
+except ImportError:  # pragma: no cover - exercised only in the minimal container
     _Base = object
     _HAS_GYM = False
+
+_SIM_SEED_BOUND = 2**63
 
 
 class _Box:
@@ -40,11 +46,15 @@ class _Box:
         self.high = np.broadcast_to(np.asarray(high, np.float32), shape).copy()
         self.shape = tuple(shape)
         self.dtype = np.float32
+        self._rng = np.random.default_rng()
+
+    def seed(self, seed=None) -> None:
+        self._rng = np.random.default_rng(seed)
 
     def sample(self) -> np.ndarray:
         lo = np.where(np.isfinite(self.low), self.low, -1.0)
         hi = np.where(np.isfinite(self.high), self.high, 1.0)
-        return np.random.uniform(lo, hi).astype(np.float32)
+        return self._rng.uniform(lo, hi).astype(np.float32)
 
     def contains(self, x) -> bool:
         x = np.asarray(x)
@@ -74,106 +84,140 @@ class DogfightGymEnv(_Base):
         learner_id: int = 1,
         opponent_id: int | None = None,
         opponent=None,
-        ground_alt: float = 0.0,
         gamma: float = C.GAMMA,
     ):
         super().__init__()
-        self._env = astrum_env.DogfightEnv(scenario_toml or tier1_scenario())
-        ids = self._env.agent_ids()
-        if learner_id not in ids:
-            raise ValueError(f"learner_id {learner_id} not in scenario ids {ids}")
+        self._env = astrum_env.Env(scenario_toml or tier1_scenario())
         self.learner_id = learner_id
-        if opponent_id is None:
-            others = [i for i in ids if i != learner_id]
-            if len(others) != 1:
-                raise ValueError(f"expected exactly one opponent, got ids {ids}")
-            opponent_id = others[0]
-        self.opponent_id = opponent_id
+        self._requested_opponent = opponent_id
+        self._bind_ids()
         self.opponent = opponent or Tier1Opponent()
-        self.ground_alt = ground_alt
         self.gamma = gamma
+        if not _HAS_GYM:
+            self.np_random = np.random.default_rng()
 
         self.observation_space = _box(-np.inf, np.inf, (C.OBS_DIM,))
         # [aileron, elevator, rudder] ∈ [-1,1]; throttle, trigger ∈ [0,1].
         self.action_space = _box(
             [-1.0, -1.0, -1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0, 1.0], (C.ACTION_DIM,)
         )
-        self._states: dict[int, AState] = {}
+        self._actions = np.zeros((len(self._env.agent_ids), C.ACTION_DIM))
 
     # -- helpers -----------------------------------------------------------
-    def _snapshot(self, obs_list) -> dict[int, AState]:
-        return {int(o.id): AState.from_obs(o) for o in obs_list}
+    def _bind_ids(self) -> None:
+        ids = list(self._env.agent_ids)
+        if self.learner_id not in ids:
+            raise ValueError(f"learner_id {self.learner_id} not in scenario ids {ids}")
+        opp = self._requested_opponent
+        if opp is None:
+            others = [i for i in ids if i != self.learner_id]
+            if len(others) != 1:
+                raise ValueError(f"expected exactly one opponent, got ids {ids}")
+            opp = others[0]
+        elif opp not in ids:
+            raise ValueError(f"opponent_id {opp} not in scenario ids {ids}")
+        self.opponent_id = opp
+        self._li = ids.index(self.learner_id)
+        self._oi = ids.index(opp)
 
-    def _obs_vec(self) -> np.ndarray:
-        return build_observation(
-            self._states[self.learner_id], self._states[self.opponent_id], self.ground_alt
-        )
+    def _snapshot(self, obs: np.ndarray) -> None:
+        self._me = AState.from_env(self._env, obs[self._li])
+        self._bandit = AState.from_env(self._env, obs[self._oi])
+        self._gun_me = GunSolution.query(self._env, self.learner_id, self.opponent_id)
+        self._gun_opp = GunSolution.query(self._env, self.opponent_id, self.learner_id)
+        self._rg = relative(self._me, self._bandit, self._gun_me)
+
+    @property
+    def sim(self) -> astrum_env.Env:
+        """The wrapped `astrum_env.Env` (read access: gun_solution, rotations)."""
+        return self._env
+
+    @property
+    def dt(self) -> float:
+        return self._env.dt
+
+    @property
+    def scenario_toml(self) -> str:
+        return self._env.scenario_toml
+
+    def aircraft(self, aircraft_id: int) -> AState:
+        """The latest snapshot of the learner or the opponent."""
+        if aircraft_id == self.learner_id:
+            return self._me
+        if aircraft_id == self.opponent_id:
+            return self._bandit
+        raise KeyError(aircraft_id)
 
     # -- Gymnasium API -----------------------------------------------------
     def reset(self, *, seed=None, options=None):
-        # The scenario carries its own deterministic sim.seed; reset seed is a no-op.
-        self._states = self._snapshot(self._env.reset())
-        self.opponent.reset(self._states[self.opponent_id])
-        return self._obs_vec(), {}
+        if _HAS_GYM:
+            super().reset(seed=seed)
+        else:
+            if seed is not None:
+                self.np_random = np.random.default_rng(seed)
+        sim_seed = int(self.np_random.integers(_SIM_SEED_BOUND))
+        scenario = (options or {}).get("scenario_toml")
+        obs = self._env.reset(seed=sim_seed, scenario_toml=scenario)
+        if scenario is not None:
+            self._bind_ids()
+            self._actions = np.zeros((len(self._env.agent_ids), C.ACTION_DIM))
+        self._snapshot(obs)
+        self.opponent.reset(self._bandit, self._env.dt)
+        return build_observation(self._me, self._bandit, self._rg), {"sim_seed": sim_seed}
 
     def step(self, action):
-        action = np.asarray(action, dtype=np.float64).reshape(-1)
-        me_prev = self._states[self.learner_id]
-        bandit_prev = self._states[self.opponent_id]
+        me_prev, bandit_prev, rg_prev = self._me, self._bandit, self._rg
+        self._actions[self._li] = np.asarray(action, dtype=np.float64).reshape(-1)[: C.ACTION_DIM]
+        self._actions[self._oi] = self.opponent.act(bandit_prev, me_prev, self._gun_opp)
+        obs, info = self._env.step(self._actions)
+        self._snapshot(obs)
 
-        opp_action = self.opponent.act(bandit_prev, me_prev)
-        actions = [
-            (self.learner_id, [float(x) for x in action[: C.ACTION_DIM]]),
-            (self.opponent_id, [float(x) for x in opp_action]),
-        ]
-        obs_list, info = self._env.step(actions)
-        self._states = self._snapshot(obs_list)
-        me = self._states[self.learner_id]
-        bandit = self._states[self.opponent_id]
-
-        r = _reward.compute(me_prev, bandit_prev, me, bandit, self.ground_alt, self.gamma)
-        terminated = r.terminated or bool(info.terminated)
-        truncated = r.truncated or bool(info.truncated)
+        r = _reward.compute(
+            me_prev, bandit_prev, self._me, self._bandit, rg_prev, self._rg, self.gamma
+        )
         info_out = {
             **r.info,
-            "sim_terminated": bool(info.terminated),
-            "sim_truncated": bool(info.truncated),
-            "sim_time_s": float(info.sim_time_s),
+            "sim_terminated": info.terminated,
+            "sim_truncated": info.truncated,
+            "sim_time_s": info.sim_time_s,
         }
-        return self._obs_vec(), float(r.reward), terminated, truncated, info_out
+        return (
+            build_observation(self._me, self._bandit, self._rg),
+            float(r.reward),
+            r.terminated or info.terminated,
+            r.truncated or info.truncated,
+            info_out,
+        )
 
 
 def make_tier1_env(**scenario_kwargs) -> DogfightGymEnv:
-    """Convenience: a Tier-1 (straight-and-level dummy) dogfight env."""
+    """A Tier-1 (straight-and-level dummy) dogfight env."""
     return DogfightGymEnv(tier1_scenario(**scenario_kwargs))
 
 
 def make_tier2_env(*, maneuver: str = "break", **scenario_kwargs) -> DogfightGymEnv:
-    """Convenience: a Tier-2 (predictable defensive maneuvers) dogfight env.
+    """A Tier-2 (predictable defensive maneuvers) dogfight env.
 
-    The opponent starts on the learner's tail-side (same setup as Tier 1) and, on
-    detecting the learner in its rear hemisphere, breaks or Split-Ses away.
+    The opponent starts ahead of the learner (Tier-1 geometry) and, on detecting
+    it in its rear hemisphere, breaks or Split-Ses away.
     `maneuver` ∈ {"break", "split_s", "alternate"}.
     """
-    rate_hz = scenario_kwargs.get("rate_hz", 120.0)
-    opponent = Tier2Opponent(maneuver=maneuver, dt=1.0 / rate_hz)
-    return DogfightGymEnv(tier1_scenario(**scenario_kwargs), opponent=opponent)
+    return DogfightGymEnv(
+        tier1_scenario(**scenario_kwargs), opponent=Tier2Opponent(maneuver=maneuver)
+    )
 
 
 def make_tier3_env(*, posture: str = "offensive", **scenario_kwargs) -> DogfightGymEnv:
-    """Convenience: a Tier-3 (FSM tactician + WEZ gun) dogfight env.
+    """A Tier-3 (FSM tactician + WEZ gun) dogfight env.
 
     `posture` picks the starting geometry: "offensive" puts the shooting bot on the
     learner's six (`tier3_scenario`); "defensive" puts it ahead with the learner on
-    its tail (`tier1_scenario`), so the bot opens by breaking. The opponent is a
-    `Tier3Opponent` either way.
+    its tail (`tier1_scenario`), so the bot opens by breaking.
     """
-    rate_hz = scenario_kwargs.get("rate_hz", 120.0)
-    opponent = Tier3Opponent(dt=1.0 / rate_hz)
     if posture == "offensive":
         scenario = tier3_scenario(**scenario_kwargs)
     elif posture == "defensive":
         scenario = tier1_scenario(**scenario_kwargs)
     else:
         raise ValueError(f"unknown posture {posture!r}")
-    return DogfightGymEnv(scenario, opponent=opponent)
+    return DogfightGymEnv(scenario, opponent=Tier3Opponent())

@@ -1,186 +1,299 @@
-//! ASTRUM simulation systems: fleet spawn (startup) and the fixed-step update
-//! chain that drives every aircraft's flight dynamics and derives its ENU pose.
+//! Fleet spawn (startup) and the per-tick physics systems: stepping every FDM
+//! (in parallel), the sim clock, progress reporting, pacing and termination.
 
-use astrum_fdm::{prop, Fdm, FT_TO_M};
-use astrum_geo::Geodetic;
-use bevy::prelude::*;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::combat::{Gun, Health, Team, Trigger};
-use crate::components::{Aircraft, FdmInstance, GeoState, SimParams, VehicleKind, WorldFrame};
-use crate::net::{AutopilotState, FixedWingGains};
-use crate::scenario::Scenario;
+use astrum_fdm::{prop, Controls, Fdm, FdmError, InitialConditions, TrimMode};
+use astrum_geo::{Enu, Geodetic, LocalFrame, Ned};
+use bevy::prelude::*;
+
+use crate::combat::{Dead, Gun, Health, Team, Trigger};
+use crate::components::{
+    Aircraft, AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus,
+    VehicleKind, WorldFrame,
+};
+use crate::pilot::{FixedWingGains, Pilot};
+use crate::scenario::{AircraftClass, AircraftSpec, Scenario};
 
 /// JSBSim data root (`aircraft/`, `engine/`, `systems/`).
-fn jsbsim_root() -> String {
-    std::env::var("JSBSIM_ROOT").unwrap_or_else(|_| "/opt/jsbsim/share/jsbsim".into())
+pub fn jsbsim_root() -> PathBuf {
+    std::env::var_os("JSBSIM_ROOT").map(PathBuf::from).unwrap_or("/opt/jsbsim/share/jsbsim".into())
 }
 
-/// Startup: instantiate one FDM-owning entity per scenario aircraft.
-pub fn spawn_fleet(mut commands: Commands, scenario: Res<Scenario>, params: Res<SimParams>) {
-    let root = jsbsim_root();
-    let mut spawned = 0u32;
+/// Per-aircraft JSBSim random seed derived from the scenario seed, so every
+/// instance's noise is reproducible and distinct.
+fn fdm_seed(scenario_seed: u64, id: u32) -> f64 {
+    let mixed = scenario_seed ^ (u64::from(id).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    (mixed % (1 << 31)) as f64
+}
 
+fn initial_conditions(spec: &AircraftSpec) -> InitialConditions {
+    InitialConditions {
+        lat_geod_deg: spec.lat_deg,
+        lon_deg: spec.lon_deg,
+        alt_hae_m: spec.alt_hae_m,
+        psi_true_deg: spec.heading_deg,
+        tas_mps: spec.tas_mps,
+    }
+}
+
+/// Everything after the ICs are applied: engines on, the multirotor SCAS
+/// engaged, the trim (if configured).
+fn finish_init(fdm: &mut Fdm, class: &AircraftClass) -> Result<(), FdmError> {
+    // An airborne start: without this a piston engine is off and throttle inert.
+    fdm.start_engines()?;
+    if class.kind == VehicleKind::Multirotor {
+        // Without the stability augmentation the quad has no attitude control.
+        fdm.set(prop::SCAS_ENGAGE, 1.0)?;
+    }
+    if class.trim {
+        fdm.trim(TrimMode::Full)?;
+    }
+    Ok(())
+}
+
+/// Load, initialise and (optionally) trim one aircraft's FDM.
+pub fn build_fdm(
+    spec: &AircraftSpec,
+    class: &AircraftClass,
+    dt: f64,
+    seed: u64,
+) -> Result<Fdm, String> {
+    let ctx = |e: FdmError| format!("aircraft {} ({}): {e}", spec.id, spec.model);
+    let mut fdm = Fdm::load(&jsbsim_root(), &spec.model).map_err(ctx)?;
+    fdm.set_dt(dt).map_err(ctx)?;
+    fdm.set(prop::RANDOM_SEED, fdm_seed(seed, spec.id)).map_err(ctx)?;
+    fdm.set_initial_conditions(&initial_conditions(spec)).map_err(ctx)?;
+    fdm.run_ic().map_err(ctx)?;
+    finish_init(&mut fdm, class).map_err(ctx)?;
+    Ok(fdm)
+}
+
+/// Return an existing FDM to `spec`'s initial conditions without reloading the
+/// model (`ResetToInitialConditions`), re-seeding and re-trimming exactly as
+/// [`build_fdm`] does.
+pub fn reset_fdm(
+    fdm: &mut Fdm,
+    spec: &AircraftSpec,
+    class: &AircraftClass,
+    seed: u64,
+) -> Result<(), String> {
+    let ctx = |e: FdmError| format!("aircraft {} ({}): {e}", spec.id, spec.model);
+    fdm.set(prop::RANDOM_SEED, fdm_seed(seed, spec.id)).map_err(ctx)?;
+    fdm.set_initial_conditions(&initial_conditions(spec)).map_err(ctx)?;
+    fdm.reset().map_err(ctx)?;
+    finish_init(fdm, class).map_err(ctx)
+}
+
+/// Map JSBSim's state onto the world grid.
+pub fn grid_state(
+    frame: &LocalFrame,
+    fdm: &mut Fdm,
+    prev_pos_enu: Option<Enu>,
+) -> Result<AircraftState, FdmError> {
+    let s = fdm.state()?;
+    let at = Geodetic::from_degrees(s.lat_deg, s.lon_deg, s.alt_hae_m);
+    let pos_enu = frame.geodetic_to_enu(&at);
+    let vel_enu =
+        frame.ned_to_enu(&at, &Ned { n: s.vel_north_mps, e: s.vel_east_mps, d: s.vel_down_mps });
+    Ok(AircraftState { fdm: s, pos_enu, prev_pos_enu: prev_pos_enu.unwrap_or(pos_enu), vel_enu })
+}
+
+/// The combat/pilot components every aircraft carries, in their initial state.
+pub fn initial_components(
+    spec: &AircraftSpec,
+    class: &AircraftClass,
+) -> (Team, Health, Trigger, Pilot, Option<(FixedWingGains, Gun)>) {
+    // Fixed-wing aircraft carry the gun and autopilot gains; multirotors are
+    // unarmed and use the hover-hold law.
+    let armed = class.profile.map(|p| {
+        let mut gun = Gun::m61a1();
+        if let Some(ammo) = spec.ammo {
+            gun.ammo = ammo;
+        }
+        (FixedWingGains::for_profile(p), gun)
+    });
+    (Team(spec.team), Health::full(spec.health), Trigger(false), Pilot::new(spec.lockstep), armed)
+}
+
+/// Startup: one FDM-owning entity per scenario aircraft. Any failure is fatal.
+pub fn spawn_fleet(
+    mut commands: Commands,
+    scenario: Res<Scenario>,
+    params: Res<SimParams>,
+    frame: Res<WorldFrame>,
+    mut status: ResMut<SimStatus>,
+) {
+    let mut index = AircraftIndex::default();
     for spec in &scenario.aircraft {
-        let mut fdm = Fdm::new();
-        fdm.set_root_dir(&root);
-        if !fdm.load_model(&spec.model) {
-            eprintln!(
-                "[astrum-sim] aircraft {}: failed to load model '{}' — skipping",
-                spec.id, spec.model
-            );
-            continue;
-        }
-
-        // Initial conditions (see astrum_fdm::prop).
-        fdm.set(prop::IC_LAT_GEOD_DEG, spec.lat_deg);
-        fdm.set(prop::IC_LON_GC_DEG, spec.lon_deg);
-        fdm.set(prop::IC_H_SL_FT, spec.alt_ft);
-        fdm.set(prop::IC_PSI_TRUE_DEG, spec.heading_deg);
-        fdm.set(prop::IC_VC_KTS, spec.airspeed_kts);
-        if !fdm.run_ic() {
-            eprintln!("[astrum-sim] aircraft {}: RunIC failed — skipping", spec.id);
-            continue;
-        }
-        // Start all engines running (airborne start). Without this the piston
-        // engine is off and throttle commands are inert — a live flight
-        // controller's throttle would do nothing. Electric multirotor motors
-        // spin up the same way.
-        fdm.set(prop::PROPULSION_SET_RUNNING, -1.0);
-
-        // Multirotors need their stability-augmentation loop engaged, otherwise
-        // roll/pitch/yaw commands have no effect (see prop::SCAS_ENGAGE).
-        let kind = spec.resolved_kind();
-        if kind == VehicleKind::Multirotor {
-            fdm.set(prop::SCAS_ENGAGE, 1.0);
-        }
-        fdm.set_dt(params.dt);
-
-        // Every aircraft is a combat participant: a team, a health pool, and a
-        // (default-off) trigger. Same-team craft never damage each other, so a
-        // single-team scenario behaves exactly as before combat existed.
+        let class = match spec.class() {
+            Ok(c) => c,
+            Err(e) => {
+                status.fatal = Some(e.to_string());
+                return;
+            }
+        };
+        let mut fdm = match build_fdm(spec, &class, params.dt, scenario.sim.seed) {
+            Ok(f) => f,
+            Err(e) => {
+                status.fatal = Some(e);
+                return;
+            }
+        };
+        let state = match grid_state(&frame.0, &mut fdm, None) {
+            Ok(s) => s,
+            Err(e) => {
+                status.fatal = Some(format!("aircraft {}: {e}", spec.id));
+                return;
+            }
+        };
+        let (team, health, trigger, pilot, armed) = initial_components(spec, &class);
         let mut ent = commands.spawn((
             Aircraft { id: spec.id },
-            FdmInstance(fdm),
-            kind,
-            GeoState::default(),
-            Transform::default(),
-            AutopilotState::default(),
-            Team(spec.team),
-            Health::full(spec.health),
-            Trigger::default(),
+            FdmInstance::new(fdm),
+            class.kind,
+            state,
+            pilot,
+            team,
+            health,
+            trigger,
         ));
-        // Fixed-wing entities carry a per-airframe gain set for the built-in
-        // autopilot inner loop (a fighter turns far harder than a trainer);
-        // multirotors use a separate hover-hold law and need none. They also carry
-        // the gun — multirotors are unarmed in this environment.
-        if kind == VehicleKind::FixedWing {
-            ent.insert(FixedWingGains::for_model(&spec.model));
-            let mut gun = Gun::m61a1();
-            if let Some(ammo) = spec.ammo {
-                gun.ammo = ammo;
-            }
-            ent.insert(gun);
+        if let Some((gains, gun)) = armed {
+            ent.insert((gains, gun));
         }
-        spawned += 1;
+        index.0.insert(spec.id, ent.id());
     }
-
     println!(
-        "[astrum-sim] spawned {spawned}/{} aircraft @ {:.1} Hz (dt={:.6}s)",
+        "[astrum-sim] spawned {} aircraft @ {:.1} Hz (dt={:.6}s)",
         scenario.aircraft.len(),
         params.rate_hz,
-        params.dt,
+        params.dt
     );
+    commands.insert_resource(index);
 }
 
-/// Advance every *living* aircraft's flight dynamics by one fixed timestep. A
-/// `Dead` aircraft is skipped, freezing its FDM so the wreck holds its final
-/// pose (combat decision §12.5).
-pub fn step_fdm(mut q: Query<&mut FdmInstance, Without<crate::combat::Dead>>) {
-    for mut inst in &mut q {
-        inst.0.step();
+fn advance(
+    fdm: &mut Fdm,
+    output: Option<Controls>,
+    frame: &LocalFrame,
+    st: &mut AircraftState,
+) -> Result<(), FdmError> {
+    if let Some(c) = output {
+        fdm.set_controls(c)?;
+    }
+    fdm.step()?;
+    *st = grid_state(frame, fdm, Some(st.pos_enu))?;
+    Ok(())
+}
+
+/// The threads that step the FDMs; `None` steps on the schedule's own thread.
+/// Owned per app (not a process-global pool), so every sim or env in a process
+/// gets exactly the parallelism its scenario asks for.
+#[derive(Resource)]
+pub struct StepPool(pub Option<rayon::ThreadPool>);
+
+impl StepPool {
+    pub fn new(threads: usize) -> Self {
+        if threads <= 1 {
+            return Self(None);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("astrum-fdm-{i}"))
+            .build()
+            .expect("spawning the FDM stepping threads");
+        Self(Some(pool))
     }
 }
 
-/// Read JSBSim state into [`GeoState`] and derive the Cartesian ENU [`Transform`].
-pub fn sync_geo_transform(
+type StepItem<'a> = (&'a Aircraft, Mut<'a, FdmInstance>, &'a Pilot, Mut<'a, AircraftState>);
+
+/// Write each living aircraft's FCS inputs, advance its FDM one step and read
+/// back its state — in parallel across aircraft when the scenario asks for
+/// threads (instances are independent, so the result is identical for any
+/// thread count). A dead aircraft is frozen.
+pub fn step_fdm(
     frame: Res<WorldFrame>,
-    mut q: Query<(&FdmInstance, &mut GeoState, &mut Transform)>,
+    pool: Res<StepPool>,
+    mut status: ResMut<SimStatus>,
+    mut q: Query<(&Aircraft, &mut FdmInstance, &Pilot, &mut AircraftState), Without<Dead>>,
 ) {
-    for (inst, mut gs, mut tf) in &mut q {
-        let f = &inst.0;
-        gs.lat_deg = f.get(prop::LAT_GEOD_DEG);
-        gs.lon_deg = f.get(prop::LON_GC_DEG);
-        gs.alt_m = f.get(prop::ALT_SL_M);
-        gs.phi_rad = f.get(prop::PHI_RAD);
-        gs.theta_rad = f.get(prop::THETA_RAD);
-        gs.psi_rad = f.get(prop::PSI_RAD);
-        gs.vel_north_mps = f.get(prop::V_NORTH_FPS) * FT_TO_M;
-        gs.vel_east_mps = f.get(prop::V_EAST_FPS) * FT_TO_M;
-        gs.vel_down_mps = f.get(prop::V_DOWN_FPS) * FT_TO_M;
-        gs.airspeed_mps = f.get(prop::VT_FPS) * FT_TO_M;
-        gs.sim_time_s = f.get(prop::SIM_TIME);
-
-        let enu =
-            frame.0.geodetic_to_enu(&Geodetic::from_degrees(gs.lat_deg, gs.lon_deg, gs.alt_m));
-        tf.translation = Vec3::new(enu.e as f32, enu.n as f32, enu.u as f32);
-        // Provisional: yaw about Up (+Z) from true heading. Full pitch/roll body
-        // attitude is finalised with the replay renderer; GeoState carries the
-        // exact euler angles for downstream (telemetry) use regardless.
-        tf.rotation = Quat::from_rotation_z(-gs.psi_rad as f32);
+    use rayon::prelude::*;
+    let frame = frame.0;
+    let step = |(ac, mut inst, pilot, mut st): StepItem| {
+        advance(inst.fdm(), pilot.output, &frame, &mut st).err().map(|e| (ac.id, e))
+    };
+    let mut failures: Vec<(u32, FdmError)> = match &pool.0 {
+        None => q.iter_mut().filter_map(step).collect(),
+        Some(pool) => {
+            let items: Vec<StepItem> = q.iter_mut().collect();
+            pool.install(|| items.into_par_iter().filter_map(step).collect())
+        }
+    };
+    if !failures.is_empty() {
+        failures.sort_by_key(|(id, _)| *id);
+        let msg: Vec<String> =
+            failures.iter().map(|(id, e)| format!("aircraft {id}: {e}")).collect();
+        status.fatal = Some(msg.join("; "));
     }
+}
+
+/// Dead aircraft keep their last pose; their "previous" position catches up so
+/// a frozen wreck never sweeps a hit volume.
+pub fn freeze_dead(mut q: Query<&mut AircraftState, With<Dead>>) {
+    for mut st in &mut q {
+        st.prev_pos_enu = st.pos_enu;
+    }
+}
+
+/// One step completed.
+pub fn advance_clock(mut clock: ResMut<SimClock>) {
+    clock.tick += 1;
 }
 
 /// Tracks wall-clock cadence so we can report the achieved step rate.
 #[derive(Resource)]
 pub struct Diag {
-    steps: u64,
-    last_log_step: u64,
+    last_log_tick: u64,
     last_log: Instant,
-}
-
-impl Diag {
-    pub fn new() -> Self {
-        Self { steps: 0, last_log_step: 0, last_log: Instant::now() }
-    }
 }
 
 impl Default for Diag {
     fn default() -> Self {
-        Self::new()
+        Self { last_log_tick: 0, last_log: Instant::now() }
     }
 }
 
 /// Roughly once per simulated second, report achieved vs configured step rate.
-pub fn report_progress(params: Res<SimParams>, mut diag: ResMut<Diag>, q: Query<&GeoState>) {
-    diag.steps += 1;
-    let interval = params.rate_hz.max(1.0) as u64;
-    if !diag.steps.is_multiple_of(interval) {
+pub fn report_progress(
+    params: Res<SimParams>,
+    clock: Res<SimClock>,
+    mut diag: ResMut<Diag>,
+    q: Query<(), With<Aircraft>>,
+) {
+    let interval = params.rate_hz.round().max(1.0) as u64;
+    if !clock.tick.is_multiple_of(interval) {
         return;
     }
-
     let now = Instant::now();
     let secs = now.duration_since(diag.last_log).as_secs_f64();
-    let did = diag.steps - diag.last_log_step;
+    let did = clock.tick - diag.last_log_tick;
     let achieved = if secs > 0.0 { did as f64 / secs } else { 0.0 };
-    let sim_time = q.iter().next().map(|g| g.sim_time_s).unwrap_or(0.0);
-
     println!(
-        "[astrum-sim] step {} | sim {:.1}s | {} aircraft | {:.1} Hz achieved (target {:.1})",
-        diag.steps,
-        sim_time,
+        "[astrum-sim] tick {} | sim {:.1}s | {} aircraft | {:.1} Hz achieved (target {:.1})",
+        clock.tick,
+        clock.time_s(&params),
         q.iter().count(),
         achieved,
         params.rate_hz,
     );
-
     diag.last_log = now;
-    diag.last_log_step = diag.steps;
+    diag.last_log_tick = clock.tick;
 }
 
-/// Real-time throttle. Bevy's `ScheduleRunnerPlugin` sleep is a no-op under
-/// `default-features = false` (its `no_std` fallback returns immediately), so we
-/// pace the loop ourselves with `std::thread::sleep`.
+/// Real-time throttle. Bevy's runner sleep is a no-op under
+/// `default-features = false`, so the loop is paced here.
 #[derive(Resource)]
 pub struct Pacer {
     dt: Duration,
@@ -195,9 +308,8 @@ impl Pacer {
     }
 }
 
-/// Sleep so consecutive steps are `dt` apart (≈ real-time). When physics can't
-/// keep up (`now >= target`), rebaseline instead of accumulating debt — the sim
-/// simply runs slower than real-time rather than spiralling.
+/// Sleep so consecutive steps are `dt` apart. When physics can't keep up,
+/// rebaseline instead of accumulating debt.
 pub fn pace(mut pacer: ResMut<Pacer>) {
     if !pacer.realtime {
         return;
@@ -208,28 +320,33 @@ pub fn pace(mut pacer: ResMut<Pacer>) {
             std::thread::sleep(target - now);
             pacer.next = Some(target + pacer.dt);
         }
-        _ => {
-            pacer.next = Some(now + pacer.dt);
-        }
+        _ => pacer.next = Some(now + pacer.dt),
     }
 }
 
 /// Exit once the configured simulated-time limit is reached (`max_time_s > 0`).
 pub fn stop_at_max_time(
     params: Res<SimParams>,
-    q: Query<&GeoState>,
+    clock: Res<SimClock>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if params.max_time_s <= 0.0 {
-        return;
+    if params.max_time_s > 0.0 && clock.time_s(&params) >= params.max_time_s {
+        println!("[astrum-sim] reached max_time_s={:.1} — exiting", params.max_time_s);
+        exit.write(AppExit::Success);
     }
-    if let Some(g) = q.iter().next() {
-        if g.sim_time_s >= params.max_time_s {
-            println!(
-                "[astrum-sim] reached max_time_s={:.1} (sim {:.2}s) — exiting",
-                params.max_time_s, g.sim_time_s
-            );
-            exit.write(AppExit::Success);
+}
+
+/// Report a fatal error once and exit with a failure code.
+pub fn exit_on_fatal(
+    status: Res<SimStatus>,
+    mut exit: MessageWriter<AppExit>,
+    mut reported: Local<bool>,
+) {
+    if let Some(msg) = &status.fatal {
+        if !*reported {
+            eprintln!("[astrum-sim] fatal: {msg}");
+            *reported = true;
         }
+        exit.write(AppExit::from_code(1));
     }
 }

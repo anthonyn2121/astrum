@@ -1,16 +1,13 @@
-//! `astrum-sim` binary entrypoint.
-//!
-//! Loads a scenario, builds the headless simulation app ([`astrum_sim::build_app`]),
-//! opens the Zenoh session (telemetry out + commands in), and runs the loop. All
-//! the app-building and system logic lives in the `astrum_sim` library; the
-//! integration tests in `tests/` exercise it there. This file is only the process
-//! wiring: scenario load, session open, `run()`.
+//! `astrum-sim` binary: load a scenario, build the app, open the Zenoh session
+//! (telemetry out, commands in, scenario queryable) and run. Every startup
+//! failure is fatal: a sim that cannot serve anything exits non-zero.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-use astrum_net::{CommandReceiver, Session, TelemetryPublisher};
-use astrum_sim::build_app;
+use astrum_net::{CommandReceiver, ScenarioServer, Session, TelemetryPublisher};
 use astrum_sim::scenario::Scenario;
+use astrum_sim::{build_app, RunMode};
 use bevy::prelude::*;
 use clap::Parser;
 
@@ -19,50 +16,60 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "astrum-sim", version, about)]
 struct Cli {
-    /// Scenario TOML to run (the fleet + world origin).
+    /// Scenario TOML to run.
     #[arg(env = "ASTRUM_SCENARIO", default_value = "config/scenario.example.toml")]
     scenario: PathBuf,
 
-    /// Zenoh endpoint to listen on (telemetry out + commands in).
+    /// Zenoh endpoint to listen on.
     #[arg(long, env = "ASTRUM_ZENOH_LISTEN", default_value_t = astrum_net::DEFAULT_LISTEN_ENDPOINT.to_string())]
     listen: String,
+
+    /// FDM stepping threads, overriding `sim.threads` (0 = all cores).
+    #[arg(long, env = "ASTRUM_THREADS")]
+    threads: Option<usize>,
 }
 
-/// Open the Zenoh session on `listen` and install the telemetry publisher +
-/// command receiver as `NonSend` resources, activating the bridge systems.
-/// Telemetry and commands share the one session. A failure to open is logged,
-/// not fatal — the bridge systems stay inert.
-fn install_net(app: &mut App, listen: &str) {
-    let session = match Session::listen(listen) {
-        Ok(s) => {
-            println!("[astrum-sim] zenoh session listening: {listen}");
-            s
-        }
-        Err(e) => {
-            eprintln!("[astrum-sim] zenoh listen {listen} failed: {e}");
-            return;
-        }
-    };
-
-    app.insert_non_send(TelemetryPublisher::new(&session));
-    match CommandReceiver::bind(&session) {
-        Ok(r) => {
-            app.insert_non_send(r);
-        }
-        Err(e) => eprintln!("[astrum-sim] command subscribe failed: {e}"),
-    }
-}
-
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let scenario = match Scenario::load(&cli.scenario) {
+    let mut scenario = match Scenario::load(&cli.scenario) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[astrum-sim] scenario error: {e}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
-    let mut app = build_app(scenario);
-    install_net(&mut app, &cli.listen);
-    app.run();
+    if let Some(n) = cli.threads {
+        scenario.sim.threads = n;
+    }
+    let scenario_toml = scenario.to_toml();
+    let session = match Session::listen(&cli.listen) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[astrum-sim] zenoh listen {} failed: {e}", cli.listen);
+            return ExitCode::FAILURE;
+        }
+    };
+    let receiver = match CommandReceiver::bind(&session) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[astrum-sim] command subscribe failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _scenario_server = match ScenarioServer::serve(&session, scenario_toml) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[astrum-sim] scenario queryable failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("[astrum-sim] zenoh session listening: {}", cli.listen);
+
+    let mut app = build_app(scenario, RunMode::Server);
+    app.insert_non_send(TelemetryPublisher::new(&session));
+    app.insert_non_send(receiver);
+    match app.run() {
+        AppExit::Success => ExitCode::SUCCESS,
+        AppExit::Error(code) => ExitCode::from(code.get()),
+    }
 }

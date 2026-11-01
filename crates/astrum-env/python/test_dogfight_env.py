@@ -1,297 +1,338 @@
-#!/usr/bin/env python3
 """Tests for the `astrum_dogfight` Gym adapter (design doc §8.2–§8.5).
 
-Three parts, none needing gymnasium/SB3:
-  1. Geometry — fabricated `AState`s exercise ATA / aspect / closure / Φ.
-  2. Reward — fabricated transitions exercise the reward table + boundaries.
-  3. Live rollout — a real two-f16 Tier-1 episode: obs shape/finiteness, reward
-     finiteness, and that the scripted opponent actually flies straight & level.
+Fabricated `AState`s exercise geometry / reward / the fire gate with no live
+sim; live rollouts exercise the scripted opponents, seeding and the agreement
+between the Python features and the sim's own exports.
 
-Run via:  bash crates/astrum-env/python/run_gym_test.sh
+    PYTHONPATH="$(bash scripts/build-astrum-env.sh):crates/astrum-env/python" \
+        pytest -q crates/astrum-env/python
 """
 
-from math import degrees
+from math import atan2, cos, degrees, radians, sin
 
+import astrum_env
 import numpy as np
+import pytest
 from astrum_dogfight import constants as C
 from astrum_dogfight import reward as R
 from astrum_dogfight.env import make_tier1_env, make_tier2_env, make_tier3_env
-from astrum_dogfight.geometry import AState, build_observation, potential, relative
+from astrum_dogfight.geometry import (
+    AState,
+    GunSolution,
+    body_bearing,
+    build_observation,
+    potential,
+    relative,
+)
 from astrum_dogfight.opponent import Tier3Opponent, wez_fire
+from astrum_dogfight.scenario import tier1_scenario
+
+# Hand-built body axes (rows: nose, starboard, down) in grid ENU.
+LEVEL_NORTH = [[0, 1, 0], [1, 0, 0], [0, 0, -1]]
+LEVEL_SOUTH = [[0, -1, 0], [-1, 0, 0], [0, 0, -1]]
+_P = radians(30.0)
+PITCHED_UP_30_NORTH = [[0, cos(_P), sin(_P)], [1, 0, 0], [0, sin(_P), -cos(_P)]]
+ROLLED_RIGHT_90_NORTH = [[0, 1, 0], [0, 0, -1], [-1, 0, 0]]
+CRUISE = np.array([0.0, 180.0, 0.0])
+NO_GUN = None
+LEARNER = np.array([0.0, 0.0, 0.0, 0.9, 0.0])
 
 
-def _course_deg(s) -> float:
-    """Ground course (deg, 0=N, +E) from an AState's ENU velocity."""
-    return degrees(np.arctan2(s.vel[0], s.vel[1]))
+def _state(axes=LEVEL_NORTH, *, pos=(0.0, 0.0, 4500.0), vel=CRUISE, **cols):
+    e, n, u = pos
+    ve, vn, vu = vel
+    cols = {"tas": float(np.linalg.norm(vel)), "nz": 1.0, "alt_hae_m": u, **cols}
+    return AState.fabricate(
+        axes, pos_e=e, pos_n=n, pos_u=u, vel_e=ve, vel_n=vn, vel_u=vu, vel_ned_n=vn,
+        vel_ned_e=ve, vel_ned_d=-vu, **cols,
+    )  # fmt: skip
 
 
-def _sweep_deg(course_deg, ref_deg) -> float:
-    """Shortest-arc |Δheading| in degrees."""
-    return abs((course_deg - ref_deg + 180.0) % 360.0 - 180.0)
+def _gun(*, aim_error, in_range=True, hit=False):
+    return GunSolution(
+        miss_m=0.0, tof_s=0.5, hit=hit, aim_dir=np.array([0.0, 1.0, 0.0]),
+        aim_error_rad=aim_error, in_range=in_range,
+    )  # fmt: skip
 
 
-def _state(id, *, pos, psi=0.0, vel=None, alive=True, hp=100.0, ammo=511, alt=None):
-    pos = np.asarray(pos, float)
-    if vel is None:
-        vel = np.array([np.sin(psi), np.cos(psi), 0.0]) * 180.0  # along heading, ENU
-    return AState(
-        id=id,
-        team=0,
-        alive=alive,
-        pos=pos,
-        vel=np.asarray(vel, float),
-        phi=0.0,
-        theta=0.0,
-        psi=psi,
-        p=0.0,
-        q=0.0,
-        r=0.0,
-        alpha=0.0,
-        beta=0.0,
-        nz=1.0,
-        airspeed=180.0,
-        alt=(pos[2] if alt is None else alt),
-        health=hp,
-        ammo=ammo,
+def _sweep_deg(a: float, b: float) -> float:
+    return abs(degrees(astrum_env.wrap_pi(a - b)))
+
+
+# --- geometry -------------------------------------------------------------
+
+
+def test_geometry_level():
+    me = _state(pos=(0, 0, 4500))
+    bandit = _state(pos=(0, 400, 4500))
+    rg = relative(me, bandit, _gun(aim_error=0.0))
+    assert abs(rg.rng - 400.0) < 1e-9
+    assert degrees(rg.ata) < 1e-6, "nose-on bandit ⇒ 0 ATA"
+    assert degrees(rg.aspect) < 1e-6, "at his six ⇒ 0 aspect"
+    assert rg.in_range and rg.gun_quality == pytest.approx(1.0)
+    assert potential(me, bandit, rg) > 0.8
+
+    behind = _state(pos=(0, -800, 4500))
+    assert degrees(relative(me, behind, NO_GUN).ata) == pytest.approx(180.0)
+
+    fast = _state(vel=(0, 250, 0))
+    slow_ahead = _state(pos=(0, 1000, 4500), vel=(0, 100, 0))
+    assert relative(fast, slow_ahead, NO_GUN).closure == pytest.approx(150.0)
+
+    head_on = _state(LEVEL_SOUTH, pos=(0, 1000, 4500), vel=(0, -180, 0))
+    assert abs(degrees(relative(me, head_on, NO_GUN).hca)) == pytest.approx(180.0)
+    assert degrees(relative(me, head_on, NO_GUN).aspect) == pytest.approx(180.0)
+
+    obs = build_observation(me, bandit, rg)
+    assert obs.shape == (C.OBS_DIM,) and np.all(np.isfinite(obs))
+
+
+def test_geometry_pitched():
+    me = _state(PITCHED_UP_30_NORTH)
+    level_ahead = _state(pos=(0, 1000, 4500))
+    rg = relative(me, level_ahead, NO_GUN)
+    assert degrees(rg.ata) == pytest.approx(30.0)
+    assert degrees(rg.ata_el) == pytest.approx(-30.0), "level target sits below a raised nose"
+    assert degrees(rg.ata_az) == pytest.approx(0.0, abs=1e-9)
+    along_nose = _state(pos=(0, 1000 * cos(_P), 4500 + 1000 * sin(_P)))
+    assert degrees(relative(me, along_nose, NO_GUN).ata) == pytest.approx(0.0, abs=1e-6)
+    off, bank_err, _ = body_bearing(me, [0.0, 1.0, 0.0])
+    assert degrees(off) == pytest.approx(30.0)
+    assert abs(degrees(bank_err)) == pytest.approx(180.0), "below the nose ⇒ roll inverted"
+
+
+def test_geometry_rolled():
+    me = _state(ROLLED_RIGHT_90_NORTH)
+    east = _state(pos=(1000, 0, 4500))
+    rg = relative(me, east, NO_GUN)
+    assert degrees(rg.ata) == pytest.approx(90.0)
+    assert degrees(rg.ata_el) == pytest.approx(90.0), "rolled right, the east target is overhead"
+    _, bank_err, _ = body_bearing(me, [1.0, 0.0, 0.0])
+    assert degrees(bank_err) == pytest.approx(0.0, abs=1e-9), "lift vector already on it"
+    _, bank_err_west, _ = body_bearing(me, [-1.0, 0.0, 0.0])
+    assert abs(degrees(bank_err_west)) == pytest.approx(180.0)
+    obs = build_observation(me, east, rg)
+    assert obs[2] == pytest.approx(0.0) and obs[3] == pytest.approx(1.0), (
+        "fabricated row has phi=0; sin/cos(phi) come from the row, not the axes"
     )
 
 
-def test_geometry():
-    # Me at origin facing north; bandit 400 m north, also facing north (flying away).
-    me = _state(1, pos=[0, 0, 4500], psi=0.0)
-    bandit = _state(2, pos=[0, 400, 4500], psi=0.0)
-    rg = relative(me, bandit)
-    assert abs(rg.rng - 400.0) < 1e-6
-    assert degrees(rg.ata) < 1.0, f"nose-on bandit should give ~0 ATA, got {degrees(rg.ata):.1f}°"
-    assert degrees(rg.aspect) < 1.0, f"at his six → ~0 aspect, got {degrees(rg.aspect):.1f}°"
-    assert rg.in_range and rg.range_factor > 0.0, "400 m < R_eff should be in range"
-    assert potential(me, bandit) > 0.5, "nose-on + rear-hemisphere + in-WEZ ⇒ high Φ"
+def test_python_features_agree_with_sim():
+    """Attitude: body axes from `body_to_grid` vs the Euler angles in the obs row
+    (nose·up = sinθ, starboard·up = −sinφ·cosθ, nose bearing = ψ). Velocity: the
+    grid columns vs local NED (the local-level tilt is negligible near the origin).
+    Gun: `aim_error_rad` vs the angle between the nose and `aim_dir`."""
+    env = make_tier3_env(posture="offensive", max_time_s=20.0)
+    env.reset(seed=1)
+    roll_pull = np.array([0.6, -0.4, 0.0, 1.0, 0.0])
+    checked = 0
+    for k in range(400):
+        env.step(roll_pull)
+        if k % 50 != 49:
+            continue
+        me = env.aircraft(env.learner_id)
+        nose, starboard, _ = me.axes
+        assert np.allclose(me.axes @ me.axes.T, np.eye(3), atol=1e-9), "orthonormal axes"
+        assert nose[2] == pytest.approx(sin(me.theta), abs=2e-3)
+        assert starboard[2] == pytest.approx(-sin(me.phi) * cos(me.theta), abs=2e-3)
+        if abs(cos(me.theta)) > 0.2:
+            assert _sweep_deg(atan2(nose[0], nose[1]), me.psi) < 0.5
+        ned = np.array([me.vel_ned_e, me.vel_ned_n, -me.vel_ned_d])
+        assert np.allclose(me.vel, ned, atol=0.05 * np.linalg.norm(ned))
+        checked += 1
+    me = env.aircraft(env.learner_id)
+    assert abs(me.phi) > radians(5) and abs(me.theta) > radians(2), "attitude exercised"
+    sol = env.sim.gun_solution(env.learner_id, env.opponent_id)
+    angle = np.arccos(np.clip(np.dot(me.nose, sol["aim_dir"]), -1, 1))
+    assert angle == pytest.approx(sol["aim_error_rad"], abs=radians(1.0))
+    assert checked == 8
 
-    # Bandit directly behind me → ATA ≈ 180°.
-    behind = _state(2, pos=[0, -800, 4500], psi=0.0)
-    assert degrees(relative(me, behind).ata) > 179.0
 
-    # Closure: me faster than a bandit ahead → closing (+).
-    fast = _state(1, pos=[0, 0, 4500], psi=0.0, vel=[0, 250, 0])
-    slow_ahead = _state(2, pos=[0, 1000, 4500], psi=0.0, vel=[0, 100, 0])
-    assert relative(fast, slow_ahead).closure > 0.0
+# --- reward ---------------------------------------------------------------
 
-    obs = build_observation(me, bandit)
-    assert obs.shape == (C.OBS_DIM,) and np.all(np.isfinite(obs))
-    print(f"  geometry OK — obs dim {C.OBS_DIM}, Φ(nose-on)={potential(me, bandit):.3f}")
+
+def _reward(prev_me, prev_bandit, me, bandit):
+    return R.compute(
+        prev_me, prev_bandit, me, bandit,
+        relative(prev_me, prev_bandit, NO_GUN), relative(me, bandit, NO_GUN),
+    )  # fmt: skip
 
 
 def test_reward():
-    me = _state(1, pos=[0, 0, 4500])
-    bandit = _state(2, pos=[0, 1000, 4500])
+    me = _state()
+    bandit = _state(pos=(0, 1000, 4500))
 
-    # Damage dealt: 2 HP off the bandit ⇒ +1.0 (minus tiny time/shaping).
-    hit = _state(2, pos=[0, 1000, 4500], hp=98.0)
-    out = R.compute(me, bandit, me, hit)
+    out = _reward(me, bandit, me, _state(pos=(0, 1000, 4500), hit_points=98.0))
     assert 0.9 < out.reward < 1.1 and not out.terminated, out
 
-    # Kill: bandit → dead ⇒ +100, terminated.
-    dead_bandit = _state(2, pos=[0, 1000, 4500], alive=False, hp=0.0)
-    out = R.compute(me, bandit, me, dead_bandit)
+    dead_bandit = _state(pos=(0, 1000, 4500), alive=0.0, hit_points=0.0)
+    out = _reward(me, bandit, me, dead_bandit)
     assert out.terminated and out.reward > 90.0 and out.info["event"] == "kill", out
 
-    # Death: learner → dead ⇒ −100, terminated.
-    dead_me = _state(1, pos=[0, 0, 4500], alive=False, hp=0.0)
-    out = R.compute(me, bandit, dead_me, bandit)
+    dead_me = _state(alive=0.0, hit_points=0.0)
+    out = _reward(me, bandit, dead_me, bandit)
     assert out.terminated and out.reward < -90.0 and out.info["event"] == "killed", out
 
-    # Hard deck: below 300 m AGL ⇒ −200, terminated, wins precedence over everything.
-    low = _state(1, pos=[0, 0, 100], alt=100.0)
-    out = R.compute(me, bandit, low, bandit)
+    low = _state(pos=(0, 0, C.DECK_HAE_M - 1.0))
+    out = _reward(me, bandit, low, bandit)
     assert out.terminated and out.reward < -190.0 and out.info["event"] == "hard_deck", out
+    assert not R.below_hard_deck(_state(pos=(0, 0, C.DECK_HAE_M + 1.0)))
 
-    # Bubble exit: horizontal range > R_bubble ⇒ −50, truncated.
-    far = _state(1, pos=[C.R_BUBBLE + 100.0, 0, 4500])
-    out = R.compute(me, bandit, far, bandit)
+    far = _state(pos=(C.R_BUBBLE + 100.0, 0, 4500))
+    out = _reward(me, bandit, far, bandit)
     assert out.truncated and not out.terminated and out.reward < -49.0, out
-    print("  reward OK — damage/kill/death/deck/bubble table verified")
+    high = _state(pos=(0, 0, C.CEILING_HAE_M + 1.0))
+    assert R.outside_bubble(high)
 
 
-def test_live_rollout():
-    env = make_tier1_env(max_time_s=30.0)
-    obs, info = env.reset()
-    assert obs.shape == (C.OBS_DIM,) and np.all(np.isfinite(obs)), "reset obs must be finite"
+# --- fire gate / Tier-3 laws (fabricated) ----------------------------------
 
-    opp0 = env._states[env.opponent_id]
-    hdg0, alt0 = opp0.psi, opp0.alt
 
-    # Learner holds a mild pursuit; opponent (Tier-1) should hold straight & level.
-    action = np.array([0.0, 0.0, 0.0, 0.9, 0.0], dtype=np.float32)
-    total = 0.0
-    steps = 240  # ~2 s at 120 Hz
+def test_wez_fire_gate():
+    me = _state()
+    tgt = _state(pos=(0, 500, 4500))
+    assert wez_fire(me, tgt, _gun(aim_error=radians(1.0)))
+    assert not wez_fire(me, tgt, _gun(aim_error=radians(1.0), in_range=False))
+    assert not wez_fire(me, tgt, _gun(aim_error=radians(10.0)))
+    assert wez_fire(me, tgt, _gun(aim_error=radians(10.0), hit=True)), "a predicted hit fires"
+    assert not wez_fire(_state(ammo=0.0), tgt, _gun(aim_error=0.0)), "no ammo"
+    assert not wez_fire(me, _state(alive=0.0), _gun(aim_error=0.0)), "dead target"
+    assert not wez_fire(me, tgt, NO_GUN), "unarmed"
+
+
+@pytest.mark.parametrize("dt", [1.0 / 120.0, 1.0 / 50.0, 0.1])
+def test_tier3_dwell_is_time_based(dt):
+    me = _state()
+    tgt = _state(pos=(0, 1500, 4500))  # ahead, nose-on, within OFF_RANGE
+    opp = Tier3Opponent()
+    opp.reset(me, dt)
+    ticks = 0
+    while opp.state == "neutral":
+        opp.act(me, tgt, NO_GUN)
+        ticks += 1
+        assert ticks < 10_000
+    assert opp.state == "offensive"
+    assert ticks * dt == pytest.approx(C.FSM_MIN_DWELL_S, abs=dt + 1e-9)
+
+
+@pytest.mark.parametrize(
+    "tgt",
+    [
+        _state(pos=(0, 600, 4500)),  # ahead: pursuit
+        _state(pos=(0, -600, 4500)),  # nose-on threat behind: break
+        _state(pos=(800, 300, 5200)),  # off-axis, above
+    ],
+)
+@pytest.mark.parametrize("axes", [LEVEL_NORTH, PITCHED_UP_30_NORTH, ROLLED_RIGHT_90_NORTH])
+def test_tier3_actions_bounded(tgt, axes):
+    opp = Tier3Opponent()
+    me = _state(axes, phi=radians(20.0), theta=radians(10.0), p=0.5)
+    opp.reset(me, 1.0 / 120.0)
+    for _ in range(120):
+        a = opp.act(me, tgt, _gun(aim_error=radians(2.0)))
+        assert len(a) == 5 and all(np.isfinite(x) for x in a)
+        assert all(-1.0 <= x <= 1.0 for x in a[:3]) and 0.0 <= a[3] <= 1.0
+        assert a[4] in (0.0, 1.0)
+
+
+# --- live rollouts ----------------------------------------------------------
+
+
+def _rollout(env, steps, *, seed, action=LEARNER):
+    env.reset(seed=seed)
     for _ in range(steps):
         obs, rew, terminated, truncated, info = env.step(action)
-        assert np.all(np.isfinite(obs)), "obs stayed finite"
-        assert np.isfinite(rew), f"reward finite, got {rew}"
-        total += rew
+        assert np.all(np.isfinite(obs)) and np.isfinite(rew)
+        yield env, info
         if terminated or truncated:
             break
 
-    opp = env._states[env.opponent_id]
-    dh = degrees(abs(((opp.psi - hdg0) + np.pi) % (2 * np.pi) - np.pi))
-    da = abs(opp.alt - alt0)
-    assert dh < 15.0, f"Tier-1 opponent should hold heading, drifted {dh:.1f}°"
-    assert da < 500.0, f"Tier-1 opponent should hold altitude, drifted {da:.0f} m"
-    assert env._states[env.learner_id].alive, "learner survives a 2 s neutral rollout"
-    print(
-        f"  live rollout OK — {steps} steps, Σreward={total:.3f}, "
-        f"opp drift Δhdg={dh:.2f}° Δalt={da:.0f} m"
-    )
+
+def test_seeded_rollouts_are_identical():
+    def run(seed):
+        env = make_tier3_env(posture="offensive", max_time_s=10.0)
+        out = []
+        for e, _ in _rollout(env, 600, seed=seed):
+            me, opp = e.aircraft(e.learner_id), e.aircraft(e.opponent_id)
+            out.append(np.concatenate([me.row, opp.row]))
+        return np.array(out)
+
+    a, b = run(42), run(42)
+    assert a.shape == b.shape and np.array_equal(a, b), "same seed ⇒ identical rollout"
+
+
+def test_reset_changes_scenario_in_place():
+    env = make_tier1_env(max_time_s=5.0)
+    env.reset(seed=0)
+    near = env.aircraft(env.opponent_id).pos - env.aircraft(env.learner_id).pos
+    _, info = env.reset(seed=0, options={"scenario_toml": tier1_scenario(separation_m=3500.0)})
+    far = env.aircraft(env.opponent_id).pos - env.aircraft(env.learner_id).pos
+    assert np.linalg.norm(near) == pytest.approx(2000.0, rel=0.02)
+    assert np.linalg.norm(far) == pytest.approx(3500.0, rel=0.02)
+    assert isinstance(info["sim_seed"], int)
+
+
+def test_tier1_holds_straight_and_level():
+    env = make_tier1_env(max_time_s=30.0)
+    env.reset(seed=0)
+    opp0 = env.aircraft(env.opponent_id)
+    hdg0, alt0, tas0 = opp0.course_local(), opp0.alt_hae_m, opp0.tas
+    for _ in _rollout(env, 1200, seed=0):
+        pass
+    opp = env.aircraft(env.opponent_id)
+    assert _sweep_deg(opp.course_local(), hdg0) < 3.0
+    assert abs(opp.alt_hae_m - alt0) < 60.0
+    assert abs(opp.tas - tas0) < 10.0
+    assert env.aircraft(env.learner_id).alive
 
 
 def test_tier2_break():
-    # Opponent starts on the learner's tail-side, so it detects a rear-hemisphere
-    # attacker at once and breaks. A hard break must swing its heading hard.
     env = make_tier2_env(maneuver="break", max_time_s=40.0)
-    obs, _ = env.reset()
-    hdg0 = _course_deg(env._states[env.opponent_id])
-    action = np.array([0.0, 0.0, 0.0, 0.9, 0.0], dtype=np.float32)  # learner: level, holding
-    triggered = False
+    env.reset(seed=0)
+    hdg0 = env.aircraft(env.opponent_id).course_local()
     max_sweep = 0.0
-    for _ in range(1600):
-        obs, rew, terminated, truncated, info = env.step(action)
-        assert np.all(np.isfinite(obs)) and np.isfinite(rew)
-        triggered = triggered or env.opponent._active is not None
-        opp = env._states[env.opponent_id]
-        max_sweep = max(max_sweep, _sweep_deg(_course_deg(opp), hdg0))
-        if terminated or truncated:
-            break
-
-    opp = env._states[env.opponent_id]
-    assert triggered, "Tier-2 opponent should detect the tail-side attacker and commit a break"
-    assert max_sweep > 60.0, f"a hard break should swing heading, got only {max_sweep:.0f}°"
-    assert opp.alive and abs(opp.nz) < 12.0, "FLCS keeps the break inside the envelope"
-    print(f"  tier2 break OK — maneuver triggered, heading swept {max_sweep:.0f}°")
+    for e, _ in _rollout(env, 1600, seed=0):
+        opp = e.aircraft(e.opponent_id)
+        max_sweep = max(max_sweep, _sweep_deg(opp.course_local(), hdg0))
+    opp = env.aircraft(env.opponent_id)
+    assert max_sweep > 60.0, f"a hard break swings the course, got {max_sweep:.0f}°"
+    assert opp.alive and abs(opp.nz) < 12.0
 
 
 def test_tier2_split_s():
-    # Same tail-side trigger, but the Split-S reverses heading and dumps altitude
-    # (mirrors crates/astrum-sim/tests/split_s.rs: ~180° reversal, ~2 km lost).
     env = make_tier2_env(maneuver="split_s", max_time_s=40.0)
-    obs, _ = env.reset()
-    opp0 = env._states[env.opponent_id]
-    hdg0, alt0 = _course_deg(opp0), opp0.alt
-    action = np.array([0.0, 0.0, 0.0, 0.9, 0.0], dtype=np.float32)
-    max_reversal = 0.0
-    min_alt = alt0
-    for _ in range(1800):
-        obs, rew, terminated, truncated, info = env.step(action)
-        assert np.all(np.isfinite(obs)) and np.isfinite(rew)
-        opp = env._states[env.opponent_id]
-        max_reversal = max(max_reversal, _sweep_deg(_course_deg(opp), hdg0))
-        min_alt = min(min_alt, opp.alt)
-        if terminated or truncated:
-            break
-
-    assert max_reversal > 120.0, f"a Split-S reverses heading, got {max_reversal:.0f}°"
-    assert alt0 - min_alt > 300.0, f"a Split-S trades altitude, lost only {alt0 - min_alt:.0f} m"
-    print(
-        f"  tier2 split-s OK — heading reversed {max_reversal:.0f}°, alt lost {alt0 - min_alt:.0f} m"
-    )
+    env.reset(seed=0)
+    opp0 = env.aircraft(env.opponent_id)
+    hdg0, alt0 = opp0.course_local(), opp0.alt_hae_m
+    max_reversal, min_alt = 0.0, alt0
+    for e, _ in _rollout(env, 1800, seed=0):
+        opp = e.aircraft(e.opponent_id)
+        max_reversal = max(max_reversal, _sweep_deg(opp.course_local(), hdg0))
+        min_alt = min(min_alt, opp.alt_hae_m)
+    assert max_reversal > 120.0, f"a Split-S reverses course, got {max_reversal:.0f}°"
+    assert alt0 - min_alt > 300.0, f"a Split-S trades altitude, lost {alt0 - min_alt:.0f} m"
 
 
-def test_tier3_fire_gate():
-    # The WEZ trigger honors effective range, the lead cone, and ammo.
-    me = _state(1, pos=[0, 0, 4500], psi=0.0)
-    on_six = _state(2, pos=[0, 500, 4500], psi=0.0)  # 500 m ahead, on the nose
-    assert wez_fire(me, on_six), "in range + on the nose ⇒ fire"
-    far = _state(2, pos=[0, 2000, 4500], psi=0.0)  # 2 km > R_eff
-    assert not wez_fire(me, far), "out of gun range ⇒ hold fire"
-    off_nose = _state(2, pos=[500, 0, 4500], psi=0.0)  # in range but 90° off boresight
-    assert not wez_fire(me, off_nose), "no lead solution ⇒ hold fire"
-    dry = _state(1, pos=[0, 0, 4500], psi=0.0, ammo=0)
-    assert not wez_fire(dry, on_six), "no ammo ⇒ never fire"
-    print("  tier3 fire-gate OK — WEZ trigger honors range, lead cone, ammo")
-
-
-def test_tier3_control_laws():
-    # Every state's control law emits a finite, in-bounds raw action.
-    opp = Tier3Opponent()
-    me = _state(1, pos=[0, 0, 4500], psi=0.0)
-    tgt = _state(2, pos=[0, 600, 4500], psi=0.0)
-
-    def bounded(a4):
-        assert len(a4) == 4 and all(np.isfinite(x) for x in a4)
-        assert all(-1.0 <= a4[i] <= 1.0 for i in range(3)) and 0.0 <= a4[3] <= 1.0
-
-    bounded(opp._pursue(me, tgt))
-    bounded(opp._break(me, tgt))
-    bounded(opp._high_yoyo(me, tgt))
-    bounded(opp._energy_recover(me))
-    full = opp.act(me, tgt)
-    assert len(full) == 5 and full[4] in (0.0, 1.0)
-    print("  tier3 control-laws OK — pursue/break/yoyo/energy emit finite, bounded actions")
-
-
-def test_tier3_offensive():
-    # Bot on the learner's six, learner flies straight: bot goes offensive and guns
-    # it — a *real* end-to-end shot (fire_guns → bullets → resolve_hits → damage).
+def test_tier3_offensive_guns_learner():
     env = make_tier3_env(posture="offensive", separation_m=600.0, max_time_s=25.0)
-    obs, _ = env.reset()
-    action = np.array([0.0, 0.0, 0.0, 0.9, 0.0], dtype=np.float32)  # learner: level, not firing
-    saw_offensive = False
-    min_hp = 100.0
-    killed = False
-    for _ in range(3000):
-        obs, rew, terminated, truncated, info = env.step(action)
-        assert np.all(np.isfinite(obs)) and np.isfinite(rew)
-        saw_offensive = saw_offensive or env.opponent.state == "offensive"
-        min_hp = min(min_hp, env._states[env.learner_id].health)
-        if info.get("event") == "killed":
-            killed = True
-        if terminated or truncated:
-            break
-
-    assert saw_offensive, "Tier-3 bot on the six should enter OFFENSIVE"
+    saw_offensive, min_hp = False, 100.0
+    for e, _ in _rollout(env, 3000, seed=0):
+        saw_offensive = saw_offensive or e.opponent.state == "offensive"
+        min_hp = min(min_hp, e.aircraft(e.learner_id).hit_points)
+    assert saw_offensive
     assert min_hp < 100.0, f"the bot's guns should draw blood, learner HP stayed {min_hp:.0f}"
-    print(f"  tier3 offensive OK — entered OFFENSIVE, learner HP → {min_hp:.0f}, killed={killed}")
+    assert env.aircraft(env.opponent_id).ammo < astrum_env.GUN_AMMO
 
 
-def test_tier3_defensive():
-    # Learner starts on the bot's six pointing at it: the FSM should read the threat
-    # and break (heading swings hard) while staying inside the envelope.
+def test_tier3_defensive_breaks():
     env = make_tier3_env(posture="defensive", max_time_s=25.0)
-    obs, _ = env.reset()
-    hdg0 = _course_deg(env._states[env.opponent_id])
-    action = np.array([0.0, 0.0, 0.0, 0.9, 0.0], dtype=np.float32)  # learner: level, not firing
-    saw_defensive = False
-    max_sweep = 0.0
-    for _ in range(2000):
-        obs, rew, terminated, truncated, info = env.step(action)
-        assert np.all(np.isfinite(obs)) and np.isfinite(rew)
-        saw_defensive = saw_defensive or env.opponent.state == "defensive"
-        opp = env._states[env.opponent_id]
-        max_sweep = max(max_sweep, _sweep_deg(_course_deg(opp), hdg0))
-        if terminated or truncated:
-            break
-
-    opp = env._states[env.opponent_id]
-    assert saw_defensive, "Tier-3 bot facing a nose-on threat should enter DEFENSIVE"
-    assert max_sweep > 45.0, f"a defensive break should swing heading, got {max_sweep:.0f}°"
-    assert opp.alive and abs(opp.nz) < 12.0, "FLCS keeps the break inside the envelope"
-    print(f"  tier3 defensive OK — entered DEFENSIVE, heading swept {max_sweep:.0f}°")
-
-
-def main():
-    test_geometry()
-    test_reward()
-    test_live_rollout()
-    test_tier2_break()
-    test_tier2_split_s()
-    test_tier3_fire_gate()
-    test_tier3_control_laws()
-    test_tier3_offensive()
-    test_tier3_defensive()
-    print(
-        "\nOK — astrum_dogfight Tier-1/2/3 adapter: geometry, reward, rollout, "
-        "break, split-s, fire-gate, FSM offense+defense all pass."
-    )
-
-
-if __name__ == "__main__":
-    main()
+    env.reset(seed=0)
+    hdg0 = env.aircraft(env.opponent_id).course_local()
+    saw_defensive, max_sweep = False, 0.0
+    for e, _ in _rollout(env, 2000, seed=0):
+        saw_defensive = saw_defensive or e.opponent.state == "defensive"
+        max_sweep = max(max_sweep, _sweep_deg(e.aircraft(e.opponent_id).course_local(), hdg0))
+    opp = env.aircraft(env.opponent_id)
+    assert saw_defensive
+    assert max_sweep > 45.0, f"a defensive break swings the course, got {max_sweep:.0f}°"
+    assert opp.alive and abs(opp.nz) < 12.0

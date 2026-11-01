@@ -48,9 +48,11 @@ const ui = new UI({
     state.playhead = b.min + frac * b.span;
     state.followLive = false;
     ui.setLiveActive(false);
+    scene.resetTrails(); // a seek: don't draw a chord to the new position
   },
   onLive: () => {
     if (state.mode !== "live") return;
+    if (!state.followLive) scene.resetTrails(); // jumping to the head is a seek
     state.followLive = true;
     state.playing = true;
     ui.setPlaying(true);
@@ -69,8 +71,12 @@ const ui = new UI({
 });
 
 const net = new Net({
-  onFrame: (f) => {
-    store.addFrame(f);
+  onFrames: (frames) => {
+    if (!store.appendLive(frames)) {
+      // An aircraft's clock went backwards: a new run started upstream.
+      startLiveRun();
+      store.appendLive(frames);
+    }
     if (state.followLive) state.playhead = store.bounds().max;
   },
   onStatus: (st, label) => {
@@ -81,16 +87,21 @@ const net = new Net({
 
 // ---- source switching ----
 
-function connect(url) {
+// Empty the timeline and the scene for a fresh live run.
+function startLiveRun() {
   store.reset("live");
   scene.clearFleet();
-  state.mode = "live";
-  state.followLive = true;
-  state.playing = true;
   state.playhead = 0;
   state.selectedId = null;
   scene.setSelected(null);
   state.needsFrame = true;
+}
+
+function connect(url) {
+  startLiveRun();
+  state.mode = "live";
+  state.followLive = true;
+  state.playing = true;
   ui.setMode("live");
   ui.setPlaying(true);
   ui.setLiveActive(true);
@@ -101,10 +112,9 @@ function connect(url) {
 async function openFile(file) {
   net.disconnect();
   try {
-    const { frames, meta } = await loadExportFile(file);
-    store.reset("file");
+    const { meta, frames } = await loadExportFile(file);
+    store.loadFile(frames);
     scene.clearFleet();
-    for (const f of frames) store.addFrame(f);
     const b = store.bounds();
     state.mode = "file";
     state.followLive = false;
@@ -116,8 +126,9 @@ async function openFile(file) {
     ui.setMode("file");
     ui.setPlaying(true);
     ui.setLiveActive(false);
-    ui.setStatus("file", `${file.name} · ${frames.length} frames`
-      + (meta?.aircraft ? ` · ${meta.aircraft.length} aircraft` : ""));
+    ui.setStatus("file", `${file.name} · ${store.frameCount} frames`
+      + ` · ${store.ids().length} aircraft`
+      + (meta?.rejected ? ` · ${Number(meta.rejected)} rejected` : ""));
   } catch (e) {
     ui.setStatus("error", String(e.message || e));
   }
@@ -142,24 +153,31 @@ function updateReadout() {
   const res = track ? store.sampleAt(id, state.playhead) : null;
   if (!res) { ui.setReadout(null); return; }
   const s = res.s;
-  const gs = Math.hypot(s.vel_north_mps, s.vel_east_mps);
   let hdg = (s.psi_rad * RAD2DEG) % 360; if (hdg < 0) hdg += 360;
   ui.setReadout({
-    id, kind: track.kind, t: s.t,
-    lat_deg: s.lat_deg, lon_deg: s.lon_deg, alt_m: s.alt_m,
+    id, kind: track.kind, control_mode: s.control_mode, t: s.t,
+    lat_deg: s.lat_deg, lon_deg: s.lon_deg, alt_hae_m: s.alt_hae_m,
     enu_e: s.enu_e, enu_n: s.enu_n, enu_u: s.enu_u,
     heading_deg: hdg, pitch_deg: s.theta_rad * RAD2DEG, roll_deg: s.phi_rad * RAD2DEG,
-    airspeed_mps: s.airspeed_mps, ground_speed_mps: gs,
-    vertical_speed_mps: -s.vel_down_mps,
+    tas_mps: s.tas_mps, ground_speed_mps: Math.hypot(s.vel_e_mps, s.vel_n_mps),
+    vertical_speed_mps: s.vel_u_mps,
+    mach: s.mach, alpha_deg: s.alpha_rad * RAD2DEG, nz_g: s.nz_g,
+    team: s.team, alive: s.alive, hit_points: s.hit_points,
+    hit_points_max: s.hit_points_max, ammo: s.ammo,
   });
 }
 
 // ---- fleet list (rebuilt by UI only when it actually changes) ----
 
+const swatchCache = new Map(); // "kind:id" -> CSS colour
+
 function updateFleetList() {
   const items = store.ids().map((id) => {
     const kind = store.track(id).kind;
-    return { id, kind, color: `#${aircraftColor(kind, id).getHexString()}` };
+    const key = `${kind}:${id}`;
+    let color = swatchCache.get(key);
+    if (!color) { color = `#${aircraftColor(kind, id).getHexString()}`; swatchCache.set(key, color); }
+    return { id, kind, color };
   });
   ui.setFleet(items, state.selectedId);
 }
@@ -199,7 +217,7 @@ function tick(now) {
   });
 
   // Once the first aircraft is on screen, select it and frame the fleet where it
-  // actually is (aircraft sit at their MSL altitude, not on the grid).
+  // actually is (aircraft fly at their HAE altitude, not on the grid).
   if (state.needsFrame && !b.empty) {
     const ids = store.ids();
     if (ids.length) {

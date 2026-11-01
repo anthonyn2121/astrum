@@ -1,86 +1,187 @@
-//! Zenoh bridge integration test. Drives the full ECS over a single in-process
-//! Zenoh session — the same telemetry-out / commands-in path the binary uses over
-//! TCP — publishing commands in and subscribing to telemetry out, then asserting
-//! the commands reached the right aircraft and telemetry came back for the fleet.
-//!
-//! The test's pub/sub share the sim's [`Session`], so same-session delivery is
-//! synchronous (no slow-joiner race like ZMQ PUB/SUB): a `publish` lands in the
-//! subscriber's channel inline, and a `send` lands in the receiver's before the
-//! next `app.update()` drains it.
+//! The Zenoh bridge end to end over an in-process session: commands in (raw,
+//! autopilot, refusals), telemetry out, and lockstep reproducibility with a
+//! controller running in another thread.
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use astrum_net::zenoh::Wait;
 use astrum_net::{
-    CommandReceiver, CommandSender, Session, TelemetryPublisher, TelemetrySubscriber,
+    keys, CommandReceiver, CommandSender, LatestTelemetry, Selection, Session, TelemetryPublisher,
 };
-use astrum_proto::{CommandMsg, Control};
-use astrum_sim::build_app;
-use common::{aircraft_probe, fdm_guard, two_ship};
+use astrum_proto::{
+    encode_command, AutopilotTargets, Command, Control, ControlMode, RawActuators, Telemetry,
+};
+use astrum_sim::components::SimStatus;
+use astrum_sim::net::LastPublished;
+use astrum_sim::{build_app, RunMode};
+use bevy::prelude::*;
+use common::{of, two_ship};
+
+fn app_on(session: &Session, scenario: astrum_sim::scenario::Scenario) -> App {
+    let mut app = build_app(scenario, RunMode::Embedded);
+    app.insert_non_send(TelemetryPublisher::new(session));
+    app.insert_non_send(CommandReceiver::bind(session).unwrap());
+    app
+}
+
+fn raw(a: f64) -> Control {
+    Control::Raw(RawActuators { aileron: a, elevator: 0.0, rudder: 0.0, throttle: 0.7 })
+}
+
+fn last(app: &App) -> Vec<Telemetry> {
+    app.world().resource::<LastPublished>().0.clone()
+}
 
 #[test]
-fn net_bridge_telemetry_out_and_commands_in() {
-    let _fdm = fdm_guard();
-    // One shared session so the test's sockets meet the sim's in-process.
+fn commands_in_telemetry_out() {
     let session = Session::in_process().unwrap();
-    let publisher = TelemetryPublisher::new(&session);
-    let receiver = CommandReceiver::bind(&session).unwrap();
+    let mut app = app_on(&session, two_ship());
+    let fleet = LatestTelemetry::subscribe(&session, Selection::Fleet).unwrap();
+    let mut tx1 = CommandSender::new(&session, 1).unwrap();
+    let mut tx2 = CommandSender::new(&session, 2).unwrap();
+    app.update();
 
-    let mut app = build_app(two_ship());
-    app.insert_non_send(publisher);
-    app.insert_non_send(receiver);
+    for _ in 0..60 {
+        let tick = last(&app)[0].tick;
+        tx1.send(raw(0.5), false, tick).unwrap();
+        tx2.send(
+            Control::Autopilot(AutopilotTargets {
+                heading_rad: 1.0,
+                alt_hae_m: 1600.0,
+                tas_mps: 55.0,
+            }),
+            false,
+            tick,
+        )
+        .unwrap();
+        app.update();
+    }
 
-    // Subscriber + command sender on the same session.
-    let mut sub = TelemetrySubscriber::connect(&session).unwrap();
-    sub.subscribe_all().unwrap();
-    let sender = CommandSender::connect(&session);
+    let obs = last(&app);
+    assert_eq!(of(&obs, 1).control_mode, ControlMode::Raw);
+    assert!(of(&obs, 1).rates.p_rad_s > 0.1, "raw aileron reached aircraft 1");
+    assert_eq!(of(&obs, 2).control_mode, ControlMode::Autopilot);
+    // The subscriber sees the same latest state the sim published.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(fleet.latest(1), Some(of(&obs, 1)));
+    assert_eq!(fleet.latest(2), Some(of(&obs, 2)));
+}
 
-    // Spawn the fleet and pump a few ticks.
+#[test]
+fn forged_stale_and_future_commands_are_refused() {
+    let session = Session::in_process().unwrap();
+    let mut app = app_on(&session, two_ship());
+    for _ in 0..200 {
+        app.update();
+    }
+    let now = last(&app)[0].tick;
+    let put = |key: String, c: Command| session.raw().put(key, encode_command(&c)).wait().unwrap();
+    // Key says aircraft 1, payload says 2.
+    put(
+        keys::command(1),
+        Command { target_id: 2, seq: 1, telemetry_tick: now, trigger: false, control: raw(1.0) },
+    );
+    // Answers telemetry older than the 0.5 s lease.
+    put(
+        keys::command(1),
+        Command {
+            target_id: 1,
+            seq: 2,
+            telemetry_tick: now - 100,
+            trigger: false,
+            control: raw(1.0),
+        },
+    );
+    // Answers a tick the sim has not reached.
+    put(
+        keys::command(2),
+        Command {
+            target_id: 2,
+            seq: 3,
+            telemetry_tick: now + 5,
+            trigger: false,
+            control: raw(1.0),
+        },
+    );
     for _ in 0..5 {
         app.update();
     }
-
-    // Raw command → aircraft 1; Autopilot command → aircraft 2.
-    sender
-        .send(&CommandMsg {
-            target_id: 1,
-            control: Control::Raw { aileron: 0.5, elevator: 0.0, rudder: 0.0, throttle: 0.9 },
-        })
-        .unwrap();
-    sender
-        .send(&CommandMsg {
-            target_id: 2,
-            control: Control::Autopilot { heading_rad: 1.0, alt_msl_m: 2000.0, airspeed_mps: 55.0 },
-        })
-        .unwrap();
-
-    // Collect telemetry across several ticks.
-    let mut seen_ids = std::collections::HashSet::new();
-    let mut last_ac1 = None;
-    for _ in 0..60 {
-        app.update();
-        while let Some(s) = sub.try_recv().unwrap() {
-            seen_ids.insert(s.aircraft_id);
-            if s.aircraft_id == 1 {
-                last_ac1 = Some(s);
-            }
-        }
+    for t in last(&app) {
+        assert_eq!(
+            t.control_mode,
+            ControlMode::Uncommanded,
+            "aircraft {} took a refused command",
+            t.aircraft_id
+        );
     }
+}
 
-    // Telemetry reached the subscriber for both aircraft, with sane values.
-    assert!(seen_ids.contains(&1) && seen_ids.contains(&2), "telemetry for both ids: {seen_ids:?}");
-    let t = last_ac1.expect("aircraft 1 telemetry");
-    assert!((t.lat_deg - 37.6188).abs() < 0.5, "plausible latitude, got {}", t.lat_deg);
-    assert!(t.sim_time_s > 0.0 && t.alt_m.is_finite());
+/// Run a lockstep scenario with a controller thread whose law depends only on
+/// the telemetry it receives. Returns the final telemetry.
+fn lockstep_run(ticks: usize) -> Vec<Telemetry> {
+    let mut s = two_ship();
+    s.sim.lockstep = true;
+    s.sim.lockstep_timeout_s = 10.0;
+    s.aircraft[0].lockstep = true;
+    let session = Session::in_process().unwrap();
+    let mut app = app_on(&session, s);
 
-    // The raw command reached aircraft 1's FDM and disengaged its autopilot.
-    let (aileron1, ap1) = aircraft_probe(&mut app, 1);
-    assert!((aileron1 - 0.5).abs() < 1e-6, "raw aileron applied, got {aileron1}");
-    assert!(!ap1.engaged, "raw command disengages autopilot");
+    let stop = Arc::new(AtomicBool::new(false));
+    let controller = {
+        let (session, stop) = (session.clone(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut sub = LatestTelemetry::subscribe(&session, Selection::Aircraft(1)).unwrap();
+            let mut tx = CommandSender::new(&session, 1).unwrap();
+            let mut answered = None;
+            while !stop.load(Ordering::Relaxed) {
+                if sub.wait(Duration::from_millis(20)).is_err() {
+                    continue;
+                }
+                let t = sub.latest(1).unwrap();
+                if answered != Some(t.tick) {
+                    // A deterministic law of the received state only.
+                    let ail = (-2.0 * t.attitude.phi_rad + 0.3 * (t.tick as f64 * 0.01).sin())
+                        .clamp(-1.0, 1.0);
+                    tx.send(raw(ail), false, t.tick).unwrap();
+                    answered = Some(t.tick);
+                }
+            }
+        })
+    };
+    app.update(); // startup publishes tick 0, then waits for its answer
+    for _ in 0..ticks {
+        app.update();
+        assert!(app.world().resource::<SimStatus>().fatal.is_none());
+    }
+    stop.store(true, Ordering::Relaxed);
+    controller.join().unwrap();
+    last(&app)
+}
 
-    // The autopilot command engaged aircraft 2 with its targets.
-    let (_, ap2) = aircraft_probe(&mut app, 2);
-    assert!(ap2.engaged, "autopilot engaged for aircraft 2");
-    assert!((ap2.heading_rad - 1.0).abs() < 1e-9);
-    assert!((ap2.alt_msl_m - 2000.0).abs() < 1e-9);
-    assert!((ap2.airspeed_mps - 55.0).abs() < 1e-9);
+#[test]
+fn lockstep_makes_networked_runs_reproducible() {
+    let a = lockstep_run(240);
+    let b = lockstep_run(240);
+    assert_eq!(of(&a, 1).tick, 241);
+    assert_eq!(of(&a, 1).control_mode, ControlMode::Raw);
+    assert_eq!(a, b, "a lockstep run with a deterministic controller replays exactly");
+}
+
+#[test]
+fn lockstep_without_a_controller_is_fatal() {
+    let mut s = two_ship();
+    s.sim.lockstep = true;
+    s.sim.lockstep_timeout_s = 0.3;
+    s.aircraft[1].lockstep = true;
+    let session = Session::in_process().unwrap();
+    let mut app = app_on(&session, s);
+    app.update();
+    let fatal =
+        app.world().resource::<SimStatus>().fatal.clone().expect("lockstep wait must time out");
+    assert!(fatal.contains("from aircraft {2}"), "{fatal}");
+    assert_eq!(last(&app)[0].tick, 0, "no step ran after the timeout");
 }

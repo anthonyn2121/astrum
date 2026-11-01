@@ -1,73 +1,90 @@
 # ASTRUM example flight controller (Python)
 
-The Python twin of [`controllers/cpp`](../cpp) — a minimal out-of-sim flight
+The Python twin of [`controllers/cpp`](../cpp): a minimal out-of-sim flight
 controller that talks to `astrum-sim` **only over Zenoh**, using the shared Cap'n
-Proto schema (`crates/astrum-proto/schema/astrum.capnp`) for the wire format. It
-exists to prove a controller in any language plugs into ASTRUM with nothing but
-**eclipse-zenoh + pycapnp** (both ship in the dev image); there is **no codegen step** —
-`capnp.load()` reads `astrum.capnp` at runtime. Telemetry and commands share **one**
-`mode=peer` Zenoh session connecting to `tcp/sim:7447` (not two ports); the id is in the key:
+Proto schema (`crates/astrum-proto/schema/astrum.capnp`, schema v2). There is no
+codegen step — `capnp.load()` reads the schema at runtime.
 
-- **SUB** `astrum/telemetry/<id>` — telemetry for one aircraft.
-- **PUB** `astrum/command/<id>` — commands (target id + raw actuators *or* autopilot targets).
+The directory is also the **`astrum_client`** package — the shared client every
+Python controller (this example and [`controllers/optimal`](../optimal)) builds on:
+
+| Module | What it does |
+|---|---|
+| `astrum_client.wire` | `load_schema()`, `decode_telemetry()` → `VehicleState` (every v2 field), `encode_command()`; bad payloads raise `DecodeError` (framing checked, trailing bytes rejected) |
+| `astrum_client.transport` | `open_session()` (client mode, no multicast scouting, waits up to the startup timeout for the sim), `subscribe_telemetry()` (latest-value, per aircraft or fleet-wide), `CommandPublisher` (DROP / express / INTERACTIVE_HIGH, `seq` 1, 2, … and `telemetryTick`) |
+| `astrum_client.loop` | `run_control_loop()`: one command per telemetry tick, startup/staleness timeouts, vehicle-kind refusal, output saturation |
+| `astrum_client.cli` | shared flags with `ASTRUM_*` env fallbacks |
+| `astrum_client.mathutil` | `wrap_pi` (→ `[-pi, pi)`, NaN for non-finite input), `clamp`, anti-windup integrator step |
+| `astrum_client.hold` | the example's raw `HoldLaw` |
+| `astrum_client.wire_fixture` | writes / checks the cross-language wire fixtures |
+
+The dev image puts `controllers/python` and `controllers/optimal/python` on
+`PYTHONPATH`; elsewhere `pip install -e controllers/python` (+ `-e
+controllers/optimal/python`). The schema is resolved relative to the checkout.
+
+## Transport
+
+One `mode=client` Zenoh session connecting to the sim, which listens as the Zenoh router
+(`tcp/sim:7447` under compose):
+
+- **SUB** `astrum/telemetry/<id>` — a callback keeps only the **newest** sample per
+  aircraft, so a slow law always acts on fresh state (never a FIFO of stale data).
+  A payload that fails to decode, or whose `aircraftId` differs from its key, is
+  logged, counted and skipped.
+- **PUB** `astrum/command/<id>` — one command per telemetry tick, carrying
+  `seq` (strictly increasing per process) and `telemetryTick` (the tick it answers).
+  If the sim republishes a tick it is waiting on (lockstep), the last command is
+  resent with a new `seq` without re-running the law.
 
 ## Modes (`--mode`)
 
-- **`raw`** (default) — the controller closes a heading / altitude / airspeed hold loop
-  *itself* (identical gains to the C++ `HoldLaw`) and sends raw `fcs/*-cmd-norm`
-  deflections every telemetry tick. This is ASTRUM's intended usage: **you own the
-  control law**.
-- **`autopilot`** — the controller sends one high-level target (reasserted over the first
-  second of telemetry) and then just monitors; the sim's built-in proportional inner loop flies
-  the aircraft. Resending briefly clears the Zenoh startup race: Zenoh drops a `put` with no
-  matching subscriber yet (unlike ZMQ PUSH, which queued it), so a single shot at t=0 would be
-  lost while the sim loads JSBSim — receiving telemetry proves the link is up.
+- **`raw`** (default) — closes a heading / altitude / airspeed hold loop here and
+  sends raw actuators every tick. Raw commands are a **lease**: if they stop, the
+  sim's failsafe takes over (`Telemetry.controlMode = failsafe`, logged). The law
+  damps with the body rates the sim publishes, limits bank/pitch to
+  `--max-bank-deg` / `--max-pitch-deg`, saturates every actuator, and has
+  heading/altitude/airspeed integrators with conditional-integration anti-windup
+  (the heading integral removes the few-degree steady error propeller torque leaves).
+  Fixed-wing only: any other `vehicleKind` (including an unknown value) is refused.
+- **`autopilot`** — sends the target to the sim's inner loop every tick (which also
+  keeps the lease fresh). Fixed-wing or multirotor.
 
 ## Configuration (flags)
 
-The same knobs as the C++ controller. Pass them as command-line flags (run
-`--help` for the list); each falls back to its old `ASTRUM_*` env var, then the
-default, so precedence is **CLI arg > `$ENV` > default** and the compose wiring is
-shared and unchanged.
+Each flag falls back to its `ASTRUM_*` env var, then the default
+(**CLI arg > `$ENV` > default**). Values are SI, altitudes HAE, speeds TAS.
 
 | Flag | Env fallback | Default | Meaning |
 |---|---|---|---|
-| `--connect` | `ASTRUM_ZENOH_CONNECT`      | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (telemetry + commands) |
-| `--id`      | `ASTRUM_TARGET_ID`         | `1`    | aircraft id to subscribe to / command |
-| `--heading` | `ASTRUM_TARGET_HEADING_DEG`| `0`    | target heading in degrees (0 = due north) |
-| `--alt`     | `ASTRUM_TARGET_ALT_M`      | `1500` | target MSL altitude (m) |
-| `--speed`   | `ASTRUM_TARGET_SPD_MPS`    | `50`   | target airspeed (m/s) |
-| `--mode`    | `ASTRUM_CONTROL_MODE`      | `raw`  | `raw` or `autopilot` |
-| `--schema`  | `ASTRUM_SCHEMA`            | `../../crates/astrum-proto/schema/astrum.capnp` | schema to load |
+| `--connect` | `ASTRUM_ZENOH_CONNECT` | `tcp/127.0.0.1:7447` | sim Zenoh endpoint |
+| `--id` | `ASTRUM_TARGET_ID` | `1` | aircraft id to subscribe to / command |
+| `--heading` | `ASTRUM_TARGET_HEADING_DEG` | `0` | target true heading, degrees (0 = north) |
+| `--alt` | `ASTRUM_TARGET_ALT_M` | `1500` | target altitude, m HAE |
+| `--speed` | `ASTRUM_TARGET_SPD_MPS` | `50` | target true airspeed, m/s |
+| `--mode` | `ASTRUM_CONTROL_MODE` | `raw` | `raw` or `autopilot` |
+| `--max-bank-deg` | `ASTRUM_MAX_BANK_DEG` | `25` | bank limit (raw); f16: `60` |
+| `--max-pitch-deg` | `ASTRUM_MAX_PITCH_DEG` | `10` | pitch limit (raw); f16: `24` |
+| `--startup-timeout` | `ASTRUM_STARTUP_TIMEOUT_S` | `60` | exit 1 if no telemetry arrives within this many seconds |
+| `--telemetry-timeout` | `ASTRUM_TELEMETRY_TIMEOUT_S` | `10` | exit 0 once telemetry has stopped this long |
+| `--schema` | `ASTRUM_SCHEMA` | `crates/astrum-proto/schema/astrum.capnp` | schema to load |
+
+Exit codes: `0` telemetry stopped, `1` no telemetry at startup, `2` refused to fly
+(wrong/unknown vehicle kind).
 
 ## Run (inside the dev container)
 
 ```bash
 python controllers/python/example.py --heading 0 --id 1
+make demo-python     # bounded single-ship demo with auto teardown
 ```
 
-Or the whole self-terminating demo (bounded single-ship scenario, auto teardown):
+## Tests and wire fixtures
 
 ```bash
-make demo-python
+python -m pytest -q controllers/python controllers/optimal/python
+python -m astrum_client.wire_fixture    # writes crates/astrum-proto/tests/fixtures/*.python.bin
 ```
 
-which is `docker compose --profile python up --exit-code-from sim sim controller-python`.
-
-## Notes
-
-- **Wire compatibility is by construction:** the same `astrum.capnp` is the source of
-  truth for the Rust sim, the C++ controller, and this script. Framing is Cap'n Proto's
-  flat serialization — pycapnp's `to_bytes()` / `from_bytes()` interoperate directly with
-  Rust's `serialize::write_message` / `read_message`. (Verified live: this controller
-  drove aircraft 1 from 90° to ~3.4° heading holding ~1500 m, the same trace as the C++
-  controller.)
-- Telemetry carries no body rates, so the raw hold loop estimates roll/pitch rate by
-  finite-differencing attitude between frames for damping — same as the C++ `HoldLaw`.
-- The aircraft id lives in the Zenoh **key** (`astrum/telemetry/<id>`), not a topic frame:
-  the subscriber declares that key and each sample's `payload` is the whole Cap'n Proto message.
-  Key matching is exact, so `astrum/telemetry/1` never matches `astrum/telemetry/10`.
-- This example follows **one** aircraft (`--id`), but the transport is fleet-wide:
-  subscribe `astrum/telemetry/*` instead of a single id to receive **every** aircraft's telemetry
-  over the same session (whole-fleet / swarm awareness). Adding aircraft needs no endpoint or port
-  change; the id is just another key.
+`tests/test_wire_fixtures.py` decodes every `<kind>.<lang>.bin` present
+(rust / cpp / python) and compares every field exactly with `values.json`; the
+Python files must exist and match what the encoder produces today.

@@ -1,83 +1,103 @@
 //! `astrum-net` — the ASTRUM Zenoh transport layer.
 //!
-//! Two channels, both carrying [`astrum_proto`] payloads on the wire, multiplexed
-//! over a single Zenoh session (one TCP endpoint instead of ZMQ's two ports):
+//! One Zenoh session per process carries every stream, each keyed by aircraft id
+//! (see [`keys`]):
 //!
-//! * **Telemetry** — the sim publishes each [`TelemetrySample`] on the key
-//!   `astrum/telemetry/<aircraft-id>`. Subscribers take one aircraft with
-//!   [`TelemetrySubscriber::subscribe`] (`astrum/telemetry/<id>`) or the whole
-//!   fleet with [`TelemetrySubscriber::subscribe_all`] (`astrum/telemetry/*`).
-//!   The aircraft id lives in the key, so no fixed-width topic frame is needed —
-//!   key expressions match exactly (`.../1` never matches `.../10`).
-//! * **Commands** — controllers publish each [`CommandMsg`] on
-//!   `astrum/command/<target-id>`; the sim subscribes `astrum/command/**` and
-//!   drains them non-blockingly each tick (fan-in from every controller).
+//! * **Telemetry** — the sim publishes each [`Telemetry`] on
+//!   `astrum/telemetry/<id>` through a per-aircraft declared publisher.
+//!   [`LatestTelemetry`] keeps the newest sample per aircraft for controllers and
+//!   viewers: a control law must act on the freshest state, never on a queue of
+//!   stale frames.
+//! * **Commands** — a controller's [`CommandSender`] publishes on
+//!   `astrum/command/<id>`; the sim's [`CommandReceiver`] drains them each tick
+//!   and rejects any whose payload `target_id` disagrees with the key.
+//! * **Scenario** — the sim answers `get astrum/scenario` with its scenario TOML
+//!   ([`ScenarioServer`] / [`fetch_scenario`]), so recorders can embed it.
 //!
-//! The bag recorder is just another subscriber, and replay just another
-//! publisher, so replay feeds any subscriber byte-for-byte identically to the
-//! live sim.
+//! Topology is a star: the sim (or a bag replay) listens as a Zenoh router and
+//! every other process connects to it as a connect-only peer, so the hub routes
+//! between clients (a recorder sees the controllers' commands, a follower sees
+//! the leader's telemetry).
 //!
-//! Zenoh embeds its own async runtime; every call here uses the **synchronous**
-//! `.wait()` resolver and the subscriber's blocking/non-blocking channel
-//! (`recv` / `recv_timeout` / `try_recv`), so these wrappers drop straight into
-//! Bevy's synchronous systems with no runtime for us to drive. Unlike the old
-//! `zmq::Socket`, a Zenoh [`Session`] is `Send + Sync`, but the sim still holds
-//! the wrappers as Bevy `NonSend` resources (single-threaded under
-//! `ScheduleRunnerPlugin`) — no change to the bridge systems was needed.
+//! QoS ([`qos`]) is the same for both streams: they carry latest-value state, so a
+//! congested link drops the older sample (`CongestionControl::Drop`), samples are
+//! not batched (`express`), and they ride above bulk data (`InteractiveHigh`).
+//!
+//! Every call uses Zenoh's synchronous `.wait()` resolver; Zenoh runs its own
+//! runtime internally, so these wrappers drop into synchronous code as-is.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use astrum_proto::{
-    decode_command, decode_telemetry, encode_command, encode_telemetry, CommandMsg, TelemetrySample,
-};
-use zenoh::qos::CongestionControl;
+use astrum_proto::{decode_command, decode_telemetry, encode_command, encode_telemetry};
+pub use astrum_proto::{Command, Control, Telemetry};
+use zenoh::handlers::FifoChannelHandler;
+use zenoh::pubsub::{Publisher, Subscriber};
+use zenoh::query::Queryable;
+use zenoh::sample::Sample;
 use zenoh::Wait;
 
 // Re-export so downstream crates share one zenoh version / type set.
 pub use zenoh;
 
-/// Key-expression prefix for telemetry (`astrum/telemetry/<id>`).
-const TELEMETRY_PREFIX: &str = "astrum/telemetry";
-/// Key-expression prefix for commands (`astrum/command/<target-id>`).
-const COMMAND_PREFIX: &str = "astrum/command";
+/// Key expressions.
+pub mod keys {
+    /// `astrum/telemetry/<id>`
+    pub const TELEMETRY_PREFIX: &str = "astrum/telemetry";
+    /// `astrum/command/<id>`
+    pub const COMMAND_PREFIX: &str = "astrum/command";
+    /// Every aircraft's telemetry.
+    pub const TELEMETRY_ALL: &str = "astrum/telemetry/*";
+    /// Every aircraft's commands.
+    pub const COMMAND_ALL: &str = "astrum/command/*";
+    /// The sim's scenario TOML (queryable).
+    pub const SCENARIO: &str = "astrum/scenario";
 
-/// Default endpoint the sim (and bag replay) LISTENS on — clients connect here.
-/// Zenoh endpoints use `proto/host:port` (note: `/`, not `://`).
+    pub fn telemetry(id: u32) -> String {
+        format!("{TELEMETRY_PREFIX}/{id}")
+    }
+
+    pub fn command(id: u32) -> String {
+        format!("{COMMAND_PREFIX}/{id}")
+    }
+
+    /// The id in `<prefix>/<id>`, or `None` if `key` is not of that form.
+    pub fn id_of(key: &str, prefix: &str) -> Option<u32> {
+        key.strip_prefix(prefix)?.strip_prefix('/')?.parse().ok()
+    }
+}
+
+/// The QoS every telemetry and command publication uses.
+pub mod qos {
+    use zenoh::qos::{CongestionControl, Priority};
+
+    /// Latest-value state: drop the older sample rather than block the sender.
+    pub const CONGESTION: CongestionControl = CongestionControl::Drop;
+    /// Above bulk data, below Zenoh's own control traffic.
+    pub const PRIORITY: Priority = Priority::InteractiveHigh;
+    /// Send each sample immediately instead of batching.
+    pub const EXPRESS: bool = true;
+}
+
+/// Default endpoint the sim (and bag replay) LISTENS on. Zenoh endpoints use
+/// `proto/host:port` (a single `/`, not `://`).
 pub const DEFAULT_LISTEN_ENDPOINT: &str = "tcp/0.0.0.0:7447";
 /// Default endpoint a client CONNECTS to (the sim on localhost).
 pub const DEFAULT_CONNECT_ENDPOINT: &str = "tcp/127.0.0.1:7447";
 
-/// The telemetry key for one aircraft.
-#[inline]
-fn telemetry_key(aircraft_id: u32) -> String {
-    format!("{TELEMETRY_PREFIX}/{aircraft_id}")
-}
-
-/// The command key targeting one aircraft.
-#[inline]
-fn command_key(target_id: u32) -> String {
-    format!("{COMMAND_PREFIX}/{target_id}")
-}
-
-/// The concrete subscriber type: a Zenoh subscriber with the default FIFO channel
-/// handler, whose `recv` / `recv_timeout` / `try_recv` we use synchronously.
-type FifoSubscriber =
-    zenoh::pubsub::Subscriber<zenoh::handlers::FifoChannelHandler<zenoh::sample::Sample>>;
-
-/// Transport errors surfaced to callers.
-#[derive(Debug)]
+/// Transport errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetError {
-    /// A configured receive timeout elapsed with no sample (ZMQ `EAGAIN` analogue).
+    /// A receive timed out.
     Timeout,
-    /// The subscriber's channel disconnected (the session was closed).
+    /// The subscription's channel closed (the session went away).
     Disconnected,
-    /// `recv`/`try_recv` was called before `subscribe`/`subscribe_all`.
-    NotSubscribed,
-    /// A received payload failed to decode.
-    Decode,
     /// An underlying Zenoh session / declaration / publication error.
     Zenoh(String),
+    /// A scenario reply was not UTF-8.
+    BadScenario(String),
 }
 
 impl fmt::Display for NetError {
@@ -85,9 +105,8 @@ impl fmt::Display for NetError {
         match self {
             NetError::Timeout => write!(f, "receive timed out"),
             NetError::Disconnected => write!(f, "subscription channel disconnected"),
-            NetError::NotSubscribed => write!(f, "not subscribed (call subscribe/subscribe_all)"),
-            NetError::Decode => write!(f, "payload decode failed"),
             NetError::Zenoh(e) => write!(f, "zenoh error: {e}"),
+            NetError::BadScenario(e) => write!(f, "scenario reply is not UTF-8: {e}"),
         }
     }
 }
@@ -95,57 +114,50 @@ impl fmt::Display for NetError {
 impl std::error::Error for NetError {}
 
 /// Transport result alias.
-pub type Result<T> = std::result::Result<T, NetError>;
+pub type Result<T, E = NetError> = std::result::Result<T, E>;
 
 fn zerr<E: fmt::Display>(e: E) -> NetError {
     NetError::Zenoh(e.to_string())
 }
 
-/// A Zenoh session — the transport handle every wrapper is built from. Cheap to
-/// clone (an `Arc` inside), so it can be shared across the telemetry publisher
-/// and command receiver in one process.
+/// A Zenoh session. Cheap to clone (an `Arc` inside).
 #[derive(Clone)]
 pub struct Session {
     z: zenoh::Session,
 }
 
 impl Session {
-    /// Open a session that LISTENS on `endpoint` (the sim / bag-replay role):
-    /// mode `peer`, multicast scouting disabled (Docker bridge networks don't
-    /// pass multicast — peers connect by explicit endpoint).
+    /// Open a session that LISTENS on `endpoint` (the sim / bag-replay role) as a
+    /// Zenoh **router**: every other process connects only to this hub, and peers
+    /// do not forward for each other, so the hub must route — otherwise one
+    /// client's publications (a controller's commands) would never reach another
+    /// client (the recorder). Multicast scouting is off: Docker bridge networks
+    /// don't pass multicast, so clients connect by explicit endpoint.
     pub fn listen(endpoint: &str) -> Result<Self> {
         Self::open(&[
             ("scouting/multicast/enabled", "false".into()),
-            ("mode", r#""peer""#.into()),
+            ("mode", r#""router""#.into()),
             ("listen/endpoints", format!(r#"["{endpoint}"]"#)),
         ])
     }
 
-    /// Open a session that CONNECTS to `endpoint` (the controller / recorder /
-    /// web role): mode `peer`, connect-out only (no listener), multicast off.
-    ///
-    /// Peer mode is what makes the open non-fatal when the sim isn't listening
-    /// yet: a `peer` `open()` returns immediately and Zenoh retries the outbound
-    /// connection in the background (infinite retry per `connect/retry`), so a
-    /// process started alongside the sim just attaches once the sim comes up —
-    /// mirroring ZMQ's lazy, tolerant `connect`. A `client` instead *aborts* its
-    /// `open()` if the endpoint isn't reachable the instant it starts (`client`
-    /// defaults to `connect/timeout_ms: 0`), which loses the startup race with
-    /// the sim's ~10s JSBSim load. `listen/endpoints: []` keeps this peer purely
-    /// connect-out (the bidirectional link to the sim carries pub/sub both ways),
-    /// so it behaves like the old client role without needing to accept inbound.
-    pub fn connect(endpoint: &str) -> Result<Self> {
+    /// Open a session that CONNECTS to the hub at `endpoint` (controller /
+    /// recorder / web) as a Zenoh **client**: the hub routes everything for it,
+    /// including other clients' publications. Waits up to `timeout` for the hub
+    /// (a sim still loading its aircraft), then fails; once connected, Zenoh
+    /// reconnects by itself if the hub restarts.
+    pub fn connect(endpoint: &str, timeout: Duration) -> Result<Self> {
+        let timeout_ms = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
         Self::open(&[
             ("scouting/multicast/enabled", "false".into()),
-            ("mode", r#""peer""#.into()),
+            ("mode", r#""client""#.into()),
             ("connect/endpoints", format!(r#"["{endpoint}"]"#)),
-            ("listen/endpoints", "[]".into()),
+            ("connect/timeout_ms", timeout_ms.to_string()),
         ])
     }
 
-    /// Open an isolated in-process session (no endpoints, multicast off) whose own
-    /// publishers deliver to its own subscribers — used by the integration tests
-    /// in place of ZMQ's `inproc://` shared context.
+    /// An isolated in-process session (no endpoints) whose publishers deliver to
+    /// its own subscribers — for tests.
     pub fn in_process() -> Result<Self> {
         Self::open(&[("scouting/multicast/enabled", "false".into()), ("mode", r#""peer""#.into())])
     }
@@ -159,154 +171,287 @@ impl Session {
         Ok(Self { z })
     }
 
-    /// Borrow the underlying Zenoh session (for advanced use / downstream crates).
+    /// The underlying Zenoh session (raw recording / replay, advanced use).
     pub fn raw(&self) -> &zenoh::Session {
         &self.z
     }
+
+    /// Declare a publisher on `key` with the ASTRUM [`qos`].
+    pub fn declare_publisher(&self, key: String) -> Result<Publisher<'static>> {
+        self.z
+            .declare_publisher(key)
+            .congestion_control(qos::CONGESTION)
+            .priority(qos::PRIORITY)
+            .express(qos::EXPRESS)
+            .wait()
+            .map_err(zerr)
+    }
 }
 
-/// Sim-side telemetry broadcaster. Publishes on `astrum/telemetry/<id>` with
-/// best-effort delivery (a dropped frame is non-fatal — the subscriber just
-/// renders the next state), matching ZMQ `PUB` semantics.
+// --- Telemetry ----------------------------------------------------------------
+
+/// Sim-side telemetry broadcaster: one declared publisher per aircraft, created
+/// on first use, so each key expression is resolved and declared once.
 pub struct TelemetryPublisher {
     session: Session,
+    publishers: HashMap<u32, Publisher<'static>>,
 }
 
 impl TelemetryPublisher {
-    /// Build a publisher on `session`.
     pub fn new(session: &Session) -> Self {
-        Self { session: session.clone() }
+        Self { session: session.clone(), publishers: HashMap::new() }
     }
 
-    /// Publish one sample on `astrum/telemetry/<sample.aircraft_id>`.
-    pub fn publish(&self, sample: &TelemetrySample) -> Result<()> {
-        let payload = encode_telemetry(sample);
-        self.session
+    /// Publish one sample on `astrum/telemetry/<t.aircraft_id>`.
+    pub fn publish(&mut self, t: &Telemetry) -> Result<()> {
+        self.publish_raw(t.aircraft_id, encode_telemetry(t))
+    }
+
+    /// Publish an already-encoded `Telemetry` payload (bag replay).
+    pub fn publish_raw(&mut self, aircraft_id: u32, payload: Vec<u8>) -> Result<()> {
+        let publisher = match self.publishers.entry(aircraft_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(self.session.declare_publisher(keys::telemetry(aircraft_id))?)
+            }
+        };
+        publisher.put(payload).wait().map_err(zerr)
+    }
+}
+
+/// Which telemetry a [`LatestTelemetry`] tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Aircraft(u32),
+    Fleet,
+}
+
+#[derive(Default)]
+struct LatestState {
+    latest: BTreeMap<u32, Telemetry>,
+    generation: u64,
+    decode_errors: u64,
+}
+
+type Shared = Arc<(Mutex<LatestState>, Condvar)>;
+
+/// The newest telemetry sample per aircraft. Samples are decoded on Zenoh's
+/// receive thread and overwrite the previous one for that aircraft, so a slow
+/// consumer always sees current state and never blocks the transport.
+pub struct LatestTelemetry {
+    shared: Shared,
+    seen_generation: u64,
+    _sub: Subscriber<()>,
+}
+
+impl LatestTelemetry {
+    pub fn subscribe(session: &Session, selection: Selection) -> Result<Self> {
+        let key = match selection {
+            Selection::Aircraft(id) => keys::telemetry(id),
+            Selection::Fleet => keys::TELEMETRY_ALL.to_owned(),
+        };
+        let shared: Shared = Arc::default();
+        let sink = Arc::clone(&shared);
+        let sub = session
             .z
-            .put(telemetry_key(sample.aircraft_id), payload)
-            .congestion_control(CongestionControl::Drop)
+            .declare_subscriber(key)
+            .callback(move |sample: Sample| {
+                let decoded = decode_telemetry(&sample.payload().to_bytes());
+                let (lock, cv) = &*sink;
+                let mut st = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                match decoded {
+                    Ok(t) => {
+                        st.latest.insert(t.aircraft_id, t);
+                        st.generation += 1;
+                    }
+                    Err(_) => st.decode_errors += 1,
+                }
+                drop(st);
+                cv.notify_all();
+            })
             .wait()
-            .map_err(zerr)
-    }
-}
-
-/// Subscriber-side telemetry reader — used by the bag recorder, controllers, and
-/// the replay renderer. Construction is two-step to mirror the old ZMQ `SUB`:
-/// [`connect`](Self::connect) opens the reader, then [`subscribe`](Self::subscribe)
-/// / [`subscribe_all`](Self::subscribe_all) declares the actual Zenoh subscriber.
-pub struct TelemetrySubscriber {
-    session: Session,
-    sub: Option<FifoSubscriber>,
-    timeout: Option<Duration>,
-}
-
-impl TelemetrySubscriber {
-    /// Prepare a reader on `session`. Nothing is delivered until you call
-    /// [`subscribe`](Self::subscribe) or [`subscribe_all`](Self::subscribe_all).
-    pub fn connect(session: &Session) -> Result<Self> {
-        Ok(Self { session: session.clone(), sub: None, timeout: None })
+            .map_err(zerr)?;
+        Ok(Self { shared, seen_generation: 0, _sub: sub })
     }
 
-    /// Subscribe to a single aircraft's telemetry (`astrum/telemetry/<id>`).
-    pub fn subscribe(&mut self, aircraft_id: u32) -> Result<()> {
-        self.declare(telemetry_key(aircraft_id))
+    fn state(&self) -> std::sync::MutexGuard<'_, LatestState> {
+        self.shared.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Subscribe to every aircraft (`astrum/telemetry/*`).
-    pub fn subscribe_all(&mut self) -> Result<()> {
-        self.declare(format!("{TELEMETRY_PREFIX}/*"))
+    /// The newest sample for `aircraft_id`, if any arrived.
+    pub fn latest(&self, aircraft_id: u32) -> Option<Telemetry> {
+        self.state().latest.get(&aircraft_id).copied()
     }
 
-    fn declare(&mut self, key: String) -> Result<()> {
-        let sub = self.session.z.declare_subscriber(key).wait().map_err(zerr)?;
-        self.sub = Some(sub);
+    /// The newest sample of every aircraft seen, ordered by id.
+    pub fn snapshot(&self) -> Vec<Telemetry> {
+        self.state().latest.values().copied().collect()
+    }
+
+    /// Payloads that failed to decode so far.
+    pub fn decode_errors(&self) -> u64 {
+        self.state().decode_errors
+    }
+
+    /// Block until at least one sample newer than the last `wait` arrives.
+    pub fn wait(&mut self, timeout: Duration) -> Result<()> {
+        let (lock, cv) = &*self.shared;
+        let deadline = Instant::now() + timeout;
+        let mut st = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while st.generation == self.seen_generation {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(NetError::Timeout);
+            }
+            st = cv.wait_timeout(st, left).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        self.seen_generation = st.generation;
         Ok(())
     }
+}
 
-    /// Set a receive timeout in milliseconds; a negative value blocks forever
-    /// (the default). With a timeout set, [`recv`](Self::recv) returns
-    /// [`NetError::Timeout`] when it elapses.
-    pub fn set_recv_timeout_ms(&mut self, ms: i32) {
-        self.timeout = if ms < 0 { None } else { Some(Duration::from_millis(ms as u64)) };
-    }
+// --- Commands -----------------------------------------------------------------
 
-    /// Block for the next sample (honouring any configured timeout).
-    pub fn recv(&self) -> Result<TelemetrySample> {
-        let sub = self.sub.as_ref().ok_or(NetError::NotSubscribed)?;
-        let sample = match self.timeout {
-            Some(t) => match sub.recv_timeout(t).map_err(|_| NetError::Disconnected)? {
-                Some(s) => s,
-                None => return Err(NetError::Timeout),
-            },
-            None => sub.recv().map_err(|_| NetError::Disconnected)?,
-        };
-        decode_sample(&sample)
-    }
+/// Why the sim refused a command payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandReject {
+    pub key: String,
+    pub reason: String,
+}
 
-    /// Non-blocking receive: `Ok(None)` when no sample is queued.
-    pub fn try_recv(&self) -> Result<Option<TelemetrySample>> {
-        let sub = self.sub.as_ref().ok_or(NetError::NotSubscribed)?;
-        match sub.try_recv().map_err(|_| NetError::Disconnected)? {
-            Some(s) => Ok(Some(decode_sample(&s)?)),
-            None => Ok(None),
-        }
+impl fmt::Display for CommandReject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "command on {} rejected: {}", self.key, self.reason)
     }
 }
 
-fn decode_sample(sample: &zenoh::sample::Sample) -> Result<TelemetrySample> {
-    let bytes = sample.payload().to_bytes();
-    decode_telemetry(&bytes).map_err(|_| NetError::Decode)
-}
+/// Queue depth of the sim's command intake: far above one tick's worth of
+/// commands for any fleet, so the intake never pushes back on Zenoh in practice.
+const COMMAND_QUEUE: usize = 4096;
 
-/// Sim-side command intake — subscribes `astrum/command/**` (fan-in from every
-/// controller) and drains decoded commands non-blockingly each tick.
+/// Sim-side command intake on `astrum/command/*`.
 pub struct CommandReceiver {
-    sub: FifoSubscriber,
+    sub: Subscriber<FifoChannelHandler<Sample>>,
 }
 
 impl CommandReceiver {
-    /// Declare the command subscriber on `session`.
     pub fn bind(session: &Session) -> Result<Self> {
-        let sub =
-            session.z.declare_subscriber(format!("{COMMAND_PREFIX}/**")).wait().map_err(zerr)?;
+        let sub = session
+            .z
+            .declare_subscriber(keys::COMMAND_ALL)
+            .with(zenoh::handlers::FifoChannel::new(COMMAND_QUEUE))
+            .wait()
+            .map_err(zerr)?;
         Ok(Self { sub })
     }
 
-    /// Drain every queued command without blocking. Undecodable payloads are
-    /// skipped so one malformed frame can't wedge the intake.
-    pub fn drain(&self) -> Vec<CommandMsg> {
+    fn validate(sample: &Sample) -> Result<Command, CommandReject> {
+        let key = sample.key_expr().as_str();
+        let reject = |reason: String| CommandReject { key: key.to_owned(), reason };
+        let key_id = keys::id_of(key, keys::COMMAND_PREFIX)
+            .ok_or_else(|| reject("key is not astrum/command/<id>".into()))?;
+        let cmd = decode_command(&sample.payload().to_bytes())
+            .map_err(|e| reject(format!("decode failed: {e}")))?;
+        if cmd.target_id != key_id {
+            return Err(reject(format!(
+                "payload targets {} but key names {key_id}",
+                cmd.target_id
+            )));
+        }
+        Ok(cmd)
+    }
+
+    /// Every command queued so far, in arrival order, without blocking.
+    pub fn drain(&self) -> Vec<Result<Command, CommandReject>> {
         let mut out = Vec::new();
         while let Ok(Some(sample)) = self.sub.try_recv() {
-            let bytes = sample.payload().to_bytes();
-            if let Ok(cmd) = decode_command(&bytes) {
-                out.push(cmd);
-            }
+            out.push(Self::validate(&sample));
         }
         out
     }
+
+    /// Block up to `timeout` for the next command.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Result<Command, CommandReject>> {
+        match self.sub.recv_timeout(timeout) {
+            Ok(Some(sample)) => Ok(Self::validate(&sample)),
+            Ok(None) => Err(NetError::Timeout),
+            Err(_) => Err(NetError::Disconnected),
+        }
+    }
 }
 
-/// Controller-side command sender. Publishes on `astrum/command/<target-id>`
-/// with `Block` congestion control so a control input is never silently dropped
-/// (reliable over the TCP transport, matching ZMQ `PUSH`/`PULL`).
+/// Controller-side command publisher for one aircraft. Stamps every command
+/// with a strictly increasing `seq`.
 pub struct CommandSender {
-    session: Session,
+    target_id: u32,
+    seq: u64,
+    publisher: Publisher<'static>,
 }
 
 impl CommandSender {
-    /// Build a sender on `session`.
-    pub fn connect(session: &Session) -> Self {
-        Self { session: session.clone() }
+    pub fn new(session: &Session, target_id: u32) -> Result<Self> {
+        let publisher = session.declare_publisher(keys::command(target_id))?;
+        Ok(Self { target_id, seq: 0, publisher })
     }
 
-    /// Send one command to its target aircraft.
-    pub fn send(&self, cmd: &CommandMsg) -> Result<()> {
-        let payload = encode_command(cmd);
-        self.session
+    /// Send `control` computed from telemetry tick `telemetry_tick`. Returns the
+    /// sequence number used.
+    pub fn send(&mut self, control: Control, trigger: bool, telemetry_tick: u64) -> Result<u64> {
+        self.seq += 1;
+        let cmd =
+            Command { target_id: self.target_id, seq: self.seq, telemetry_tick, trigger, control };
+        self.publisher.put(encode_command(&cmd)).wait().map_err(zerr)?;
+        Ok(self.seq)
+    }
+}
+
+// --- Scenario -----------------------------------------------------------------
+
+/// Answers `get astrum/scenario` with the sim's scenario TOML for as long as it
+/// is alive.
+pub struct ScenarioServer {
+    _queryable: Queryable<()>,
+}
+
+impl ScenarioServer {
+    pub fn serve(session: &Session, scenario_toml: String) -> Result<Self> {
+        let queryable = session
             .z
-            .put(command_key(cmd.target_id), payload)
-            .congestion_control(CongestionControl::Block)
+            .declare_queryable(keys::SCENARIO)
+            .callback(move |query| {
+                // A failed reply (the querier went away) affects only that querier.
+                let _ = query.reply(keys::SCENARIO, scenario_toml.clone()).wait();
+            })
             .wait()
-            .map_err(zerr)
+            .map_err(zerr)?;
+        Ok(Self { _queryable: queryable })
+    }
+}
+
+/// How often [`fetch_scenario`] re-asks while nobody has answered.
+const SCENARIO_RETRY: Duration = Duration::from_millis(100);
+
+/// Ask the sim for its scenario TOML, re-asking until `timeout` elapses (a
+/// query sent before the sim declared its queryable gets no reply at all).
+/// `Ok(None)` if nobody answered in time.
+pub fn fetch_scenario(session: &Session, timeout: Duration) -> Result<Option<String>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        let attempt = left.min(SCENARIO_RETRY);
+        let started = Instant::now();
+        let replies = session.z.get(keys::SCENARIO).timeout(attempt).wait().map_err(zerr)?;
+        while let Ok(reply) = replies.recv() {
+            if let Ok(sample) = reply.result() {
+                let text = String::from_utf8(sample.payload().to_bytes().into_owned())
+                    .map_err(|e| NetError::BadScenario(e.to_string()))?;
+                return Ok(Some(text));
+            }
+        }
+        // No queryable yet: the query finished early; wait out the attempt.
+        std::thread::sleep(attempt.saturating_sub(started.elapsed()));
     }
 }

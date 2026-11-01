@@ -1,14 +1,19 @@
 // Telemetry sources for the renderer.
 //
-//  * WebSocket — the `astrum-web` bridge streams one JSON frame per sample from
-//    the live sim or `astrum-bag-play`. Frames arrive continuously; the store
-//    buffers them so you can still scrub back through what's been received.
-//  * File — a `astrum-web-export` document (a whole bag baked to JSON). Loaded
+//  * WebSocket — the `astrum-web` bridge streams fleet snapshots,
+//    `{"type":"frames","frames":[FrameJson…]}`, from the live sim or
+//    `astrum-bag-play`. The store buffers them so you can scrub back through
+//    what's been received.
+//  * File — an `astrum-web-export` document (a whole bag baked to JSON). Loaded
 //    whole, giving a fully seekable timeline with no running services.
 
+// The export document this viewer reads (astrum_web::ExportDoc).
+const EXPORT_KIND = "astrum-replay";
+const EXPORT_VERSION = 2;
+
 export class Net {
-  constructor({ onFrame, onStatus }) {
-    this.onFrame = onFrame;
+  constructor({ onFrames, onStatus }) {
+    this.onFrames = onFrames;
     this.onStatus = onStatus || (() => {});
     this.ws = null;
   }
@@ -31,9 +36,13 @@ export class Net {
     ws.onclose = () => { if (this.ws === ws) { this.ws = null; this.onStatus("closed", target); } };
     ws.onerror = () => this.onStatus("error", target);
     ws.onmessage = (ev) => {
+      let msg;
       try {
-        this.onFrame(JSON.parse(ev.data));
-      } catch { /* ignore a malformed frame */ }
+        msg = JSON.parse(ev.data);
+      } catch {
+        return; // ignore a malformed message
+      }
+      if (msg && msg.type === "frames" && Array.isArray(msg.frames)) this.onFrames(msg.frames);
     };
   }
 
@@ -57,14 +66,19 @@ export function defaultWsUrl() {
   return `${proto}//${host}/telemetry`;
 }
 
-// Parse a astrum-web-export document. Returns { frames, meta } or throws.
+// Parse an astrum-web-export document. Returns { frames, meta } or throws.
 export async function loadExportFile(file) {
-  const text = await file.text();
-  const doc = JSON.parse(text);
-  if (doc && doc.kind === "astrum-replay-bag" && Array.isArray(doc.frames)) {
-    return { frames: doc.frames, meta: doc.meta || null };
+  let doc;
+  try {
+    doc = JSON.parse(await file.text());
+  } catch {
+    throw new Error("not JSON (expected an astrum-web-export document)");
   }
-  // Tolerate a bare array of frames too.
-  if (Array.isArray(doc)) return { frames: doc, meta: null };
-  throw new Error("not a ASTRUM replay export (expected a astrum-web-export JSON document)");
+  if (!doc || doc.kind !== EXPORT_KIND || !Array.isArray(doc.frames)) {
+    throw new Error("not an ASTRUM replay export (expected an astrum-web-export document)");
+  }
+  if (doc.version !== EXPORT_VERSION) {
+    throw new Error(`unsupported export version ${String(doc.version)} (this viewer reads version ${EXPORT_VERSION}; re-export the bag)`);
+  }
+  return { frames: doc.frames, meta: doc.meta && typeof doc.meta === "object" ? doc.meta : null };
 }

@@ -3,6 +3,8 @@ name = "astrum-net"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "ASTRUM Zenoh transport: telemetry & command pub/sub over the astrum-proto wire schema."
 
 [lib]
@@ -10,7 +12,4 @@ name = "astrum_net"
 
 [dependencies]
 astrum-proto = { path = "../astrum-proto" }
-# Zenoh pub/sub over key expressions. Used via its synchronous `.wait()` resolver
-# and blocking/non-blocking channel handlers, so it fits Bevy's synchronous
-# systems with no async runtime for us to drive (Zenoh embeds its own).
-zenoh = "1"
+zenoh = { workspace = true }
