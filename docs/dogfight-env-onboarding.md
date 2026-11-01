@@ -174,6 +174,8 @@ first tasks, in order:
    and `step` — several envs can run on Python threads concurrently.
    `astrum_env.BatchEnv` steps K envs in parallel (rayon) inside one call.
    Process-level vectorisation (`SubprocVecEnv` / `AsyncVectorEnv`) also works.
+   Keep `sim.threads = 1` (the default) in batched scenarios — per-env FDM
+   workers would oversubscribe the cores the batch already uses.
 2. **gymnasium and stable-baselines3 are not in the dev image**
    (`docker/requirements.txt` ships numpy/scipy only). The adapter is numpy-only
    and subclasses `gymnasium.Env` *only if it's importable*, so it runs offline

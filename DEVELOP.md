@@ -172,7 +172,13 @@ fallback). Every flag falls back to the env var, then the default:
 |---|---|---|---|
 | *(positional)* `scenario` | `ASTRUM_SCENARIO` | `config/scenario.example.toml` | which scenario to load |
 | `--listen` | `ASTRUM_ZENOH_LISTEN` | `tcp/0.0.0.0:7447` | Zenoh endpoint the sim's router listens on |
-| `--threads` | `ASTRUM_THREADS` | scenario `sim.threads` | FDM stepping threads (0 = all cores) |
+| `--threads` | `ASTRUM_THREADS` | scenario `sim.threads` | FDM stepping threads (0 = all cores, capped at the fleet size) |
+| `--speed` | `ASTRUM_SPEED` | scenario `sim.speed` | pace as × real time (1 = real time, 0 = as fast as possible) |
+| `--record` | `ASTRUM_RECORD` | — | record every tick's telemetry + received commands to this MCAP bag, in-process |
+
+SIGINT/SIGTERM end the run cleanly at the end of the tick (a `--record` bag is finished); a
+second signal exits at once. `make bench` measures the headless tick cost for a few fleet sizes
+and thread counts.
 
 ## 5. Scenarios
 
@@ -189,9 +195,9 @@ origin_alt_hae_m = 0.0
 [sim]
 rate_hz    = 120.0           # fixed physics step = 1/rate_hz seconds
 max_time_s = 40.0            # 0 = run forever; >0 = stop after N sim-seconds
-realtime   = true            # true ≈ wall-clock (for live control); false = as fast as possible
+speed      = 1.0             # × wall-clock (1 for live control / watching); 0 = as fast as possible
 seed       = 0               # gun dispersion + each aircraft's JSBSim RNG
-threads    = 1               # FDM stepping threads (0 = all cores); identical results for any value
+threads    = 1               # FDM stepping threads (0 = all cores, ≤ fleet); identical results for any value
 command_lease_s = 0.5        # raw-command lease → failsafe hold; 0 disables
 lockstep   = false           # wait each tick for commands from lockstep aircraft
 lockstep_timeout_s = 30.0    # fatal if a lockstep wait exceeds this
@@ -207,6 +213,7 @@ heading_deg = 90.0
 tas_mps = 55.0               # a multirotor initialises at hover: tas_mps = 0.0
 # trim = true                # default: fixed-wing yes, multirotor no; a failed trim is fatal
 # lockstep = false
+# control_rate_hz = 30.0     # telemetry (+ lockstep commands) at this rate; divides rate_hz
 # team = 0 / health = 100.0 / ammo = 511
 ```
 

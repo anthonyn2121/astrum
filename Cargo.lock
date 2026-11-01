@@ -227,14 +227,16 @@ dependencies = [
 name = "astrum-sim"
 version = "0.1.0"
 dependencies = [
+ "astrum-bag",
  "astrum-fdm",
  "astrum-geo",
  "astrum-net",
  "astrum-proto",
  "bevy",
  "clap",
- "rayon",
+ "ctrlc",
  "serde",
+ "tempfile",
  "toml",
 ]
 

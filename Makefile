@@ -15,7 +15,7 @@ export UID GID
 .DEFAULT_GOAL := help
 .PHONY: help build up down demo demo-python demo-quad demo-formation smoke replay export \
         shell exec verify fmt fmt-check lint test test-rust test-cpp test-python \
-        wire-fixtures deny ci logs ps clean
+        wire-fixtures deny bench ci logs ps clean
 
 # One-off command in a fresh container (no deps, no TTY): $(IN) '<bash script>'.
 IN = $(COMPOSE) run --rm --no-deps -T $(SERVICE) bash -c
@@ -115,6 +115,9 @@ wire-fixtures: ## Regenerate the Rust/C++/Python wire fixtures (crates/astrum-pr
 
 deny: ## Dependency audit: licenses, advisories, bans, sources (cargo deny)
 	$(IN) 'cargo deny --locked check'
+
+bench: ## Headless sim throughput (µs/tick, × real time) for fixed fleets and thread counts
+	$(IN) 'cargo run --release --locked -q -p astrum-sim --example throughput 2>/dev/null | grep "^|"'
 
 ci: fmt-check lint test deny ## Full gate: fmt-check + lint + all tests + deny (fails on any failure)
 

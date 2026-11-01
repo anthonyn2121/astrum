@@ -30,6 +30,7 @@ pub fn spec(
         tas_mps,
         trim: None,
         lockstep: false,
+        control_rate_hz: None,
         team: 0,
         health: 100.0,
         ammo: None,
@@ -42,7 +43,7 @@ pub fn scenario(aircraft: Vec<AircraftSpec>) -> Scenario {
         sim: Sim {
             rate_hz: 120.0,
             max_time_s: 0.0,
-            realtime: false,
+            speed: 0.0,
             seed: 0,
             threads: 1,
             command_lease_s: 0.5,

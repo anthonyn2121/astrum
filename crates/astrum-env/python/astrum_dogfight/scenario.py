@@ -30,7 +30,7 @@ origin_alt_hae_m = 0.0
 [sim]
 rate_hz = {rate_hz}
 max_time_s = {max_time_s}
-realtime = false
+speed = 0.0
 seed = {seed}
 """
 

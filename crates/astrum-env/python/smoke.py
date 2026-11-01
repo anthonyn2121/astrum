@@ -23,7 +23,7 @@ origin_alt_hae_m = 0.0
 [sim]
 rate_hz = 120.0
 max_time_s = 0.0
-realtime = false
+speed = 0.0
 seed = 7
 
 [[aircraft]]

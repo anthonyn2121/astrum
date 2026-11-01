@@ -33,3 +33,5 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# `termination`: SIGTERM (docker stop) as well as SIGINT ends a run cleanly.
+ctrlc = { version = "3.5", features = ["termination"] }

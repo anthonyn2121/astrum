@@ -21,8 +21,8 @@ rate_hz = 120.0
 # Bounded so `make demo-formation` self-terminates: 220 s covers the formation
 # capture plus both lobes and the crossover of the 8 km x 4 km pattern at 120 m/s.
 max_time_s = 220.0
-# Real-time so the run is watchable in the 3-D replay renderer.
-realtime = true
+# Real time so the run is watchable in the 3-D replay renderer.
+speed = 1.0
 
 # --- Fleet -------------------------------------------------------------------
 # All F-16s at 4572 m HAE, trimmed at 120 m/s TAS — the leader's commanded speed

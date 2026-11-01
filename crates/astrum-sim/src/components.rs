@@ -59,6 +59,11 @@ impl FdmInstance {
     }
 }
 
+/// Which [`StepPool`](crate::systems::StepPool) shard steps this aircraft's FDM,
+/// fixed at spawn so an instance's working set stays in one core's cache.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepShard(pub usize);
+
 /// The authoritative per-aircraft state after the latest step, read from
 /// JSBSim and mapped onto the world grid (all `f64`).
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq)]
@@ -85,7 +90,8 @@ pub struct SimParams {
     pub dt: f64,
     /// Stop after this many simulated seconds; `0` runs indefinitely.
     pub max_time_s: f64,
-    pub realtime: bool,
+    /// Wall-clock pace as a multiple of real time; `0` = unpaced.
+    pub speed: f64,
     /// Command lease in ticks; `None` disables it.
     pub lease_ticks: Option<u64>,
     pub lockstep: bool,

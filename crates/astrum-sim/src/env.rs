@@ -140,7 +140,7 @@ fn reset_world(world: &mut World, scenario: &Scenario) -> Result<()> {
     world.insert_resource(SimClock::default());
     world.insert_resource(SimStatus::default());
     world.insert_resource(Diag::default());
-    world.insert_resource(Pacer::new(params.dt, params.realtime));
+    world.insert_resource(Pacer::new(params.dt, params.speed));
     world.insert_resource(CombatParams::default());
     world.insert_resource(CombatRng::seeded(scenario.sim.seed));
     world.insert_resource(CombatState { initial_living_teams: team_count(scenario) });
@@ -162,7 +162,8 @@ fn reset_world(world: &mut World, scenario: &Scenario) -> Result<()> {
         let fdm = inst.fdm();
         reset_fdm(fdm, spec, &class, scenario.sim.seed).map_err(EnvError::Sim)?;
         let state = grid_state(&frame.0, fdm, None).map_err(|e| EnvError::Sim(e.to_string()))?;
-        let (team, health, trigger, pilot, armed) = initial_components(spec, &class);
+        let (team, health, trigger, pilot, armed) =
+            initial_components(spec, &class, params.rate_hz);
         ent.insert((state, team, health, trigger, pilot));
         ent.remove::<Dead>();
         if let Some((gains, gun)) = armed {

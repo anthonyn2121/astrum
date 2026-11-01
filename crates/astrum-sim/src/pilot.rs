@@ -54,21 +54,32 @@ pub struct Pilot {
     pub last_seq: Option<u64>,
     /// In a lockstep scenario, the sim waits for this aircraft's commands.
     pub lockstep: bool,
+    /// Ticks between this aircraft's telemetry samples (and, in lockstep, the
+    /// commands the sim waits for): `rate_hz / control_rate_hz`, default 1.
+    pub control_period_ticks: u64,
     pub integrators: Integrators,
     /// FCS inputs to write before this tick's step (`None` = leave as is).
     pub output: Option<Controls>,
 }
 
 impl Pilot {
+    /// A pilot sampled every tick.
     pub fn new(lockstep: bool) -> Self {
         Self {
             mode: PilotMode::Uncommanded,
             last_command_tick: 0,
             last_seq: None,
             lockstep,
+            control_period_ticks: 1,
             integrators: Integrators::default(),
             output: None,
         }
+    }
+
+    /// Whether tick `tick` is one of this aircraft's control ticks (telemetry
+    /// published; in lockstep, a command awaited). Tick 0 always is.
+    pub fn due(&self, tick: u64) -> bool {
+        tick.is_multiple_of(self.control_period_ticks)
     }
 }
 

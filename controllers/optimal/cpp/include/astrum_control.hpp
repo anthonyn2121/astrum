@@ -20,7 +20,7 @@ namespace astrum {
 
 // Construction-time knobs every law receives (from the CLI).
 struct LawConfig {
-  double dt = 1.0 / 120.0;  // control period = 1 / --rate-hz (= the sim's tick)
+  double dt = 1.0 / 120.0;  // control period = 1 / --rate-hz (the aircraft's control_rate_hz)
   AttitudeLimits limits;    // --max-bank-deg / --max-pitch-deg
   double horizon_s = 0.5;   // --horizon-s: MPC look-ahead, round(horizon_s / dt) steps of dt
 };

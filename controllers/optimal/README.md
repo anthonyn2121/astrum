@@ -86,8 +86,9 @@ class MyLaw : public Law {
 The C++ runtime is the shared client in [`controllers/common/cpp`](../common/cpp) (the
 same one the example uses): latest-value telemetry, exception-safe decoding, contract
 QoS, `seq`/`telemetryTick`, one command per sample, `--startup-timeout` (exit 1) /
-`--telemetry-timeout` (exit 0). It also exits 2 if the telemetry's tick period
-(`simTimeS / tick`) is not `1/--rate-hz`, because the laws are discretized for it.
+`--telemetry-timeout` (exit 0). It also exits 2 unless telemetry arrives every
+`1/--rate-hz` (the sim step must divide that period, and samples must come one period
+apart), because the laws are discretized for it.
 
 `VehicleState` is SI units, decoded from telemetry v2 — including the body rates
 `p`/`q`/`r` the sim measures, `alpha`/`beta`, ENU and NED velocities, vehicle kind
@@ -202,7 +203,8 @@ ctest --test-dir build/controllers --output-on-failure
 C++ flags: `--law lqr|mpc` (`ASTRUM_LAW`), the client and reference flags of the
 example (`--connect --id --heading --alt --speed --startup-timeout --telemetry-timeout`),
 `--max-bank-deg` / `--max-pitch-deg` (25 / 10; f16: 60 / 24), `--rate-hz` (`ASTRUM_RATE_HZ`,
-default 120 — must equal the scenario's `sim.rate_hz`) and `--horizon-s` (mpc only).
+default 120 — the aircraft's control rate: its `control_rate_hz` in the scenario, which
+defaults to `sim.rate_hz`) and `--horizon-s` (mpc only).
 
 `--help` lists every flag with its `ASTRUM_*` env fallback (precedence: **CLI arg >
 `$ENV` > default**, as everywhere in ASTRUM). Start a sim in another shell first,

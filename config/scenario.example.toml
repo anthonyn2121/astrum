@@ -17,14 +17,17 @@ origin_alt_hae_m = 0.0          # height above the WGS84 ellipsoid
 rate_hz = 120.0
 # Stop after this many simulated seconds (0 / omitted = run indefinitely).
 max_time_s = 0.0
-# true (default) throttles to ~real time for live controllers; false runs as fast
-# as the host allows. With external controllers, only `lockstep` makes runs
-# reproducible (commands otherwise land on whichever tick they arrive).
-realtime = true
+# Wall-clock pace as a multiple of real time: 1 (default) for live controllers
+# and watching, 10 = ten times faster, 0 = as fast as the host allows
+# (astrum-sim --speed overrides). With external controllers, only `lockstep`
+# makes runs reproducible (commands otherwise land on whichever tick they arrive).
+speed = 1.0
 # Seed for gun dispersion and each aircraft's JSBSim random generator.
 seed = 0
 # Threads stepping the FDMs in parallel (astrum-sim --threads overrides; 0 = all
-# cores). The result is identical for any value.
+# cores; capped at the fleet size). Each aircraft stays on one worker, and idle
+# workers spin briefly between unpaced ticks, so leave cores free on a busy host.
+# The result is identical for any value.
 threads = 1
 # A controller must keep commanding: an aircraft that received commands and then
 # gets none for this long switches to the failsafe hold (0 disables).
@@ -40,6 +43,9 @@ lockstep_timeout_s = 30.0
 # needs `kind = "fixed-wing" | "multirotor"` and, if fixed-wing,
 # `autopilot_profile = "trainer" | "fighter"`. Fixed-wing aircraft are trimmed
 # for level flight at spawn (`trim = false` to skip); a failed trim is fatal.
+# `control_rate_hz` (default: every tick) publishes that aircraft's telemetry —
+# and, in lockstep, waits for its commands — at a lower rate that divides
+# rate_hz; the last command holds in between.
 
 [[aircraft]]
 id = 1

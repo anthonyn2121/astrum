@@ -18,7 +18,8 @@ coordination (no sideslip). Three decoupled channels:
         v_err'   = -a_v v_err + b_v (throttle - trim)
 
 The continuous model is discretized exactly (zero-order hold) at the control
-period — the sim step, since a command answers every telemetry tick. The
+period ``1/--rate-hz`` — the spacing of this aircraft's telemetry (its
+``control_rate_hz``, by default every sim step), since a command answers each sample. The
 airframe constants below are placeholders for the c172x trainer; replace them
 with your own linearization (JSBSim trim + finite differences).
 

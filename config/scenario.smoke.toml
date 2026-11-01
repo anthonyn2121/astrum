@@ -9,7 +9,7 @@ origin_alt_hae_m = 0.0
 [sim]
 rate_hz = 120.0
 max_time_s = 3.0
-realtime = false  # run as fast as possible for the test
+speed = 0.0  # run as fast as possible for the test
 
 [[aircraft]]
 id = 1

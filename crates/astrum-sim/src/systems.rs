@@ -2,6 +2,8 @@
 //! (in parallel), the sim clock, progress reporting, pacing and termination.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use astrum_fdm::{prop, Controls, Fdm, FdmError, InitialConditions, TrimMode};
@@ -10,11 +12,12 @@ use bevy::prelude::*;
 
 use crate::combat::{Dead, Gun, Health, Team, Trigger};
 use crate::components::{
-    Aircraft, AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus,
+    Aircraft, AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus, StepShard,
     VehicleKind, WorldFrame,
 };
 use crate::pilot::{FixedWingGains, Pilot};
 use crate::scenario::{AircraftClass, AircraftSpec, Scenario};
+use crate::step_pool::ShardPool;
 
 /// JSBSim data root (`aircraft/`, `engine/`, `systems/`).
 pub fn jsbsim_root() -> PathBuf {
@@ -104,6 +107,7 @@ pub fn grid_state(
 pub fn initial_components(
     spec: &AircraftSpec,
     class: &AircraftClass,
+    rate_hz: f64,
 ) -> (Team, Health, Trigger, Pilot, Option<(FixedWingGains, Gun)>) {
     // Fixed-wing aircraft carry the gun and autopilot gains; multirotors are
     // unarmed and use the hover-hold law.
@@ -114,19 +118,25 @@ pub fn initial_components(
         }
         (FixedWingGains::for_profile(p), gun)
     });
-    (Team(spec.team), Health::full(spec.health), Trigger(false), Pilot::new(spec.lockstep), armed)
+    let pilot = Pilot {
+        control_period_ticks: spec.control_period_ticks(rate_hz),
+        ..Pilot::new(spec.lockstep)
+    };
+    (Team(spec.team), Health::full(spec.health), Trigger(false), pilot, armed)
 }
 
-/// Startup: one FDM-owning entity per scenario aircraft. Any failure is fatal.
+/// Startup: one FDM-owning entity per scenario aircraft, dealt round-robin to
+/// the [`StepPool`]'s shards in scenario order. Any failure is fatal.
 pub fn spawn_fleet(
     mut commands: Commands,
     scenario: Res<Scenario>,
     params: Res<SimParams>,
     frame: Res<WorldFrame>,
+    pool: Res<StepPool>,
     mut status: ResMut<SimStatus>,
 ) {
     let mut index = AircraftIndex::default();
-    for spec in &scenario.aircraft {
+    for (rank, spec) in scenario.aircraft.iter().enumerate() {
         let class = match spec.class() {
             Ok(c) => c,
             Err(e) => {
@@ -148,10 +158,12 @@ pub fn spawn_fleet(
                 return;
             }
         };
-        let (team, health, trigger, pilot, armed) = initial_components(spec, &class);
+        let (team, health, trigger, pilot, armed) =
+            initial_components(spec, &class, params.rate_hz);
         let mut ent = commands.spawn((
             Aircraft { id: spec.id },
             FdmInstance::new(fdm),
+            StepShard(rank % pool.threads()),
             class.kind,
             state,
             pilot,
@@ -191,44 +203,66 @@ fn advance(
 /// Owned per app (not a process-global pool), so every sim or env in a process
 /// gets exactly the parallelism its scenario asks for.
 #[derive(Resource)]
-pub struct StepPool(pub Option<rayon::ThreadPool>);
+pub struct StepPool(Option<ShardPool>);
 
 impl StepPool {
+    /// `threads <= 1` steps on the schedule's thread.
     pub fn new(threads: usize) -> Self {
-        if threads <= 1 {
-            return Self(None);
-        }
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("astrum-fdm-{i}"))
-            .build()
-            .expect("spawning the FDM stepping threads");
-        Self(Some(pool))
+        Self((threads > 1).then(|| ShardPool::new(threads)))
+    }
+
+    /// Shards an aircraft can be assigned to ([`StepShard`]).
+    pub fn threads(&self) -> usize {
+        self.0.as_ref().map_or(1, ShardPool::threads)
     }
 }
 
 type StepItem<'a> = (&'a Aircraft, Mut<'a, FdmInstance>, &'a Pilot, Mut<'a, AircraftState>);
 
 /// Write each living aircraft's FCS inputs, advance its FDM one step and read
-/// back its state — in parallel across aircraft when the scenario asks for
+/// back its state — on its [`StepShard`]'s worker when the scenario asks for
 /// threads (instances are independent, so the result is identical for any
 /// thread count). A dead aircraft is frozen.
 pub fn step_fdm(
     frame: Res<WorldFrame>,
     pool: Res<StepPool>,
     mut status: ResMut<SimStatus>,
-    mut q: Query<(&Aircraft, &mut FdmInstance, &Pilot, &mut AircraftState), Without<Dead>>,
+    mut q: Query<
+        (&Aircraft, &StepShard, &mut FdmInstance, &Pilot, &mut AircraftState),
+        Without<Dead>,
+    >,
 ) {
-    use rayon::prelude::*;
     let frame = frame.0;
-    let step = |(ac, mut inst, pilot, mut st): StepItem| {
-        advance(inst.fdm(), pilot.output, &frame, &mut st).err().map(|e| (ac.id, e))
+    let step = |(ac, inst, pilot, st): &mut StepItem| {
+        advance(inst.fdm(), pilot.output, &frame, st).err().map(|e| (ac.id, e))
     };
     let mut failures: Vec<(u32, FdmError)> = match &pool.0 {
-        None => q.iter_mut().filter_map(step).collect(),
+        None => {
+            q.iter_mut().filter_map(|(ac, _, inst, p, st)| step(&mut (ac, inst, p, st))).collect()
+        }
         Some(pool) => {
-            let items: Vec<StepItem> = q.iter_mut().collect();
-            pool.install(|| items.into_par_iter().filter_map(step).collect())
+            // One contiguous run of items per shard (the query's order follows
+            // archetypes, not shards), handed to the shard's worker.
+            let mut items: Vec<(usize, StepItem)> =
+                q.iter_mut().map(|(ac, shard, inst, p, st)| (shard.0, (ac, inst, p, st))).collect();
+            items.sort_unstable_by_key(|(shard, _)| *shard);
+            let mut shards: Vec<&mut [(usize, StepItem)]> = Vec::with_capacity(pool.threads());
+            let mut rest = items.as_mut_slice();
+            for shard in 0..pool.threads() {
+                let n = rest.iter().take_while(|(s, _)| *s == shard).count();
+                let (mine, tail) = std::mem::take(&mut rest).split_at_mut(n);
+                shards.push(mine);
+                rest = tail;
+            }
+            let failed = Mutex::new(Vec::new());
+            pool.run(&mut shards, |_, shard| {
+                for (_, item) in shard.iter_mut() {
+                    if let Some(f) = step(item) {
+                        failed.lock().unwrap_or_else(PoisonError::into_inner).push(f);
+                    }
+                }
+            });
+            failed.into_inner().unwrap_or_else(PoisonError::into_inner)
         }
     };
     if !failures.is_empty() {
@@ -265,63 +299,73 @@ impl Default for Diag {
     }
 }
 
-/// Roughly once per simulated second, report achieved vs configured step rate.
+/// How often the binary reports progress (wall clock).
+const REPORT_EVERY: Duration = Duration::from_secs(1);
+
+/// About once per wall-clock second, report the achieved step rate and speed.
 pub fn report_progress(
     params: Res<SimParams>,
     clock: Res<SimClock>,
     mut diag: ResMut<Diag>,
     q: Query<(), With<Aircraft>>,
 ) {
-    let interval = params.rate_hz.round().max(1.0) as u64;
-    if !clock.tick.is_multiple_of(interval) {
+    let now = Instant::now();
+    let elapsed = now.duration_since(diag.last_log);
+    if elapsed < REPORT_EVERY {
         return;
     }
-    let now = Instant::now();
-    let secs = now.duration_since(diag.last_log).as_secs_f64();
-    let did = clock.tick - diag.last_log_tick;
-    let achieved = if secs > 0.0 { did as f64 / secs } else { 0.0 };
+    let hz = (clock.tick - diag.last_log_tick) as f64 / elapsed.as_secs_f64();
+    let target =
+        if params.speed > 0.0 { format!("{}×", params.speed) } else { "unpaced".to_owned() };
     println!(
-        "[astrum-sim] tick {} | sim {:.1}s | {} aircraft | {:.1} Hz achieved (target {:.1})",
+        "[astrum-sim] tick {} | sim {:.1}s | {} aircraft | {:.0} Hz = {:.1}× real time (target {target})",
         clock.tick,
         clock.time_s(&params),
         q.iter().count(),
-        achieved,
-        params.rate_hz,
+        hz,
+        hz / params.rate_hz,
     );
     diag.last_log = now;
     diag.last_log_tick = clock.tick;
 }
 
-/// Real-time throttle. Bevy's runner sleep is a no-op under
+/// Wall-clock throttle (`sim.speed`). Bevy's runner sleep is a no-op under
 /// `default-features = false`, so the loop is paced here.
 #[derive(Resource)]
 pub struct Pacer {
-    dt: Duration,
-    realtime: bool,
+    /// Wall time per step, `dt / speed`; `None` runs unpaced.
+    period: Option<Duration>,
     /// Wall-clock instant the next step should not begin before.
     next: Option<Instant>,
 }
 
 impl Pacer {
-    pub fn new(dt: f64, realtime: bool) -> Self {
-        Self { dt: Duration::from_secs_f64(dt), realtime, next: None }
+    /// `speed` as validated by the scenario: `0` or at least [`MIN_SPEED`].
+    pub fn new(dt: f64, speed: f64) -> Self {
+        Self { period: (speed > 0.0).then(|| Duration::from_secs_f64(dt / speed)), next: None }
     }
 }
 
-/// Sleep so consecutive steps are `dt` apart. When physics can't keep up,
-/// rebaseline instead of accumulating debt.
+/// Slowest supported `sim.speed` other than `0` (unpaced).
+pub const MIN_SPEED: f64 = 1e-3;
+
+/// How far the pacer may fall behind its schedule (sleep overshoot, a slow
+/// tick) and still catch up, so a high speed factor is met on average; beyond
+/// this it re-baselines instead of bursting to recover the debt.
+const MAX_PACE_LAG: Duration = Duration::from_millis(50);
+
+/// Hold each step until its slot on the `dt / speed` schedule.
 pub fn pace(mut pacer: ResMut<Pacer>) {
-    if !pacer.realtime {
-        return;
-    }
+    let Some(period) = pacer.period else { return };
     let now = Instant::now();
-    match pacer.next {
-        Some(target) if now < target => {
-            std::thread::sleep(target - now);
-            pacer.next = Some(target + pacer.dt);
-        }
-        _ => pacer.next = Some(now + pacer.dt),
+    let slot = match pacer.next {
+        Some(next) if now < next + MAX_PACE_LAG => next,
+        _ => now, // first step, or too far behind: start a new schedule here
+    };
+    if now < slot {
+        std::thread::sleep(slot - now);
     }
+    pacer.next = Some(slot + period);
 }
 
 /// Exit once the configured simulated-time limit is reached (`max_time_s > 0`).
@@ -332,6 +376,32 @@ pub fn stop_at_max_time(
 ) {
     if params.max_time_s > 0.0 && clock.time_s(&params) >= params.max_time_s {
         println!("[astrum-sim] reached max_time_s={:.1} — exiting", params.max_time_s);
+        exit.write(AppExit::Success);
+    }
+}
+
+/// Set by the binary's SIGINT/SIGTERM handler: the run ends cleanly (bag
+/// finished, exit 0) at the end of the current tick.
+#[derive(Resource, Clone, Default)]
+pub struct StopRequested(pub Arc<AtomicBool>);
+
+impl StopRequested {
+    pub fn requested(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Exit once a stop has been requested.
+pub fn exit_on_signal(
+    stop: Option<Res<StopRequested>>,
+    mut exit: MessageWriter<AppExit>,
+    mut reported: Local<bool>,
+) {
+    if stop.is_some_and(|s| s.requested()) {
+        if !*reported {
+            println!("[astrum-sim] stop requested — exiting");
+            *reported = true;
+        }
         exit.write(AppExit::Success);
     }
 }

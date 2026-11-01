@@ -1,6 +1,6 @@
 //! `astrum-sim` — the ASTRUM headless Bevy ECS state server, as a library.
 //!
-//! [`build_app`] stands up a headless Bevy app (`MinimalPlugins`) that spawns one
+//! [`build_app`] stands up a headless Bevy app (only the schedule runner) that spawns one
 //! entity per scenario aircraft — each owning an independent JSBSim FDM — and
 //! advances them one deterministic step per update, deriving the world-grid
 //! state from each aircraft's geodetic state. The binary adds the Zenoh bridge;
@@ -19,7 +19,9 @@ pub mod components;
 pub mod env;
 pub mod net;
 pub mod pilot;
+pub mod record;
 pub mod scenario;
+pub mod step_pool;
 pub mod systems;
 
 use bevy::app::ScheduleRunnerPlugin;
@@ -34,8 +36,8 @@ use net::{ingest_commands, publish_telemetry, LastPublished, RefusalLog};
 use pilot::{autopilot_step, expire_leases};
 use scenario::Scenario;
 use systems::{
-    advance_clock, exit_on_fatal, freeze_dead, pace, report_progress, spawn_fleet, step_fdm,
-    stop_at_max_time, Diag, Pacer, StepPool,
+    advance_clock, exit_on_fatal, exit_on_signal, freeze_dead, pace, report_progress, spawn_fleet,
+    step_fdm, stop_at_max_time, Diag, Pacer, StepPool,
 };
 
 /// Resolve the scenario's timing into [`SimParams`].
@@ -46,7 +48,7 @@ pub fn sim_params(scenario: &Scenario) -> SimParams {
         rate_hz: s.rate_hz,
         dt,
         max_time_s: s.max_time_s,
-        realtime: s.realtime,
+        speed: s.speed,
         lease_ticks: (s.command_lease_s > 0.0).then(|| (s.command_lease_s / dt).ceil() as u64),
         lockstep: s.lockstep,
         lockstep_timeout_s: s.lockstep_timeout_s,
@@ -86,24 +88,29 @@ fn is_server(mode: Res<RunMode>) -> bool {
 }
 
 /// Build the headless simulation app from a validated scenario (does not run
-/// it). `sim.threads` sets the FDM stepping threads (`0` = all cores).
+/// it). `sim.threads` sets the FDM stepping threads (`0` = all cores), capped
+/// at the fleet size.
 pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
     let params = sim_params(&scenario);
     let threads = match scenario.sim.threads {
         0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
         n => n,
-    };
+    }
+    .min(scenario.aircraft.len());
 
     let mut app = App::new();
-    // Physics steps exactly once per loop; `pace` throttles real time.
-    app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::ZERO)))
+    // Only the runner: physics steps exactly once per loop and `pace` throttles
+    // wall time. `MinimalPlugins`' task pools, `Time` and frame counter are unused
+    // (FDM threads are our own `StepPool`; the clock is `SimClock`) and cost
+    // ~1.9 µs of every update (measured), so they are left out.
+    app.add_plugins(ScheduleRunnerPlugin::run_loop(Duration::ZERO))
         .insert_resource(params)
         .insert_resource(world_frame(&scenario))
         .insert_resource(SimClock::default())
         .insert_resource(SimStatus::default())
         .insert_resource(StepPool::new(threads))
         .insert_resource(Diag::default())
-        .insert_resource(Pacer::new(params.dt, params.realtime))
+        .insert_resource(Pacer::new(params.dt, params.speed))
         .insert_resource(CombatParams::default())
         .insert_resource(CombatRng::seeded(scenario.sim.seed))
         .insert_resource(CombatState { initial_living_teams: team_count(&scenario) })
@@ -137,6 +144,7 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
                     .chain()
                     .distributive_run_if(SimStatus::running),
                 pace.run_if(is_server),
+                exit_on_signal,
                 exit_on_fatal,
             )
                 .chain(),

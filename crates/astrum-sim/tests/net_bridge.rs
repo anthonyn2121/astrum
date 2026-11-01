@@ -121,12 +121,14 @@ fn forged_stale_and_future_commands_are_refused() {
 }
 
 /// Run a lockstep scenario with a controller thread whose law depends only on
-/// the telemetry it receives. Returns the final telemetry.
-fn lockstep_run(ticks: usize) -> Vec<Telemetry> {
+/// the telemetry it receives. Returns the final telemetry and the ticks the
+/// controller answered.
+fn lockstep_run(ticks: usize, control_rate_hz: Option<f64>) -> (Vec<Telemetry>, Vec<u64>) {
     let mut s = two_ship();
     s.sim.lockstep = true;
     s.sim.lockstep_timeout_s = 10.0;
     s.aircraft[0].lockstep = true;
+    s.aircraft[0].control_rate_hz = control_rate_hz;
     let session = Session::in_process().unwrap();
     let mut app = app_on(&session, s);
 
@@ -136,20 +138,21 @@ fn lockstep_run(ticks: usize) -> Vec<Telemetry> {
         std::thread::spawn(move || {
             let mut sub = LatestTelemetry::subscribe(&session, Selection::Aircraft(1)).unwrap();
             let mut tx = CommandSender::new(&session, 1).unwrap();
-            let mut answered = None;
+            let mut answered: Vec<u64> = Vec::new();
             while !stop.load(Ordering::Relaxed) {
                 if sub.wait(Duration::from_millis(20)).is_err() {
                     continue;
                 }
                 let t = sub.latest(1).unwrap();
-                if answered != Some(t.tick) {
+                if answered.last() != Some(&t.tick) {
                     // A deterministic law of the received state only.
                     let ail = (-2.0 * t.attitude.phi_rad + 0.3 * (t.tick as f64 * 0.01).sin())
                         .clamp(-1.0, 1.0);
                     tx.send(raw(ail), false, t.tick).unwrap();
-                    answered = Some(t.tick);
+                    answered.push(t.tick);
                 }
             }
+            answered
         })
     };
     app.update(); // startup publishes tick 0, then waits for its answer
@@ -158,17 +161,32 @@ fn lockstep_run(ticks: usize) -> Vec<Telemetry> {
         assert!(app.world().resource::<SimStatus>().fatal.is_none());
     }
     stop.store(true, Ordering::Relaxed);
-    controller.join().unwrap();
-    last(&app)
+    let answered = controller.join().unwrap();
+    (last(&app), answered)
 }
 
 #[test]
 fn lockstep_makes_networked_runs_reproducible() {
-    let a = lockstep_run(240);
-    let b = lockstep_run(240);
+    let (a, answered) = lockstep_run(240, None);
+    let (b, _) = lockstep_run(240, None);
     assert_eq!(of(&a, 1).tick, 241);
     assert_eq!(of(&a, 1).control_mode, ControlMode::Raw);
+    // The sim waited on ticks 0..=240; tick 241's answer may or may not have
+    // been sent before the controller stopped.
+    assert_eq!(answered[..241], (0..=240).collect::<Vec<_>>(), "every tick is a control tick");
     assert_eq!(a, b, "a lockstep run with a deterministic controller replays exactly");
+}
+
+#[test]
+fn decimated_lockstep_publishes_and_waits_only_on_control_ticks() {
+    // 30 Hz control at 120 Hz physics: telemetry and the lockstep wait every 4th
+    // tick, the last command held in between — and still reproducible.
+    let (a, answered) = lockstep_run(240, Some(30.0));
+    let (b, _) = lockstep_run(240, Some(30.0));
+    assert_eq!(of(&a, 1).tick, 241);
+    assert_eq!(of(&a, 1).control_mode, ControlMode::Raw);
+    assert_eq!(answered, (0..=240).step_by(4).collect::<Vec<_>>());
+    assert_eq!(a, b);
 }
 
 #[test]

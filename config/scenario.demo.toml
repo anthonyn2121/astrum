@@ -10,7 +10,7 @@ origin_alt_hae_m = 0.0
 [sim]
 rate_hz = 120.0
 max_time_s = 40.0
-realtime = true
+speed = 1.0
 
 [[aircraft]]
 id = 1

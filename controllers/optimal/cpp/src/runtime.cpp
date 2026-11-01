@@ -4,12 +4,13 @@
 // telemetry, exception-safe decoding, contract QoS, seq + telemetryTick on every
 // command, one command per sample, startup / telemetry timeouts. This file only parses
 // the CLI, builds the law, refuses vehicle kinds the law was not written for, checks
-// that the sim runs at the --rate-hz the law was discretized for, and logs.
+// that telemetry arrives at the --rate-hz the law was discretized for, and logs.
 
 #include <cmath>
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -29,15 +30,55 @@ std::unique_ptr<Law> make_law(const std::string& name, const LawConfig& config) 
   return nullptr;
 }
 
-// Stop (exit 2) if the sim's tick period (simTimeS / tick) is not the law's dt.
-std::optional<Stop> check_rate(const VehicleState& s, double rate_hz) {
-  if (s.tick == 0) return std::nullopt;
-  const double sim_rate_hz = static_cast<double>(s.tick) / s.t;
-  if (std::abs(sim_rate_hz - rate_hz) <= 1e-6 * rate_hz) return std::nullopt;
-  return Stop{2, "the sim runs at " + std::to_string(sim_rate_hz) +
-                     " Hz but the law was discretized for --rate-hz " + std::to_string(rate_hz) +
-                     "; pass --rate-hz to match the scenario's sim.rate_hz"};
-}
+// Stops (exit 2) unless telemetry arrives at the law's control rate: the sim step
+// (simTimeS / tick) must divide the law's period, and samples must arrive one period
+// apart (the aircraft's control_rate_hz). A dropped sample only lengthens a gap, so the
+// check passes on the first gap of exactly one period and fails on a shorter gap or on
+// kMaxLongGaps longer ones in a row.
+class RateCheck {
+ public:
+  explicit RateCheck(double rate_hz) : rate_hz_(rate_hz), period_(1.0 / rate_hz) {}
+
+  std::optional<Stop> operator()(const VehicleState& s) {
+    if (done_) return std::nullopt;
+    if (!step_checked_ && s.tick > 0) {
+      const double step = s.t / static_cast<double>(s.tick);
+      const double n = period_ / step;
+      if (n < 1.0 - 1e-6 || std::abs(n - std::round(n)) > 1e-6 * n) {
+        return fail("the sim steps at " + std::to_string(1.0 / step) +
+                    " Hz, which --rate-hz does not divide");
+      }
+      step_checked_ = true;
+    }
+    if (prev_t_ && s.t > *prev_t_) {
+      const double gap = s.t - *prev_t_;
+      if (std::abs(gap - period_) <= 1e-6 * period_) {
+        done_ = step_checked_;
+      } else if (gap < period_) {
+        return fail("telemetry arrives at " + std::to_string(1.0 / gap) + " Hz");
+      } else if (++long_gaps_ >= kMaxLongGaps) {
+        return fail("telemetry arrives every " + std::to_string(gap) + " s");
+      }
+    }
+    prev_t_ = s.t;
+    return std::nullopt;
+  }
+
+ private:
+  static constexpr int kMaxLongGaps = 8;
+
+  Stop fail(const std::string& why) const {
+    return Stop{2, why + " but the law was discretized for --rate-hz " + std::to_string(rate_hz_) +
+                       "; pass the aircraft's control_rate_hz (default sim.rate_hz)"};
+  }
+
+  double rate_hz_;
+  double period_;
+  bool step_checked_ = false;
+  bool done_ = false;
+  int long_gaps_ = 0;
+  std::optional<double> prev_t_;
+};
 
 int run(int argc, char** argv) {
   ClientConfig client;
@@ -54,7 +95,9 @@ int run(int argc, char** argv) {
   add_reference_options(options, reference);
   add_attitude_limit_options(options, law_config.limits);
   options
-      .add("--rate-hz", "hz", "control period the laws are discretized for (= sim.rate_hz)",
+      .add("--rate-hz", "hz",
+           "control rate the laws are discretized for (= the aircraft's control_rate_hz, "
+           "default sim.rate_hz)",
            "ASTRUM_RATE_HZ", &rate_hz)
       .add("--horizon-s", "s", "MPC look-ahead (mpc only; steps = horizon-s * rate-hz)", nullptr,
            &law_config.horizon_s);
@@ -73,13 +116,10 @@ int run(int argc, char** argv) {
             << "deg pitch=" << law_config.limits.max_pitch_deg << "deg\n";
 
   std::uint64_t samples = 0;
-  bool rate_checked = false;
+  RateCheck check_rate(rate_hz);
   return zenoh_client.run([&](const VehicleState& s) -> Step {
     if (auto stop = check_vehicle_kind(s, law->vehicle_kind(), "law " + law_name)) return *stop;
-    if (!rate_checked && s.tick > 0) {
-      if (auto stop = check_rate(s, rate_hz)) return *stop;
-      rate_checked = true;
-    }
+    if (auto stop = check_rate(s)) return *stop;
     const Command command = law->control(s, ref);
     if (samples++ % 120 == 0) {
       std::cerr << kTag << " t=" << s.t << "s hdg=" << rad_to_deg(s.yaw) << "deg alt=" << s.alt_m

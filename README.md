@@ -65,10 +65,11 @@ ingest_commands    decode astrum/command/<id>; refuse stale/future/duplicate/for
 expire_leases      a raw command older than command_lease_s → failsafe hold
 autopilot_step     autopilot / failsafe targets → fcs/*-cmd-norm (per VehicleKind)
 fire_guns          rounds leave the muzzle at t_k
-step_fdm           every FDM steps once, in parallel on the sim.threads pool
+step_fdm           every FDM steps once; with sim.threads > 1 each on its fixed worker
 freeze_dead → advance_clock → step_bullets → resolve_hits → apply_damage → end_on_elimination
-publish_telemetry  one Telemetry per aircraft → put astrum/telemetry/<id>
-report_progress / stop_at_max_time, then pace (realtime only)
+publish_telemetry  one Telemetry per aircraft → put astrum/telemetry/<id> (at its control_rate_hz);
+                   with --record every tick of every aircraft goes to the MCAP bag
+report_progress / stop_at_max_time, then pace (sim.speed > 0)
 ```
 
 Controllers write **control inputs** (`fcs/*-cmd-norm`), never state; JSBSim computes all motion
@@ -127,6 +128,8 @@ make shell                                  # into a dev container
 cargo run -p astrum-sim                     # uses config/scenario.example.toml
 cargo run -p astrum-sim -- config/my.toml   # scenario is a positional argument
 cargo run -p astrum-sim -- --threads 8      # FDM stepping threads (0 = all cores)
+cargo run -p astrum-sim -- --speed 0        # as fast as possible (1 = real time, 10 = 10×)
+cargo run -p astrum-sim -- --speed 0 --record run.mcap   # + record every tick, in-process
 cargo run -p astrum-sim -- --help           # every flag, each with its [env: …] fallback
 ```
 
@@ -148,9 +151,9 @@ origin_alt_hae_m = 0.0
 [sim]
 rate_hz = 120.0           # fixed physics step = 1/rate_hz
 max_time_s = 0.0          # 0 = unbounded
-realtime = true           # false = as fast as the host allows
+speed = 1.0               # × real time; 0 = as fast as the host allows (--speed overrides)
 seed = 0                  # gun dispersion + each aircraft's JSBSim RNG
-threads = 1               # FDM stepping threads; --threads overrides (0 = all cores)
+threads = 1               # FDM stepping threads, ≤ fleet size; --threads overrides (0 = all cores)
 command_lease_s = 0.5     # raw-command lease; 0 disables
 lockstep = false
 lockstep_timeout_s = 30.0
@@ -167,6 +170,7 @@ heading_deg = 90.0
 tas_mps = 250.0
 # trim = true             # default: true for fixed-wing, false for multirotor; failure is fatal
 # lockstep = false        # in a lockstep scenario, wait for this aircraft's commands
+# control_rate_hz = 30.0  # telemetry + lockstep commands at this rate (divides rate_hz)
 team = 0
 health = 100.0
 # ammo = 511              # armed (fixed-wing) aircraft only
@@ -176,11 +180,12 @@ Bundled scenarios: `scenario.example.toml` (2-ship fleet), `scenario.demo.toml` 
 fixed-wing), `scenario.quad.toml` (single F450), `scenario.formation.toml` (4-ship formation),
 `scenario.smoke.toml` (fast, for tests).
 
-Physics advances **exactly one step of `1/rate_hz` per loop**; `realtime = true` throttles that to
-wall-clock, `false` runs as fast as the host allows. The sim itself is deterministic: for a given
-scenario, seed and command sequence the result is identical in realtime and fast mode and for any
-`threads` value (tested). With external controllers over Zenoh, a run is reproducible only in
-**lockstep** mode — otherwise each command lands on whichever tick it happens to arrive.
+Physics advances **exactly one step of `1/rate_hz` per loop**; `speed` paces that against the wall
+clock (1 = real time, 10 = ten times faster, 0.5 = half speed, 0 = as fast as the host allows).
+The sim itself is deterministic: for a given scenario, seed and command sequence the result is
+identical at any speed and for any `threads` value (tested). With external controllers over Zenoh,
+a run is reproducible only in **lockstep** mode — otherwise each command lands on whichever tick it
+happens to arrive.
 
 ### Lease, failsafe and lockstep
 
@@ -197,23 +202,55 @@ scenario, seed and command sequence the result is identical in realtime and fast
   tick until that aircraft has a command whose `telemetryTick` equals the last published tick,
   republishing the last telemetry every 100 ms while waiting, and fails after
   `lockstep_timeout_s`. Controllers need nothing beyond echoing `telemetryTick`.
+- **Control rate.** `control_rate_hz` on an aircraft (it must divide `rate_hz`) publishes its
+  telemetry only every `rate_hz / control_rate_hz` ticks, and in lockstep the sim waits for its
+  command only on those ticks; the last command holds in between (zero-order hold). Physics still
+  steps at `rate_hz`, and `--record` still records every tick. Controllers need no change (the
+  optimal laws take the control rate as `--rate-hz`); the lease must cover two control periods.
 
-### Performance
+### Running fast, recording, and watching
 
-FDM stepping cost per tick, measured in the dev container on a 24-core host (F-16s at 4572 m,
-200 m/s):
+- **Speed.** `--speed 0` (or `sim.speed = 0`) runs as fast as the host allows; `--speed 1` is real
+  time (watch it live with `make replay`); any factor in between works (`--speed 10`).
+- **Threads.** For fleets of about four or more, `--threads N`: each aircraft's FDM stays on one
+  worker (so its working set stays in that core's cache) and idle workers spin briefly between
+  unpaced ticks. Keep `N` at or below the cores that are actually free — spinning workers on an
+  oversubscribed host are slower than fewer of them.
+- **Recording.** `--record run.mcap` writes every tick of every aircraft (and the commands the sim
+  received) in-process, on a writer thread: lossless at any speed. Watch it afterwards in real time
+  with `astrum-bag-play run.mcap --rate 1` (any subscriber, including the viewer bridge), or bake it
+  with `make export BAG=run.mcap` and scrub it in the viewer. SIGINT/SIGTERM finish the bag.
+- **External controllers.** Faster than real time only makes sense in **lockstep**; the sim then
+  waits for a controller round trip every control tick, which bounds the speed. A
+  `control_rate_hz` below `rate_hz` cuts the round trips per simulated second.
 
-| Fleet | before (1 thread, old code) | now, 1 thread | 8 threads | 16 threads |
-|---|---|---|---|---|
-| 1 | 16 µs | 15 µs | 23 µs | 22 µs |
-| 10 | 85 µs | 73 µs | 61 µs | 65 µs |
-| 50 | 668 µs | 530 µs | 152 µs | 161 µs |
-| 100 | 5098 µs (196 Hz max) | 4412 µs | 341 µs | 280 µs (3573 Hz max) |
-| 200 | — | 9832 µs | 1178 µs | 854 µs (1171 Hz max) |
+Headless tick cost (`make bench`: the embedded app, aircraft holding their trim, fastest of three
+windows; a 24-core Core Ultra 9 285K that was also running other jobs, load average ~20):
 
-Embedded 1v1 F-16 env: step 15.8 µs (was 22.6 µs); reset 6.0 ms (a fresh build is 10.4 ms). Most of
-the reset is the JSBSim trim; `trim = false` per aircraft skips it. Cap'n Proto telemetry is
-~170 B with ~0.1 µs encode/decode — not a bottleneck.
+| Fleet | Threads | µs/tick | × real time @ 120 Hz |
+|---|---|---|---|
+| 1 × F-16 | 1 | 7.1 | 1177× |
+| 4 × F-16 | 1 | 24.5 | 340× |
+| 4 × F-16 | 4 | 12.2 | 685× |
+| 16 × F-16 | 8 | 24.2 | 345× |
+| 64 × F-16 | 8 | 183 | 45× |
+
+One JSBSim F-16 step is ~5.3 µs on its own; the rest of a 1-aircraft tick is the ECS schedule
+(~1 µs of Bevy, ~0.6 µs of our systems). Beyond ~16 aircraft the cost is JSBSim's, and grows per
+aircraft as the fleet outgrows the caches (5.3 µs alone, 8.5 µs per aircraft in a 16-ship, 14 µs in
+a 64-ship, on one thread).
+
+End to end through the binary and Zenoh (lockstep, unpaced):
+
+| Run | × real time |
+|---|---|
+| 1 × c172x + C++ raw controller, control at 120 Hz | 130× |
+| same, `control_rate_hz` = 30 / 20 | 293× / 365× |
+| formation demo (4 F-16s, 4 Python controllers), 30 Hz control, `--threads 4 --record` | 79× |
+
+Embedded env reset: 6.0 ms (a fresh build is 10.4 ms); most of it is the JSBSim trim, which
+`trim = false` per aircraft skips. Cap'n Proto telemetry is ~170 B with ~0.1 µs encode/decode — not
+a bottleneck.
 
 ## Flight controllers
 

@@ -52,8 +52,8 @@ Phases 1–2 alone give a functioning, deterministic gun-combat sim.
 
 ### 2.1 The tick
 
-The sim is a headless Bevy app (`crates/astrum-sim`). It uses `MinimalPlugins` +
-`ScheduleRunnerPlugin::run_loop(Duration::ZERO)`; **there is no `FixedUpdate`** — all physics
+The sim is a headless Bevy app (`crates/astrum-sim`). It uses only
+`ScheduleRunnerPlugin::run_loop(Duration::ZERO)` (no `MinimalPlugins`); **there is no `FixedUpdate`** — all physics
 runs in the plain `Update` schedule, so **one `App::update()` == exactly one physics tick** at
 `dt = 1/rate_hz` (default **120 Hz → 8.33 ms**, `SimParams` in `components.rs`). The sim
 clock is the `SimClock` resource (`tick · dt`), independent of any aircraft.
@@ -297,7 +297,7 @@ controller per jet, mirroring `demo-formation`.
 ## 7. Determinism
 
 For RL the embedded env is fully reproducible: the same scenario and seed reproduce an
-episode bit-for-bit, `realtime` only changes wall-clock pacing (never step count or `dt`), and
+episode bit-for-bit, `sim.speed` only changes wall-clock pacing (never step count or `dt`), and
 results are identical for any `sim.threads` value (tested). Gun dispersion and each aircraft's
 JSBSim random generator draw from `sim.seed` (`CombatRng`; shooters are visited in id order so
 draws don't depend on ECS iteration order). Over the wire, external controllers make a run
@@ -309,7 +309,7 @@ tick it arrives.
 ## 8. RL environment seam & Gym-wrapper spec
 
 The sim *is* the environment; the integration-test pattern (`build_app` + a bare
-`app.update()` loop at `realtime:false`) is already the RL stepping loop. Two paths were
+`app.update()` loop, unpaced) is already the RL stepping loop. Two paths were
 considered:
 
 - **(a) Over-the-wire Python Gym env** — reuse the controller/Zenoh harness
@@ -599,14 +599,15 @@ observability/polish. Phase 4 is the RL payoff.
 |---|---|
 | App build + system chain + `dt` | `astrum-sim/src/lib.rs` (`build_app`, `sim_params`) |
 | Spawn / arming / trim | `astrum-sim/src/systems.rs` (`spawn_fleet`, `initial_components`) |
-| FDM stepping (rayon pool) / FDM→grid state | `astrum-sim/src/systems.rs` (`step_fdm`, `grid_state`) |
+| FDM stepping (per-aircraft shard workers) / FDM→grid state | `astrum-sim/src/step_pool.rs` (`ShardPool`), `systems.rs` (`StepPool`, `step_fdm`, `grid_state`) |
 | State components (`AircraftState`, `SimParams`, `SimClock`) | `astrum-sim/src/components.rs` |
 | Command ingest / lease / failsafe | `astrum-sim/src/net.rs` (`ingest_commands`), `pilot.rs` (`apply_command`, `expire_leases`) |
 | Built-in autopilot laws | `astrum-sim/src/pilot.rs` (`FixedWingGains`, `autopilot_step`) |
 | Telemetry assembly / publish | `astrum-sim/src/net.rs` (`LastPublished`, `publish_telemetry`) |
 | Combat chain | `astrum-sim/src/combat/` (`systems.rs`, `ballistics.rs`, `geometry.rs`, `fire_control.rs`) |
 | Termination | `astrum-sim/src/systems.rs` (`stop_at_max_time`), `combat/systems.rs` (`end_on_elimination`) |
-| Pacing / realtime; lockstep wait | `astrum-sim/src/systems.rs` (`Pacer`, `pace`); `net.rs` (`ingest_commands`) |
+| Pacing (`sim.speed`); lockstep wait (`control_rate_hz`) | `astrum-sim/src/systems.rs` (`Pacer`, `pace`); `net.rs` (`ingest_commands`) |
+| In-process recording (`--record`) | `astrum-sim/src/record.rs` (`TickRecorder`, `Recording`) |
 | Wire schema | `astrum-proto/schema/astrum.capnp` (`Telemetry`, `Command`, `Combat`) |
 | Encode / decode | `astrum-proto/src/lib.rs` |
 | Zenoh keys / transport | `astrum-net/src/lib.rs` (`keys`, `qos`, `LatestTelemetry`, `CommandSender`) |

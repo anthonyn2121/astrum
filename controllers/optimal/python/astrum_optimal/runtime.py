@@ -81,29 +81,59 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         "--rate-hz",
         type=cli.positive_float,
         default=cli.env_default("ASTRUM_RATE_HZ", "120"),
-        help="sim rate (scenario sim.rate_hz); laws are discretized at 1/rate. "
-        "Checked against telemetry (simTimeS/tick); a mismatch exits 2 [$ASTRUM_RATE_HZ]",
+        help="control rate the laws are discretized for: the rate this aircraft's "
+        "telemetry arrives at (its control_rate_hz, default sim.rate_hz). Checked "
+        "against the telemetry; a mismatch exits 2 [$ASTRUM_RATE_HZ]",
     )
 
 
 class PeriodCheck:
-    """Verifies the configured control period against the sim's own clock
-    (``simTimeS = tick * dt``) on the first telemetry with ``tick > 0``."""
+    """Verifies the law's control period against the telemetry it flies on: the
+    sim step (``simTimeS / tick``) must divide it, and samples must arrive one
+    period apart (the aircraft's ``control_rate_hz``). A dropped sample only
+    lengthens a gap, so the check passes on the first gap of exactly one period
+    and refuses a shorter gap, or :attr:`MAX_LONG_GAPS` longer ones in a row."""
+
+    MAX_LONG_GAPS = 8
 
     def __init__(self, period_s: float):
         self.period_s = period_s
         self.checked = False
+        self._step_checked = False
+        self._prev_t: float | None = None
+        self._long_gaps = 0
 
     def __call__(self, s: VehicleState) -> None:
-        if self.checked or s.tick == 0:
+        if self.checked:
             return
-        sim_period = s.t / s.tick
-        if not math.isclose(sim_period, self.period_s, rel_tol=1e-6):
-            raise RefuseToFly(
-                f"the sim steps at {1.0 / sim_period:.6g} Hz (simTimeS/tick) but the law "
-                f"was discretized for --rate-hz {1.0 / self.period_s:.6g}"
-            )
-        self.checked = True
+        if not self._step_checked and s.tick > 0:
+            step = s.t / s.tick
+            n = self.period_s / step
+            if n < 1.0 - 1e-6 or not math.isclose(n, round(n), rel_tol=1e-6):
+                raise RefuseToFly(
+                    f"the sim steps at {1.0 / step:.6g} Hz, which --rate-hz "
+                    f"{1.0 / self.period_s:.6g} does not divide; pass the aircraft's "
+                    "control_rate_hz (default sim.rate_hz)"
+                )
+            self._step_checked = True
+        if self._prev_t is not None and s.t > self._prev_t:
+            gap = s.t - self._prev_t
+            if math.isclose(gap, self.period_s, rel_tol=1e-6):
+                self.checked = self._step_checked
+            elif gap < self.period_s:
+                raise RefuseToFly(
+                    f"telemetry arrives at {1.0 / gap:.6g} Hz but the law was discretized "
+                    f"for --rate-hz {1.0 / self.period_s:.6g}"
+                )
+            else:
+                self._long_gaps += 1
+                if self._long_gaps >= self.MAX_LONG_GAPS:
+                    raise RefuseToFly(
+                        f"telemetry arrives every {gap:.6g} s ({1.0 / gap:.6g} Hz) but the "
+                        f"law was discretized for --rate-hz {1.0 / self.period_s:.6g}; pass "
+                        "the aircraft's control_rate_hz"
+                    )
+        self._prev_t = s.t
 
 
 def parse_args(argv: list[str]) -> tuple[Law, argparse.Namespace]:

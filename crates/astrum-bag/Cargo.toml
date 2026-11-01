@@ -24,8 +24,8 @@ path = "src/bin/play.rs"
 astrum-proto = { path = "../astrum-proto" }
 astrum-net = { path = "../astrum-net" }
 clap = { workspace = true }
-# `termination`: SIGTERM (docker stop) as well as SIGINT finishes the bag.
-ctrlc = { version = "3.5", features = ["termination"] }
+# SIGTERM (docker stop) as well as SIGINT finishes the bag.
+ctrlc = { workspace = true }
 mcap = "0.26"
 
 [dev-dependencies]

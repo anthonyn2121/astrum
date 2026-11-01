@@ -10,8 +10,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
+use astrum_bag::wall_clock_ns;
 use astrum_net::{CommandReceiver, CommandReject, TelemetryPublisher};
-use astrum_proto::{Aero, BodyRates, CombatStatus, Command, Euler, Ned, Telemetry};
+use astrum_proto::{
+    encode_command, encode_telemetry, Aero, BodyRates, CombatStatus, Command, Euler, Ned, Telemetry,
+};
 use bevy::prelude::*;
 
 use crate::combat::{Dead, Gun, Health, Team, Trigger};
@@ -19,6 +22,10 @@ use crate::components::{
     Aircraft, AircraftIndex, AircraftState, SimClock, SimParams, SimStatus, VehicleKind,
 };
 use crate::pilot::{apply_command, Pilot, Refusal};
+use crate::record::TickRecorder;
+use crate::systems::StopRequested;
+
+const RECORDING_FAILED: &str = "recording stopped: the bag writer failed";
 
 /// The telemetry of the latest tick, one sample per aircraft, sorted by id.
 #[derive(Resource, Debug, Clone, Default)]
@@ -129,25 +136,53 @@ pub type TelemetryQuery<'w, 's> = Query<
     ),
 >;
 
-/// Assemble this tick's telemetry into [`LastPublished`] and publish it.
+/// Assemble this tick's telemetry into [`LastPublished`] (every aircraft, every
+/// tick), record all of it, and publish the samples of aircraft whose control
+/// tick this is (`control_rate_hz`; default every tick). Each published or
+/// recorded sample is encoded once.
+#[allow(clippy::too_many_arguments)]
 pub fn publish_telemetry(
     publisher: Option<NonSendMut<TelemetryPublisher>>,
+    recorder: Option<Res<TickRecorder>>,
     params: Res<SimParams>,
     clock: Res<SimClock>,
+    mut status: ResMut<SimStatus>,
     mut last: ResMut<LastPublished>,
+    mut due: Local<Vec<(u32, bool)>>,
     q: TelemetryQuery,
 ) {
     let t = clock.time_s(&params);
-    let mut samples: Vec<Telemetry> = q
-        .iter()
-        .map(|(ac, st, kind, pilot, team, hp, gun, dead)| {
-            telemetry(clock.tick, t, ac, st, kind, pilot, team, hp, gun, dead)
-        })
-        .collect();
-    samples.sort_unstable_by_key(|s| s.aircraft_id);
-    if let Some(mut p) = publisher {
-        for s in &samples {
-            if let Err(e) = p.publish(s) {
+    last.0.clear();
+    due.clear();
+    for (ac, st, kind, pilot, team, hp, gun, dead) in &q {
+        last.0.push(telemetry(clock.tick, t, ac, st, kind, pilot, team, hp, gun, dead));
+        due.push((ac.id, pilot.due(clock.tick)));
+    }
+    last.0.sort_unstable_by_key(|s| s.aircraft_id);
+    due.sort_unstable_by_key(|(id, _)| *id);
+    let mut publisher = publisher;
+    if publisher.is_none() && recorder.is_none() {
+        return;
+    }
+    let log_time_ns = if recorder.is_some() { wall_clock_ns() } else { 0 };
+    for (s, &(_, due)) in last.0.iter().zip(due.iter()) {
+        let publish = due && publisher.is_some();
+        if !publish && recorder.is_none() {
+            continue;
+        }
+        let payload = encode_telemetry(s);
+        let to_publish = match &recorder {
+            Some(r) => {
+                let keep = publish.then(|| payload.clone());
+                if !r.telemetry(s.aircraft_id, log_time_ns, s.sim_time_s, payload) {
+                    status.fatal.get_or_insert_with(|| RECORDING_FAILED.to_owned());
+                }
+                keep
+            }
+            None => Some(payload),
+        };
+        if let (Some(p), Some(payload)) = (publisher.as_mut(), to_publish) {
+            if let Err(e) = p.publish_raw(s.aircraft_id, payload) {
                 eprintln!(
                     "[astrum-sim] telemetry publish failed for aircraft {}: {e}",
                     s.aircraft_id
@@ -155,7 +190,19 @@ pub fn publish_telemetry(
             }
         }
     }
-    last.0 = samples;
+}
+
+/// Record a received command (as decoded) when recording.
+fn record_received(
+    recorder: Option<&TickRecorder>,
+    received: &Result<Command, CommandReject>,
+    status: &mut SimStatus,
+) {
+    if let (Some(r), Ok(cmd)) = (recorder, received) {
+        if !r.command(cmd.target_id, wall_clock_ns(), encode_command(cmd)) {
+            status.fatal.get_or_insert_with(|| RECORDING_FAILED.to_owned());
+        }
+    }
 }
 
 /// How often a lockstep wait re-sends the last telemetry, so a controller that
@@ -198,12 +245,15 @@ fn apply_received(
 
 /// Drain queued commands and apply them in arrival order (the latest command
 /// per aircraft wins). In a lockstep scenario, then block until every living
-/// lockstep aircraft has a command answering the last published tick,
-/// re-sending that telemetry while waiting; too long a wait is fatal.
+/// lockstep aircraft due a command this tick (see `control_rate_hz`) has one
+/// answering it, re-sending that telemetry while waiting; too long a wait is
+/// fatal, and a stop request ends the wait.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_commands(
     receiver: Option<NonSend<CommandReceiver>>,
     publisher: Option<NonSendMut<TelemetryPublisher>>,
+    recorder: Option<Res<TickRecorder>>,
+    stop: Option<Res<StopRequested>>,
     last: Res<LastPublished>,
     params: Res<SimParams>,
     clock: Res<SimClock>,
@@ -213,10 +263,12 @@ pub fn ingest_commands(
     mut q: Query<(&mut Pilot, Option<&mut Trigger>, Has<Dead>)>,
 ) {
     let Some(rx) = receiver else { return };
+    let recorder = recorder.as_deref();
     let now = clock.tick;
     let lease = params.lease_ticks;
     let mut answered: BTreeSet<u32> = BTreeSet::new();
     for r in rx.drain() {
+        record_received(recorder, &r, &mut status);
         if let Some((id, tick)) = apply_received(r, now, lease, &index, &mut q, &mut log) {
             if tick == now {
                 answered.insert(id);
@@ -231,7 +283,7 @@ pub fn ingest_commands(
                     .0
                     .iter()
                     .filter(|(id, e)| {
-                        q.get(**e).is_ok_and(|(p, _, dead)| p.lockstep && !dead)
+                        q.get(**e).is_ok_and(|(p, _, dead)| p.lockstep && !dead && p.due(now))
                             && !answered.contains(id)
                     })
                     .map(|(id, _)| *id)
@@ -241,6 +293,9 @@ pub fn ingest_commands(
         let mut publisher = publisher;
         let mut waiting = pending(&answered, &q);
         while !waiting.is_empty() {
+            if stop.as_ref().is_some_and(|s| s.requested()) {
+                return;
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 status.fatal = Some(format!(
@@ -251,6 +306,7 @@ pub fn ingest_commands(
             }
             match rx.recv_timeout(left.min(LOCKSTEP_REPUBLISH)) {
                 Ok(r) => {
+                    record_received(recorder, &r, &mut status);
                     if let Some((id, tick)) =
                         apply_received(r, now, lease, &index, &mut q, &mut log)
                     {

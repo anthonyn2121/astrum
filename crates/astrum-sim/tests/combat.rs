@@ -24,7 +24,7 @@ fn params() -> SimParams {
         rate_hz: 120.0,
         dt: DT,
         max_time_s: 0.0,
-        realtime: false,
+        speed: 0.0,
         lease_ticks: None,
         lockstep: false,
         lockstep_timeout_s: 1.0,

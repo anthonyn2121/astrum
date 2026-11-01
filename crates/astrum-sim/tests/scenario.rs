@@ -28,7 +28,7 @@ fn err(toml: &str) -> String {
 fn defaults_fill_in_and_known_models_resolve() {
     let s = Scenario::from_toml_str(BASE).unwrap();
     assert!(
-        s.sim.realtime && s.sim.command_lease_s == 0.5 && s.sim.threads == 1 && !s.sim.lockstep
+        s.sim.speed == 1.0 && s.sim.command_lease_s == 0.5 && s.sim.threads == 1 && !s.sim.lockstep
     );
     let c = s.aircraft[0].class().unwrap();
     assert_eq!(c.kind, VehicleKind::FixedWing);
@@ -42,6 +42,9 @@ fn unknown_and_legacy_keys_are_rejected() {
     assert!(err(&BASE.replace("tas_mps = 55.0", "airspeed_kts = 100.0")).contains("airspeed_kts"));
     assert!(err(&BASE.replace("rate_hz = 120.0", "rate_hz = 120.0\nmax_time = 60.0"))
         .contains("max_time"));
+    // `realtime = true|false` became `speed`.
+    assert!(err(&BASE.replace("rate_hz = 120.0", "rate_hz = 120.0\nrealtime = false"))
+        .contains("realtime"));
 }
 
 #[test]
@@ -65,4 +68,26 @@ fn invalid_values_are_rejected() {
     assert!(Scenario::from_toml_str(no_fleet).is_err());
     let lockstep_alone = BASE.replace("tas_mps = 55.0", "tas_mps = 55.0\nlockstep = true");
     assert!(err(&lockstep_alone).contains("sim.lockstep"));
+    for bad in ["-1.0", "nan", "inf", "0.0001"] {
+        let slow = BASE.replace("rate_hz = 120.0", &format!("rate_hz = 120.0\nspeed = {bad}"));
+        assert!(err(&slow).contains("sim.speed"), "speed = {bad} accepted");
+    }
+    for ok in ["0.0", "0.001", "1000.0"] {
+        let s = BASE.replace("rate_hz = 120.0", &format!("rate_hz = 120.0\nspeed = {ok}"));
+        assert!(Scenario::from_toml_str(&s).is_ok(), "speed = {ok} rejected");
+    }
+    let control = |rate: &str| {
+        BASE.replace("tas_mps = 55.0", &format!("tas_mps = 55.0\ncontrol_rate_hz = {rate}"))
+    };
+    for bad in ["50.0", "0.0", "-30.0", "240.0", "nan"] {
+        assert!(err(&control(bad)).contains("control_rate_hz"), "control_rate_hz = {bad} accepted");
+    }
+    for ok in ["120.0", "60.0", "30.0", "4.0"] {
+        assert!(Scenario::from_toml_str(&control(ok)).is_ok(), "control_rate_hz = {ok} rejected");
+    }
+    // 1 Hz control under the default 0.5 s lease would trip the failsafe between commands.
+    assert!(err(&control("1.0")).contains("command_lease_s"));
+    let no_lease =
+        control("1.0").replace("rate_hz = 120.0", "rate_hz = 120.0\ncommand_lease_s = 0.0");
+    assert!(Scenario::from_toml_str(&no_lease).is_ok());
 }

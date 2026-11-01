@@ -16,8 +16,8 @@ name = "astrum-sim"
 path = "src/main.rs"
 
 [dependencies]
-# Headless: no render/winit/audio, and no Bevy task-pool parallelism: the tick is
-# a strict chain, and FDM stepping runs on a per-app rayon pool (`sim.threads`).
+# Headless: no render/winit/audio, and no Bevy task pools: the tick is a strict
+# chain, and FDM stepping runs on the sim's own shard pool (`sim.threads`).
 bevy = { version = "0.19", default-features = false }
 astrum-fdm = { path = "../astrum-fdm" }
 astrum-geo = { path = "../astrum-geo" }
@@ -26,4 +26,10 @@ astrum-proto = { path = "../astrum-proto" }
 clap = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-rayon = "1"
+# In-process recording writes the `astrum-bag` MCAP format.
+astrum-bag = { path = "../astrum-bag" }
+# SIGINT/SIGTERM end a run cleanly (a recording is finished, not truncated).
+ctrlc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -85,7 +85,9 @@ above the ellipsoid — the env has no terrain model. It subclasses
 `step`, so several `Env`s can be driven from Python threads concurrently.
 `BatchEnv` steps its K envs in parallel (rayon) inside one call — the cheapest
 way to vectorize. Process-level parallelism (Gymnasium `AsyncVectorEnv`, SB3
-`SubprocVecEnv`) works as well.
+`SubprocVecEnv`) works as well. Either way, keep each scenario's `sim.threads`
+at 1 (the default): the batch already uses the cores, and per-env FDM workers
+(which spin between ticks) would oversubscribe them.
 
 ## Build & test (inside the dev image)
 

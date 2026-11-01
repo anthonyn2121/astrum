@@ -9,6 +9,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::components::{AutopilotProfile, VehicleKind};
+use crate::systems::MIN_SPEED;
 
 /// Top-level scenario document.
 #[derive(Resource, Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -39,11 +40,13 @@ pub struct Sim {
     /// Stop after this many simulated seconds; `0` runs indefinitely.
     #[serde(default)]
     pub max_time_s: f64,
-    /// `true` throttles each step to `1/rate_hz` of wall time (for live
-    /// controllers); `false` runs as fast as the host allows. Without external
-    /// controllers (or with `lockstep`) the trajectory is identical either way.
-    #[serde(default = "default_true")]
-    pub realtime: bool,
+    /// Wall-clock pace as a multiple of real time: `1` = real time (for live
+    /// controllers and watching), `10` = ten times faster, `0.5` = half speed,
+    /// `0` = as fast as the host allows (`astrum-sim --speed` overrides).
+    /// Without external controllers (or with `lockstep`) the trajectory is
+    /// identical at any speed.
+    #[serde(default = "default_speed")]
+    pub speed: f64,
     /// Seed for the combat RNG and each aircraft's JSBSim random generator.
     #[serde(default)]
     pub seed: u64,
@@ -64,8 +67,8 @@ pub struct Sim {
     pub lockstep_timeout_s: f64,
 }
 
-fn default_true() -> bool {
-    true
+fn default_speed() -> f64 {
+    1.0
 }
 fn default_threads() -> usize {
     1
@@ -112,6 +115,11 @@ pub struct AircraftSpec {
     /// In a `sim.lockstep` scenario, wait for this aircraft's commands each tick.
     #[serde(default, skip_serializing_if = "is_false")]
     pub lockstep: bool,
+    /// Rate (Hz) of this aircraft's telemetry and — in lockstep — of the commands
+    /// the sim waits for; the last command holds in between (zero-order hold).
+    /// Must divide `sim.rate_hz` evenly. Default: every tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_rate_hz: Option<f64>,
     /// Combat side; same-team rounds never damage, and a ≥2-team scenario ends
     /// when one team is left.
     #[serde(default)]
@@ -179,6 +187,11 @@ impl AircraftSpec {
         };
         let trim = self.trim.unwrap_or(kind == VehicleKind::FixedWing);
         Ok(AircraftClass { kind, profile, trim })
+    }
+
+    /// Ticks between this aircraft's control samples at `rate_hz` (1 = every tick).
+    pub fn control_period_ticks(&self, rate_hz: f64) -> u64 {
+        self.control_rate_hz.map_or(1, |c| (rate_hz / c).round() as u64)
     }
 
     fn err(&self, msg: String) -> ScenarioError {
@@ -250,6 +263,12 @@ impl Scenario {
                 s.max_time_s
             )));
         }
+        if !(s.speed == 0.0 || (s.speed.is_finite() && s.speed >= MIN_SPEED)) {
+            return Err(ScenarioError(format!(
+                "sim.speed must be 0 (as fast as possible) or >= {MIN_SPEED}, got {}",
+                s.speed
+            )));
+        }
         if !(s.command_lease_s.is_finite() && s.command_lease_s >= 0.0) {
             return Err(ScenarioError(format!(
                 "sim.command_lease_s must be >= 0, got {}",
@@ -294,6 +313,26 @@ impl Scenario {
             let class = a.class()?;
             if a.ammo.is_some() && class.kind == VehicleKind::Multirotor {
                 return Err(a.err("ammo applies to armed fixed-wing aircraft only".into()));
+            }
+            if let Some(c) = a.control_rate_hz {
+                let ratio = s.rate_hz / c;
+                if !(c.is_finite() && c > 0.0 && ratio >= 1.0)
+                    || (ratio - ratio.round()).abs() > 1e-9 * ratio
+                {
+                    return Err(a.err(format!(
+                        "control_rate_hz must divide sim.rate_hz ({}) evenly, got {c}",
+                        s.rate_hz
+                    )));
+                }
+                // One late or lost sample must not trip the failsafe.
+                if s.command_lease_s > 0.0 && s.command_lease_s < 2.0 / c {
+                    return Err(a.err(format!(
+                        "control_rate_hz {c} needs sim.command_lease_s >= {} (two control \
+                         periods), got {}",
+                        2.0 / c,
+                        s.command_lease_s
+                    )));
+                }
             }
         }
         if s.lockstep && !self.aircraft.iter().any(|a| a.lockstep) {

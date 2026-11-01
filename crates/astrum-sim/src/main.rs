@@ -1,13 +1,17 @@
 //! `astrum-sim` binary: load a scenario, build the app, open the Zenoh session
-//! (telemetry out, commands in, scenario queryable) and run. Every startup
-//! failure is fatal: a sim that cannot serve anything exits non-zero.
+//! (telemetry out, commands in, scenario queryable), optionally record to an
+//! MCAP bag, and run. Every startup failure is fatal: a sim that cannot serve
+//! anything exits non-zero. SIGINT/SIGTERM end the run cleanly (a second one
+//! exits at once).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
 use astrum_net::{CommandReceiver, ScenarioServer, Session, TelemetryPublisher};
 use astrum_sim::scenario::Scenario;
-use astrum_sim::{build_app, RunMode};
+use astrum_sim::systems::StopRequested;
+use astrum_sim::{build_app, record, RunMode};
 use bevy::prelude::*;
 use clap::Parser;
 
@@ -27,6 +31,17 @@ struct Cli {
     /// FDM stepping threads, overriding `sim.threads` (0 = all cores).
     #[arg(long, env = "ASTRUM_THREADS")]
     threads: Option<usize>,
+
+    /// Pace as a multiple of real time, overriding `sim.speed` (1 = real time,
+    /// 10 = ten times faster, 0 = as fast as the host allows).
+    #[arg(long, env = "ASTRUM_SPEED")]
+    speed: Option<f64>,
+
+    /// Record every tick's telemetry (and the commands received) to this MCAP
+    /// bag, in-process: lossless at any speed (`astrum-bag-play` and
+    /// `astrum-web-export` read it).
+    #[arg(long, env = "ASTRUM_RECORD")]
+    record: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -40,6 +55,13 @@ fn main() -> ExitCode {
     };
     if let Some(n) = cli.threads {
         scenario.sim.threads = n;
+    }
+    if let Some(speed) = cli.speed {
+        scenario.sim.speed = speed;
+    }
+    if let Err(e) = scenario.validate() {
+        eprintln!("[astrum-sim] {e}");
+        return ExitCode::FAILURE;
     }
     let scenario_toml = scenario.to_toml();
     let session = match Session::listen(&cli.listen) {
@@ -56,6 +78,26 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let recording = match &cli.record {
+        Some(path) => match record::start(path, &scenario_toml) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("[astrum-sim] cannot record to {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let stop = StopRequested::default();
+    let flag = stop.0.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        if flag.swap(true, Ordering::Relaxed) {
+            std::process::exit(130); // second signal: give up on a clean exit
+        }
+    }) {
+        eprintln!("[astrum-sim] cannot install the signal handler: {e}");
+        return ExitCode::FAILURE;
+    }
     let _scenario_server = match ScenarioServer::serve(&session, scenario_toml) {
         Ok(s) => s,
         Err(e) => {
@@ -64,12 +106,37 @@ fn main() -> ExitCode {
         }
     };
     println!("[astrum-sim] zenoh session listening: {}", cli.listen);
+    match scenario.sim.speed {
+        s if s > 0.0 => println!("[astrum-sim] pace: {s}× real time"),
+        _ => println!("[astrum-sim] pace: unpaced (as fast as possible)"),
+    }
 
     let mut app = build_app(scenario, RunMode::Server);
     app.insert_non_send(TelemetryPublisher::new(&session));
     app.insert_non_send(receiver);
-    match app.run() {
+    app.insert_resource(stop);
+    let (recorder, recording) = recording.unzip();
+    if let Some(r) = recorder {
+        app.insert_resource(r);
+    }
+    // The runner owns (and on return drops) the app, recorder included, which
+    // closes the recording queue so `finish` can complete the bag.
+    let mut code = match app.run() {
         AppExit::Success => ExitCode::SUCCESS,
         AppExit::Error(code) => ExitCode::from(code.get()),
+    };
+    if let Some(recording) = recording {
+        let path = recording.path().display().to_string();
+        match recording.finish() {
+            Ok(s) => println!(
+                "[astrum-sim] recorded {} telemetry, {} command messages → {path}",
+                s.telemetry, s.commands
+            ),
+            Err(e) => {
+                eprintln!("[astrum-sim] recording {path} failed: {e}");
+                code = ExitCode::FAILURE;
+            }
+        }
     }
+    code
 }

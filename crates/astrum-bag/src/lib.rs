@@ -265,7 +265,7 @@ pub fn wall_clock_ns() -> u64 {
 }
 
 /// Telemetry sim time in ns (`publish_time`).
-fn sim_time_ns(sim_time_s: f64) -> u64 {
+pub fn sim_time_ns(sim_time_s: f64) -> u64 {
     // Saturating float->int cast: NaN and negative times become 0.
     (sim_time_s * 1e9).round() as u64
 }
