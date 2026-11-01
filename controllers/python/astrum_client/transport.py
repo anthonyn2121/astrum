@@ -1,5 +1,6 @@
 """Zenoh transport per the ASTRUM contract: one client session per process,
-latest-value telemetry, and command publishers with the contract QoS.
+latest-value telemetry, a FIFO event stream, and command publishers with the
+contract QoS.
 
 * Session: ``mode=client`` of the sim, which is a Zenoh router (the hub every
   process connects to, so it routes between them); multicast scouting off;
@@ -8,6 +9,9 @@ latest-value telemetry, and command publishers with the contract QoS.
   startup timeout for a sim that is still starting.
 * Telemetry: a callback overwrites the latest decoded sample per aircraft, so a
   slow control law always acts on the freshest state; nothing is ever queued.
+* Events: ``astrum/events`` (no id suffix), one event per sample in the order
+  they happened; a callback appends each decoded event to an :class:`EventQueue`
+  (nothing is superseded or dropped; a kind this schema predates is skipped).
 * Commands: declared publisher, CongestionControl DROP, express, priority
   INTERACTIVE_HIGH; every command carries a per-process ``seq`` (1, 2, ...) and
   the ``telemetryTick`` it answers.
@@ -22,6 +26,7 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 
 import zenoh
 
@@ -29,7 +34,9 @@ from astrum_client.wire import (
     Command,
     Control,
     DecodeError,
+    Event,
     VehicleState,
+    decode_event,
     decode_telemetry,
     encode_command,
 )
@@ -38,6 +45,7 @@ TELEMETRY_PREFIX = "astrum/telemetry/"
 COMMAND_PREFIX = "astrum/command/"
 ALIVE_PREFIX = "astrum/alive/controller/"
 TELEMETRY_ALL = "astrum/telemetry/*"
+EVENTS = "astrum/events"
 
 log = logging.getLogger("astrum.transport")
 
@@ -168,6 +176,70 @@ def subscribe_telemetry(
 
     sub = session.declare_subscriber(key, on_sample)
     return store, sub
+
+
+class EventQueue:
+    """FIFO of decoded events, fed by :meth:`offer` (thread-safe).
+
+    Bad payloads (framing/decoding failures, or a kind this schema predates) are
+    logged, counted in :attr:`decode_errors` and skipped.
+    """
+
+    def __init__(self, schema):
+        self._schema = schema
+        self._cond = threading.Condition()
+        self._events: deque[Event] = deque()
+        self.decode_errors = 0
+
+    def offer(self, payload: bytes) -> bool:
+        """Decode and enqueue one event; returns whether it was accepted."""
+        try:
+            ev = decode_event(self._schema, payload)
+        except DecodeError as e:
+            with self._cond:
+                self.decode_errors += 1
+                n = self.decode_errors
+            if n <= 10 or n % 1000 == 0:
+                log.warning("skipping bad event payload (%d so far): %s", n, e)
+            return False
+        with self._cond:
+            self._events.append(ev)
+            self._cond.notify_all()
+        return True
+
+    def drain(self) -> list[Event]:
+        """Every queued event, oldest first, emptying the queue."""
+        with self._cond:
+            out = list(self._events)
+            self._events.clear()
+        return out
+
+    def wait(self, timeout_s: float) -> Event | None:
+        """Pop the oldest event, blocking up to ``timeout_s`` for one; None on timeout."""
+        deadline = time.monotonic() + timeout_s
+        with self._cond:
+            while not self._events:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self._cond.wait(remaining)
+            return self._events.popleft()
+
+
+def subscribe_events(session: zenoh.Session, schema) -> tuple[EventQueue, zenoh.Subscriber]:
+    """Every event the sim publishes from now on, in order. Keep the returned
+    subscriber alive."""
+    queue = EventQueue(schema)
+
+    def on_sample(sample: zenoh.Sample) -> None:
+        # Runs on a Zenoh thread: never let an exception escape into it.
+        try:
+            queue.offer(sample.payload.to_bytes())
+        except Exception:  # pragma: no cover - defensive; offer() handles bad input
+            log.exception("event callback failed")
+
+    sub = session.declare_subscriber(EVENTS, on_sample)
+    return queue, sub
 
 
 class CommandPublisher:

@@ -146,7 +146,24 @@ button.icon { width: 38px; text-align: center; font-size: 14px; }
 button.live { font-weight: 700; letter-spacing: 0.5px; }
 button.live.active { background: var(--live); border-color: var(--live); color: #fff; }
 .time { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 54px; text-align: center; }
-#scrub { flex: 1; accent-color: var(--accent); cursor: pointer; }
+#scrubWrap { flex: 1; position: relative; display: flex; align-items: center; height: 30px; }
+#scrub { flex: 1; margin: 0; accent-color: var(--accent); cursor: pointer; }
+/* Event ticks over the scrubber, inset by half the range thumb so a tick lines
+   up with the thumb at the same time. Only the ticks take pointer events. */
+#markers { position: absolute; left: 8px; right: 8px; top: 0; bottom: 0; pointer-events: none; }
+.marker {
+  position: absolute; transform: translateX(-50%); pointer-events: auto; cursor: pointer;
+  border-radius: 1px;
+}
+.marker.hit { top: 3px; height: 8px; width: 2px; background: #ffb547; opacity: 0.85; }
+.marker.kill {
+  top: 0; bottom: 0; width: 3px; background: var(--live);
+  box-shadow: 0 0 6px var(--live);
+}
+.marker.kill::before {
+  content: ""; position: absolute; left: 50%; top: -4px; width: 9px; height: 9px;
+  transform: translateX(-50%) rotate(45deg); background: var(--live);
+}
 #fps { min-width: 58px; text-align: right; }
 
 /* ---- Map attribution (bottom-left, above the transport; the toggles hold the right) ---- */

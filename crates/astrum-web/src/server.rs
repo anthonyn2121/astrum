@@ -9,13 +9,20 @@
 //! newest one, and a browser that connects mid-run gets the current snapshot at
 //! once. The payload is a [`Utf8Bytes`], so handing it to N clients is N
 //! reference-count bumps, not N copies.
+//!
+//! Events are NOT latest-value: [`pump_events`] encodes each batch of
+//! `astrum/events` into one `{"type":"events",…}` message and sends it on a
+//! [`broadcast`] channel, which every browser's task forwards in order on the
+//! same socket. A browser gets only the events sent after it connected (no
+//! history); one that falls more than [`EVENT_BACKLOG`] batches behind loses
+//! the oldest of them.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use astrum_net::{LatestTelemetry, NetError};
+use astrum_net::{EventReceiver, LatestTelemetry, NetError};
 use astrum_proto::Telemetry;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
@@ -26,12 +33,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use tokio::sync::watch;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, watch};
 use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::snapshot_message;
+use crate::{events_message, snapshot_message};
 
 /// The newest encoded fleet snapshot (`None` until the first one).
 pub type Snapshot = Option<Utf8Bytes>;
@@ -44,6 +52,8 @@ const MAX_TILE_BYTES: usize = 8 * 1024 * 1024;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// How often an idle pump re-checks whether anyone is still listening.
 const IDLE_POLL: Duration = Duration::from_secs(1);
+/// Event batches buffered per browser before the slowest one starts losing them.
+pub const EVENT_BACKLOG: usize = 1024;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -59,6 +69,7 @@ pub struct Config {
 #[derive(Clone)]
 struct AppState {
     telemetry: watch::Receiver<Snapshot>,
+    events: broadcast::Sender<Utf8Bytes>,
     tiles: Arc<TileProxy>,
 }
 
@@ -68,9 +79,14 @@ struct TileProxy {
     client: reqwest::Client,
 }
 
-/// Build the service: `GET /telemetry` (WebSocket), `GET /tiles/<z>/<x>/<y>.jpg`,
+/// Build the service: `GET /telemetry` (WebSocket: fleet snapshots from
+/// `telemetry` and event batches from `events`), `GET /tiles/<z>/<x>/<y>.jpg`,
 /// and every other path served from `cfg.root`.
-pub fn router(cfg: Config, telemetry: watch::Receiver<Snapshot>) -> reqwest::Result<Router> {
+pub fn router(
+    cfg: Config,
+    telemetry: watch::Receiver<Snapshot>,
+    events: broadcast::Sender<Utf8Bytes>,
+) -> reqwest::Result<Router> {
     // Bounded timeouts so an offline upstream fails fast (the renderer then
     // shows the plain grid where the tile would be).
     let client = reqwest::Client::builder()
@@ -88,7 +104,7 @@ pub fn router(cfg: Config, telemetry: watch::Receiver<Snapshot>) -> reqwest::Res
         .route("/telemetry", get(telemetry_ws))
         .route("/tiles/{*rest}", get(tile))
         .fallback_service(static_files)
-        .with_state(AppState { telemetry, tiles }))
+        .with_state(AppState { telemetry, events, tiles }))
 }
 
 /// Whether a WebSocket upgrade may proceed: requests without an `Origin`
@@ -132,11 +148,17 @@ async fn telemetry_ws(
         return (StatusCode::FORBIDDEN, "cross-origin WebSocket refused").into_response();
     }
     let rx = state.telemetry.clone();
-    ws.on_upgrade(move |socket| stream_snapshots(socket, rx))
+    let events = state.events.subscribe(); // events from now on
+    ws.on_upgrade(move |socket| stream_snapshots(socket, rx, events))
 }
 
-/// Forward the newest snapshot to one browser until it leaves.
-async fn stream_snapshots(mut socket: WebSocket, mut rx: watch::Receiver<Snapshot>) {
+/// Forward the newest snapshot and every event batch to one browser until it
+/// leaves.
+async fn stream_snapshots(
+    mut socket: WebSocket,
+    mut rx: watch::Receiver<Snapshot>,
+    mut events: broadcast::Receiver<Utf8Bytes>,
+) {
     rx.mark_changed(); // send the current snapshot straight away
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // the first tick is immediate
@@ -153,6 +175,15 @@ async fn stream_snapshots(mut socket: WebSocket, mut rx: watch::Receiver<Snapsho
                     }
                 }
             }
+            batch = events.recv() => match batch {
+                Ok(text) => {
+                    if socket.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {} // this browser fell behind; those batches are gone
+                Err(RecvError::Closed) => break, // the pump is gone
+            },
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                 Some(Ok(_)) => {} // the browser has nothing to say; pings are answered by the socket
@@ -202,6 +233,25 @@ pub fn pump_snapshots(
         tx.send_replace(Some(Utf8Bytes::from(snapshot_message(&snapshot))));
         sent = snapshot;
         sent_at = Some(Instant::now());
+    }
+}
+
+/// Forward every event from `events` into `tx`, one message per batch of
+/// events that arrived together, in order. Batches sent while no browser is
+/// connected are dropped.
+///
+/// Blocking — run it on a dedicated thread. Runs until the transport fails and
+/// returns that error.
+pub fn pump_events(events: &EventReceiver, tx: &broadcast::Sender<Utf8Bytes>) -> NetError {
+    loop {
+        let first = match events.recv_timeout(IDLE_POLL) {
+            Ok(e) => e,
+            Err(NetError::Timeout) => continue,
+            Err(e) => return e,
+        };
+        let mut batch = vec![first];
+        batch.extend(events.drain());
+        let _ = tx.send(Utf8Bytes::from(events_message(&batch)));
     }
 }
 

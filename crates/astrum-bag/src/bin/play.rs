@@ -1,10 +1,11 @@
-//! `astrum-bag-play` — replay a bag's telemetry as a stand-in for the sim.
+//! `astrum-bag-play` — replay a bag's telemetry and events as a stand-in for
+//! the sim.
 //!
 //! Listens where the sim would, serves the recorded scenario on
-//! `astrum/scenario`, and republishes every telemetry message with the exact
-//! recorded payload, paced by sim time. Subscribers (controllers, the web
-//! viewer) receive it as they would the live sim. Recorded commands are for
-//! analysis and are not replayed.
+//! `astrum/scenario`, and republishes every telemetry and event message with
+//! the exact recorded payload, in recorded order, paced by sim time.
+//! Subscribers (controllers, the web viewer) receive it as they would the live
+//! sim. Recorded commands are for analysis and are not replayed.
 //!
 //! Config (CLI arg > env > default): see `--help`. Each flag falls back to its
 //! `ASTRUM_*` env var, so compose/CI keep working.
@@ -62,8 +63,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stats = replay(&session, &bag, cli.rate)?;
     println!(
-        "[play] replayed {} telemetry messages; skipped {} command and {} other messages",
-        stats.telemetry, stats.commands, stats.skipped
+        "[play] replayed {} telemetry and {} event messages; skipped {} command and {} other messages",
+        stats.telemetry, stats.events, stats.commands, stats.skipped
     );
     Ok(())
 }

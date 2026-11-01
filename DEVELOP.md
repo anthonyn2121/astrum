@@ -23,6 +23,7 @@ ASTRUM is **one server + many clients** talking over Zenoh.
 ```
 controllers ──put astrum/command/<id>─────►  sim (subscribes astrum/command/*)
 controllers ◄──put astrum/telemetry/<id>───  sim (publishes per aircraft; id in the key)
+subscribers ◄──put astrum/events───────────  sim (hits, kills, mode changes, ...; one per event)
 controllers ──token astrum/alive/controller/<id>──►  sim (liveliness: who is connected)
 astrum-ctl  ──get astrum/control/*, astrum/status──►  sim (pause / step / speed / status)
 ```
@@ -135,8 +136,8 @@ crates/            # Rust workspace (one crate per responsibility)
   astrum-fdm/       #   JSBSim FFI: safe `Fdm` wrapper (C shim, crate-owned lock, `Fdm: Send`)
   astrum-geo/       #   WGS84 geodetic ↔ ECEF ↔ ENU math, local-level ↔ grid rotations
   astrum-proto/     #   the Cap'n Proto schema v2 + encode/decode + wire fixtures
-  astrum-net/       #   Zenoh transport (keys, QoS, LatestTelemetry, CommandSender, scenario)
-  astrum-bag/       #   MCAP record (telemetry + commands) / replay (telemetry)
+  astrum-net/       #   Zenoh transport (keys, QoS, LatestTelemetry, CommandSender, events, presence, control, scenario)
+  astrum-bag/       #   MCAP record (telemetry + commands + events) / replay (telemetry + events)
   astrum-web/       #   axum bridge + tile proxy (astrum-web) + MCAP→JSON exporter (astrum-web-export)
   astrum-sim/       #   the Bevy ECS app — the sim binary + the embedded env seam (env.rs)
   astrum-env/       #   PyO3 module `astrum_env` + the dogfight Gym adapter (python/)
@@ -327,7 +328,7 @@ bake an MCAP bag to JSON and drag it onto the page (or use "Open file…"):
 ```bash
 docker compose --profile record up recorder           # record to recordings/session.mcap
 make replay                                           # sim + renderer at http://localhost:8080
-make export BAG=recordings/session.mcap OUT=out.json  # MCAP → astrum-replay (v2) JSON
+make export BAG=recordings/session.mcap OUT=out.json  # MCAP → astrum-replay (v3) JSON
 make down                                             # stop the sim + renderer
 ```
 
@@ -385,13 +386,16 @@ its staging directory for `PYTHONPATH`; `make test-python` does that and runs it
 
 ## 8. Cap'n Proto wire quick reference
 
-The schema (`crates/astrum-proto/schema/astrum.capnp`, v2) defines two messages:
+The schema (`crates/astrum-proto/schema/astrum.capnp`, v2) defines three messages:
 - **`Telemetry`** — sim → subscribers (`astrum/telemetry/<id>`; the id is in the key). Geodetic
   position (HAE), world-grid `enu` + `velEnu`, local-level `velNed`, attitude, `tasMps`,
   `faultFlags`, `vehicleKind`, `tick`, `bodyRates`, `aero`, `combat`, `controlMode`.
 - **`Command`** — controllers → sim; `targetId` (must equal the key id), a union of **`raw`**
   actuator setpoints (`fcs/*-cmd-norm`) *or* high-level **`autopilot`** targets (heading, HAE
   altitude, TAS), plus `seq`, `telemetryTick` and `trigger`.
+- **`Event`** — sim → subscribers (`astrum/events`); `tick`, `simTimeS` and a `kind` union
+  (trigger pressed / released, hit, kill, mode change, controller up / down, run ended). See the
+  README's "Events".
 
 Recordings are MCAP files (one channel per Zenoh key, raw payload bytes); there is no
 recording message in the schema.
@@ -404,11 +408,15 @@ CMake step, and Python loads it at runtime (`capnp.load(...)`).
 
 1. Rust: extend the types and encode/decode in `crates/astrum-proto/src/lib.rs`.
 2. C++: extend the codec in `controllers/common/cpp` (`wire.cpp`); Python: `astrum_client/wire.py`.
-3. Add the canonical value to `crates/astrum-proto/tests/fixtures/values.json` and teach the three
+   (`Event` has no C++ codec: nothing in C++ consumes it.)
+3. Add the canonical value to `crates/astrum-proto/tests/fixtures/values.json` and teach the
    fixture writers about it (`crates/astrum-proto/examples/wire_fixture.rs`,
-   `controllers/common/cpp/tools/wire_fixture.cpp`, `astrum_client/wire_fixture.py`).
-4. `make wire-fixtures` regenerates all nine `<kind>.<lang>.bin` files; `make test` checks that
-   every language decodes every file to `values.json` exactly.
+   `controllers/common/cpp/tools/wire_fixture.cpp`, `astrum_client/wire_fixture.py`). A new event
+   kind is an `event_<kind>` entry plus its name in `EVENT_KINDS` in
+   `crates/astrum-proto/tests/fixture/mod.rs` and `astrum_client/wire_fixture.py`.
+4. `make wire-fixtures` regenerates every `<kind>.<lang>.bin` file (nine telemetry/command files
+   in three languages, the events in Rust and Python); `make test` checks that every language
+   decodes every file to `values.json` exactly.
 
 ## 9. Before you commit
 

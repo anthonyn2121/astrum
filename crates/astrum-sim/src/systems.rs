@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use astrum_fdm::{prop, Controls, Fdm, FdmError, InitialConditions, TrimMode};
 use astrum_geo::{Enu, Geodetic, LocalFrame, Ned};
+use astrum_proto::EndReason;
 use bevy::prelude::*;
 
 use crate::combat::{Dead, Gun, Health, Team, Trigger};
@@ -15,6 +16,7 @@ use crate::components::{
     Aircraft, AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus, StepShard,
     VehicleKind, WorldFrame,
 };
+use crate::events::EventLog;
 use crate::pilot::{FixedWingGains, Pilot};
 use crate::scenario::{AircraftClass, AircraftSpec, Scenario};
 use crate::step_pool::ShardPool;
@@ -391,12 +393,14 @@ pub fn stop_at_max_time(
     params: Res<SimParams>,
     clock: Res<SimClock>,
     mode: Res<RunMode>,
+    mut events: ResMut<EventLog>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if params.max_time_s > 0.0 && clock.time_s(&params) >= params.max_time_s {
         if *mode == RunMode::Server {
             println!("[astrum-sim] reached max_time_s={:.1} — exiting", params.max_time_s);
         }
+        events.end(EndReason::MaxTime, "");
         exit.write(AppExit::Success);
     }
 }
@@ -416,6 +420,7 @@ impl StopRequested {
 pub fn exit_on_signal(
     stop: Option<Res<StopRequested>>,
     mode: Res<RunMode>,
+    mut events: ResMut<EventLog>,
     mut exit: MessageWriter<AppExit>,
     mut reported: Local<bool>,
 ) {
@@ -424,6 +429,7 @@ pub fn exit_on_signal(
             println!("[astrum-sim] stop requested — exiting");
             *reported = true;
         }
+        events.end(EndReason::Stopped, "");
         exit.write(AppExit::Success);
     }
 }
@@ -431,6 +437,7 @@ pub fn exit_on_signal(
 /// Report a fatal error once and exit with a failure code.
 pub fn exit_on_fatal(
     status: Res<SimStatus>,
+    mut events: ResMut<EventLog>,
     mut exit: MessageWriter<AppExit>,
     mut reported: Local<bool>,
 ) {
@@ -439,6 +446,7 @@ pub fn exit_on_fatal(
             eprintln!("[astrum-sim] fatal: {msg}");
             *reported = true;
         }
+        events.end(EndReason::Fatal, msg);
         exit.write(AppExit::from_code(1));
     }
 }

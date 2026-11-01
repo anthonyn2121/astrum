@@ -1,5 +1,5 @@
 {
-  "_comment": "Canonical cross-language wire fixture values (schema v2). Each language encodes these into tests/fixtures/<kind>.<lang>.bin and every language's test decodes every file and compares against these values exactly. Regenerate the .bin files with scripts/wire-fixtures.sh after a schema change.",
+  "_comment": "Canonical cross-language wire fixture values (schema v2). Each language encodes these into tests/fixtures/<kind>.<lang>.bin and every language's test decodes every file and compares against these values exactly. The event_* kinds use the shared event JSON shape and have Rust and Python files only (C++ has no Event codec). Regenerate the .bin files with scripts/wire-fixtures.sh after a schema change.",
   "telemetry": {
     "aircraft_id": 7,
     "tick": 1234567890123,
@@ -32,5 +32,58 @@
     "telemetry_tick": 5,
     "trigger": false,
     "control": { "autopilot": { "heading_rad": 1.5, "alt_hae_m": 1500.0, "tas_mps": 120.0 } }
+  },
+  "event_trigger_pressed": { "tick": 120, "sim_time_s": 1.0, "kind": "trigger-pressed", "aircraft_id": 2, "ammo": 300 },
+  "event_trigger_released": {
+    "tick": 1234567890123,
+    "sim_time_s": 10288065.6875,
+    "kind": "trigger-released",
+    "aircraft_id": 2,
+    "rounds_fired": 41,
+    "ammo": 259
+  },
+  "event_hit": {
+    "tick": 1234,
+    "sim_time_s": 10.28125,
+    "kind": "hit",
+    "shooter_id": 2,
+    "target_id": 1,
+    "damage": 2.5,
+    "hit_points": 97.5,
+    "pos_enu": [1234.5, -6789.25, 4572.125]
+  },
+  "event_kill": {
+    "tick": 4000,
+    "sim_time_s": 33.3125,
+    "kind": "kill",
+    "victim_id": 1,
+    "killer_id": 2,
+    "pos_enu": [-10.75, 20.5, 1499.0]
+  },
+  "event_kill_unknown": {
+    "tick": 17,
+    "sim_time_s": 0.140625,
+    "kind": "kill",
+    "victim_id": 4294967295,
+    "killer_id": null,
+    "pos_enu": [0.0, 0.0, 0.0]
+  },
+  "event_mode_change": {
+    "tick": 600,
+    "sim_time_s": 5.0,
+    "kind": "mode-change",
+    "aircraft_id": 3,
+    "from": "raw",
+    "to": "failsafe",
+    "reason": "lease-expired"
+  },
+  "event_controller_up": { "tick": 0, "sim_time_s": 0.0, "kind": "controller-up", "aircraft_id": 5 },
+  "event_controller_down": { "tick": 999, "sim_time_s": 8.3125, "kind": "controller-down", "aircraft_id": 7 },
+  "event_run_ended": {
+    "tick": 7200,
+    "sim_time_s": 60.0,
+    "kind": "run-ended",
+    "reason": "fatal",
+    "message": "aircraft 3: non-finite state (NaN airspeed) — stopping"
   }
 }

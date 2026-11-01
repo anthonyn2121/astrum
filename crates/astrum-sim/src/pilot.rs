@@ -4,13 +4,14 @@
 //! same [`apply_command`], so both front doors behave identically.
 
 use astrum_fdm::{Controls, FdmState};
-use astrum_proto::{AutopilotTargets, Command, Control, ControlMode};
+use astrum_proto::{AutopilotTargets, Command, Control, ControlMode, EventKind, ModeReason};
 use bevy::prelude::*;
 
 use crate::combat::{Dead, Trigger};
 use crate::components::{
     Aircraft, AircraftState, AutopilotProfile, SimClock, SimParams, VehicleKind,
 };
+use crate::events::EventLog;
 
 /// What drives an aircraft's FCS inputs this tick.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,8 +22,9 @@ pub enum PilotMode {
     Raw(Controls),
     /// The built-in autopilot flying commanded targets.
     Autopilot(AutopilotTargets),
-    /// The command lease expired; the autopilot holds the state at expiry.
-    Failsafe(AutopilotTargets),
+    /// The command lease expired or the controller went away (`ModeReason`
+    /// says which); the autopilot holds the state at that moment.
+    Failsafe(AutopilotTargets, ModeReason),
 }
 
 impl PilotMode {
@@ -31,7 +33,7 @@ impl PilotMode {
             PilotMode::Uncommanded => ControlMode::Uncommanded,
             PilotMode::Raw(_) => ControlMode::Raw,
             PilotMode::Autopilot(_) => ControlMode::Autopilot,
-            PilotMode::Failsafe(_) => ControlMode::Failsafe,
+            PilotMode::Failsafe(..) => ControlMode::Failsafe,
         }
     }
 }
@@ -60,6 +62,8 @@ pub struct Pilot {
     pub integrators: Integrators,
     /// FCS inputs to write before this tick's step (`None` = leave as is).
     pub output: Option<Controls>,
+    /// The control mode last reported as an event (see [`log_mode_changes`]).
+    pub reported_mode: ControlMode,
 }
 
 impl Pilot {
@@ -73,6 +77,7 @@ impl Pilot {
             control_period_ticks: 1,
             integrators: Integrators::default(),
             output: None,
+            reported_mode: ControlMode::Uncommanded,
         }
     }
 
@@ -157,7 +162,7 @@ pub fn apply_command(
         }
     };
     let entering_autopilot =
-        !matches!(pilot.mode, PilotMode::Autopilot(_) | PilotMode::Failsafe(_));
+        !matches!(pilot.mode, PilotMode::Autopilot(_) | PilotMode::Failsafe(..));
     if matches!(mode, PilotMode::Autopilot(_)) && entering_autopilot {
         pilot.integrators = Integrators::default();
     }
@@ -176,8 +181,13 @@ pub fn hold_targets(s: &FdmState) -> AutopilotTargets {
 }
 
 /// Switch to the failsafe hold of the current state and release the trigger.
-pub fn enter_failsafe(pilot: &mut Pilot, trigger: Option<&mut Trigger>, state: &AircraftState) {
-    pilot.mode = PilotMode::Failsafe(hold_targets(&state.fdm));
+pub fn enter_failsafe(
+    pilot: &mut Pilot,
+    trigger: Option<&mut Trigger>,
+    state: &AircraftState,
+    reason: ModeReason,
+) {
+    pilot.mode = PilotMode::Failsafe(hold_targets(&state.fdm), reason);
     pilot.integrators = Integrators::default();
     if let Some(t) = trigger {
         t.0 = false;
@@ -199,8 +209,26 @@ pub fn expire_leases(
                 ac.id,
                 (clock.tick - pilot.last_command_tick) as f64 * params.dt
             );
-            enter_failsafe(&mut pilot, trigger.map(Mut::into_inner), state);
+            let reason = ModeReason::LeaseExpired;
+            enter_failsafe(&mut pilot, trigger.map(Mut::into_inner), state, reason);
         }
+    }
+}
+
+/// Report every aircraft whose control mode changed since the last report: a
+/// command, an expired lease, or a lost controller (earlier this update).
+pub fn log_mode_changes(mut events: ResMut<EventLog>, mut q: Query<(&Aircraft, &mut Pilot)>) {
+    for (ac, mut pilot) in &mut q {
+        let to = pilot.mode.control_mode();
+        if to == pilot.reported_mode {
+            continue;
+        }
+        let reason = match pilot.mode {
+            PilotMode::Failsafe(_, reason) => reason,
+            _ => ModeReason::Command,
+        };
+        let from = std::mem::replace(&mut pilot.reported_mode, to);
+        events.push(EventKind::ModeChange { aircraft_id: ac.id, from, to, reason });
     }
 }
 
@@ -394,7 +422,7 @@ pub fn autopilot_step(
         pilot.output = match pilot.mode {
             PilotMode::Uncommanded => None,
             PilotMode::Raw(c) => Some(c),
-            PilotMode::Autopilot(t) | PilotMode::Failsafe(t) => Some(match kind {
+            PilotMode::Autopilot(t) | PilotMode::Failsafe(t, _) => Some(match kind {
                 VehicleKind::FixedWing => {
                     let g = gains.expect("fixed-wing aircraft always carry FixedWingGains");
                     fixed_wing(&state.fdm, &t, g, &mut pilot.integrators, params.dt)

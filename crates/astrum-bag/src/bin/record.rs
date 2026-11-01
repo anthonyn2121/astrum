@@ -1,5 +1,5 @@
-//! `astrum-bag-record` — record the live telemetry and command streams to an
-//! MCAP bag.
+//! `astrum-bag-record` — record the live telemetry, command and event streams
+//! to an MCAP bag.
 //!
 //! Stops after `--seconds` or on SIGINT / SIGTERM, and always finishes the bag
 //! (summary + footer) on the way out. A SIGKILL leaves an unfinished file.
@@ -85,8 +85,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     finished.map_err(|e| format!("finishing bag {out}: {e}"))?;
 
     println!(
-        "[record] wrote {out}: {} telemetry, {} command messages; {} undecodable telemetry samples skipped",
-        stats.telemetry, stats.commands, stats.rejected
+        "[record] wrote {out}: {} telemetry, {} command, {} event messages; {} undecodable samples skipped",
+        stats.telemetry, stats.commands, stats.events, stats.rejected
     );
     Ok(())
 }

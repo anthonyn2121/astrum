@@ -1,19 +1,21 @@
 //! The gun-combat chain over hand-placed entities (no JSBSim): swept hit tests
 //! in relative motion, earliest-hit attribution, velocity inheritance, damage,
-//! termination and determinism.
+//! termination, the events it reports, and determinism.
 
 use std::f64::consts::FRAC_PI_2;
 
 use astrum_fdm::FdmState;
 use astrum_geo::{Enu, Geodetic, LocalFrame};
+use astrum_proto::{EndReason, EventKind};
 use astrum_sim::combat::ballistics::DVec3;
 use astrum_sim::combat::systems::{
-    apply_damage, end_on_elimination, fire_guns, resolve_hits, step_bullets,
+    apply_damage, end_on_elimination, fire_guns, on_kill, resolve_hits, step_bullets,
 };
 use astrum_sim::combat::{
     Bullet, CombatParams, CombatRng, CombatState, Dead, Gun, Health, Team, Trigger,
 };
-use astrum_sim::components::{Aircraft, AircraftState, SimParams, WorldFrame};
+use astrum_sim::components::{Aircraft, AircraftState, SimClock, SimParams, SimStatus, WorldFrame};
+use astrum_sim::events::{publish_events, EventLog};
 use bevy::prelude::*;
 
 const DT: f64 = 1.0 / 120.0;
@@ -40,7 +42,11 @@ fn base_app(seed: u64, teams: u8) -> App {
         ))))
         .insert_resource(CombatParams::default())
         .insert_resource(CombatRng::seeded(seed))
-        .insert_resource(CombatState { initial_living_teams: teams });
+        .insert_resource(CombatState { initial_living_teams: teams })
+        .insert_resource(SimClock::default())
+        .insert_resource(SimStatus::default())
+        .insert_resource(EventLog::default())
+        .add_observer(on_kill);
     app
 }
 
@@ -49,9 +55,15 @@ fn combat_app(seed: u64, teams: u8) -> App {
     let mut app = base_app(seed, teams);
     app.add_systems(
         Update,
-        (fire_guns, step_bullets, resolve_hits, apply_damage, end_on_elimination).chain(),
+        (fire_guns, step_bullets, resolve_hits, apply_damage, end_on_elimination, publish_events)
+            .chain(),
     );
     app
+}
+
+/// Every event of the latest update.
+fn events(app: &App) -> Vec<EventKind> {
+    app.world().resource::<EventLog>().last().iter().map(|e| e.kind.clone()).collect()
 }
 
 fn state(pos: DVec3, prev: DVec3, vel: DVec3, psi_rad: f64) -> AircraftState {
@@ -180,8 +192,10 @@ fn sustained_burst_kills_and_decides_the_engagement() {
     spawn_shooter(&mut app, 1, 0, DVec3::ZERO, FRAC_PI_2, gun);
     spawn_target(&mut app, 2, 1, DVec3::new(80.0, 0.0, 0.0), DVec3::new(80.0, 0.0, 0.0), 20.0);
     let mut exited = false;
+    let mut seen = Vec::new();
     for _ in 0..400 {
         app.update();
+        seen.extend(events(&app));
         if app.should_exit().is_some() {
             exited = true;
             break;
@@ -190,6 +204,53 @@ fn sustained_burst_kills_and_decides_the_engagement() {
     assert!(exited, "one team eliminated ends the run");
     assert!(is_dead(&mut app, 2) && hp_of(&mut app, 2) <= 0.0);
     assert!(!is_dead(&mut app, 1));
+
+    // Reported: the press, every hit (the shooter's, on the target, where the
+    // round struck), the kill credited to the shooter, then the run's end.
+    assert_eq!(seen[0], EventKind::TriggerPressed { aircraft_id: 1, ammo: 511 });
+    let n = seen.len();
+    let hits = &seen[1..n - 2];
+    let damage = CombatParams::default().damage_per_hit;
+    for (i, hit) in hits.iter().enumerate() {
+        let EventKind::Hit { shooter_id, target_id, hit_points, pos_enu, .. } = *hit else {
+            panic!("event {i} between the press and the kill: {hit:?}");
+        };
+        assert_eq!((shooter_id, target_id), (1, 2));
+        assert_eq!(hit_points, 20.0 - damage * (i + 1) as f32);
+        let miss = ((pos_enu.e - 80.0).powi(2) + pos_enu.n.powi(2) + pos_enu.u.powi(2)).sqrt();
+        assert!(miss <= CombatParams::default().hit_radius_m + 1e-9, "struck {miss} m off");
+    }
+    assert!(matches!(seen[n - 2], EventKind::Kill { victim_id: 2, killer_id: Some(1), .. }));
+    assert!(matches!(
+        seen[n - 1],
+        EventKind::RunEnded { reason: EndReason::EngagementDecided, .. }
+    ));
+}
+
+#[test]
+fn a_shooter_destroyed_mid_burst_reports_its_release_then_its_death() {
+    let mut app = combat_app(5, 1);
+    spawn_shooter(&mut app, 1, 0, DVec3::ZERO, FRAC_PI_2, Gun::m61a1());
+    for _ in 0..30 {
+        app.update();
+    }
+    let mut q = app.world_mut().query::<(Entity, &Gun)>();
+    let (shooter, ammo) = q.iter(app.world()).map(|(e, g)| (e, g.ammo)).next().unwrap();
+    assert!(ammo < 511, "the burst fired");
+    // Destroyed by something other than a round: nobody to credit.
+    app.world_mut().entity_mut(shooter).insert(Dead);
+    app.update();
+    assert_eq!(
+        events(&app),
+        [
+            EventKind::TriggerReleased { aircraft_id: 1, rounds_fired: 511 - ammo, ammo },
+            EventKind::Kill {
+                victim_id: 1,
+                killer_id: None,
+                pos_enu: Enu { e: 0.0, n: 0.0, u: 0.0 }
+            },
+        ]
+    );
 }
 
 #[test]

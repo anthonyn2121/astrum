@@ -35,6 +35,7 @@ export class UI {
       readout: $("readout"),
       playBtn: $("playBtn"), liveBtn: $("liveBtn"),
       timeCur: $("timeCur"), scrub: $("scrub"), timeTot: $("timeTot"),
+      markers: $("markers"),
       speedSel: $("speedSel"), fps: $("fps"),
       tglFollow: $("tglFollow"), tglTrails: $("tglTrails"),
       tglLabels: $("tglLabels"), fitBtn: $("fitBtn"),
@@ -139,6 +140,29 @@ export class UI {
     this.el.timeTot.textContent = fmtTime(tot);
     // Don't fight the user mid-drag; setting .value here won't fire "input".
     this.el.scrub.value = String(Math.round(Math.max(0, Math.min(1, frac)) * 1000));
+  }
+
+  // markers: [{ frac, kind: "hit" | "kill", title }] — event ticks over the
+  // scrubber, frac in [0,1] along it. Reuses the marker elements; clicking one
+  // seeks there. The title reaches the DOM only through the title attribute.
+  setMarkers(markers) {
+    const layer = this.el.markers;
+    while (layer.children.length > markers.length) layer.lastChild.remove();
+    while (layer.children.length < markers.length) {
+      const el = document.createElement("span");
+      el.addEventListener("click", () => this.h.onScrub?.(Number(el.dataset.frac)));
+      layer.appendChild(el);
+    }
+    markers.forEach((m, i) => {
+      const el = layer.children[i];
+      const frac = Math.max(0, Math.min(1, m.frac));
+      const left = `${(frac * 100).toFixed(3)}%`;
+      const cls = `marker ${m.kind}`;
+      if (el.style.left !== left) el.style.left = left;
+      if (el.className !== cls) el.className = cls;
+      if (el.title !== m.title) el.title = m.title;
+      el.dataset.frac = String(frac);
+    });
   }
 
   setFps(fps) {

@@ -61,9 +61,9 @@
     <circle cx="66" cy="308" r="5" fill="#A78BFA"/>
     <text class="cName" x="80" y="313">astrum-proto</text><text class="cDesc" x="80" y="328">Cap'n Proto schema v2 · zero-copy decode</text>
     <circle cx="66" cy="344" r="5" fill="#34D399"/>
-    <text class="cName" x="80" y="349">astrum-net</text><text class="cDesc" x="80" y="364">Zenoh router/client · LatestTelemetry</text>
+    <text class="cName" x="80" y="349">astrum-net</text><text class="cDesc" x="80" y="364">Zenoh router/client · LatestTelemetry · events</text>
     <circle cx="66" cy="380" r="5" fill="#FB7185"/>
-    <text class="cName" x="80" y="385">astrum-bag</text><text class="cDesc" x="80" y="400">MCAP record (telem + cmds) / replay</text>
+    <text class="cName" x="80" y="385">astrum-bag</text><text class="cDesc" x="80" y="400">MCAP record (telem, cmds, events) / replay</text>
     <circle cx="66" cy="416" r="5" fill="#38BDF8"/>
     <text class="cName" x="80" y="421">astrum-web</text><text class="cDesc" x="80" y="436">axum WS bridge · tile proxy · export</text>
     <circle cx="66" cy="452" r="5" fill="#C084FC"/>
@@ -116,24 +116,24 @@
   <text class="monoK" x="1206" y="294">struct Command {</text>
   <text class="mono"  x="1206" y="314">  targetId · seq · telemetryTick</text>
   <text class="mono"  x="1206" y="334">  raw | autopilot · trigger }</text>
-  <text class="monoK" x="1206" y="368">bags: MCAP</text>
-  <text class="mono"  x="1206" y="388">  1 channel/key · raw payload bytes</text>
+  <text class="monoK" x="1206" y="368">struct Event {</text>
+  <text class="mono"  x="1206" y="388">  tick · hit | kill | mode | … }</text>
   <line x1="1206" y1="410" x2="1542" y2="410" stroke="#26324A" stroke-width="1.2"/>
-  <text class="cDesc" x="1206" y="432">One schema shared by the Rust sim and</text>
-  <text class="cDesc" x="1206" y="450">the C++ / Python controllers (wire fixtures).</text>
+  <text class="cDesc" x="1206" y="432">One schema: Rust sim, C++ / Python clients</text>
+  <text class="cDesc" x="1206" y="450">(wire fixtures) · bags: MCAP, raw payloads.</text>
   <line x1="1374" y1="492" x2="1374" y2="514" stroke="#5B4B86" stroke-width="1.6" stroke-dasharray="5 4"/>
   <text class="tag" x="1374" y="508" text-anchor="middle">payload</text>
 
   <!-- sim <-> bus arrows -->
   <line x1="772" y1="492" x2="772" y2="514" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
   <line x1="830" y1="514" x2="830" y2="492" stroke="#FB923C" stroke-width="3" marker-end="url(#mOrange)"/>
-  <text class="aLbl" x="766" y="507" text-anchor="end" fill="#34D399">telemetry</text>
+  <text class="aLbl" x="766" y="507" text-anchor="end" fill="#34D399">telemetry · events</text>
   <text class="aLbl" x="836" y="507" fill="#FB923C">commands</text>
 
   <!-- ============ ZENOH BUS ============ -->
   <rect x="40" y="516" width="1520" height="62" rx="14" fill="url(#busGrad)" stroke="#A78BFA" stroke-width="1.6" filter="url(#sh)"/>
   <text class="busT" x="800" y="544" text-anchor="middle">ZENOH 1.10.0  ·  TRANSPORT BUS</text>
-  <text class="busS" x="800" y="566" text-anchor="middle">one TCP endpoint :7447 (127.0.0.1)  ·  Drop · express · InteractiveHigh  ·  keys astrum/telemetry/&lt;id&gt; + astrum/command/&lt;id&gt;  ·  sim = router, all others connect as clients</text>
+  <text class="busS" x="800" y="566" text-anchor="middle">one TCP endpoint :7447 (127.0.0.1)  ·  Drop · express · InteractiveHigh (events: Block)  ·  keys astrum/telemetry/&lt;id&gt; + astrum/command/&lt;id&gt; + astrum/events  ·  sim = router, all others connect as clients</text>
 
   <!-- bus -> controllers -->
   <line x1="392" y1="578" x2="392" y2="604" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
@@ -144,7 +144,7 @@
   <!-- bus -> observation -->
   <line x1="1150" y1="578" x2="1150" y2="604" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
   <line x1="1230" y1="604" x2="1230" y2="578" stroke="#34D399" stroke-width="2.4" stroke-dasharray="6 5" marker-end="url(#mGreen)"/>
-  <text class="aLbl" x="1144" y="596" text-anchor="end" fill="#34D399">telemetry</text>
+  <text class="aLbl" x="1144" y="596" text-anchor="end" fill="#34D399">telemetry · events</text>
   <text class="aLbl" x="1236" y="596" fill="#8FE9C6">replay re-pub</text>
 
   <!-- ============ BOTTOM ROW ============ -->
@@ -194,18 +194,18 @@
   <rect class="box" x="844" y="686" width="692" height="50" rx="8"/>
   <rect x="844" y="686" width="5" height="50" rx="2.5" fill="#FB7185"/>
   <text class="cName" x="862" y="708">recorder   ·   astrum-bag</text>
-  <text class="cDesc" x="862" y="726">telemetry + commands → MCAP (raw payloads, scenario metadata)</text>
+  <text class="cDesc" x="862" y="726">telemetry + commands + events → MCAP (raw payloads, scenario metadata)</text>
 
   <rect class="box" x="844" y="742" width="692" height="50" rx="8"/>
   <rect x="844" y="742" width="5" height="50" rx="2.5" fill="#FB7185"/>
   <text class="cName" x="862" y="764">replay   ·   astrum-bag</text>
-  <text class="cDesc" x="862" y="782">MCAP → re-publish telemetry, paced by sim time (--rate)</text>
+  <text class="cDesc" x="862" y="782">MCAP → re-publish telemetry + events, paced by sim time (--rate)</text>
 
   <rect class="box" x="844" y="798" width="692" height="66" rx="8"/>
   <rect x="844" y="798" width="5" height="66" rx="2.5" fill="#38BDF8"/>
   <text class="cName" x="862" y="820">astrum-web   ·   bridge</text>
-  <text class="cDesc" x="862" y="840">axum · latest-value SUB → batched snapshot ≤ --max-hz → WS 127.0.0.1:8080</text>
-  <text class="cDesc" x="862" y="857">static web/ · /tiles proxy · Origin check · export ▸ MCAP → astrum-replay v2</text>
+  <text class="cDesc" x="862" y="840">axum · latest-value SUB → snapshot ≤ --max-hz · every event → WS 127.0.0.1:8080</text>
+  <text class="cDesc" x="862" y="857">static web/ · /tiles proxy · Origin check · export ▸ MCAP → astrum-replay v3</text>
 
   <line x1="1190" y1="864" x2="1190" y2="882" stroke="#38BDF8" stroke-width="3" marker-end="url(#mBlue)"/>
   <text class="aLbl" x="1200" y="877" fill="#38BDF8">WebSocket</text>
@@ -215,7 +215,7 @@
   <text class="cName" x="862" y="908">Browser   ·   vanilla ES-module Three.js</text>
   <text class="cDesc" x="862" y="932">procedural F-16 / F450 meshes chosen by VehicleKind · ENU↔three math</text>
   <text class="cDesc" x="862" y="952">orbit &amp; follow cameras · flight trails · entity pick</text>
-  <text class="cDesc" x="862" y="972">timeline keyed on sim_time_s with interpolation · HUD (HP · ammo)</text>
+  <text class="cDesc" x="862" y="972">timeline keyed on sim_time_s · hit / kill markers · HUD (HP · ammo)</text>
 
   <!-- ============ FOOTER ============ -->
   <line x1="40" y1="1078" x2="1560" y2="1078" stroke="#26324A" stroke-width="1.2"/>

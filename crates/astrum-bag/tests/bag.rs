@@ -1,17 +1,18 @@
-//! Behaviour of the MCAP bag: file round trip, recording from a live session,
-//! replay pacing, and damaged-file handling.
+//! Behaviour of the MCAP bag: file round trip, recording from a live session
+//! (telemetry, commands, events), replay pacing, and damaged-file handling.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use astrum_bag::{
     replay, replay_schedule, BagError, BagMessage, BagReader, BagWriter, RecordStats, Recorder,
-    COMMAND_SCHEMA, MAX_REPLAY_GAP, SCHEMA_TEXT, TELEMETRY_SCHEMA,
+    COMMAND_SCHEMA, EVENT_SCHEMA, MAX_REPLAY_GAP, SCHEMA_TEXT, TELEMETRY_SCHEMA,
 };
 use astrum_net::zenoh::Wait;
-use astrum_net::{keys, CommandSender, Session, TelemetryPublisher};
+use astrum_net::{keys, CommandSender, EventPublisher, Session, TelemetryPublisher};
 use astrum_proto::{
-    decode_command, encode_telemetry, AutopilotTargets, Control, RawActuators, Telemetry,
+    decode_command, encode_event, encode_telemetry, AutopilotTargets, Control, Enu, Event,
+    EventKind, RawActuators, Telemetry,
 };
 
 const SCENARIO: &str =
@@ -35,6 +36,20 @@ fn telemetry(id: u32, tick: u64) -> Telemetry {
         alt_hae_m: 1524.0 + tick as f64,
         tas_mps: 55.0,
         ..Telemetry::default()
+    }
+}
+
+fn hit(tick: u64) -> Event {
+    Event {
+        tick,
+        sim_time_s: tick as f64 / 120.0,
+        kind: EventKind::Hit {
+            shooter_id: 2,
+            target_id: 1,
+            damage: 2.0,
+            hit_points: 98.0,
+            pos_enu: Enu { e: 1.0, n: tick as f64, u: 1500.0 },
+        },
     }
 }
 
@@ -92,7 +107,11 @@ fn channels_carry_the_capnp_schema_text() {
     write_bag(
         &path,
         None,
-        &[msg("astrum/telemetry/3", 1, 1, &[1]), msg("astrum/command/3", 2, 2, &[2])],
+        &[
+            msg("astrum/telemetry/3", 1, 1, &[1]),
+            msg("astrum/command/3", 2, 2, &[2]),
+            msg("astrum/events", 3, 3, &[3]),
+        ],
     );
 
     let bytes = std::fs::read(&path).expect("read");
@@ -110,6 +129,7 @@ fn channels_carry_the_capnp_schema_text() {
         vec![
             ("astrum/telemetry/3".to_owned(), TELEMETRY_SCHEMA.to_owned()),
             ("astrum/command/3".to_owned(), COMMAND_SCHEMA.to_owned()),
+            ("astrum/events".to_owned(), EVENT_SCHEMA.to_owned()),
         ]
     );
     assert_eq!(BagReader::open(&path).expect("open").scenario(), None);
@@ -159,7 +179,7 @@ fn record_until(
 }
 
 #[test]
-fn recorder_captures_every_telemetry_and_command_sample() {
+fn recorder_captures_every_telemetry_command_and_event_sample() {
     const TICKS: u64 = 300;
     let session = Session::in_process().expect("session");
     let recorder = Recorder::subscribe(&session).expect("subscribe");
@@ -170,6 +190,7 @@ fn recorder_captures_every_telemetry_and_command_sample() {
             let mut telemetry_pub = TelemetryPublisher::new(&session);
             let mut cmd1 = CommandSender::new(&session, 1).expect("sender 1");
             let mut cmd2 = CommandSender::new(&session, 2).expect("sender 2");
+            let events = EventPublisher::new(&session).expect("events");
             for tick in 1..=TICKS {
                 telemetry_pub.publish(&telemetry(1, tick)).expect("publish 1");
                 telemetry_pub.publish(&telemetry(2, tick)).expect("publish 2");
@@ -181,9 +202,13 @@ fn recorder_captures_every_telemetry_and_command_sample() {
                     tas_mps: 60.0,
                 });
                 cmd2.send(ap, tick % 2 == 0, tick).expect("cmd 2");
+                if tick % 100 == 0 {
+                    events.publish_raw(encode_event(&hit(tick))).expect("event");
+                }
             }
-            // An undecodable telemetry payload is counted and skipped.
+            // Undecodable telemetry and event payloads are counted and skipped.
             session.raw().put(keys::telemetry(9), vec![1u8, 2, 3]).wait().expect("garbage");
+            events.publish_raw(vec![4u8, 5, 6]).expect("garbage event");
         })
     };
 
@@ -191,11 +216,14 @@ fn recorder_captures_every_telemetry_and_command_sample() {
     let path = bag_path(&dir, "record.mcap");
     let mut bag = BagWriter::create(&path, Some(SCENARIO)).expect("create");
     let stats = record_until(recorder, &mut bag, |s| {
-        s.telemetry == 2 * TICKS && s.commands == 2 * TICKS && s.rejected == 1
+        s.telemetry == 2 * TICKS && s.commands == 2 * TICKS && s.events == 3 && s.rejected == 2
     });
     publishing.join().expect("publisher thread");
     bag.finish().expect("finish");
-    assert_eq!(stats, RecordStats { telemetry: 2 * TICKS, commands: 2 * TICKS, rejected: 1 });
+    assert_eq!(
+        stats,
+        RecordStats { telemetry: 2 * TICKS, commands: 2 * TICKS, events: 3, rejected: 2 }
+    );
 
     let reader = BagReader::open(&path).expect("open");
     assert_eq!(reader.scenario(), Some(SCENARIO));
@@ -219,10 +247,16 @@ fn recorder_captures_every_telemetry_and_command_sample() {
         assert!(commands.iter().all(|m| m.publish_time_ns == m.log_time_ns));
     }
     assert!(messages.iter().all(|m| m.topic != keys::telemetry(9)));
+    let events: Vec<_> = messages.iter().filter(|m| m.topic == keys::EVENTS).collect();
+    assert_eq!(events.len(), 3);
+    for (m, tick) in events.iter().zip([100u64, 200, 300]) {
+        assert_eq!(m.payload, encode_event(&hit(tick)));
+        assert_eq!(m.publish_time_ns, (hit(tick).sim_time_s * 1e9).round() as u64, "sim time");
+    }
 }
 
 #[test]
-fn replay_republishes_recorded_telemetry_bytes_but_not_commands() {
+fn replay_republishes_recorded_telemetry_and_event_bytes_but_not_commands() {
     let dir = temp_dir();
     let source = bag_path(&dir, "source.mcap");
     let mut written = Vec::new();
@@ -237,6 +271,15 @@ fn replay_republishes_recorded_telemetry_bytes_but_not_commands() {
             ));
         }
         written.push(msg(&keys::command(4), tick * 10 + 1, tick * 10 + 1, &[9, 9]));
+        if tick % 10 == 0 {
+            let e = hit(tick);
+            written.push(msg(
+                keys::EVENTS,
+                tick * 10 + 2,
+                (e.sim_time_s * 1e9).round() as u64,
+                &encode_event(&e),
+            ));
+        }
     }
     write_bag(&source, Some(SCENARIO), &written);
     let bag = BagReader::open(&source).expect("open");
@@ -244,17 +287,19 @@ fn replay_republishes_recorded_telemetry_bytes_but_not_commands() {
     let session = Session::in_process().expect("session");
     let recorder = Recorder::subscribe(&session).expect("subscribe");
     let stats = replay(&session, &bag, 0.0).expect("replay");
-    assert_eq!((stats.telemetry, stats.commands, stats.skipped), (100, 50, 0));
+    assert_eq!((stats.telemetry, stats.events, stats.commands, stats.skipped), (100, 5, 50, 0));
 
     let copy = bag_path(&dir, "copy.mcap");
     let mut out = BagWriter::create(&copy, None).expect("create");
-    let recorded = record_until(recorder, &mut out, |s| s.telemetry == 100);
+    let recorded = record_until(recorder, &mut out, |s| s.telemetry == 100 && s.events == 5);
     out.finish().expect("finish");
-    assert_eq!(recorded, RecordStats { telemetry: 100, commands: 0, rejected: 0 });
+    assert_eq!(recorded, RecordStats { telemetry: 100, commands: 0, events: 5, rejected: 0 });
 
     let replayed = BagReader::open(&copy).expect("open copy").messages().expect("messages");
-    let sent: Vec<_> =
-        written.iter().filter(|m| m.topic.starts_with(keys::TELEMETRY_PREFIX)).collect();
+    let sent: Vec<_> = written
+        .iter()
+        .filter(|m| m.topic.starts_with(keys::TELEMETRY_PREFIX) || m.topic == keys::EVENTS)
+        .collect();
     assert_eq!(replayed.len(), sent.len());
     for (got, want) in replayed.iter().zip(sent) {
         assert_eq!(

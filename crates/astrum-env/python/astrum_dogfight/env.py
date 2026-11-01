@@ -180,6 +180,9 @@ class DogfightGymEnv(_Base):
             "sim_terminated": info.terminated,
             "sim_truncated": info.truncated,
             "sim_time_s": info.sim_time_s,
+            # The sim's own events this tick (hits, kills, trigger presses, mode
+            # changes): who hit whom, which HP deltas alone don't say.
+            "events": info.events,
         }
         return (
             build_observation(self._me, self._bandit, self._rg),

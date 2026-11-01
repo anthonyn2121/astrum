@@ -82,7 +82,10 @@
     <button id="playBtn" class="icon" title="Play / pause (space)">▶</button>
     <button id="liveBtn" class="live" title="Jump to live head">LIVE</button>
     <span id="timeCur" class="time">0:00.0</span>
-    <input id="scrub" type="range" min="0" max="1000" value="0" />
+    <div id="scrubWrap">
+      <input id="scrub" type="range" min="0" max="1000" value="0" />
+      <div id="markers"></div>
+    </div>
     <span id="timeTot" class="time">0:00.0</span>
     <select id="speedSel" title="Playback speed">
       <option value="0.25">0.25×</option>

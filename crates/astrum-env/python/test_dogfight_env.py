@@ -315,13 +315,23 @@ def test_tier2_split_s():
 
 def test_tier3_offensive_guns_learner():
     env = make_tier3_env(posture="offensive", separation_m=600.0, max_time_s=25.0)
-    saw_offensive, min_hp = False, 100.0
-    for e, _ in _rollout(env, 3000, seed=0):
+    saw_offensive, min_hp, hits = False, 100.0, []
+    for e, info in _rollout(env, 3000, seed=0):
         saw_offensive = saw_offensive or e.opponent.state == "offensive"
         min_hp = min(min_hp, e.aircraft(e.learner_id).hit_points)
+        hits += [ev for ev in info["events"] if ev["kind"] == "hit"]
     assert saw_offensive
     assert min_hp < 100.0, f"the bot's guns should draw blood, learner HP stayed {min_hp:.0f}"
     assert env.aircraft(env.opponent_id).ammo < astrum_env.GUN_AMMO
+    # info["events"] says who hit whom: every hit is the bot's on the learner,
+    # and the last one leaves the learner its lowest HP.
+    assert hits and all(
+        (h["shooter_id"], h["target_id"]) == (env.opponent_id, env.learner_id) for h in hits
+    )
+    assert hits[-1]["hit_points"] == pytest.approx(min_hp)
+    assert set(hits[0]) == {
+        "tick", "sim_time_s", "kind", "shooter_id", "target_id", "damage", "hit_points", "pos_enu"
+    }  # fmt: skip
 
 
 def test_tier3_defensive_breaks():

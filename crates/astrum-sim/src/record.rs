@@ -1,6 +1,7 @@
-//! In-process recording (`astrum-sim --record`): every tick's telemetry, and
-//! every command the sim decodes, written to an MCAP bag in the `astrum-bag`
-//! format, so `astrum-bag-play`, `astrum-web-export` and the viewer read it.
+//! In-process recording (`astrum-sim --record`): every tick's telemetry, every
+//! command the sim decodes, and every event, written to an MCAP bag in the
+//! `astrum-bag` format, so `astrum-bag-play`, `astrum-web-export` and the
+//! viewer read it.
 //!
 //! Unlike `astrum-bag-record`, which subscribes over Zenoh, this cannot drop a
 //! sample and adds no network hop to the tick — what an unpaced run needs. Chunk
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
-use astrum_bag::{sim_time_ns, BagError, BagWriter, RecordStats};
+use astrum_bag::{sim_time_ns, BagError, BagWriter, RecordStats, TopicKind};
 use astrum_net::keys;
 use bevy::prelude::Resource;
 
@@ -22,6 +23,7 @@ const QUEUE: usize = 1 << 16;
 enum Entry {
     Telemetry { id: u32, log_time_ns: u64, publish_time_ns: u64, payload: Vec<u8> },
     Command { id: u32, log_time_ns: u64, payload: Vec<u8> },
+    Event { log_time_ns: u64, publish_time_ns: u64, payload: Vec<u8> },
 }
 
 /// The sim's end of a recording: queues encoded messages for the writer.
@@ -42,6 +44,12 @@ impl TickRecorder {
     /// the writer has stopped.
     pub fn command(&self, id: u32, log_time_ns: u64, payload: Vec<u8>) -> bool {
         self.tx.send(Entry::Command { id, log_time_ns, payload }).is_ok()
+    }
+
+    /// Queue one encoded `Event`. `false` once the writer has stopped.
+    pub fn event(&self, log_time_ns: u64, sim_time_s: f64, payload: Vec<u8>) -> bool {
+        let publish_time_ns = sim_time_ns(sim_time_s);
+        self.tx.send(Entry::Event { log_time_ns, publish_time_ns, payload }).is_ok()
     }
 }
 
@@ -78,21 +86,27 @@ pub fn start(path: &Path, scenario_toml: &str) -> Result<(TickRecorder, Recordin
 }
 
 fn write_all(mut bag: BagWriter, rx: Receiver<Entry>) -> Result<RecordStats, BagError> {
-    let mut topics: HashMap<(bool, u32), String> = HashMap::new();
+    let mut topics: HashMap<TopicKind, String> = HashMap::new();
     let mut stats = RecordStats::default();
     // Ends when every sender is gone; an error drops `rx`, so the sim's next
     // send fails and it stops.
     for entry in rx {
         match entry {
             Entry::Telemetry { id, log_time_ns, publish_time_ns, payload } => {
-                let topic = topics.entry((true, id)).or_insert_with(|| keys::telemetry(id));
+                let topic =
+                    topics.entry(TopicKind::Telemetry(id)).or_insert_with(|| keys::telemetry(id));
                 bag.write(topic, log_time_ns, publish_time_ns, &payload)?;
                 stats.telemetry += 1;
             }
             Entry::Command { id, log_time_ns, payload } => {
-                let topic = topics.entry((false, id)).or_insert_with(|| keys::command(id));
+                let topic =
+                    topics.entry(TopicKind::Command(id)).or_insert_with(|| keys::command(id));
                 bag.write(topic, log_time_ns, log_time_ns, &payload)?;
                 stats.commands += 1;
+            }
+            Entry::Event { log_time_ns, publish_time_ns, payload } => {
+                bag.write(keys::EVENTS, log_time_ns, publish_time_ns, &payload)?;
+                stats.events += 1;
             }
         }
     }

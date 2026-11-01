@@ -11,21 +11,30 @@
 //! * **Commands** — a controller's [`CommandSender`] publishes on
 //!   `astrum/command/<id>`; the sim's [`CommandReceiver`] drains them each tick
 //!   and rejects any whose payload `target_id` disagrees with the key.
+//! * **Events** — the sim publishes each [`Event`] (hit, kill, mode change, ...)
+//!   on `astrum/events` ([`EventPublisher`]); [`EventReceiver`] queues them.
 //! * **Scenario** — the sim answers `get astrum/scenario` with its scenario TOML
 //!   ([`ScenarioServer`] / [`fetch_scenario`]), so recorders can embed it.
+//! * **Presence** — a controller announces itself with a liveliness token
+//!   ([`PresenceToken`]); the sim's [`PresenceWatcher`] sees it come and go.
+//! * **Control and status** — the sim's [`ControlServer`] answers pause /
+//!   resume / step / speed requests ([`send_control`]) and `astrum/status`
+//!   ([`fetch_status`]).
 //!
 //! Topology is a star: the sim (or a bag replay) listens as a Zenoh router and
 //! every other process connects to it as a connect-only peer, so the hub routes
 //! between clients (a recorder sees the controllers' commands, a follower sees
 //! the leader's telemetry).
 //!
-//! QoS ([`qos`]) is the same for both streams: they carry latest-value state, so a
-//! congested link drops the older sample (`CongestionControl::Drop`), samples are
-//! not batched (`express`), and they ride above bulk data (`InteractiveHigh`).
-//! The sim's router also offers Zenoh's low-latency transport (no batching, no
-//! QoS lanes), which the C++ and Python controller clients ask for: every
-//! lockstep round trip counts. Clients that don't ask (the recorder, the web
-//! bridge) get the default transport, with fragmentation for large replies.
+//! QoS ([`qos`]): telemetry and commands carry latest-value state, so a
+//! congested link drops the older sample (`CongestionControl::Drop`), samples
+//! are not batched (`express`), and they ride above bulk data
+//! (`InteractiveHigh`). Events are one-off, so they are reliable and block
+//! rather than drop. The sim's router also offers Zenoh's low-latency transport
+//! (no batching, no QoS lanes), which the C++ and Python controller clients ask
+//! for: every lockstep round trip counts. Clients that don't ask (the recorder,
+//! the web bridge) get the default transport, with fragmentation for large
+//! replies.
 //!
 //! Every call uses Zenoh's synchronous `.wait()` resolver; Zenoh runs its own
 //! runtime internally, so these wrappers drop into synchronous code as-is.
@@ -35,8 +44,10 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use astrum_proto::{decode_command, decode_telemetry, encode_command, encode_telemetry};
-pub use astrum_proto::{Command, Control, Telemetry};
+use astrum_proto::{
+    decode_command, decode_event, decode_telemetry, encode_command, encode_telemetry,
+};
+pub use astrum_proto::{Command, Control, Event, EventKind, Telemetry};
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::{Publisher, Subscriber};
 use zenoh::query::Queryable;
@@ -58,6 +69,8 @@ pub mod keys {
     pub const COMMAND_ALL: &str = "astrum/command/*";
     /// The sim's scenario TOML (queryable).
     pub const SCENARIO: &str = "astrum/scenario";
+    /// Every event the sim reports.
+    pub const EVENTS: &str = "astrum/events";
     /// `astrum/alive/controller/<id>`: liveliness token of the controller
     /// flying aircraft `<id>`.
     pub const ALIVE_PREFIX: &str = "astrum/alive/controller";
@@ -88,7 +101,7 @@ pub mod keys {
     }
 }
 
-/// The QoS every telemetry and command publication uses.
+/// The QoS of every publication.
 pub mod qos {
     use zenoh::qos::{CongestionControl, Priority};
 
@@ -98,6 +111,10 @@ pub mod qos {
     pub const PRIORITY: Priority = Priority::InteractiveHigh;
     /// Send each sample immediately instead of batching.
     pub const EXPRESS: bool = true;
+    /// Events are one-off: block rather than drop one.
+    pub const EVENT_CONGESTION: CongestionControl = CongestionControl::Block;
+    /// Below telemetry and commands.
+    pub const EVENT_PRIORITY: Priority = Priority::Data;
 }
 
 /// Default endpoint the sim (and bag replay) LISTENS on. Zenoh endpoints use
@@ -429,6 +446,84 @@ impl CommandSender {
             Command { target_id: self.target_id, seq: self.seq, telemetry_tick, trigger, control };
         self.publisher.put(encode_command(&cmd)).wait().map_err(zerr)?;
         Ok(self.seq)
+    }
+}
+
+// --- Events ---------------------------------------------------------------------
+
+/// Sim-side event publisher on `astrum/events`. Events are one-off (a dropped one
+/// is lost for good, unlike a telemetry sample the next tick replaces), so a
+/// congested link blocks instead of dropping; Zenoh's default reliability over
+/// TCP delivers the rest.
+pub struct EventPublisher {
+    publisher: Publisher<'static>,
+}
+
+impl EventPublisher {
+    pub fn new(session: &Session) -> Result<Self> {
+        let publisher = session
+            .z
+            .declare_publisher(keys::EVENTS)
+            .congestion_control(qos::EVENT_CONGESTION)
+            .priority(qos::EVENT_PRIORITY)
+            .wait()
+            .map_err(zerr)?;
+        Ok(Self { publisher })
+    }
+
+    /// Publish an already-encoded `Event` payload.
+    pub fn publish_raw(&self, payload: Vec<u8>) -> Result<()> {
+        self.publisher.put(payload).wait().map_err(zerr)
+    }
+}
+
+/// Subscriber-side event queue on `astrum/events`, in arrival order. Zenoh's
+/// callback only decodes into an unbounded channel, so a slow reader never
+/// pushes back on the transport; payloads that fail to decode (or carry a kind
+/// this build doesn't know) are counted and skipped.
+pub struct EventReceiver {
+    rx: std::sync::mpsc::Receiver<Event>,
+    skipped: Arc<std::sync::atomic::AtomicU64>,
+    _sub: Subscriber<()>,
+}
+
+impl EventReceiver {
+    pub fn subscribe(session: &Session) -> Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let skipped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = Arc::clone(&skipped);
+        let sub = session
+            .z
+            .declare_subscriber(keys::EVENTS)
+            .callback(move |sample| match decode_event(&sample.payload().to_bytes()) {
+                Ok(e) => {
+                    let _ = tx.send(e); // fails only once the receiver is gone
+                }
+                Err(_) => {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .wait()
+            .map_err(zerr)?;
+        Ok(Self { rx, skipped, _sub: sub })
+    }
+
+    /// Every event received so far, without blocking.
+    pub fn drain(&self) -> Vec<Event> {
+        self.rx.try_iter().collect()
+    }
+
+    /// Block up to `timeout` for the next event.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Event> {
+        self.rx.recv_timeout(timeout).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => NetError::Timeout,
+            std::sync::mpsc::RecvTimeoutError::Disconnected => NetError::Disconnected,
+        })
+    }
+
+    /// Payloads skipped so far (undecodable, or a kind unknown to this build).
+    pub fn skipped(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

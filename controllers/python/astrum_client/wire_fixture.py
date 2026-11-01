@@ -2,7 +2,9 @@
 
 ``values.json`` holds canonical values; each language writes
 ``<kind>.<lang>.bin`` and every language's test decodes every file present and
-compares it to ``values.json`` exactly. Write the Python files with::
+compares it to ``values.json`` exactly. The ``event_*`` kinds hold the shared
+event JSON shape (:meth:`Event.as_dict`) and exist for Rust and Python only.
+Write the Python files with::
 
     python -m astrum_client.wire_fixture [--dir DIR] [--schema PATH]
 """
@@ -18,16 +20,30 @@ from astrum_client.wire import (
     AutopilotTargets,
     Command,
     ControlMode,
+    Event,
     RawActuators,
     VehicleKind,
     VehicleState,
     encode_command,
+    encode_event,
     encode_telemetry,
     load_schema,
 )
 
 KINDS = ("telemetry", "command_raw", "command_autopilot")
 LANGS = ("rust", "cpp", "python")
+EVENT_KINDS = (
+    "event_trigger_pressed",
+    "event_trigger_released",
+    "event_hit",
+    "event_kill",
+    "event_kill_unknown",
+    "event_mode_change",
+    "event_controller_up",
+    "event_controller_down",
+    "event_run_ended",
+)
+EVENT_LANGS = ("rust", "python")
 
 _VEHICLE_KINDS = {"fixed-wing": VehicleKind.FIXED_WING, "multirotor": VehicleKind.MULTIROTOR}
 _CONTROL_MODES = {m.name.lower(): m for m in ControlMode}
@@ -100,6 +116,8 @@ def expected_command(v: dict) -> Command:
 def encode_kind(schema, kind: str, values: dict) -> bytes:
     if kind == "telemetry":
         return encode_telemetry(schema, expected_telemetry(values[kind]))
+    if kind in EVENT_KINDS:
+        return encode_event(schema, Event.from_dict(values[kind]))
     return encode_command(schema, expected_command(values[kind]))
 
 
@@ -110,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     schema = load_schema(args.schema)
     values = load_values(args.dir)
-    for kind in KINDS:
+    for kind in KINDS + EVENT_KINDS:
         path = os.path.join(args.dir, f"{kind}.python.bin")
         with open(path, "wb") as f:
             f.write(encode_kind(schema, kind, values))

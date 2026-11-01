@@ -130,6 +130,13 @@ precedence:
 `info["event"]` tells you which terminal fired; `info["phi"]` is the current
 geometry potential. Hard-deck wins over everything, then kill/death, then bubble.
 
+`info["events"]` (plural) is the sim's own record of the tick: a list of dicts such
+as `{"kind": "hit", "shooter_id": 2, "target_id": 1, "hit_points": 96.0, "pos_enu": [...], ...}`,
+`kill` (with `killer_id`), `trigger-pressed` / `trigger-released` (with `rounds_fired`)
+and `mode-change`. Use it to debug a reward or score an engagement: unlike the HP
+deltas behind `damage_dealt` / `damage_taken`, it says who hit whom and where. The
+kinds and fields are listed in the README's "Events".
+
 ### Picking the opponent (difficulty tier)
 
 One constructor swaps the whole opponent behavior — the observation/action/reward

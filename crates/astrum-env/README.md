@@ -23,7 +23,7 @@ env.agent_ids                                # sorted ids = row order of every a
 env.dt                                       # physics step (s) = 1 / sim.rate_hz
 obs = env.reset(seed=3)                      # (n, len(OBS_FIELDS)) float64; tick 1
 obs = env.reset(scenario_toml=other_toml)    # next episode in a new scenario, same Env
-obs, info = env.step(actions)                # actions (n, 5); info: StepInfo
+obs, info = env.step(actions)                # actions (n, 5); info: StepInfo (info.events: this tick's events)
 obs, info = env.step(actions, autopilot=ap, commanded=mask)
 env.observe()                                # latest obs without stepping
 env.gun_solution(shooter, target)            # sim fire control, dict or None (unarmed)
@@ -49,7 +49,12 @@ obs, terminated, truncated, tick = batch.step(actions)   # actions (K, n, 5)
   `hit_points_max`, `ammo`. SI units, radians. Use the grid columns for relative
   geometry and the NED columns only where local level is meant.
 - **`StepInfo`**: `terminated` (≥ 2 teams started, ≤ 1 has a living aircraft),
-  `truncated` (`sim.max_time_s` reached), `tick`, `sim_time_s`, `done()`.
+  `truncated` (`sim.max_time_s` reached), `tick`, `sim_time_s`, `done()`, and
+  `events`: this tick's events as dicts (`tick`, `sim_time_s`, `kind` — `hit`,
+  `kill`, `trigger-pressed`, `trigger-released`, `mode-change`, … — and the
+  kind's fields, e.g. a hit's `shooter_id`, `target_id`, `hit_points`, `pos_enu`;
+  the full table is the top-level README's "Events"). `BatchEnv.step` does not
+  return events.
 - **`gun_solution`** is the sim's own round model (drag, gravity, velocity
   inheritance, muzzle offset): `miss_m`, `tof_s` (boresight round), `hit`,
   `aim_dir` (grid unit vector), `aim_error_rad`, `in_range`. Gun/combat constants

@@ -1,5 +1,6 @@
 //! The control plane over an in-process session: pause / step / speed
-//! requests, the status reply, and controller presence (liveliness tokens).
+//! requests, the status reply, and controller presence (liveliness tokens) with
+//! the events it reports.
 
 mod common;
 
@@ -8,10 +9,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astrum_net::{
-    fetch_status, send_control, CommandSender, ControlRequest, LatestTelemetry, NetError,
-    PresenceToken, Selection, Session,
+    fetch_status, send_control, CommandSender, ControlRequest, EventReceiver, LatestTelemetry,
+    NetError, PresenceToken, Selection, Session,
 };
-use astrum_proto::{Control, ControlMode, RawActuators};
+use astrum_proto::{Control, ControlMode, EventKind, ModeReason, RawActuators};
 use astrum_sim::components::{SimClock, SimStatus};
 use astrum_sim::net::LastPublished;
 use astrum_sim::scenario::Scenario;
@@ -166,6 +167,7 @@ fn a_lost_controller_puts_its_aircraft_in_failsafe_before_its_lease_ends() {
     s.sim.command_lease_s = 30.0;
     let session = Session::in_process().unwrap();
     let mut app = app_on(&session, s, RunMode::Embedded);
+    let events = EventReceiver::subscribe(&session).unwrap();
     let token = PresenceToken::declare(&session, 1).unwrap();
     let mut tx = CommandSender::new(&session, 1).unwrap();
     let raw =
@@ -185,4 +187,16 @@ fn a_lost_controller_puts_its_aircraft_in_failsafe_before_its_lease_ends() {
     assert_eq!(mode(&app), ControlMode::Failsafe);
     assert!(took < Duration::from_secs(1), "failsafe after {took:?}, lease is 30 s");
     assert!(fatal(&app).is_none(), "a non-lockstep aircraft does not end the run");
+
+    let kinds: Vec<EventKind> = events.drain().into_iter().map(|e| e.kind).collect();
+    let mode_change = |from, to, reason| EventKind::ModeChange { aircraft_id: 1, from, to, reason };
+    assert_eq!(
+        kinds,
+        [
+            EventKind::ControllerUp { aircraft_id: 1 },
+            mode_change(ControlMode::Uncommanded, ControlMode::Raw, ModeReason::Command),
+            EventKind::ControllerDown { aircraft_id: 1 },
+            mode_change(ControlMode::Raw, ControlMode::Failsafe, ModeReason::ControllerLost),
+        ]
+    );
 }

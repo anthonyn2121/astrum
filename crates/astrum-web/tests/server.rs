@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::Router;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tower::ServiceExt;
 
 const SECRET: &str = "top-secret-outside-root";
@@ -28,7 +28,8 @@ fn app(tmp: &Path) -> Router {
     std::fs::write(cache.join("14/3/5.jpg"), b"\xff\xd8jpeg").unwrap();
     let cfg = Config { root: web, tile_url: String::new(), tile_cache: cache };
     let (_tx, rx) = watch::channel::<Snapshot>(None);
-    router(cfg, rx).unwrap()
+    let (events, _) = broadcast::channel(1);
+    router(cfg, rx, events).unwrap()
 }
 
 async fn get(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {

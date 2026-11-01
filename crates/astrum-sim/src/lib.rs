@@ -10,18 +10,20 @@
 //! # One update == one tick, in this order
 //! `serve_control` (pause / step / speed requests; blocks while paused) →
 //! `track_controllers` → `hold_commands` while paused; otherwise `ingest_commands` →
-//! `expire_leases` → `autopilot_step` → `fire_guns` (rounds leave at `t_k`) →
-//! `step_fdm` (all FDMs in parallel to `t_k+1`) → `freeze_dead` →
-//! `advance_clock` → `step_bullets` → `resolve_hits` → `apply_damage` →
+//! `expire_leases` → `log_mode_changes` → `autopilot_step` → `fire_guns`
+//! (rounds leave at `t_k`) → `step_fdm` (all FDMs in parallel to `t_k+1`) →
+//! `freeze_dead` → `advance_clock` → `step_bullets` → `resolve_hits` →
+//! `apply_damage` (the `on_kill` observer reports each kill) →
 //! `end_on_elimination` → `publish_telemetry` → `report_progress` /
 //! `stop_at_max_time` → `count_steps` → `pace`; and always `publish_status` →
-//! `exit_on_signal` → `exit_on_fatal`. Startup spawns the fleet and publishes
-//! tick 0.
+//! `exit_on_signal` → `exit_on_fatal` → `publish_events`. Startup spawns the
+//! fleet and publishes tick 0.
 
 pub mod combat;
 pub mod components;
 pub mod control;
 pub mod env;
+pub mod events;
 pub mod net;
 pub mod pilot;
 pub mod record;
@@ -33,15 +35,18 @@ pub mod systems;
 use bevy::prelude::*;
 
 use astrum_geo::{Geodetic, LocalFrame};
-use combat::systems::{apply_damage, end_on_elimination, fire_guns, resolve_hits, step_bullets};
+use combat::systems::{
+    apply_damage, end_on_elimination, fire_guns, on_kill, resolve_hits, step_bullets,
+};
 use combat::{CombatParams, CombatRng, CombatState};
 use components::{SimClock, SimParams, SimStatus, WorldFrame};
 use control::{count_steps, publish_status, serve_control, RunControl};
+use events::{publish_events, EventLog};
 use net::{
     hold_commands, ingest_commands, publish_telemetry, track_controllers, Controllers,
     HeldCommands, LastPublished, RefusalLog,
 };
-use pilot::{autopilot_step, expire_leases};
+use pilot::{autopilot_step, expire_leases, log_mode_changes};
 use scenario::Scenario;
 use systems::{
     advance_clock, exit_on_fatal, exit_on_signal, freeze_dead, pace, report_progress, spawn_fleet,
@@ -156,8 +161,10 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
         .insert_resource(Controllers::default())
         .insert_resource(HeldCommands::default())
         .insert_resource(RunControl::default())
+        .insert_resource(EventLog::default())
         .insert_resource(scenario)
         .insert_resource(mode)
+        .add_observer(on_kill)
         .add_systems(
             Startup,
             (spawn_fleet, publish_telemetry.run_if(SimStatus::running), exit_on_fatal).chain(),
@@ -172,6 +179,7 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
                     (
                         ingest_commands,
                         expire_leases,
+                        log_mode_changes,
                         autopilot_step,
                         fire_guns,
                         step_fdm,
@@ -195,6 +203,7 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
                 publish_status.run_if(on_bus),
                 exit_on_signal,
                 exit_on_fatal,
+                publish_events,
             )
                 .chain(),
         );

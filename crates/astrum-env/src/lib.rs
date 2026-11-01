@@ -8,7 +8,7 @@
 //! env = astrum_env.Env(scenario_toml)            # one sim; thread-safe to use from any thread
 //! obs = env.reset(seed=3)                         # float64 (n_agents, len(OBS_FIELDS)), rows = env.agent_ids
 //! act = np.zeros((len(env.agent_ids), 5))         # [aileron, elevator, rudder, throttle, trigger]
-//! obs, info = env.step(act)
+//! obs, info = env.step(act)                       # info.events: this tick's hits, kills, ...
 //! batch = astrum_env.BatchEnv([scenario_toml] * 16)   # 16 sims stepped in parallel per call
 //! ```
 //!
@@ -18,7 +18,9 @@
 //! or `reset` is at tick 1.
 
 use astrum_fdm::FdmState;
-use astrum_proto::{AutopilotTargets, Control, ControlMode, RawActuators, Telemetry, VehicleKind};
+use astrum_proto::{
+    AutopilotTargets, Control, ControlMode, Event, EventKind, RawActuators, Telemetry, VehicleKind,
+};
 use astrum_sim::combat::{CombatParams, Gun};
 use astrum_sim::components::AutopilotProfile;
 use astrum_sim::env::{Action, EnvError, SimEnv, StepResult};
@@ -30,7 +32,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 
 /// Observation matrix columns, in order.
@@ -242,9 +244,8 @@ fn actions_for(
     Ok(out)
 }
 
-/// Episode flags returned by `Env.step`.
+/// Episode flags and events returned by `Env.step`.
 #[pyclass(get_all, frozen)]
-#[derive(Clone, Copy)]
 pub struct StepInfo {
     /// The engagement was decided (≥ 2 teams started, ≤ 1 has a living aircraft).
     pub terminated: bool,
@@ -252,17 +253,72 @@ pub struct StepInfo {
     pub truncated: bool,
     pub tick: u64,
     pub sim_time_s: f64,
+    /// This tick's events, in order, as dicts: `tick`, `sim_time_s`, `kind`
+    /// (`hit`, `kill`, `trigger-pressed`, `mode-change`, ...) and the kind's
+    /// fields, the same shape as the replay export (README, "Events").
+    pub events: Py<PyList>,
 }
 
-impl From<StepResult> for StepInfo {
-    fn from(r: StepResult) -> Self {
-        StepInfo {
+impl StepInfo {
+    fn new(py: Python<'_>, r: StepResult, events: &[Event]) -> PyResult<Self> {
+        let list = PyList::empty(py);
+        for e in events {
+            list.append(event_dict(py, e)?)?;
+        }
+        Ok(StepInfo {
             terminated: r.terminated,
             truncated: r.truncated,
             tick: r.tick,
             sim_time_s: r.sim_time_s,
+            events: list.unbind(),
+        })
+    }
+}
+
+/// One event as the flat dict every consumer shares (see [`StepInfo::events`]).
+fn event_dict<'py>(py: Python<'py>, e: &Event) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("tick", e.tick)?;
+    d.set_item("sim_time_s", e.sim_time_s)?;
+    d.set_item("kind", e.kind.name())?;
+    let enu = |p: astrum_proto::Enu| [p.e, p.n, p.u];
+    match &e.kind {
+        EventKind::TriggerPressed { aircraft_id, ammo } => {
+            d.set_item("aircraft_id", aircraft_id)?;
+            d.set_item("ammo", ammo)?;
+        }
+        EventKind::TriggerReleased { aircraft_id, rounds_fired, ammo } => {
+            d.set_item("aircraft_id", aircraft_id)?;
+            d.set_item("rounds_fired", rounds_fired)?;
+            d.set_item("ammo", ammo)?;
+        }
+        EventKind::Hit { shooter_id, target_id, damage, hit_points, pos_enu } => {
+            d.set_item("shooter_id", shooter_id)?;
+            d.set_item("target_id", target_id)?;
+            d.set_item("damage", damage)?;
+            d.set_item("hit_points", hit_points)?;
+            d.set_item("pos_enu", enu(*pos_enu))?;
+        }
+        EventKind::Kill { victim_id, killer_id, pos_enu } => {
+            d.set_item("victim_id", victim_id)?;
+            d.set_item("killer_id", killer_id)?;
+            d.set_item("pos_enu", enu(*pos_enu))?;
+        }
+        EventKind::ModeChange { aircraft_id, from, to, reason } => {
+            d.set_item("aircraft_id", aircraft_id)?;
+            d.set_item("from", from.name())?;
+            d.set_item("to", to.name())?;
+            d.set_item("reason", reason.name())?;
+        }
+        EventKind::ControllerUp { aircraft_id } | EventKind::ControllerDown { aircraft_id } => {
+            d.set_item("aircraft_id", aircraft_id)?;
+        }
+        EventKind::RunEnded { reason, message } => {
+            d.set_item("reason", reason.name())?;
+            d.set_item("message", message)?;
         }
     }
+    Ok(d)
 }
 
 #[pymethods]
@@ -271,10 +327,14 @@ impl StepInfo {
         self.terminated || self.truncated
     }
 
-    fn __repr__(&self) -> String {
+    fn __repr__(&self, py: Python<'_>) -> String {
         format!(
-            "StepInfo(terminated={}, truncated={}, tick={}, sim_time_s={:.3})",
-            self.terminated, self.truncated, self.tick, self.sim_time_s
+            "StepInfo(terminated={}, truncated={}, tick={}, sim_time_s={:.3}, events={})",
+            self.terminated,
+            self.truncated,
+            self.tick,
+            self.sim_time_s,
+            self.events.bind(py).len()
         )
     }
 }
@@ -353,7 +413,8 @@ impl Env {
         .map_err(PyValueError::new_err)?;
         let inner = &mut self.inner;
         let (obs, result) = py.detach(|| inner.step(&parsed)).map_err(env_err)?;
-        Ok((obs_matrix(&obs).into_pyarray(py), result.into()))
+        let info = StepInfo::new(py, result, self.inner.events())?;
+        Ok((obs_matrix(&obs).into_pyarray(py), info))
     }
 
     /// The latest observation without stepping.

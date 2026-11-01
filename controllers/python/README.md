@@ -10,8 +10,8 @@ Python controller (this example and [`controllers/optimal`](../optimal)) builds 
 
 | Module | What it does |
 |---|---|
-| `astrum_client.wire` | `load_schema()`, `decode_telemetry()` → `VehicleState` (every v2 field), `encode_command()`; bad payloads raise `DecodeError` (framing checked, trailing bytes rejected) |
-| `astrum_client.transport` | `open_session()` (client mode, no multicast scouting, Zenoh's low-latency transport, waits up to the startup timeout for the sim), `subscribe_telemetry()` (latest-value, per aircraft or fleet-wide), `CommandPublisher` (DROP / express / INTERACTIVE_HIGH, `seq` 1, 2, … and `telemetryTick`) |
+| `astrum_client.wire` | `load_schema()`, `decode_telemetry()` → `VehicleState` (every v2 field), `decode_event()` → `Event`, `encode_command()`; bad payloads raise `DecodeError` (framing checked, trailing bytes rejected) |
+| `astrum_client.transport` | `open_session()` (client mode, no multicast scouting, Zenoh's low-latency transport, waits up to the startup timeout for the sim), `subscribe_telemetry()` (latest-value, per aircraft or fleet-wide), `subscribe_events()` (FIFO of every event), `CommandPublisher` (DROP / express / INTERACTIVE_HIGH, `seq` 1, 2, … and `telemetryTick`) |
 | `astrum_client.loop` | `run_control_loop()`: one command per telemetry tick, startup/staleness timeouts, vehicle-kind refusal, output saturation |
 | `astrum_client.cli` | shared flags with `ASTRUM_*` env fallbacks |
 | `astrum_client.mathutil` | `wrap_pi` (→ `[-pi, pi)`, NaN for non-finite input), `clamp`, anti-windup integrator step |
@@ -31,6 +31,9 @@ One `mode=client` Zenoh session connecting to the sim, which listens as the Zeno
   aircraft, so a slow law always acts on fresh state (never a FIFO of stale data).
   A payload that fails to decode, or whose `aircraftId` differs from its key, is
   logged, counted and skipped.
+- **SUB** `astrum/events` — hits, kills, trigger presses/releases, control-mode
+  changes, controller up/down and the run's end, one per sample in the order they
+  happened, queued FIFO (nothing superseded). See [Events](#events).
 - **PUB** `astrum/command/<id>` — one command per telemetry tick, carrying
   `seq` (strictly increasing per process) and `telemetryTick` (the tick it answers).
   If the sim republishes a tick it is waiting on (lockstep), the last command is
@@ -38,6 +41,34 @@ One `mode=client` Zenoh session connecting to the sim, which listens as the Zeno
 - **Presence** — the command publisher holds the liveliness token
   `astrum/alive/controller/<id>`, so the sim learns at once when the process goes away
   (a lockstep run fails immediately; otherwise the aircraft enters the failsafe hold).
+
+## Events
+
+```python
+from astrum_client.transport import open_session, subscribe_events
+from astrum_client.wire import Hit, Kill, load_schema
+
+schema = load_schema()
+session = open_session("tcp/127.0.0.1:7447", 60.0)
+events, sub = subscribe_events(session, schema)  # keep `sub` alive
+while (ev := events.wait(10.0)) is not None:  # or events.drain() once per tick
+    if isinstance(ev.detail, Kill):
+        print(
+            f"t={ev.sim_time_s:.2f}s aircraft {ev.detail.victim_id} killed by {ev.detail.killer_id}"
+        )
+    print(ev.as_dict())  # {"tick": …, "sim_time_s": …, "kind": "hit", "shooter_id": 2, …}
+```
+
+An `Event` has `tick` (the `Telemetry.tick` that first shows it), `sim_time_s`,
+`kind` (`trigger-pressed`, `trigger-released`, `hit`, `kill`, `mode-change`,
+`controller-up`, `controller-down`, `run-ended`) and `detail`, a frozen dataclass
+per kind (`Hit`, `Kill`, `ModeChange`, `RunEnded`, …). `as_dict()` gives the flat
+JSON shape the RL env and the web export use (`ModeChange.from_mode`/`to_mode` become
+`from`/`to`, enums their kebab-case names, `pos_enu` `[e, n, u]`, an unknown `killer_id`
+`None`); `Event.from_dict()` is its inverse. Unknown enum values from a newer sim stay
+raw `int` (`unknown(n)` in `as_dict()`); a kind this schema predates, like any bad
+payload, is logged, counted in `events.decode_errors` and skipped. Subscribe before the
+run starts: events are not replayed to late subscribers.
 
 ## Modes (`--mode`)
 
@@ -90,4 +121,5 @@ python -m astrum_client.wire_fixture    # writes crates/astrum-proto/tests/fixtu
 
 `tests/test_wire_fixtures.py` decodes every `<kind>.<lang>.bin` present
 (rust / cpp / python) and compares every field exactly with `values.json`; the
-Python files must exist and match what the encoder produces today.
+`event_*` kinds (rust / python only) compare `Event.as_dict()` with the JSON there.
+The Python files must exist and match what the encoder produces today.

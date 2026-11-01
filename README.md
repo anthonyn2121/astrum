@@ -32,8 +32,8 @@ Everything below is built and tested; here's what lives where:
 | `astrum-fdm` | safe JSBSim 6-DOF wrapper (C shim catches every C++ exception; crate-owned lock makes `Fdm: Send`) |
 | `astrum-geo` | WGS84 geodetic ↔ ECEF ↔ ENU mapping, local-level ↔ grid rotations |
 | `astrum-sim` | headless Bevy ECS state server — one JSBSim FDM per entity, combat, lease/failsafe, lockstep |
-| `astrum-proto` + `astrum-net` | Cap'n Proto schema v2 + Zenoh transport (telemetry, commands, scenario, controller presence, run control) + `astrum-ctl` |
-| `astrum-bag` | record telemetry + commands to MCAP; replay telemetry paced by sim time |
+| `astrum-proto` + `astrum-net` | Cap'n Proto schema v2 + Zenoh transport (telemetry, commands, events, scenario, controller presence, run control) + `astrum-ctl` |
+| `astrum-bag` | record telemetry, commands and events to MCAP; replay telemetry and events paced by sim time |
 | `astrum-env` | Python bindings (`Env`, `BatchEnv`) + the Gymnasium-style dogfight adapter |
 | `astrum-web` + `web/` | axum telemetry bridge + tile proxy, offline exporter, browser 3-D renderer |
 | `controllers/common` | shared C++ wire codec + Zenoh client (and the wire-fixture tool) |
@@ -55,8 +55,8 @@ failure. `make replay` starts the fleet alongside the 3-D renderer.
 `astrum-sim` is the authoritative state server: a headless Bevy ECS where **each aircraft entity
 owns its own JSBSim instance**. Controllers, recorders and the web bridge are separate processes
 that only ever touch it through Zenoh + Cap'n Proto — never shared memory. Telemetry, commands,
-controller presence and the scenario, control and status queries are key expressions multiplexed
-over **one** Zenoh session (a single TCP endpoint), not separate ports.
+events, controller presence and the scenario, control and status queries are key expressions
+multiplexed over **one** Zenoh session (a single TCP endpoint), not separate ports.
 
 Each `Update` tick runs one chained schedule:
 
@@ -66,14 +66,17 @@ track_controllers  a controller's token went away → lockstep run fails / aircr
                    — the rest runs only while not paused —
 ingest_commands    decode astrum/command/<id>; refuse stale/future/duplicate/forged; (lockstep: wait)
 expire_leases      a raw command older than command_lease_s → failsafe hold
+log_mode_changes   report each aircraft whose controlMode changed (and why)
 autopilot_step     autopilot / failsafe targets → fcs/*-cmd-norm (per VehicleKind)
-fire_guns          rounds leave the muzzle at t_k
+fire_guns          rounds leave the muzzle at t_k (trigger presses / releases reported)
 step_fdm           every FDM steps once; with sim.threads > 1 each on its fixed worker
-freeze_dead → advance_clock → step_bullets → resolve_hits → apply_damage → end_on_elimination
+freeze_dead → advance_clock → step_bullets → resolve_hits (hits reported) → apply_damage (kills
+reported) → end_on_elimination
 publish_telemetry  one Telemetry per aircraft → put astrum/telemetry/<id> (at its control_rate_hz);
                    with --record every tick of every aircraft goes to the MCAP bag
 report_progress / stop_at_max_time, then pace (sim.speed > 0)
 publish_status     refresh what get astrum/status answers (every 100 ms and on any control change)
+publish_events     this tick's events → put astrum/events (and the --record bag)
 ```
 
 Controllers write **control inputs** (`fcs/*-cmd-norm`), never state; JSBSim computes all motion
@@ -228,7 +231,7 @@ happens to arrive.
   unpaced ticks. Keep `N` at or below the cores that are actually free — spinning workers on an
   oversubscribed host are slower than fewer of them.
 - **Recording.** `--record run.mcap` writes every tick of every aircraft (and the commands the sim
-  received) in-process, on a writer thread: lossless at any speed. Watch it afterwards in real time
+  received, and every event) in-process, on a writer thread: lossless at any speed. Watch it afterwards in real time
   with `astrum-bag-play run.mcap --rate 1` (any subscriber, including the viewer bridge), or bake it
   with `make export BAG=run.mcap` and scrub it in the viewer. SIGINT/SIGTERM finish the bag.
 - **External controllers.** Faster than real time only makes sense in **lockstep**; the sim then
@@ -240,14 +243,14 @@ windows; a 24-core Core Ultra 9 285K that was also running other jobs, load aver
 
 | Fleet | Threads | µs/tick | × real time @ 120 Hz |
 |---|---|---|---|
-| 1 × F-16 | 1 | 7.3 | 1147× |
+| 1 × F-16 | 1 | 7.4 | 1126× |
 | 4 × F-16 | 1 | 24.5 | 340× |
 | 4 × F-16 | 4 | 12.2 | 685× |
 | 16 × F-16 | 8 | 24.2 | 345× |
 | 64 × F-16 | 8 | 183 | 45× |
 
 One JSBSim F-16 step is ~5.3 µs on its own; the rest of a 1-aircraft tick is the ECS schedule
-(~1 µs of Bevy, ~0.7 µs of our systems). Beyond ~16 aircraft the cost is JSBSim's, and grows per
+(~1 µs of Bevy, ~0.8 µs of our systems). Beyond ~16 aircraft the cost is JSBSim's, and grows per
 aircraft as the fleet outgrows the caches (5.3 µs alone, 8.5 µs per aircraft in a 16-ship, 14 µs in
 a 64-ship, on one thread).
 
@@ -292,6 +295,31 @@ cleanly); leases count ticks, so a pause never trips the failsafe. Commands that
 paused are held, the latest per aircraft, for the next tick. Leaving the pause starts a new pacing
 schedule, so the run doesn't sprint to make up for it. Any client on the bus can send these
 requests; that is fine on one host, and restricting it is Zenoh access-control configuration.
+
+### Events
+
+Telemetry is the state every tick; **events** are what happened: the sim publishes each on
+`astrum/events` (reliable, in order), writes it to the `--record` bag, and returns it from the
+embedded env.
+
+| Kind | Fields | Reported when |
+|---|---|---|
+| `trigger-pressed` / `trigger-released` | `aircraft_id`, `ammo` (+ `rounds_fired` on release) | the trigger goes down / up (a destroyed shooter's burst ends with it) |
+| `hit` | `shooter_id`, `target_id`, `damage`, `hit_points` (target's, after), `pos_enu` (where the round struck) | a round strikes an aircraft |
+| `kill` | `victim_id`, `killer_id` (shooter of the last hit; `null` if none), `pos_enu` | an aircraft is destroyed |
+| `mode-change` | `aircraft_id`, `from`, `to` (control modes), `reason` (`command`, `lease-expired`, `controller-lost`) | an aircraft's `controlMode` changes |
+| `controller-up` / `controller-down` | `aircraft_id` | a controller's presence token appears / goes away |
+| `run-ended` | `reason` (`max-time`, `engagement-decided`, `fatal`, `stopped`), `message` (the fatal error) | the run ends (binary and sweep runs, not the embedded env) |
+
+Every event carries `tick` and `sim_time_s`: the tick is the `Telemetry.tick` that first shows it,
+so a kill lines up with the first frame in which the victim is dead (while paused, the current
+tick). Within a tick, events come in the order the tick chain ran. They are deterministic like the
+rest of the sim: the same scenario and commands report the same events (tested on a gun pass).
+The table's JSON shape is the one the replay export, the viewer's WebSocket, the RL env's
+`info.events` and the Python client's `Event.as_dict()` all use; on the wire it is the schema's
+`Event` union. `astrum-bag-record` records them, `astrum-bag-play` replays them, and the viewer
+marks hits and kills on its timeline. Reporting adds ~0.1 µs to a 1-ship tick (`make bench`,
+within run-to-run noise); a tick without events encodes and sends nothing.
 
 ### Sweeps (`astrum-sweep`)
 
@@ -389,6 +417,10 @@ explicit `Unknown`; a bad payload is logged/counted and skipped, never a crash.
   (strictly increasing from 1 per sender), `telemetryTick` (the `Telemetry.tick` the command was
   computed from) and `trigger` (gun). The key id **must** equal `targetId`; the sim refuses
   mismatches. A raw command overrides and disengages the autopilot.
+- **Event** (`astrum/events`, one message per event): `tick`, `simTimeS` and a `kind` union
+  (`triggerPressed`, `triggerReleased`, `hit`, `kill`, `modeChange`, `controllerUp`,
+  `controllerDown`, `runEnded`); see [Events](#events). Published with `CongestionControl::Block`
+  (an event is lost for good if dropped) and read with a FIFO, never a latest-value slot.
 - **Scenario** — the sim answers `get astrum/scenario` with its scenario TOML, so any client (the
   recorder, a controller) can learn the world origin and fleet.
 - **Presence** (`astrum/alive/controller/<id>`): a Zenoh liveliness token, held by the controller
@@ -399,11 +431,13 @@ explicit `Unknown`; a bad payload is logged/counted and skipped, never a crash.
 The aircraft id lives in the key, so subscribers take one aircraft (`astrum/telemetry/<id>`) or the
 whole fleet (`astrum/telemetry/*`); key matching is exact, so `.../1` never matches `.../10`.
 
-**QoS and delivery.** Both streams use `CongestionControl::Drop`, express, and priority
+**QoS and delivery.** Telemetry and commands use `CongestionControl::Drop`, express, and priority
 `InteractiveHigh` on declared publishers, in every language. Subscribers for control and
 visualisation are **latest-value** (one slot per aircraft that the newest sample overwrites —
 `astrum_net::LatestTelemetry` in Rust), never a FIFO that queues stale state. A dropped message is
 harmless because the next tick supersedes it; the lease turns a silent controller into a safe hold.
+Events are the exception: one-off facts, published with `Block` at priority `Data` and read with a
+FIFO (`astrum_net::EventReceiver`, Python `transport.subscribe_events`).
 The sim also offers Zenoh's **low-latency transport** (no batching, no QoS lanes) and the C++ and
 Python clients ask for it (`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 %
 more lockstep throughput. A client that doesn't ask, or a sim that doesn't offer it, falls back to
@@ -427,7 +461,8 @@ State flows through the sim, which stays the single authoritative hub (a **star*
 
 **Cross-language fixtures.** `crates/astrum-proto/tests/fixtures` holds canonical values
 (`values.json`) and each language's encoding of a telemetry, a raw command and an autopilot
-command (nine `.bin` files). All three languages decode all nine in their tests; `make
+command (nine `.bin` files, decoded by all three languages), plus nine events (`event_*`,
+Rust and Python: the C++ client has no event codec, as no C++ consumer needs one). `make
 wire-fixtures` regenerates them.
 
 ## Recording & replay (MCAP bags)
@@ -435,10 +470,10 @@ wire-fixtures` regenerates them.
 The recorder is just another subscriber and replay is just another publisher.
 
 ```bash
-# record telemetry + commands to an MCAP bag (Ctrl-C / SIGTERM, or --seconds N, to stop)
+# record telemetry, commands and events to an MCAP bag (Ctrl-C / SIGTERM, or --seconds N, to stop)
 cargo run -p astrum-bag --bin astrum-bag-record -- recordings/session.mcap
 
-# replay the telemetry, listening where the sim would, paced by recorded sim time
+# replay telemetry and events, listening where the sim would, paced by recorded sim time
 cargo run -p astrum-bag --bin astrum-bag-play -- recordings/session.mcap
 
 # under compose: record the sim's streams to recordings/session.mcap
@@ -451,7 +486,8 @@ scenario fetched from `astrum/scenario` as metadata. The recorder never blocks Z
 the file on SIGINT/SIGTERM (a SIGKILL leaves it unfinished).
 
 `astrum-bag-play` serves the recorded scenario on `astrum/scenario` and republishes every
-telemetry payload; recorded commands are kept for analysis and not replayed. Flags: positional bag
+telemetry and event payload in recorded order; recorded commands are kept for analysis and not
+replayed. Flags: positional bag
 path (`ASTRUM_BAG`), `--rate` (sim-time speed multiplier, default `1.0`; ≤ 0 = unpaced; a single
 gap is capped at 5 s; `ASTRUM_REPLAY_RATE`), `--listen` (`ASTRUM_ZENOH_LISTEN`), `--warmup-ms`
 (default 300; `ASTRUM_REPLAY_WARMUP_MS`). Legacy pre-MCAP `.bag` files are not readable — re-record.
@@ -461,11 +497,13 @@ gap is capped at 5 s; `ASTRUM_REPLAY_RATE`), `--listen` (`ASTRUM_ZENOH_LISTEN`),
 A browser-based renderer visualises the fleet on the ENU grid — procedurally-generated F-16-style
 jet and F450 quad meshes (no external model assets), tinted per vehicle class and per id, oriented
 from the telemetry attitude, with motion trails, orbit + follow cameras, a playback transport
-(play/pause/scrub/speed), per-aircraft readouts (including team, HP and ammo) and, for fixed-wing
-fleets, a slippy-map ground layer. Three.js is vendored under `web/vendor/`.
+(play/pause/scrub/speed), per-aircraft readouts (including team, HP and ammo), hit and kill markers
+on the timeline (hover for who hit whom, click to jump) with a flash in the scene where each struck,
+and, for fixed-wing fleets, a slippy-map ground layer. Three.js is vendored under `web/vendor/`.
 
-Both data paths feed one JSON frame shape (`astrum_web::FrameJson`), so the live stream and an
-offline export can't drift:
+Both data paths feed one JSON frame shape (`astrum_web::FrameJson`) and one event shape
+(`astrum_web::EventJson`, see [Events](#events)), so the live stream and an offline export can't
+drift:
 
 ```bash
 # LIVE — start the fleet + the bridge, then open http://localhost:8080
@@ -478,15 +516,18 @@ make export BAG=recordings/session.mcap OUT=recordings/session.json
 
 `astrum-web` is an axum/tokio server. A latest-value Zenoh subscriber feeds one batched JSON
 snapshot of the whole fleet at most `--max-hz` times per second (default 30), fanned out to every
-browser over the WebSocket `GET /telemetry` (a slow browser skips to the newest snapshot). WebSocket
+browser over the WebSocket `GET /telemetry` (a slow browser skips to the newest snapshot). Events
+are never dropped or throttled: each batch goes to every browser as `{"type":"events","events":[…]}`
+on the same socket, from the moment it connected. WebSocket
 upgrades whose `Origin` does not match the request's `Host` are rejected. The same port serves the static `web/` app and
 the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags: `--connect` (default `tcp/127.0.0.1:7447`),
 `--bind` (default `127.0.0.1:8080`; compose binds 0.0.0.0 inside the container and publishes on
 host loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache` — each with an
 `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback. `astrum-web-export` takes
-the bag as a positional argument and writes an `astrum-replay` document (version 2) to `--out`
-(env fallbacks `ASTRUM_BAG` / `ASTRUM_WEB_EXPORT`). v1 JSON exports are not readable by the
-current renderer.
+the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,
+`events`, and `meta` with their counts) to `--out` (env fallbacks `ASTRUM_BAG` /
+`ASTRUM_WEB_EXPORT`). Version 2 exports still open (without events); v1 JSON exports are not
+readable by the current renderer.
 
 ## Embedded RL environment (`astrum-env`)
 
@@ -498,6 +539,7 @@ import astrum_env
 env = astrum_env.Env(scenario_toml)          # scenario TOML v2
 obs = env.reset(seed=3)                      # (n, len(OBS_FIELDS)) float64
 obs, info = env.step(actions)                # actions (n, 5): aileron, elevator, rudder, throttle, trigger
+info.events                                  # this tick's events (hits, kills, ...) as dicts
 batch = astrum_env.BatchEnv([scenario_toml] * 16)   # K envs stepped in parallel in one call
 ```
 

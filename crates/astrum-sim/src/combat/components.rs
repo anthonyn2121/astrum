@@ -24,6 +24,9 @@ pub struct Gun {
     /// `fire_guns` accrues `rate_hz·dt` here and spawns a round each time it
     /// crosses 1, carrying the remainder between ticks.
     pub accum: f64,
+    /// `ammo` when the trigger went down; `None` while it is up. Turns trigger
+    /// changes into press / release events with the rounds fired between.
+    pub burst_from: Option<u16>,
 }
 
 impl Gun {
@@ -37,6 +40,7 @@ impl Gun {
             ammo: 511,
             dispersion_rad: 0.008,
             accum: 0.0,
+            burst_from: None,
         }
     }
 }
@@ -46,12 +50,14 @@ impl Gun {
 pub struct Health {
     pub hp: f32,
     pub hp_max: f32,
+    /// Who fired the last round that hit this aircraft (the killer, once dead).
+    pub last_hit_by: Option<u32>,
 }
 
 impl Health {
     /// A full pool of `hp_max` points.
     pub fn full(hp_max: f32) -> Self {
-        Self { hp: hp_max, hp_max }
+        Self { hp: hp_max, hp_max, last_hit_by: None }
     }
     pub fn is_dead(&self) -> bool {
         self.hp <= 0.0

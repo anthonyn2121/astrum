@@ -1,5 +1,6 @@
-//! `astrum-web-export` — bake an MCAP telemetry bag into a single JSON document
-//! the browser renderer can open offline (no sim, no bridge, no network).
+//! `astrum-web-export` — bake an MCAP bag's telemetry and events into a single
+//! JSON document the browser renderer can open offline (no sim, no bridge, no
+//! network).
 //!
 //! Config (CLI arg > env): see `--help`. The bag is positional (env
 //! `$ASTRUM_BAG`); `--out` (env `$ASTRUM_WEB_EXPORT`) defaults to `<bag>.json`,
@@ -17,7 +18,8 @@ use std::path::PathBuf;
 use astrum_web::export::export_bag;
 use clap::Parser;
 
-/// Bake an MCAP telemetry bag into a single JSON document for offline replay.
+/// Bake an MCAP bag's telemetry and events into a single JSON document for
+/// offline replay.
 #[derive(Parser)]
 #[command(name = "astrum-web-export", version, about)]
 struct Cli {
@@ -42,9 +44,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         export_bag(&cli.bag).map_err(|e| format!("reading bag {}: {e}", cli.bag.display()))?;
     let m = &doc.meta;
     eprintln!(
-        "[export] {}: {} frames, {} aircraft, {:.1}–{:.1} s sim, scenario {}, {} rejected",
+        "[export] {}: {} frames, {} events, {} aircraft, {:.1}–{:.1} s sim, scenario {}, {} rejected",
         cli.bag.display(),
         m.frames,
+        m.events,
         m.aircraft.len(),
         m.sim_time_start,
         m.sim_time_end,

@@ -3,10 +3,11 @@
 //! encode/decode helpers so the rest of the workspace never touches capnp
 //! builders directly.
 //!
-//! Two payloads: [`Telemetry`] (sim → subscribers) and [`Command`] (controllers →
-//! sim). Decoding reads straight from the payload slice (no segment copy) and
-//! rejects trailing bytes. Enum values from a newer schema decode to an
-//! `Unknown(n)` variant instead of being silently mapped to a known one.
+//! Three payloads: [`Telemetry`] (sim → subscribers), [`Command`] (controllers →
+//! sim) and [`Event`] (sim → subscribers: hits, kills, mode changes, ...).
+//! Decoding reads straight from the payload slice (no segment copy) and rejects
+//! trailing bytes. Enum values from a newer schema decode to an `Unknown(n)`
+//! variant instead of being silently mapped to a known one.
 
 /// Generated code from `schema/astrum.capnp`. It refers to itself as
 /// `crate::astrum_capnp`, hence the name; use it through the [`wire`] alias.
@@ -152,6 +153,142 @@ pub struct Command {
     pub control: Control,
 }
 
+/// Why an aircraft's control mode changed. Mirrors the schema's `ModeReason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeReason {
+    /// A controller's command (raw or autopilot).
+    Command,
+    /// No fresh command within the command lease.
+    LeaseExpired,
+    /// The controller's presence token went away.
+    ControllerLost,
+    /// A value this build's schema does not know (sent by a newer peer).
+    Unknown(u16),
+}
+
+/// Why a run ended. Mirrors the schema's `EndReason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// `sim.max_time_s` reached.
+    MaxTime,
+    /// At most one team still has a living aircraft.
+    EngagementDecided,
+    /// A fatal error (the event's message says which).
+    Fatal,
+    /// SIGINT / SIGTERM.
+    Stopped,
+    /// A value this build's schema does not know (sent by a newer peer).
+    Unknown(u16),
+}
+
+/// What happened. Mirrors the schema's `Event.kind`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventKind {
+    TriggerPressed {
+        aircraft_id: u32,
+        ammo: u16,
+    },
+    TriggerReleased {
+        aircraft_id: u32,
+        rounds_fired: u16,
+        ammo: u16,
+    },
+    /// A round struck `target_id`, leaving it `hit_points`; `pos_enu` is where.
+    Hit {
+        shooter_id: u32,
+        target_id: u32,
+        damage: f32,
+        hit_points: f32,
+        pos_enu: Enu,
+    },
+    /// `victim_id` was destroyed; `killer_id` fired the last round that hit it.
+    Kill {
+        victim_id: u32,
+        killer_id: Option<u32>,
+        pos_enu: Enu,
+    },
+    ModeChange {
+        aircraft_id: u32,
+        from: ControlMode,
+        to: ControlMode,
+        reason: ModeReason,
+    },
+    ControllerUp {
+        aircraft_id: u32,
+    },
+    ControllerDown {
+        aircraft_id: u32,
+    },
+    /// `message` is the fatal error, empty otherwise.
+    RunEnded {
+        reason: EndReason,
+        message: String,
+    },
+}
+
+/// Something that happened during a run. Mirrors `Event`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    /// The `Telemetry.tick` that first shows it (while paused: the current tick).
+    pub tick: u64,
+    pub sim_time_s: f64,
+    pub kind: EventKind,
+}
+
+// Display names, shared by every JSON / Python projection of these values
+// (the web export, the RL env's `info["events"]`): kebab-case, `unknown` for a
+// value from a newer schema.
+
+impl ControlMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            ControlMode::Uncommanded => "uncommanded",
+            ControlMode::Raw => "raw",
+            ControlMode::Autopilot => "autopilot",
+            ControlMode::Failsafe => "failsafe",
+            ControlMode::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl ModeReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            ModeReason::Command => "command",
+            ModeReason::LeaseExpired => "lease-expired",
+            ModeReason::ControllerLost => "controller-lost",
+            ModeReason::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl EndReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            EndReason::MaxTime => "max-time",
+            EndReason::EngagementDecided => "engagement-decided",
+            EndReason::Fatal => "fatal",
+            EndReason::Stopped => "stopped",
+            EndReason::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl EventKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            EventKind::TriggerPressed { .. } => "trigger-pressed",
+            EventKind::TriggerReleased { .. } => "trigger-released",
+            EventKind::Hit { .. } => "hit",
+            EventKind::Kill { .. } => "kill",
+            EventKind::ModeChange { .. } => "mode-change",
+            EventKind::ControllerUp { .. } => "controller-up",
+            EventKind::ControllerDown { .. } => "controller-down",
+            EventKind::RunEnded { .. } => "run-ended",
+        }
+    }
+}
+
 /// Room for one whole message in the first segment (Telemetry is ~40 words), so
 /// encoding allocates once instead of zero-filling capnp's default 8 KiB segment.
 const FIRST_SEGMENT_WORDS: u32 = 64;
@@ -205,15 +342,7 @@ pub fn encode_telemetry(t: &Telemetry) -> Vec<u8> {
                 panic!("cannot encode VehicleKind value {n} unknown to this schema")
             }
         });
-        b.set_control_mode(match t.control_mode {
-            ControlMode::Uncommanded => wire::ControlMode::Uncommanded,
-            ControlMode::Raw => wire::ControlMode::Raw,
-            ControlMode::Autopilot => wire::ControlMode::Autopilot,
-            ControlMode::Failsafe => wire::ControlMode::Failsafe,
-            ControlMode::Unknown(n) => {
-                panic!("cannot encode ControlMode value {n} unknown to this schema")
-            }
-        });
+        b.set_control_mode(wire_control_mode(t.control_mode));
         {
             let mut g = b.reborrow().init_geo();
             g.set_lat_deg(t.lat_deg);
@@ -302,13 +431,7 @@ pub fn decode_telemetry(bytes: &[u8]) -> capnp::Result<Telemetry> {
             Ok(wire::VehicleKind::Multirotor) => VehicleKind::Multirotor,
             Err(capnp::NotInSchema(n)) => VehicleKind::Unknown(n),
         },
-        control_mode: match r.get_control_mode() {
-            Ok(wire::ControlMode::Uncommanded) => ControlMode::Uncommanded,
-            Ok(wire::ControlMode::Raw) => ControlMode::Raw,
-            Ok(wire::ControlMode::Autopilot) => ControlMode::Autopilot,
-            Ok(wire::ControlMode::Failsafe) => ControlMode::Failsafe,
-            Err(capnp::NotInSchema(n)) => ControlMode::Unknown(n),
-        },
+        control_mode: control_mode_of(r.get_control_mode()),
         combat: CombatStatus {
             team: combat.get_team(),
             hit_points: combat.get_hit_points(),
@@ -379,4 +502,173 @@ pub fn decode_command(bytes: &[u8]) -> capnp::Result<Command> {
         trigger: c.get_trigger(),
         control,
     })
+}
+
+fn wire_control_mode(m: ControlMode) -> wire::ControlMode {
+    match m {
+        ControlMode::Uncommanded => wire::ControlMode::Uncommanded,
+        ControlMode::Raw => wire::ControlMode::Raw,
+        ControlMode::Autopilot => wire::ControlMode::Autopilot,
+        ControlMode::Failsafe => wire::ControlMode::Failsafe,
+        ControlMode::Unknown(n) => {
+            panic!("cannot encode ControlMode value {n} unknown to this schema")
+        }
+    }
+}
+
+fn control_mode_of(m: Result<wire::ControlMode, capnp::NotInSchema>) -> ControlMode {
+    match m {
+        Ok(wire::ControlMode::Uncommanded) => ControlMode::Uncommanded,
+        Ok(wire::ControlMode::Raw) => ControlMode::Raw,
+        Ok(wire::ControlMode::Autopilot) => ControlMode::Autopilot,
+        Ok(wire::ControlMode::Failsafe) => ControlMode::Failsafe,
+        Err(capnp::NotInSchema(n)) => ControlMode::Unknown(n),
+    }
+}
+
+/// Serialise an event to one flat Cap'n Proto message.
+///
+/// # Panics
+/// If an enum field is `Unknown(_)` (only produced by decoding).
+pub fn encode_event(e: &Event) -> Vec<u8> {
+    let mut msg = builder();
+    {
+        let mut b = msg.init_root::<wire::event::Builder>();
+        b.set_tick(e.tick);
+        b.set_sim_time_s(e.sim_time_s);
+        let mut k = b.init_kind();
+        match &e.kind {
+            EventKind::TriggerPressed { aircraft_id, ammo } => {
+                let mut w = k.init_trigger_pressed();
+                w.set_aircraft_id(*aircraft_id);
+                w.set_ammo(*ammo);
+            }
+            EventKind::TriggerReleased { aircraft_id, rounds_fired, ammo } => {
+                let mut w = k.init_trigger_released();
+                w.set_aircraft_id(*aircraft_id);
+                w.set_rounds_fired(*rounds_fired);
+                w.set_ammo(*ammo);
+            }
+            EventKind::Hit { shooter_id, target_id, damage, hit_points, pos_enu } => {
+                let mut w = k.init_hit();
+                w.set_shooter_id(*shooter_id);
+                w.set_target_id(*target_id);
+                w.set_damage(*damage);
+                w.set_hit_points(*hit_points);
+                set_enu(w.init_pos_enu(), *pos_enu);
+            }
+            EventKind::Kill { victim_id, killer_id, pos_enu } => {
+                let mut w = k.init_kill();
+                w.set_victim_id(*victim_id);
+                match killer_id {
+                    Some(id) => w.reborrow().init_killer().set_aircraft_id(*id),
+                    None => w.reborrow().init_killer().set_unknown(()),
+                }
+                set_enu(w.init_pos_enu(), *pos_enu);
+            }
+            EventKind::ModeChange { aircraft_id, from, to, reason } => {
+                let mut w = k.init_mode_change();
+                w.set_aircraft_id(*aircraft_id);
+                w.set_from(wire_control_mode(*from));
+                w.set_to(wire_control_mode(*to));
+                w.set_reason(match reason {
+                    ModeReason::Command => wire::ModeReason::Command,
+                    ModeReason::LeaseExpired => wire::ModeReason::LeaseExpired,
+                    ModeReason::ControllerLost => wire::ModeReason::ControllerLost,
+                    ModeReason::Unknown(n) => {
+                        panic!("cannot encode ModeReason value {n} unknown to this schema")
+                    }
+                });
+            }
+            EventKind::ControllerUp { aircraft_id } => k.set_controller_up(*aircraft_id),
+            EventKind::ControllerDown { aircraft_id } => k.set_controller_down(*aircraft_id),
+            EventKind::RunEnded { reason, message } => {
+                let mut w = k.init_run_ended();
+                w.set_reason(match reason {
+                    EndReason::MaxTime => wire::EndReason::MaxTime,
+                    EndReason::EngagementDecided => wire::EndReason::EngagementDecided,
+                    EndReason::Fatal => wire::EndReason::Fatal,
+                    EndReason::Stopped => wire::EndReason::Stopped,
+                    EndReason::Unknown(n) => {
+                        panic!("cannot encode EndReason value {n} unknown to this schema")
+                    }
+                });
+                w.set_message(message.as_str());
+            }
+        }
+    }
+    serialize::write_message_to_words(&msg)
+}
+
+/// Deserialise an event. A kind from a newer schema is an error (skip it).
+pub fn decode_event(bytes: &[u8]) -> capnp::Result<Event> {
+    use wire::event::kind::Which;
+    let msg = reader(bytes)?;
+    let e = msg.get_root::<wire::event::Reader>()?;
+    let kind = match e.get_kind().which()? {
+        Which::TriggerPressed(w) => {
+            let w = w?;
+            EventKind::TriggerPressed { aircraft_id: w.get_aircraft_id(), ammo: w.get_ammo() }
+        }
+        Which::TriggerReleased(w) => {
+            let w = w?;
+            EventKind::TriggerReleased {
+                aircraft_id: w.get_aircraft_id(),
+                rounds_fired: w.get_rounds_fired(),
+                ammo: w.get_ammo(),
+            }
+        }
+        Which::Hit(w) => {
+            let w = w?;
+            EventKind::Hit {
+                shooter_id: w.get_shooter_id(),
+                target_id: w.get_target_id(),
+                damage: w.get_damage(),
+                hit_points: w.get_hit_points(),
+                pos_enu: get_enu(w.get_pos_enu()?),
+            }
+        }
+        Which::Kill(w) => {
+            use wire::kill::killer::Which as Killer;
+            let w = w?;
+            EventKind::Kill {
+                victim_id: w.get_victim_id(),
+                killer_id: match w.get_killer().which()? {
+                    Killer::Unknown(()) => None,
+                    Killer::AircraftId(id) => Some(id),
+                },
+                pos_enu: get_enu(w.get_pos_enu()?),
+            }
+        }
+        Which::ModeChange(w) => {
+            let w = w?;
+            EventKind::ModeChange {
+                aircraft_id: w.get_aircraft_id(),
+                from: control_mode_of(w.get_from()),
+                to: control_mode_of(w.get_to()),
+                reason: match w.get_reason() {
+                    Ok(wire::ModeReason::Command) => ModeReason::Command,
+                    Ok(wire::ModeReason::LeaseExpired) => ModeReason::LeaseExpired,
+                    Ok(wire::ModeReason::ControllerLost) => ModeReason::ControllerLost,
+                    Err(capnp::NotInSchema(n)) => ModeReason::Unknown(n),
+                },
+            }
+        }
+        Which::ControllerUp(id) => EventKind::ControllerUp { aircraft_id: id },
+        Which::ControllerDown(id) => EventKind::ControllerDown { aircraft_id: id },
+        Which::RunEnded(w) => {
+            let w = w?;
+            EventKind::RunEnded {
+                reason: match w.get_reason() {
+                    Ok(wire::EndReason::MaxTime) => EndReason::MaxTime,
+                    Ok(wire::EndReason::EngagementDecided) => EndReason::EngagementDecided,
+                    Ok(wire::EndReason::Fatal) => EndReason::Fatal,
+                    Ok(wire::EndReason::Stopped) => EndReason::Stopped,
+                    Err(capnp::NotInSchema(n)) => EndReason::Unknown(n),
+                },
+                message: w.get_message()?.to_string()?,
+            }
+        }
+    };
+    Ok(Event { tick: e.get_tick(), sim_time_s: e.get_sim_time_s(), kind })
 }

@@ -12,6 +12,9 @@ import { UI } from "./ui.js";
 import { aircraftColor } from "./meshes.js";
 
 const RAD2DEG = 180 / Math.PI;
+// A playhead move longer than this (sim s) in one frame is a seek: the events
+// it skips over are not flashed.
+const FLASH_SEEK_MAX_S = 3;
 
 const store = new Store();
 
@@ -26,6 +29,7 @@ const state = {
   trails: true,
   labels: true,
   needsFrame: false, // frame + auto-select once the first aircraft appears
+  prevPlayhead: NaN, // last frame's playhead; events crossed since get flashed
 };
 
 const scene = new Scene(document.getElementById("view"), {
@@ -79,6 +83,20 @@ const net = new Net({
     }
     if (state.followLive) state.playhead = store.bounds().max;
   },
+  onEvents: (events) => {
+    let from = store.events.length;
+    if (!store.appendEvents(events)) {
+      // An event went back in time: a new run started upstream.
+      startLiveRun();
+      store.appendEvents(events);
+      from = 0;
+    }
+    // Following the head, an event for a tick already on screen will never be
+    // crossed by the playhead: flash it now.
+    if (state.followLive) {
+      scene.flash(store.events.slice(from).filter((e) => e.t <= state.playhead));
+    }
+  },
   onStatus: (st, label) => {
     ui.setStatus(st, label);
     if (st === "live") { state.mode = "live"; ui.setMode("live"); }
@@ -95,6 +113,7 @@ function startLiveRun() {
   state.selectedId = null;
   scene.setSelected(null);
   state.needsFrame = true;
+  state.prevPlayhead = NaN;
 }
 
 function connect(url) {
@@ -112,8 +131,8 @@ function connect(url) {
 async function openFile(file) {
   net.disconnect();
   try {
-    const { meta, frames } = await loadExportFile(file);
-    store.loadFile(frames);
+    const { meta, frames, events } = await loadExportFile(file);
+    store.loadFile(frames, events);
     scene.clearFleet();
     const b = store.bounds();
     state.mode = "file";
@@ -123,11 +142,13 @@ async function openFile(file) {
     state.selectedId = null;
     scene.setSelected(null);
     state.needsFrame = true;
+    state.prevPlayhead = NaN;
     ui.setMode("file");
     ui.setPlaying(true);
     ui.setLiveActive(false);
     ui.setStatus("file", `${file.name} · ${store.frameCount} frames`
       + ` · ${store.ids().length} aircraft`
+      + (store.events.length ? ` · ${store.events.length} events` : "")
       + (meta?.rejected ? ` · ${Number(meta.rejected)} rejected` : ""));
   } catch (e) {
     ui.setStatus("error", String(e.message || e));
@@ -182,6 +203,39 @@ function updateFleetList() {
   ui.setFleet(items, state.selectedId);
 }
 
+// ---- event markers over the timeline (rebuilt only when events/bounds change) ----
+
+const MARKER_KINDS = new Set(["hit", "kill"]);
+let markerKey = null;
+
+function markerTitle(e) {
+  const at = `at ${e.t.toFixed(1)} s`;
+  if (e.kind === "kill") return `kill: ${e.killer_id ?? "?"} → ${e.victim_id ?? "?"} ${at}`;
+  return `hit: ${e.shooter_id ?? "?"} → ${e.target_id ?? "?"} ${at} (${e.damage} dmg, ${e.hit_points} hp left)`;
+}
+
+function updateMarkers(b) {
+  const events = store.events;
+  const key = [events, events.length, b.min, b.max];
+  if (markerKey && key.every((v, i) => v === markerKey[i])) return;
+  markerKey = key;
+  const markers = [];
+  for (const e of events) {
+    if (!MARKER_KINDS.has(e.kind)) continue;
+    markers.push({ frac: b.span > 0 ? (e.t - b.min) / b.span : 0, kind: e.kind, title: markerTitle(e) });
+  }
+  ui.setMarkers(markers);
+}
+
+// Flash the events the playhead crossed since the last frame (either way, so a
+// scrub flashes too); a long jump is a seek and flashes nothing.
+function flashCrossedEvents() {
+  const prev = state.prevPlayhead, cur = state.playhead;
+  state.prevPlayhead = cur;
+  if (!Number.isFinite(prev) || Math.abs(cur - prev) > FLASH_SEEK_MAX_S) return;
+  scene.flash(store.eventsBetween(Math.min(prev, cur), Math.max(prev, cur)));
+}
+
 // ---- main loop ----
 
 let last = performance.now();
@@ -208,6 +262,7 @@ function tick(now) {
     if (state.playhead < b.min) state.playhead = b.min;
   }
 
+  if (!b.empty) flashCrossedEvents();
   scene.update(store, state.playhead, {
     showTrails: state.trails,
     showLabels: state.labels,
@@ -234,6 +289,7 @@ function tick(now) {
   const frac = b.span > 0 ? (state.playhead - b.min) / b.span : 0;
   ui.setTime(state.playhead - b.min, b.span, frac);
   updateFleetList();
+  updateMarkers(b);
   updateReadout();
 
   const inst = dt > 0 ? 1 / dt : 0;

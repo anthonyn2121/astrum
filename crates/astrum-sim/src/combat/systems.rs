@@ -10,9 +10,11 @@
 
 use bevy::prelude::*;
 
-use astrum_geo::Geodetic;
+use astrum_geo::{Enu, Geodetic};
+use astrum_proto::{EndReason, EventKind};
 
 use crate::components::{Aircraft, AircraftState, SimParams, WorldFrame};
+use crate::events::EventLog;
 use crate::RunMode;
 
 use super::ballistics::{earth_rate_enu, grid_altitude, step_projectile, DVec3};
@@ -58,14 +60,16 @@ pub fn muzzle_and_boresight(
 }
 
 /// Spawn rounds for every armed, triggered, living aircraft at the start of the
-/// tick. Fractional rounds accumulate in [`Gun::accum`]; each round carries the
-/// aircraft's own velocity plus the muzzle speed along a dispersed boresight.
+/// tick, reporting trigger presses and releases. Fractional rounds accumulate
+/// in [`Gun::accum`]; each round carries the aircraft's own velocity plus the
+/// muzzle speed along a dispersed boresight.
 #[allow(clippy::type_complexity)] // a plain six-component query
 pub fn fire_guns(
     params: Res<SimParams>,
     frame: Res<WorldFrame>,
     combat: Res<CombatParams>,
     mut rng: ResMut<CombatRng>,
+    mut events: ResMut<EventLog>,
     mut commands: Commands,
     mut q: Query<(&Aircraft, &AircraftState, &Team, &mut Gun, &Trigger), Without<Dead>>,
 ) {
@@ -73,6 +77,14 @@ pub fn fire_guns(
     // RNG draws must not depend on ECS iteration order.
     shooters.sort_by_key(|(ac, ..)| ac.id);
     for (ac, state, team, mut gun, trigger) in shooters {
+        match (trigger.0, gun.burst_from) {
+            (true, None) => {
+                gun.burst_from = Some(gun.ammo);
+                events.push(EventKind::TriggerPressed { aircraft_id: ac.id, ammo: gun.ammo });
+            }
+            (false, Some(from)) => events.push(release(ac.id, &mut gun, from)),
+            _ => {}
+        }
         if !trigger.0 || gun.ammo == 0 {
             gun.accum = 0.0; // a released (or empty) trigger carries no partial round
             continue;
@@ -95,6 +107,15 @@ pub fn fire_guns(
             });
         }
     }
+}
+
+fn release(aircraft_id: u32, gun: &mut Gun, from: u16) -> EventKind {
+    gun.burst_from = None;
+    EventKind::TriggerReleased { aircraft_id, rounds_fired: from - gun.ammo, ammo: gun.ammo }
+}
+
+fn enu(v: DVec3) -> Enu {
+    Enu { e: v.x, n: v.y, u: v.z }
 }
 
 /// Integrate every round one tick and cull rounds whose lifetime ran out or
@@ -127,6 +148,7 @@ pub fn step_bullets(
 /// the living, non-friendly aircraft it reaches *first*; ties go to the lower id.
 pub fn resolve_hits(
     combat: Res<CombatParams>,
+    mut events: ResMut<EventLog>,
     mut commands: Commands,
     bullets: Query<(Entity, &Bullet)>,
     mut targets: Query<(&Aircraft, &Team, &AircraftState, &mut Health), Without<Dead>>,
@@ -146,10 +168,18 @@ pub fn resolve_hits(
                 }
             }
         }
-        if let Some((_, id)) = best {
+        if let Some((s, id)) = best {
             for (ac, _, _, mut hp) in &mut targets {
                 if ac.id == id {
                     hp.hp -= combat.damage_per_hit;
+                    hp.last_hit_by = Some(b.owner_id);
+                    events.push(EventKind::Hit {
+                        shooter_id: b.owner_id,
+                        target_id: id,
+                        damage: combat.damage_per_hit,
+                        hit_points: hp.hp,
+                        pos_enu: enu(b.prev_pos + (b.pos - b.prev_pos) * s),
+                    });
                 }
             }
             commands.entity(bent).despawn();
@@ -164,6 +194,27 @@ pub fn apply_damage(mut commands: Commands, q: Query<(Entity, &Health), Without<
             commands.entity(ent).insert(Dead);
         }
     }
+}
+
+/// Report a kill whenever an aircraft is marked [`Dead`] (by `apply_damage`, or
+/// by anyone else), crediting the shooter of the last round that hit it; a
+/// burst it was firing ends with it.
+pub fn on_kill(
+    add: On<Add, Dead>,
+    mut events: ResMut<EventLog>,
+    mut q: Query<(&Aircraft, &AircraftState, &Health, Option<&mut Gun>)>,
+) {
+    let Ok((ac, state, hp, gun)) = q.get_mut(add.entity) else { return };
+    if let Some(mut gun) = gun {
+        if let Some(from) = gun.burst_from {
+            events.push(release(ac.id, &mut gun, from));
+        }
+    }
+    events.push(EventKind::Kill {
+        victim_id: ac.id,
+        killer_id: hp.last_hit_by,
+        pos_enu: state.pos_enu,
+    });
 }
 
 /// Number of teams that still have a living aircraft.
@@ -184,12 +235,14 @@ pub fn end_on_elimination(
     state: Res<CombatState>,
     mode: Option<Res<RunMode>>,
     living: Query<&Team, (With<Health>, Without<Dead>)>,
+    mut events: ResMut<EventLog>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if engagement_decided(&state, living.iter()) {
         if mode.is_some_and(|m| *m == RunMode::Server) {
             println!("[astrum-sim] engagement decided — exiting");
         }
+        events.end(EndReason::EngagementDecided, "");
         exit.write(AppExit::Success);
     }
 }

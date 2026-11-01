@@ -1,23 +1,26 @@
-//! The Zenoh bridge: commands in (with optional lockstep) and telemetry out.
+//! The Zenoh bridge: commands in (with optional lockstep), telemetry out, and
+//! controller presence.
 //!
 //! Telemetry is assembled once per tick by [`publish_telemetry`] into
 //! [`LastPublished`] whether or not a publisher is installed — the RL env reads
 //! its observations from the same resource, so both front doors see identical
-//! state. The transport wrappers are `NonSend` resources; without them the
-//! bridge systems only assemble telemetry, so the physics-only app (tests, the
-//! embedded env) runs without a session.
+//! state. The transport wrappers are `NonSend` resources ([`Bus`]); without
+//! them the bridge systems only assemble telemetry, so the physics-only app
+//! (tests, the embedded env) runs without a session.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use astrum_bag::wall_clock_ns;
 use astrum_net::{
-    CommandReceiver, CommandReject, ControlServer, Presence, PresenceWatcher, Session,
-    TelemetryPublisher,
+    CommandReceiver, CommandReject, ControlServer, EventPublisher, Presence, PresenceWatcher,
+    Session, TelemetryPublisher,
 };
 use astrum_proto::{
-    encode_command, encode_telemetry, Aero, BodyRates, CombatStatus, Command, Euler, Ned, Telemetry,
+    encode_command, encode_telemetry, Aero, BodyRates, CombatStatus, Command, Euler, EventKind,
+    ModeReason, Ned, Telemetry,
 };
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 use crate::combat::{Dead, Gun, Health, Team, Trigger};
@@ -25,26 +28,38 @@ use crate::components::{
     Aircraft, AircraftIndex, AircraftState, SimClock, SimParams, SimStatus, VehicleKind,
 };
 use crate::control::Board;
+use crate::events::EventLog;
 use crate::pilot::{apply_command, enter_failsafe, Pilot, Refusal};
 use crate::record::TickRecorder;
 use crate::systems::{StopRequested, MIN_SPEED};
 use crate::RunMode;
 
-/// Put `app` on the bus: telemetry out, commands in, controller presence, and
-/// the control plane (`astrum/control/*`, `astrum/status`).
+/// Put `app` on the bus: telemetry and events out, commands in, controller
+/// presence, and the control plane (`astrum/control/*`, `astrum/status`).
 pub fn connect(app: &mut App, session: &Session) -> astrum_net::Result<()> {
     let receiver = CommandReceiver::bind(session)?;
     let watcher = PresenceWatcher::watch(session)?;
     let control = ControlServer::serve(session, MIN_SPEED)?;
+    let events = EventPublisher::new(session)?;
     app.insert_resource(Board(control.board()));
     app.insert_non_send(TelemetryPublisher::new(session));
+    app.insert_non_send(events);
     app.insert_non_send(receiver);
     app.insert_non_send(watcher);
     app.insert_non_send(control);
     Ok(())
 }
 
-const RECORDING_FAILED: &str = "recording stopped: the bag writer failed";
+/// The transport the lockstep wait needs (all absent off the bus).
+#[derive(SystemParam)]
+pub struct Bus<'w> {
+    receiver: Option<NonSend<'w, CommandReceiver>>,
+    publisher: Option<NonSendMut<'w, TelemetryPublisher>>,
+    watcher: Option<NonSend<'w, PresenceWatcher>>,
+    board: Option<Res<'w, Board>>,
+}
+
+pub(crate) const RECORDING_FAILED: &str = "recording stopped: the bag writer failed";
 
 /// The telemetry of the latest tick, one sample per aircraft, sorted by id.
 #[derive(Resource, Debug, Clone, Default)]
@@ -241,20 +256,24 @@ impl Controllers {
         self.tokens.iter().filter(|(_, n)| **n > 0).map(|(id, _)| *id).collect()
     }
 
-    fn apply(&mut self, changes: &[Presence], mode: RunMode) {
+    fn apply(&mut self, changes: &[Presence], mode: RunMode, events: &mut EventLog) {
         for change in changes {
             match *change {
                 Presence::Up(id) => {
                     let n = self.tokens.entry(id).or_default();
                     *n += 1;
-                    if *n == 1 && mode == RunMode::Server {
-                        println!("[astrum-sim] controller for aircraft {id} connected");
+                    if *n == 1 {
+                        events.push(EventKind::ControllerUp { aircraft_id: id });
+                        if mode == RunMode::Server {
+                            println!("[astrum-sim] controller for aircraft {id} connected");
+                        }
                     }
                 }
                 Presence::Down(id) => {
                     if let Some(n) = self.tokens.get_mut(&id).filter(|n| **n > 0) {
                         *n -= 1;
                         if *n == 0 {
+                            events.push(EventKind::ControllerDown { aircraft_id: id });
                             self.lost.push(id);
                         }
                     }
@@ -272,11 +291,12 @@ pub fn track_controllers(
     mode: Res<RunMode>,
     index: Res<AircraftIndex>,
     mut controllers: ResMut<Controllers>,
+    mut events: ResMut<EventLog>,
     mut status: ResMut<SimStatus>,
     mut q: Query<(&mut Pilot, Option<&mut Trigger>, &AircraftState), Without<Dead>>,
 ) {
     if let Some(w) = watcher {
-        controllers.apply(&w.drain(), *mode);
+        controllers.apply(&w.drain(), *mode, &mut events);
     }
     for id in std::mem::take(&mut controllers.lost) {
         let Some((mut pilot, trigger, state)) = index.0.get(&id).and_then(|e| q.get_mut(*e).ok())
@@ -287,7 +307,8 @@ pub fn track_controllers(
             status.fatal.get_or_insert_with(|| lost_lockstep(id));
         } else if pilot.commanded() {
             eprintln!("[astrum-sim] aircraft {id}: controller disconnected — failsafe hold");
-            enter_failsafe(&mut pilot, trigger.map(Mut::into_inner), state);
+            let reason = ModeReason::ControllerLost;
+            enter_failsafe(&mut pilot, trigger.map(Mut::into_inner), state, reason);
         }
     }
 }
@@ -374,10 +395,7 @@ const LOCKSTEP_POLL: Duration = Duration::from_millis(20);
 /// away, is fatal; a stop request ends the wait.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_commands(
-    receiver: Option<NonSend<CommandReceiver>>,
-    publisher: Option<NonSendMut<TelemetryPublisher>>,
-    watcher: Option<NonSend<PresenceWatcher>>,
-    board: Option<Res<Board>>,
+    mut bus: Bus,
     recorder: Option<Res<TickRecorder>>,
     stop: Option<Res<StopRequested>>,
     mode: Res<RunMode>,
@@ -386,12 +404,13 @@ pub fn ingest_commands(
     clock: Res<SimClock>,
     index: Res<AircraftIndex>,
     mut controllers: ResMut<Controllers>,
+    mut events: ResMut<EventLog>,
     mut status: ResMut<SimStatus>,
     mut log: ResMut<RefusalLog>,
     mut held: ResMut<HeldCommands>,
     mut q: Query<(&mut Pilot, Option<&mut Trigger>, Has<Dead>)>,
 ) {
-    let Some(rx) = receiver else { return };
+    let Some(rx) = bus.receiver.as_deref() else { return };
     let recorder = recorder.as_deref();
     let now = clock.tick;
     let lease = params.lease_ticks;
@@ -429,15 +448,14 @@ pub fn ingest_commands(
                     .collect::<BTreeSet<u32>>()
             };
         let deadline = Instant::now() + Duration::from_secs_f64(params.lockstep_timeout_s);
-        let mut publisher = publisher;
         let mut waiting = pending(&answered, &q);
         let mut republished = Instant::now();
         while !waiting.is_empty() {
             if stop.as_ref().is_some_and(|s| s.requested()) {
                 return;
             }
-            if let Some(w) = &watcher {
-                controllers.apply(&w.drain(), *mode);
+            if let Some(w) = &bus.watcher {
+                controllers.apply(&w.drain(), *mode, &mut events);
                 if let Some(id) = controllers.lost.iter().find(|id| waiting.contains(id)) {
                     status.fatal = Some(lost_lockstep(*id));
                     return;
@@ -470,10 +488,10 @@ pub fn ingest_commands(
             }
             if republished.elapsed() >= LOCKSTEP_REPUBLISH {
                 republished = Instant::now();
-                if let Some(b) = &board {
+                if let Some(b) = &bus.board {
                     b.show_waiting(&waiting);
                 }
-                if let Some(p) = publisher.as_mut() {
+                if let Some(p) = bus.publisher.as_mut() {
                     for s in last.0.iter().filter(|s| waiting.contains(&s.aircraft_id)) {
                         let _ = p.publish(s);
                     }

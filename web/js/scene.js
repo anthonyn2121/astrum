@@ -9,6 +9,14 @@ import { buildAircraft, enuToThree, attitudeToQuaternion, MODEL_SCALE } from "./
 const TRAIL_MAX = 240;      // points per trail
 const TRAIL_MIN_STEP = 1.0; // metres between recorded trail points
 
+// Event flashes at an event's `pos_enu`: world size (m, the sprite's full width
+// at peak) and lifetime (real seconds). Kills are the prominent one.
+const FLASH = {
+  hit: { size: 45, life: 0.45, color: 0xffc46a },
+  kill: { size: 260, life: 1.4, color: 0xff6a3a },
+};
+const FLASH_MAX = 96; // live flashes at once; older ones are dropped first
+
 // Ground map: a slippy-map tile layer laid flat under the fleet, centred on the
 // scenario datum. Tiles come from astrum-web at /tiles/{z}/{x}/{y}.jpg, which
 // proxies + disk-caches an upstream tile server — so any geolocated datum gets a
@@ -38,6 +46,8 @@ export class Scene {
     this.onSelect = onSelect || (() => {});
     this.fleet = new Map(); // id -> { group, trail, kind }
     this.selectedId = null;
+    this._flashes = [];      // { sprite, age, life, size }
+    this._flashTex = null;   // shared radial glow, built on first use
 
     // Ground map tile layer (built lazily once the fleet's datum is known).
     this._mapGroup = null;
@@ -201,9 +211,10 @@ export class Scene {
     this._mapTried = false;
   }
 
-  // Drop every aircraft and free all of its GPU resources: geometries,
-  // materials (shared ones once) and textures (the canvas label sprites).
-  // Sprites share one three.js-owned quad geometry, which stays.
+  // Drop every aircraft and event flash and free all of their GPU resources:
+  // geometries, materials (shared ones once) and textures (the canvas label
+  // sprites, the flash glow). Sprites share one three.js-owned quad geometry,
+  // which stays.
   clearFleet() {
     const geometries = new Set(), materials = new Set();
     const collect = (o) => {
@@ -221,6 +232,54 @@ export class Scene {
     this.fleet.clear();
     this.selectedId = null;
     this._clearMap(); // a new source may sit at a different datum
+    this._clearFlashes();
+  }
+
+  // Flash every hit / kill in `events` (store events with `pos`) at its
+  // position: small and brief for a hit, large and longer for a kill.
+  flash(events) {
+    for (const ev of events) {
+      const spec = FLASH[ev.kind];
+      if (!spec || !ev.pos) continue;
+      if (!this._flashTex) this._flashTex = glowTexture();
+      const mat = new THREE.SpriteMaterial({
+        map: this._flashTex, color: spec.color, transparent: true,
+        blending: THREE.AdditiveBlending, depthWrite: false, fog: false,
+      });
+      const sprite = new THREE.Sprite(mat);
+      enuToThree(ev.pos[0], ev.pos[1], ev.pos[2], sprite.position);
+      sprite.renderOrder = 2;
+      this.scene.add(sprite);
+      this._flashes.push({ sprite, age: 0, life: spec.life, size: spec.size });
+    }
+    while (this._flashes.length > FLASH_MAX) this._dropFlash(this._flashes.shift());
+  }
+
+  // Age the flashes by `dt` real seconds: each swells and fades, then goes.
+  _animateFlashes(dt) {
+    const keep = [];
+    for (const f of this._flashes) {
+      f.age += dt;
+      const k = f.age / f.life;
+      if (k >= 1) { this._dropFlash(f); continue; }
+      const s = f.size * (0.35 + 0.65 * Math.sqrt(k));
+      f.sprite.scale.set(s, s, 1);
+      f.sprite.material.opacity = (1 - k) * (1 - k);
+      keep.push(f);
+    }
+    this._flashes = keep;
+  }
+
+  _dropFlash(f) {
+    this.scene.remove(f.sprite);
+    f.sprite.material.dispose();
+  }
+
+  _clearFlashes() {
+    for (const f of this._flashes) this._dropFlash(f);
+    this._flashes = [];
+    this._flashTex?.dispose();
+    this._flashTex = null;
   }
 
   // Forget every trail (after a seek, so no chord joins the old and new spot).
@@ -277,6 +336,7 @@ export class Scene {
   // Drive the whole fleet from the store at playhead time `t`.
   update(store, t, opts) {
     const { showTrails = true, showLabels = true, spinRotors = true, spinRate = 1, dt = 0 } = opts || {};
+    this._animateFlashes(dt);
     const seen = new Set();
     const _p = new THREE.Vector3();
     const _q = new THREE.Quaternion();
@@ -401,6 +461,21 @@ export class Scene {
       if (o) this.onSelect(o.userData.id);
     }
   }
+}
+
+// A soft white radial glow (tinted per flash by the sprite colour).
+function glowTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 128;
+  const ctx = canvas.getContext("2d");
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, "rgba(255,255,255,1)");
+  g.addColorStop(0.2, "rgba(255,255,255,0.85)");
+  g.addColorStop(0.5, "rgba(255,255,255,0.25)");
+  g.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(canvas);
 }
 
 export { MODEL_SCALE };

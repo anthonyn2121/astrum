@@ -9,8 +9,13 @@
 //    sample is overwritten once a track is full.
 //  * File tracks keep every frame of the opened export.
 //
-// Frames are untrusted input: `parseFrame` validates the id, kind and clock and
-// coerces every other field to a finite number / known string.
+// Run events (hits, kills, …) sit in one list sorted by sim time beside the
+// tracks: appended live (and trimmed once the rings have evicted the frames of
+// their time), or loaded whole from a file.
+//
+// Frames and events are untrusted input: `parseFrame` / `parseEvent` validate
+// the id, kind and clock and coerce every other field to a finite number /
+// known string.
 
 // Live history per aircraft: 20 min at the bridge's default 30 Hz.
 const LIVE_CAPACITY = 36000;
@@ -60,6 +65,47 @@ export function parseFrame(f) {
   return { id, kind: KINDS.has(f.kind) ? f.kind : "unknown", s };
 }
 
+const EVENT_KINDS = new Set([
+  "trigger-pressed", "trigger-released", "hit", "kill", "mode-change",
+  "controller-up", "controller-down", "run-ended",
+]);
+// Aircraft-id fields an event may carry (by kind).
+const EVENT_IDS = ["aircraft_id", "shooter_id", "target_id", "victim_id"];
+const EVENT_NUMBERS = ["ammo", "rounds_fired", "damage", "hit_points"];
+const EVENT_NAMES = ["from", "to", "reason", "message"];
+
+function validId(v) {
+  return Number.isInteger(v) && v >= 0 && v <= MAX_ID;
+}
+
+// Validate one astrum_web::EventJson. Returns { t, tick, kind, …fields } or
+// null; `pos_enu` becomes `pos` ([e, n, u] or null), `killer_id` stays null
+// when unknown.
+export function parseEvent(e) {
+  if (!e || typeof e !== "object" || !EVENT_KINDS.has(e.kind)) return null;
+  const { sim_time_s: t, tick } = e;
+  if (typeof t !== "number" || !Number.isFinite(t)) return null;
+  const ev = { t, tick: Number.isInteger(tick) ? tick : 0, kind: e.kind };
+  for (const k of EVENT_IDS) if (validId(e[k])) ev[k] = e[k];
+  for (const k of EVENT_NUMBERS) if (k in e) ev[k] = finite(e[k]);
+  for (const k of EVENT_NAMES) if (typeof e[k] === "string") ev[k] = e[k];
+  if (e.kind === "kill") ev.killer_id = validId(e.killer_id) ? e.killer_id : null;
+  const p = e.pos_enu;
+  ev.pos = Array.isArray(p) && p.length === 3 && p.every((v) => typeof v === "number" && Number.isFinite(v))
+    ? [p[0], p[1], p[2]] : null;
+  return ev;
+}
+
+// First index in sorted `events` whose time is > t (`strict`) or >= t.
+function eventIndex(events, t, strict) {
+  let lo = 0, hi = events.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (strict ? events[mid].t <= t : events[mid].t < t) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
 // Fixed-capacity ring of samples, oldest first.
 class RingTrack {
   constructor(capacity) {
@@ -107,6 +153,7 @@ export class Store {
     this._min = Infinity;
     this._max = -Infinity;
     this._minStale = false; // a ring evicted its oldest sample
+    this.events = [];       // sorted by t (do not mutate)
   }
 
   get frameCount() { return this._frameCount; }
@@ -139,8 +186,23 @@ export class Store {
     return true;
   }
 
-  // File: load every frame of an export document (any order).
-  loadFile(frames) {
+  // Live: append a batch of events (the sim sends them in order). Returns
+  // false — having stopped — if one is earlier than the newest buffered event
+  // (a new run started); the caller resets the store and appends again.
+  appendEvents(events) {
+    for (const e of events) {
+      const ev = parseEvent(e);
+      if (!ev) continue;
+      const list = this.events;
+      const newest = list[list.length - 1];
+      if (newest && ev.t < newest.t) return false;
+      list.push(ev);
+    }
+    return true;
+  }
+
+  // File: load every frame and event of an export document (any order).
+  loadFile(frames, events = []) {
     this.reset("file");
     const byId = new Map(); // id -> { kind, samples: [] }
     for (const f of frames) {
@@ -164,6 +226,8 @@ export class Store {
       if (out[0].t < this._min) this._min = out[0].t;
       if (out[out.length - 1].t > this._max) this._max = out[out.length - 1].t;
     }
+    // Stable: events sharing a time keep the document's order.
+    this.events = events.map(parseEvent).filter(Boolean).sort((a, b) => a.t - b.t);
   }
 
   _addTrack(id, kind, samples) {
@@ -190,10 +254,22 @@ export class Store {
       }
       this._min = min;
       this._minStale = false;
+      // Events older than every buffered frame went with them.
+      if (Number.isFinite(min)) {
+        const keep = eventIndex(this.events, min, false);
+        if (keep > 0) this.events = this.events.slice(keep);
+      }
     }
     const { _min: min, _max: max } = this;
     if (!Number.isFinite(min)) return { min: 0, max: 0, span: 0, empty: true };
     return { min, max, span: Math.max(0, max - min), empty: false };
+  }
+
+  // Events with t0 < t <= t1, in time order (a half-open window, so stepping
+  // the playhead forward window by window yields each event once).
+  eventsBetween(t0, t1) {
+    if (!(t1 > t0)) return [];
+    return this.events.slice(eventIndex(this.events, t0, true), eventIndex(this.events, t1, true));
   }
 
   // Interpolated state of aircraft `id` at playhead time `t`.

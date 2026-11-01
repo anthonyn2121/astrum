@@ -130,8 +130,8 @@ fn main() -> ExitCode {
         let path = recording.path().display().to_string();
         match recording.finish() {
             Ok(s) => println!(
-                "[astrum-sim] recorded {} telemetry, {} command messages → {path}",
-                s.telemetry, s.commands
+                "[astrum-sim] recorded {} telemetry, {} command, {} event messages → {path}",
+                s.telemetry, s.commands, s.events
             ),
             Err(e) => {
                 eprintln!("[astrum-sim] recording {path} failed: {e}");

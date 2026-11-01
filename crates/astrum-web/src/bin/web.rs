@@ -2,9 +2,12 @@
 //! static 3-D renderer, on one port.
 //!
 //!  * **`GET /telemetry`** (WebSocket) — one JSON message per fleet snapshot,
-//!    `{"type":"frames","frames":[FrameJson…]}`, at most `--max-hz` per second.
-//!    The upstream is the Zenoh telemetry stream, so the source is either the
-//!    live sim or `astrum-bag-play`. Upgrades from another origin are refused.
+//!    `{"type":"frames","frames":[FrameJson…]}`, at most `--max-hz` per second,
+//!    plus every `astrum/events` event as `{"type":"events","events":[EventJson…]}`
+//!    (in order, never throttled; a browser that connects mid-run gets only the
+//!    events from then on). The upstream is the Zenoh stream, so the source is
+//!    either the live sim or `astrum-bag-play`. Upgrades from another origin are
+//!    refused.
 //!  * **`GET /tiles/<z>/<x>/<y>.jpg`** — slippy-map tile proxy with a disk cache.
 //!  * **`GET /…`** — static files from `--root`.
 //!
@@ -15,10 +18,10 @@ use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use astrum_net::{LatestTelemetry, Selection, Session};
-use astrum_web::server::{self, Config};
+use astrum_net::{EventReceiver, LatestTelemetry, Selection, Session};
+use astrum_web::server::{self, Config, EVENT_BACKLOG};
 use clap::Parser;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 /// Stream live/replayed telemetry to browsers over WebSocket and serve the
 /// static 3-D renderer, both on one port.
@@ -72,14 +75,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let wait = Duration::try_from_secs_f64(cli.connect_timeout)
         .map_err(|e| format!("--connect-timeout {}: {e}", cli.connect_timeout))?;
 
-    // Zenoh's blocking API runs on its own runtime: drive it from a plain thread,
-    // outside this one. It reports why it stopped through `stopped`.
+    // Zenoh's blocking API runs on its own runtime: drive it from plain threads,
+    // outside this one. Each pump reports why it stopped through `stopped`.
     let (tx, rx) = watch::channel(None);
-    let (stopped_tx, stopped) = oneshot::channel::<String>();
+    let (events_tx, _) = broadcast::channel(EVENT_BACKLOG);
+    let (stopped_tx, mut stopped) = mpsc::unbounded_channel::<String>();
     let connect = cli.connect.clone();
+    let pump_events_tx = events_tx.clone();
     std::thread::Builder::new().name("telemetry".into()).spawn(move || {
         let result = Session::connect(&connect, wait).and_then(|session| {
             let mut latest = LatestTelemetry::subscribe(&session, Selection::Fleet)?;
+            let events = EventReceiver::subscribe(&session)?;
+            let (events_stopped, events_from) = (stopped_tx.clone(), connect.clone());
+            let session = session.clone(); // keeps the event subscription's session open
+            std::thread::Builder::new()
+                .name("events".into())
+                .spawn(move || {
+                    let _session = session;
+                    let e = server::pump_events(&events, &pump_events_tx);
+                    let _ = events_stopped.send(format!("events from {events_from}: {e}"));
+                })
+                .expect("spawning the events thread");
             server::pump_snapshots(&mut latest, &tx, min_period)
         });
         let why = match result {
@@ -96,7 +112,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         format!("{} → cache {}", cfg.tile_url, cfg.tile_cache.display())
     };
     let root = cfg.root.display().to_string();
-    let app = server::router(cfg, rx)?;
+    let app = server::router(cfg, rx, events_tx)?;
 
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await
@@ -112,7 +128,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
     tokio::select! {
         served = serve.into_future() => Ok(served?),
-        why = stopped => Err(why.unwrap_or_else(|_| "telemetry thread panicked".to_owned()).into()),
+        why = stopped.recv() => Err(why.unwrap_or_else(|| "telemetry thread panicked".to_owned()).into()),
     }
 }
 

@@ -7,11 +7,15 @@
 #   * Telemetry : sim --put--> astrum/telemetry/<aircraftId>   (one per aircraft per tick)
 #   * Command   : controller --put--> astrum/command/<targetId> (the key's id MUST equal
 #                 targetId; the sim rejects mismatches)
+#   * Event     : sim --put--> astrum/events (one per event, in the order they happened)
 #   * Scenario  : the sim answers `get astrum/scenario` with its scenario TOML (UTF-8 text)
-# Both streams are latest-value state: publish with CongestionControl::DROP, express,
-# priority INTERACTIVE_HIGH, and read with a latest-value (ring) handler — a stale
-# sample is worse than a dropped one. Controllers may ask for Zenoh's low-latency
-# transport (the sim offers it).
+#   * Presence, control and status (astrum/alive/controller/<id>, astrum/control/*,
+#     astrum/status) carry no Cap'n Proto: a liveliness token and JSON / text replies.
+# Telemetry and commands are latest-value state: publish with CongestionControl::DROP,
+# express, priority INTERACTIVE_HIGH, and read with a latest-value (ring) handler — a
+# stale sample is worse than a dropped one. Events are discrete and must not be lost:
+# CongestionControl::BLOCK, read with a FIFO. Controllers may ask for Zenoh's
+# low-latency transport (the sim offers it).
 #
 # Framing: one unpacked flat message per Zenoh payload (Rust write_message /
 # C++ messageToFlatArray / pycapnp to_bytes).
@@ -135,4 +139,78 @@ struct Command {
   seq           @3 :UInt64;   # per-sender, strictly increasing; older seqs are ignored
   telemetryTick @4 :UInt64;   # Telemetry.tick this command was computed from
   trigger       @5 :Bool;     # gun trigger (armed aircraft only)
+}
+
+# Why an aircraft's controlMode changed.
+enum ModeReason {
+  command        @0;   # a controller's command (raw or autopilot)
+  leaseExpired   @1;   # no fresh command within the command lease
+  controllerLost @2;   # the controller's presence token went away
+}
+
+# Why a run ended.
+enum EndReason {
+  maxTime           @0;   # sim.max_time_s reached
+  engagementDecided @1;   # at most one team still has a living aircraft
+  fatal             @2;   # a fatal error; RunEnded.message says which
+  stopped           @3;   # SIGINT / SIGTERM
+}
+
+struct TriggerPressed {
+  aircraftId @0 :UInt32;
+  ammo       @1 :UInt16;   # rounds left when pressed
+}
+
+struct TriggerReleased {
+  aircraftId  @0 :UInt32;
+  roundsFired @1 :UInt16;   # since the matching TriggerPressed
+  ammo        @2 :UInt16;   # rounds left
+}
+
+# A round struck an aircraft.
+struct Hit {
+  shooterId @0 :UInt32;
+  targetId  @1 :UInt32;
+  damage    @2 :Float32;
+  hitPoints @3 :Float32;   # the target's, after this hit
+  posEnu    @4 :Enu;       # where the round struck (world grid, m)
+}
+
+# An aircraft was destroyed (its hit points reached zero).
+struct Kill {
+  victimId @0 :UInt32;
+  killer :union {
+    unknown    @1 :Void;     # no hit recorded (e.g. destroyed by the sim's caller)
+    aircraftId @2 :UInt32;   # the shooter of the last round that hit it
+  }
+  posEnu   @3 :Enu;         # the victim's position (world grid, m)
+}
+
+struct ModeChange {
+  aircraftId @0 :UInt32;
+  from       @1 :ControlMode;
+  to         @2 :ControlMode;
+  reason     @3 :ModeReason;
+}
+
+struct RunEnded {
+  reason  @0 :EndReason;
+  message @1 :Text;   # the fatal error; empty otherwise
+}
+
+# Something that happened, as opposed to the per-tick state in Telemetry. A
+# subscriber must ignore (skip) a kind it does not know.
+struct Event {
+  tick     @0 :UInt64;    # the Telemetry.tick that first shows it (while paused: the current tick)
+  simTimeS @1 :Float64;   # tick * dt
+  kind :union {
+    triggerPressed  @2 :TriggerPressed;
+    triggerReleased @3 :TriggerReleased;
+    hit             @4 :Hit;
+    kill            @5 :Kill;
+    modeChange      @6 :ModeChange;
+    controllerUp    @7 :UInt32;   # aircraft id whose controller connected (presence)
+    controllerDown  @8 :UInt32;   # aircraft id whose controller went away
+    runEnded        @9 :RunEnded;
+  }
 }

@@ -10,11 +10,13 @@
 //!   last command until the scenario's `command_lease_s` expires, then holds.
 //! * One `step` is one physics tick. The first observation (after construction
 //!   or `reset`) is at tick 1.
+//! * [`SimEnv::events`] are the events of the latest tick (hits, kills, mode
+//!   changes, ...), the same ones the bridge publishes on `astrum/events`.
 //! * [`SimEnv`] is `Send`: environments may be stepped from different threads
 //!   (JSBSim's construction race is handled inside `astrum-fdm`).
 
 use astrum_geo::{Geodetic, LocalFrame};
-use astrum_proto::{Command, Control, Telemetry};
+use astrum_proto::{Command, Control, Event, Telemetry};
 use bevy::ecs::schedule::ScheduleLabel;
 use bevy::prelude::*;
 
@@ -27,6 +29,7 @@ use crate::combat::{
 use crate::components::{
     AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus, WorldFrame,
 };
+use crate::events::EventLog;
 use crate::net::{LastPublished, RefusalLog};
 use crate::pilot::{apply_command, Pilot};
 use crate::scenario::{Scenario, ScenarioError};
@@ -146,6 +149,7 @@ fn reset_world(world: &mut World, scenario: &Scenario) -> Result<()> {
     world.insert_resource(CombatState { initial_living_teams: team_count(scenario) });
     world.insert_resource(LastPublished::default());
     world.insert_resource(RefusalLog::default());
+    world.insert_resource(EventLog::default());
     world.insert_resource(scenario.clone());
 
     let bullets: Vec<Entity> = world.query_filtered::<Entity, With<Bullet>>().iter(world).collect();
@@ -275,6 +279,12 @@ impl SimEnv {
     /// The latest tick's telemetry, sorted by id.
     pub fn observe(&self) -> Vec<Telemetry> {
         self.world.resource::<LastPublished>().0.clone()
+    }
+
+    /// The events of the latest tick (`step`, or the first tick of `reset`), in
+    /// the order they happened.
+    pub fn events(&self) -> &[Event] {
+        self.world.resource::<EventLog>().last()
     }
 
     fn step_result(&mut self) -> StepResult {

@@ -1,13 +1,15 @@
-//! `astrum-bag` — record the ASTRUM telemetry and command streams to an MCAP
-//! file, and replay the telemetry as a stand-in for the sim.
+//! `astrum-bag` — record the ASTRUM telemetry, command and event streams to an
+//! MCAP file, and replay telemetry and events as a stand-in for the sim.
 //!
 //! A bag is an [MCAP](https://mcap.dev) file with one channel per Zenoh key
-//! (topic = key, e.g. `astrum/telemetry/1`, `astrum/command/1`). Every message is
-//! the exact Zenoh payload (a Cap'n Proto `Telemetry` / `Command`, never
-//! re-encoded); the channel's schema is the full text of `astrum.capnp`. Times:
+//! (topic = key, e.g. `astrum/telemetry/1`, `astrum/command/1`, `astrum/events`).
+//! Every message is the exact Zenoh payload (a Cap'n Proto `Telemetry` /
+//! `Command` / `Event`, never re-encoded); the channel's schema is the full text
+//! of `astrum.capnp`. Times:
 //!
 //! * `log_time` — recorder wall clock at receipt, ns since the Unix epoch;
-//! * `publish_time` — sim time in ns for telemetry, the `log_time` for commands.
+//! * `publish_time` — sim time in ns for telemetry and events, the `log_time`
+//!   for commands.
 //!
 //! The scenario TOML served by the sim at record start is stored as the metadata
 //! record `astrum.scenario` (key `toml`).
@@ -27,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use astrum_net::zenoh::pubsub::Subscriber;
 use astrum_net::zenoh::Wait;
-use astrum_net::{keys, NetError, Session, TelemetryPublisher};
+use astrum_net::{keys, EventPublisher, NetError, Session, TelemetryPublisher};
 use mcap::records::{MessageHeader, Metadata, Record};
 
 /// Metadata record holding the recorded scenario.
@@ -40,6 +42,8 @@ pub const ENCODING: &str = "capnp";
 pub const TELEMETRY_SCHEMA: &str = "astrum.wire.Telemetry";
 /// Schema name of `astrum/command/<id>` channels.
 pub const COMMAND_SCHEMA: &str = "astrum.wire.Command";
+/// Schema name of the `astrum/events` channel.
+pub const EVENT_SCHEMA: &str = "astrum.wire.Event";
 /// Full text of the wire schema, stored as every channel's schema data.
 pub const SCHEMA_TEXT: &str = include_str!("../../astrum-proto/schema/astrum.capnp");
 
@@ -54,7 +58,7 @@ pub enum BagError {
     Io(std::io::Error),
     /// A malformed, truncated or unfinished MCAP file, or an MCAP write failure.
     Mcap(mcap::McapError),
-    /// A topic that is not `astrum/telemetry/<id>` or `astrum/command/<id>`.
+    /// A topic that is not `astrum/telemetry/<id>`, `astrum/command/<id>` or `astrum/events`.
     UnknownTopic(String),
     /// The Zenoh transport failed.
     Net(NetError),
@@ -65,7 +69,9 @@ impl fmt::Display for BagError {
         match self {
             BagError::Io(e) => write!(f, "bag I/O error: {e}"),
             BagError::Mcap(e) => write!(f, "MCAP error: {e}"),
-            BagError::UnknownTopic(t) => write!(f, "not an ASTRUM telemetry/command topic: {t:?}"),
+            BagError::UnknownTopic(t) => {
+                write!(f, "not an ASTRUM telemetry/command/events topic: {t:?}")
+            }
             BagError::Net(e) => write!(f, "{e}"),
         }
     }
@@ -104,19 +110,23 @@ impl From<NetError> for BagError {
 pub type Result<T, E = BagError> = std::result::Result<T, E>;
 
 /// What a topic carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TopicKind {
     /// `astrum/telemetry/<id>`
     Telemetry(u32),
     /// `astrum/command/<id>`
     Command(u32),
+    /// `astrum/events`
+    Events,
 }
 
 impl TopicKind {
-    /// Classify a Zenoh key / bag topic; `None` if it is neither stream.
+    /// Classify a Zenoh key / bag topic; `None` if it is none of the streams.
     pub fn of(topic: &str) -> Option<Self> {
         if let Some(id) = keys::id_of(topic, keys::TELEMETRY_PREFIX) {
             Some(TopicKind::Telemetry(id))
+        } else if topic == keys::EVENTS {
+            Some(TopicKind::Events)
         } else {
             keys::id_of(topic, keys::COMMAND_PREFIX).map(TopicKind::Command)
         }
@@ -145,6 +155,7 @@ pub struct BagWriter {
     mcap: mcap::Writer<BufWriter<File>>,
     telemetry_schema: u16,
     command_schema: u16,
+    event_schema: u16,
     channels: HashMap<String, ChannelSlot>,
 }
 
@@ -159,17 +170,18 @@ impl BagWriter {
         let telemetry_schema =
             mcap.add_schema(TELEMETRY_SCHEMA, ENCODING, SCHEMA_TEXT.as_bytes())?;
         let command_schema = mcap.add_schema(COMMAND_SCHEMA, ENCODING, SCHEMA_TEXT.as_bytes())?;
+        let event_schema = mcap.add_schema(EVENT_SCHEMA, ENCODING, SCHEMA_TEXT.as_bytes())?;
         if let Some(toml) = scenario {
             mcap.write_metadata(&Metadata {
                 name: SCENARIO_METADATA.to_owned(),
                 metadata: BTreeMap::from([(SCENARIO_KEY.to_owned(), toml.to_owned())]),
             })?;
         }
-        Ok(Self { mcap, telemetry_schema, command_schema, channels: HashMap::new() })
+        Ok(Self { mcap, telemetry_schema, command_schema, event_schema, channels: HashMap::new() })
     }
 
-    /// Append one message on `topic` (`astrum/telemetry/<id>` or
-    /// `astrum/command/<id>`; its channel is declared on first use).
+    /// Append one message on `topic` (`astrum/telemetry/<id>`,
+    /// `astrum/command/<id>` or `astrum/events`; its channel is declared on first use).
     pub fn write(
         &mut self,
         topic: &str,
@@ -183,6 +195,7 @@ impl BagWriter {
                 let schema = match TopicKind::of(topic) {
                     Some(TopicKind::Telemetry(_)) => self.telemetry_schema,
                     Some(TopicKind::Command(_)) => self.command_schema,
+                    Some(TopicKind::Events) => self.event_schema,
                     None => return Err(BagError::UnknownTopic(topic.to_owned())),
                 };
                 let id = self.mcap.add_channel(schema, topic, ENCODING, &BTreeMap::new())?;
@@ -277,8 +290,10 @@ pub struct RecordStats {
     pub telemetry: u64,
     /// Command messages written.
     pub commands: u64,
-    /// Telemetry samples dropped because their payload did not decode (no sim
-    /// time to stamp them with).
+    /// Event messages written.
+    pub events: u64,
+    /// Telemetry samples and events dropped because their payload did not decode
+    /// (no sim time to stamp them with).
     pub rejected: u64,
 }
 
@@ -293,7 +308,7 @@ const RECORD_POLL: Duration = Duration::from_millis(100);
 /// How long [`Recorder::run`] waits for in-flight callbacks after unsubscribing.
 const RECORD_DRAIN: Duration = Duration::from_millis(200);
 
-/// Subscribes to every telemetry and command key and records them to a
+/// Subscribes to every telemetry, command and event key and records them to a
 /// [`BagWriter`].
 ///
 /// Zenoh's receive callback only timestamps and copies each sample into an
@@ -309,8 +324,8 @@ impl Recorder {
     /// captured (buffered until [`Recorder::run`] writes them).
     pub fn subscribe(session: &Session) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
-        let mut subscribers = Vec::with_capacity(2);
-        for key in [keys::TELEMETRY_ALL, keys::COMMAND_ALL] {
+        let mut subscribers = Vec::with_capacity(3);
+        for key in [keys::TELEMETRY_ALL, keys::COMMAND_ALL, keys::EVENTS] {
             let tx = tx.clone();
             let subscriber = session
                 .raw()
@@ -374,7 +389,14 @@ fn record_one(bag: &mut BagWriter, stats: &mut RecordStats, received: Received) 
             bag.write(&topic, log_time_ns, log_time_ns, &payload)?;
             stats.commands += 1;
         }
-        // The subscriptions only match the two streams; a non-numeric id lands here.
+        Some(TopicKind::Events) => match astrum_proto::decode_event(&payload) {
+            Ok(e) => {
+                bag.write(&topic, log_time_ns, sim_time_ns(e.sim_time_s), &payload)?;
+                stats.events += 1;
+            }
+            Err(_) => stats.rejected += 1,
+        },
+        // The subscriptions only match the streams; a non-numeric id lands here.
         None => stats.rejected += 1,
     }
     Ok(())
@@ -412,37 +434,45 @@ pub fn replay_schedule(publish_times_ns: &[u64], rate: f64) -> Vec<Duration> {
 pub struct ReplayStats {
     /// Telemetry messages published.
     pub telemetry: u64,
+    /// Event messages published.
+    pub events: u64,
     /// Command messages skipped (recorded for analysis, never replayed).
     pub commands: u64,
     /// Messages on any other topic, skipped.
     pub skipped: u64,
 }
 
-/// Publish the bag's telemetry on `session` exactly as the sim did (same keys,
-/// same payload bytes, the sim's QoS), paced by [`replay_schedule`]. Commands
-/// are not replayed.
+/// Publish the bag's telemetry and events on `session` exactly as the sim did
+/// (same keys, same payload bytes, the sim's QoS), in recorded order, paced by
+/// [`replay_schedule`]. Commands are not replayed.
 pub fn replay(session: &Session, bag: &BagReader, rate: f64) -> Result<ReplayStats> {
     let mut stats = ReplayStats::default();
-    let mut telemetry = Vec::new();
+    let mut out = Vec::new();
     for message in bag.messages()? {
         match TopicKind::of(&message.topic) {
-            Some(TopicKind::Telemetry(id)) => telemetry.push((id, message)),
+            Some(kind @ (TopicKind::Telemetry(_) | TopicKind::Events)) => out.push((kind, message)),
             Some(TopicKind::Command(_)) => stats.commands += 1,
             None => stats.skipped += 1,
         }
     }
-    let times: Vec<u64> = telemetry.iter().map(|(_, m)| m.publish_time_ns).collect();
+    let times: Vec<u64> = out.iter().map(|(_, m)| m.publish_time_ns).collect();
     let schedule = replay_schedule(&times, rate);
 
-    let mut publisher = TelemetryPublisher::new(session);
+    let mut telemetry = TelemetryPublisher::new(session);
+    let events = EventPublisher::new(session)?;
     let start = Instant::now();
-    for ((id, message), offset) in telemetry.into_iter().zip(schedule) {
+    for ((kind, message), offset) in out.into_iter().zip(schedule) {
         let wait = (start + offset).saturating_duration_since(Instant::now());
         if !wait.is_zero() {
             std::thread::sleep(wait);
         }
-        publisher.publish_raw(id, message.payload)?;
-        stats.telemetry += 1;
+        if let TopicKind::Telemetry(id) = kind {
+            telemetry.publish_raw(id, message.payload)?;
+            stats.telemetry += 1;
+        } else {
+            events.publish_raw(message.payload)?;
+            stats.events += 1;
+        }
     }
     Ok(stats)
 }

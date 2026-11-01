@@ -608,6 +608,7 @@ observability/polish. Phase 4 is the RL payoff.
 | Termination | `astrum-sim/src/systems.rs` (`stop_at_max_time`), `combat/systems.rs` (`end_on_elimination`) |
 | Pacing (`sim.speed`); lockstep wait (`control_rate_hz`) | `astrum-sim/src/systems.rs` (`Pacer`, `pace`); `net.rs` (`ingest_commands`) |
 | Run control (pause / step / speed), status; controller presence | `astrum-sim/src/control.rs` (`RunControl`, `serve_control`, `publish_status`); `net.rs` (`connect`, `Controllers`, `track_controllers`, `HeldCommands`); `astrum-net/src/lib.rs` (`ControlServer`, `PresenceWatcher`), `src/bin/ctl.rs` |
+| Event stream (hits, kills, trigger, mode changes, run end) | `astrum-sim/src/events.rs` (`EventLog`, `publish_events`); emitted in `combat/systems.rs` (`fire_guns`, `resolve_hits`, `on_kill`), `pilot.rs` (`log_mode_changes`), `net.rs` (`Controllers`), `systems.rs` (exit systems); `SimEnv::events`; schema `Event` |
 | In-process recording (`--record`) | `astrum-sim/src/record.rs` (`TickRecorder`, `Recording`) |
 | Sweeps (`astrum-sweep`) | `astrum-sim/src/sweep.rs` (planning, in-process runs, summary), `src/bin/sweep.rs` (process mode) |
 | Wire schema | `astrum-proto/schema/astrum.capnp` (`Telemetry`, `Command`, `Combat`) |
