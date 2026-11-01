@@ -2,12 +2,14 @@
 //! browser-based 3-D replay renderer (`web/`).
 //!
 //! It defines ONE JSON shape per message kind — [`FrameJson`] for telemetry,
-//! [`EventJson`] for `astrum/events` — used by both delivery paths:
+//! [`EventJson`] for `astrum/events`, [`AircraftModel`] for the fleet's JSBSim
+//! models — used by both delivery paths:
 //!
 //! * **live / replay stream** — the `astrum-web` binary ([`server`]) tracks the
 //!   newest telemetry of every aircraft (the live sim *or* `astrum-bag-play`) and
-//!   pushes rate-limited fleet snapshots ([`snapshot_message`]) plus every event
-//!   ([`events_message`]) to every connected browser over WebSocket, while also
+//!   pushes rate-limited fleet snapshots ([`snapshot_message`]), every event
+//!   ([`events_message`]) and the scenario's aircraft models
+//!   ([`models_message`]) to every connected browser over WebSocket, while also
 //!   serving the static renderer.
 //! * **offline export** — the `astrum-web-export` binary ([`export`]) reads an
 //!   MCAP bag and bakes it into a single [`ExportDoc`] the renderer can open with
@@ -19,7 +21,7 @@ pub mod export;
 pub mod server;
 
 use astrum_proto::{Enu, Event, EventKind, Telemetry, VehicleKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The renderer's name for a vehicle class (matches the scenario `kind` field
 /// and the browser's mesh factory).
@@ -250,6 +252,59 @@ pub fn events_message(events: &[Event]) -> String {
         .unwrap_or_else(|e| unreachable!("EventJson serialisation failed: {e}"))
 }
 
+/// One aircraft's JSBSim model as the scenario declares it. Telemetry carries
+/// only the vehicle class, so this is how the renderer learns that, say,
+/// aircraft 1 is an F-16 (and draws the daytime environment for it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AircraftModel {
+    pub id: u32,
+    /// The scenario's `model` string, e.g. `"f16"` or `"c172x"`.
+    pub model: String,
+}
+
+/// The part of a scenario TOML [`aircraft_models`] reads; every other key is
+/// ignored, so scenario schema changes elsewhere cannot break it.
+#[derive(Deserialize)]
+struct ScenarioFleet {
+    #[serde(default)]
+    aircraft: Vec<ScenarioAircraft>,
+}
+
+#[derive(Deserialize)]
+struct ScenarioAircraft {
+    id: Option<u32>,
+    model: Option<String>,
+}
+
+/// The `[[aircraft]]` ids and models of a scenario TOML, sorted by id. Entries
+/// missing either field are skipped; TOML that does not parse (or whose fleet
+/// has the wrong shape) yields none — the renderer then keeps its default look.
+pub fn aircraft_models(scenario_toml: &str) -> Vec<AircraftModel> {
+    let Ok(fleet) = toml::from_str::<ScenarioFleet>(scenario_toml) else { return Vec::new() };
+    let mut models: Vec<AircraftModel> = fleet
+        .aircraft
+        .into_iter()
+        .filter_map(|a| Some(AircraftModel { id: a.id?, model: a.model? }))
+        .collect();
+    models.sort_by_key(|m| m.id);
+    models
+}
+
+/// One live WebSocket message: the fleet's aircraft models.
+#[derive(Serialize)]
+struct ModelsMessage<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    models: &'a [AircraftModel],
+}
+
+/// Encode the fleet's aircraft models as the live stream's message,
+/// `{"type":"models","models":[{"id":1,"model":"f16"}…]}`.
+pub fn models_message(models: &[AircraftModel]) -> String {
+    serde_json::to_string(&ModelsMessage { kind: "models", models })
+        .unwrap_or_else(|e| unreachable!("AircraftModel serialisation failed: {e}"))
+}
+
 /// One exported telemetry sample plus the recorder's receive time.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExportFrame {
@@ -273,6 +328,9 @@ pub struct ExportMeta {
     pub sim_time_end: f64,
     /// The scenario TOML the recorder embedded, if any.
     pub scenario: Option<String>,
+    /// The embedded scenario's aircraft models ([`aircraft_models`]), sorted by
+    /// id; empty without a (parseable) scenario.
+    pub models: Vec<AircraftModel>,
     /// Telemetry or event messages skipped because they failed to decode, or
     /// (telemetry) their payload id disagreed with their topic.
     pub rejected: u64,
@@ -315,6 +373,7 @@ impl ExportDoc {
             })
             .unwrap_or((0.0, 0.0));
         events.sort_by_key(|e| e.tick); // stable: ties keep bag order
+        let models = scenario.as_deref().map(aircraft_models).unwrap_or_default();
         let meta = ExportMeta {
             frames: frames.len() as u64,
             events: events.len() as u64,
@@ -322,6 +381,7 @@ impl ExportDoc {
             sim_time_start,
             sim_time_end,
             scenario,
+            models,
             rejected,
         };
         Self { kind: Self::KIND, version: Self::VERSION, meta, frames, events }

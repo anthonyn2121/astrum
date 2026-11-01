@@ -28,6 +28,8 @@ astrum-bag = { path = "../astrum-bag" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Reads the fleet's JSBSim models out of the scenario TOML.
+toml = { workspace = true }
 # HTTP + WebSocket server on tokio (already in the build via zenoh).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "sync", "time"] }

@@ -5,7 +5,9 @@
 //!    `{"type":"frames","frames":[FrameJson…]}`, at most `--max-hz` per second,
 //!    plus every `astrum/events` event as `{"type":"events","events":[EventJson…]}`
 //!    (in order, never throttled; a browser that connects mid-run gets only the
-//!    events from then on). The upstream is the Zenoh stream, so the source is
+//!    events from then on), plus the scenario's aircraft models as
+//!    `{"type":"models","models":[{"id":1,"model":"f16"}…]}` (on connect and
+//!    whenever they change). The upstream is the Zenoh stream, so the source is
 //!    either the live sim or `astrum-bag-play`. Upgrades from another origin are
 //!    refused.
 //!  * **`GET /tiles/<z>/<x>/<y>.jpg`** — slippy-map tile proxy with a disk cache.
@@ -22,6 +24,10 @@ use astrum_net::{EventReceiver, LatestTelemetry, Selection, Session};
 use astrum_web::server::{self, Config, EVENT_BACKLOG};
 use clap::Parser;
 use tokio::sync::{broadcast, mpsc, watch};
+
+/// How often the scenario is re-fetched, so a restarted sim or replay with
+/// another fleet reaches the browsers within a few seconds.
+const MODELS_POLL: Duration = Duration::from_secs(5);
 
 /// Stream live/replayed telemetry to browsers over WebSocket and serve the
 /// static 3-D renderer, both on one port.
@@ -79,6 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // outside this one. Each pump reports why it stopped through `stopped`.
     let (tx, rx) = watch::channel(None);
     let (events_tx, _) = broadcast::channel(EVENT_BACKLOG);
+    let (models_tx, models_rx) = watch::channel(None);
     let (stopped_tx, mut stopped) = mpsc::unbounded_channel::<String>();
     let connect = cli.connect.clone();
     let pump_events_tx = events_tx.clone();
@@ -86,6 +93,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let result = Session::connect(&connect, wait).and_then(|session| {
             let mut latest = LatestTelemetry::subscribe(&session, Selection::Fleet)?;
             let events = EventReceiver::subscribe(&session)?;
+            let (models_stopped, models_from) = (stopped_tx.clone(), connect.clone());
+            let models_session = session.clone();
+            std::thread::Builder::new()
+                .name("models".into())
+                .spawn(move || {
+                    let e = server::pump_models(&models_session, &models_tx, MODELS_POLL);
+                    let _ = models_stopped.send(format!("scenario from {models_from}: {e}"));
+                })
+                .expect("spawning the models thread");
             let (events_stopped, events_from) = (stopped_tx.clone(), connect.clone());
             let session = session.clone(); // keeps the event subscription's session open
             std::thread::Builder::new()
@@ -112,7 +128,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         format!("{} → cache {}", cfg.tile_url, cfg.tile_cache.display())
     };
     let root = cfg.root.display().to_string();
-    let app = server::router(cfg, rx, events_tx)?;
+    let app = server::router(cfg, rx, events_tx, models_rx)?;
 
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await

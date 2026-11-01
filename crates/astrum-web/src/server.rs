@@ -16,13 +16,20 @@
 //! same socket. A browser gets only the events sent after it connected (no
 //! history); one that falls more than [`EVENT_BACKLOG`] batches behind loses
 //! the oldest of them.
+//!
+//! The fleet's aircraft models are latest-value too, and rarely change:
+//! [`pump_models`] polls the sim's (or replay's) `astrum/scenario` queryable,
+//! encodes its `[[aircraft]]` models as one `{"type":"models",…}` message and
+//! stores it in a second [`watch`] channel only when it differs from the
+//! current one. Each browser gets the current message on connect and every
+//! change after that, on the same socket.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use astrum_net::{EventReceiver, LatestTelemetry, NetError};
+use astrum_net::{fetch_scenario, EventReceiver, LatestTelemetry, NetError, Session};
 use astrum_proto::Telemetry;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
@@ -39,7 +46,7 @@ use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::{events_message, snapshot_message};
+use crate::{aircraft_models, events_message, models_message, snapshot_message};
 
 /// The newest encoded fleet snapshot (`None` until the first one).
 pub type Snapshot = Option<Utf8Bytes>;
@@ -54,6 +61,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 const IDLE_POLL: Duration = Duration::from_secs(1);
 /// Event batches buffered per browser before the slowest one starts losing them.
 pub const EVENT_BACKLOG: usize = 1024;
+/// How long one scenario poll waits for the sim's reply: short, because no
+/// reply simply keeps the models already sent.
+const SCENARIO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -70,6 +80,7 @@ pub struct Config {
 struct AppState {
     telemetry: watch::Receiver<Snapshot>,
     events: broadcast::Sender<Utf8Bytes>,
+    models: watch::Receiver<Option<Utf8Bytes>>,
     tiles: Arc<TileProxy>,
 }
 
@@ -80,12 +91,14 @@ struct TileProxy {
 }
 
 /// Build the service: `GET /telemetry` (WebSocket: fleet snapshots from
-/// `telemetry` and event batches from `events`), `GET /tiles/<z>/<x>/<y>.jpg`,
-/// and every other path served from `cfg.root`.
+/// `telemetry`, event batches from `events` and the newest aircraft-models
+/// message from `models`), `GET /tiles/<z>/<x>/<y>.jpg`, and every other path
+/// served from `cfg.root`.
 pub fn router(
     cfg: Config,
     telemetry: watch::Receiver<Snapshot>,
     events: broadcast::Sender<Utf8Bytes>,
+    models: watch::Receiver<Option<Utf8Bytes>>,
 ) -> reqwest::Result<Router> {
     // Bounded timeouts so an offline upstream fails fast (the renderer then
     // shows the plain grid where the tile would be).
@@ -104,7 +117,7 @@ pub fn router(
         .route("/telemetry", get(telemetry_ws))
         .route("/tiles/{*rest}", get(tile))
         .fallback_service(static_files)
-        .with_state(AppState { telemetry, events, tiles }))
+        .with_state(AppState { telemetry, events, models, tiles }))
 }
 
 /// Whether a WebSocket upgrade may proceed: requests without an `Origin`
@@ -149,17 +162,21 @@ async fn telemetry_ws(
     }
     let rx = state.telemetry.clone();
     let events = state.events.subscribe(); // events from now on
-    ws.on_upgrade(move |socket| stream_snapshots(socket, rx, events))
+    let models = state.models.clone();
+    ws.on_upgrade(move |socket| stream_snapshots(socket, rx, events, models))
 }
 
-/// Forward the newest snapshot and every event batch to one browser until it
-/// leaves.
+/// Forward the newest snapshot, every event batch and the newest models
+/// message to one browser until it leaves.
 async fn stream_snapshots(
     mut socket: WebSocket,
     mut rx: watch::Receiver<Snapshot>,
     mut events: broadcast::Receiver<Utf8Bytes>,
+    mut models: watch::Receiver<Option<Utf8Bytes>>,
 ) {
-    rx.mark_changed(); // send the current snapshot straight away
+    // Send the current snapshot and models straight away.
+    rx.mark_changed();
+    models.mark_changed();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // the first tick is immediate
     loop {
@@ -170,6 +187,17 @@ async fn stream_snapshots(
                 }
                 let snapshot = rx.borrow_and_update().clone();
                 if let Some(text) = snapshot {
+                    if socket.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            changed = models.changed() => {
+                if changed.is_err() {
+                    break; // the pump is gone
+                }
+                let message = models.borrow_and_update().clone();
+                if let Some(text) = message {
                     if socket.send(Message::Text(text)).await.is_err() {
                         break;
                     }
@@ -252,6 +280,40 @@ pub fn pump_events(events: &EventReceiver, tx: &broadcast::Sender<Utf8Bytes>) ->
         let mut batch = vec![first];
         batch.extend(events.drain());
         let _ = tx.send(Utf8Bytes::from(events_message(&batch)));
+    }
+}
+
+/// Keep `tx` holding the fleet's aircraft-models message: ask `session` for the
+/// scenario at once and then every `poll`, and store a new message only when
+/// it differs from the current one, so browsers hear of the fleet once per
+/// change (a restarted sim or replay may fly another scenario). A poll nobody
+/// answers — no sim yet, or between replays — keeps the last message; so does
+/// a reply that is not UTF-8.
+///
+/// Blocking — run it on a dedicated thread. Runs until the transport fails and
+/// returns that error.
+pub fn pump_models(
+    session: &Session,
+    tx: &watch::Sender<Option<Utf8Bytes>>,
+    poll: Duration,
+) -> NetError {
+    loop {
+        let asked = Instant::now();
+        match fetch_scenario(session, SCENARIO_TIMEOUT) {
+            Ok(Some(scenario)) => {
+                let message = models_message(&aircraft_models(&scenario));
+                tx.send_if_modified(|current| {
+                    if current.as_ref().is_some_and(|c| c.as_str() == message) {
+                        return false;
+                    }
+                    *current = Some(Utf8Bytes::from(message));
+                    true
+                });
+            }
+            Ok(None) | Err(NetError::BadScenario(_)) => {}
+            Err(e) => return e,
+        }
+        std::thread::sleep(poll.saturating_sub(asked.elapsed()));
     }
 }
 

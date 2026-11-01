@@ -8,7 +8,7 @@ use astrum_proto::{
     Event, EventKind, ModeReason, RawActuators, Telemetry, VehicleKind,
 };
 use astrum_web::export::export_bag;
-use astrum_web::{EventFields, ExportDoc};
+use astrum_web::{AircraftModel, EventFields, ExportDoc};
 
 const DT: f64 = 1.0 / 120.0;
 
@@ -31,7 +31,9 @@ fn event(tick: u64, kind: EventKind) -> Event {
 fn export_keeps_every_telemetry_frame_and_event_and_summarises_the_bag() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("run.mcap");
-    let scenario = "[world]\norigin_lat_deg = 37.6\n";
+    let scenario = "[world]\norigin_lat_deg = 37.6\n\n\
+                    [[aircraft]]\nid = 7\nmodel = \"f450\"\nkind = \"multirotor\"\n\n\
+                    [[aircraft]]\nid = 1\nmodel = \"f16\"\nkind = \"fixed-wing\"\n";
 
     let mut w = BagWriter::create(&path, Some(scenario)).unwrap();
     let mut log_ns = 1_700_000_000_000_000_000u64;
@@ -111,6 +113,13 @@ fn export_keeps_every_telemetry_frame_and_event_and_summarises_the_bag() {
     assert!((doc.meta.sim_time_start - 10.0 * DT).abs() < 1e-12);
     assert!((doc.meta.sim_time_end - 59.0 * DT).abs() < 1e-12);
     assert_eq!(doc.meta.scenario.as_deref(), Some(scenario));
+    assert_eq!(
+        doc.meta.models,
+        [
+            AircraftModel { id: 1, model: "f16".to_owned() },
+            AircraftModel { id: 7, model: "f450".to_owned() }
+        ]
+    );
 
     let first = &doc.frames[0].frame;
     assert_eq!((first.id, first.tick, first.kind), (1, 10, "fixed-wing"));
@@ -149,6 +158,10 @@ fn export_keeps_every_telemetry_frame_and_event_and_summarises_the_bag() {
     assert_eq!(json["kind"], "astrum-replay");
     assert_eq!(json["version"], 3);
     assert_eq!(json["meta"]["events"], 7);
+    assert_eq!(
+        json["meta"]["models"],
+        serde_json::json!([{"id": 1, "model": "f16"}, {"id": 7, "model": "f450"}])
+    );
     assert_eq!(json["frames"][0]["id"], 1);
     assert!(json["frames"][0]["log_time_ns"].is_u64());
     let events = &json["events"];
@@ -182,4 +195,5 @@ fn export_of_a_bag_without_telemetry_or_scenario_is_empty() {
     assert!(doc.meta.aircraft.is_empty());
     assert_eq!((doc.meta.sim_time_start, doc.meta.sim_time_end), (0.0, 0.0));
     assert_eq!(doc.meta.scenario, None);
+    assert!(doc.meta.models.is_empty());
 }

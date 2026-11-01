@@ -495,11 +495,27 @@ gap is capped at 5 s; `ASTRUM_REPLAY_RATE`), `--listen` (`ASTRUM_ZENOH_LISTEN`),
 ## 3-D replay renderer (`astrum-web` + `web/`)
 
 A browser-based renderer visualises the fleet on the ENU grid — procedurally-generated F-16-style
-jet and F450 quad meshes (no external model assets), tinted per vehicle class and per id, oriented
-from the telemetry attitude, with motion trails, orbit + follow cameras, a playback transport
-(play/pause/scrub/speed), per-aircraft readouts (including team, HP and ammo), hit and kill markers
-on the timeline (hover for who hit whom, click to jump) with a flash in the scene where each struck,
-and, for fixed-wing fleets, a slippy-map ground layer. Three.js is vendored under `web/vendor/`.
+jet and F450 quad meshes (no external model assets), tinted per vehicle class and per id (per team,
+two-tone, in the F-16 daytime view), oriented from the telemetry attitude, with motion trails and
+altitude drop lines. Aircraft stay legible: a constant-width silhouette outline (also through
+clouds, where a ghost of the jet shows too), corner brackets around the selection instead of
+anything drawn over it, name tags lifted clear of the model, at least 36 px on screen at any range,
+and a toolbar **Size** slider for the close-range exaggeration (1× = true size, default 4×).
+Docked panels surround the 3-D view: a **fleet** list grouped by team (control mode, hit points,
+destroyed / no-data state), an **aircraft** inspector (key flight values, attitude, combat state,
+position, and — with a target pinned — range, closure, ATA, aspect and relative altitude, using the
+dogfight env's definitions), a filterable **event log** (click to seek), and a **plot** dock of
+uPlot time series for the selection and its target that follows the playhead (click to seek, drag
+to zoom). Cameras: orbit, follow, chase (padlocked on the target), top-down and side-on; a compass
+and scale bar track the view. The transport plays, pauses, scrubs and sets speed, with hit and kill
+markers on the timeline (hover for who hit whom, click to jump) and a flash in the scene where each
+struck. When the fleet includes an F-16 (scenario model `f16*`, from the bridge's `models` message
+or the export's `meta.models`), the view turns to daytime — a sky with sun, a cumulus deck and
+cirrus — over aerial imagery streamed for the ground below the camera out to ~150 km, placed on the
+curved WGS84 surface; every other platform keeps the dark ENU grid. Presentation mode
+(`P`) hides the panels and shows a kill feed; `?` lists the keyboard shortcuts. Docks, overlays,
+plot channels and event filters persist in `localStorage`. Three.js and uPlot are vendored under
+`web/vendor/`.
 
 Both data paths feed one JSON frame shape (`astrum_web::FrameJson`) and one event shape
 (`astrum_web::EventJson`, see [Events](#events)), so the live stream and an offline export can't
@@ -510,7 +526,7 @@ drift:
 make replay          # docker compose up -d sim replay
 # (the bridge equally serves a bag being replayed by astrum-bag-play)
 
-# OFFLINE — bake an MCAP bag into one JSON the renderer opens with "Open file…" (no services)
+# OFFLINE — bake an MCAP bag into one JSON the renderer opens via Source ▸ "Open export file…" (no services)
 make export BAG=recordings/session.mcap OUT=recordings/session.json
 ```
 
@@ -518,14 +534,18 @@ make export BAG=recordings/session.mcap OUT=recordings/session.json
 snapshot of the whole fleet at most `--max-hz` times per second (default 30), fanned out to every
 browser over the WebSocket `GET /telemetry` (a slow browser skips to the newest snapshot). Events
 are never dropped or throttled: each batch goes to every browser as `{"type":"events","events":[…]}`
-on the same socket, from the moment it connected. WebSocket
+on the same socket, from the moment it connected. The fleet's JSBSim models, which telemetry does
+not carry, come from the sim's (or `astrum-bag-play`'s) `astrum/scenario` reply, polled every 5 s:
+each browser gets `{"type":"models","models":[{"id":1,"model":"f16"},…]}` (sorted by id) on
+connect once known, and again whenever the fleet changes. WebSocket
 upgrades whose `Origin` does not match the request's `Host` are rejected. The same port serves the static `web/` app and
 the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags: `--connect` (default `tcp/127.0.0.1:7447`),
 `--bind` (default `127.0.0.1:8080`; compose binds 0.0.0.0 inside the container and publishes on
 host loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache` — each with an
 `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback. `astrum-web-export` takes
 the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,
-`events`, and `meta` with their counts) to `--out` (env fallbacks `ASTRUM_BAG` /
+`events`, and `meta` with their counts, the embedded `scenario` TOML and its aircraft `models`
+as `[{"id","model"},…]`, `[]` without a scenario) to `--out` (env fallbacks `ASTRUM_BAG` /
 `ASTRUM_WEB_EXPORT`). Version 2 exports still open (without events); v1 JSON exports are not
 readable by the current renderer.
 

@@ -323,7 +323,7 @@ healthcheck.
 http://localhost:8080 to see every aircraft on the ENU grid (orbit/follow cameras, trails,
 playback transport). It works against a *live* sim or a bag being replayed by `astrum-bag-play`
 (both listen on the endpoint the bridge connects to). For an offline, service-free view,
-bake an MCAP bag to JSON and drag it onto the page (or use "Open file…"):
+bake an MCAP bag to JSON and drag it onto the page (or use Source ▸ "Open export file…"):
 
 ```bash
 docker compose --profile record up recorder           # record to recordings/session.mcap
@@ -332,19 +332,30 @@ make export BAG=recordings/session.mcap OUT=out.json  # MCAP → astrum-replay (
 make down                                             # stop the sim + renderer
 ```
 
-The renderer is static files under `web/` (Three.js vendored in `web/vendor/`; the modules
-live in `web/js/`); the bridge and exporter are the two binaries in `crates/astrum-web/`, both
-projecting telemetry through the one `astrum_web::FrameJson` shape. The bridge sends one
-batched snapshot of the fleet at most `--max-hz` (default 30) times per second.
+The renderer is static files under `web/` (Three.js and uPlot vendored in `web/vendor/`; the
+modules live in `web/js/`: `main.js` owns playback and selection state, `store.js` the timeline,
+`scene.js`/`meshes.js` the 3-D view, `ui.js` the shell and transport, `fleet.js`, `inspector.js`,
+`eventlog.js` and `plots.js` the docks, `geometry.js` the relative geometry); the bridge and
+exporter are the two binaries in `crates/astrum-web/`, both projecting telemetry through the one
+`astrum_web::FrameJson` shape. The bridge sends one batched snapshot of the fleet at most
+`--max-hz` (default 30) times per second. Telemetry carries only the vehicle class, so the bridge
+also polls `astrum/scenario` every 5 s and sends each aircraft's JSBSim model
+(`{"type":"models","models":[{"id","model"}…]}`) on connect and whenever it changes; exports carry
+the same list as `meta.models`.
 
-**Ground map.** For **fixed-wing** fleets — which fly a real geographic route — the renderer lays a
-slippy-map (XYZ / Web-Mercator) aerial layer flat under the aircraft, centred on the scenario's ENU
-datum. Multirotor and idle views keep the plain ENU grid. Tiles are served by `astrum-web` at
-`/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every tile under
-`tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling, and an area
-viewed once while online works **offline** afterward; a tile that 404s (offline + uncached) is
-skipped and the grid shows through. Compose passes `ASTRUM_TILE_URL`, `ASTRUM_TILE_CACHE` and
-`ASTRUM_WEB_MAX_HZ` through from your shell when set:
+**Ground map and sky.** Only when the fleet includes an **F-16** (a scenario `model` starting with
+`f16`; the bridge polls the sim's scenario and sends `{"type":"models",…}`, exports carry
+`meta.models`) does the renderer switch to daytime: a sky dome with the sun, a drifting cumulus deck
+(~1.8 km) and cirrus (~9 km), haze fog, and slippy-map (XYZ / Web-Mercator) aerial imagery streamed
+in level-of-detail rings around the ground point below the camera — fine tiles near it, coarser
+ones out to ~150 km — each tile placed at its exact WGS84 position in the scenario's ENU frame, so
+the map follows the Earth's curvature and stays under the aircraft however far they fly. Every other
+platform (c172x, F450, unknown) keeps the dark ENU grid with no map. Tiles are served by
+`astrum-web` at `/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every
+tile under `tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling,
+and an area viewed once while online works **offline** afterward; a tile that 404s (offline +
+uncached) is skipped and the coarser level or the haze shows through. Compose passes
+`ASTRUM_TILE_URL`, `ASTRUM_TILE_CACHE` and `ASTRUM_WEB_MAX_HZ` through from your shell when set:
 
 ```bash
 # Default: Esri World Imagery (global aerial, no key). Point elsewhere with:

@@ -1,22 +1,41 @@
 // Telemetry sources for the renderer.
 //
 //  * WebSocket — the `astrum-web` bridge streams fleet snapshots,
-//    `{"type":"frames","frames":[FrameJson…]}`, and run events,
+//    `{"type":"frames","frames":[FrameJson…]}`, run events,
 //    `{"type":"events","events":[EventJson…]}`, from the live sim or
-//    `astrum-bag-play`. The store buffers them so you can scrub back through
-//    what's been received (events only from when this page connected).
+//    `astrum-bag-play`, and each aircraft's JSBSim model from the scenario,
+//    `{"type":"models","models":[{"id","model"}…]}` (on connect and on change).
+//    The store buffers frames and events so you can scrub back through what's
+//    been received (events only from when this page connected).
 //  * File — an `astrum-web-export` document (a whole bag baked to JSON). Loaded
-//    whole, giving a fully seekable timeline with no running services.
+//    whole, giving a fully seekable timeline with no running services; its
+//    `meta.models` names the models.
 
 // The export documents this viewer reads (astrum_web::ExportDoc): version 3 has
 // `events`; version 2 predates them (opened with none).
 const EXPORT_KIND = "astrum-replay";
 const EXPORT_VERSIONS = [2, 3];
 
+// Longest model name accepted (JSBSim model directory names are short).
+const MODEL_MAX_LEN = 64;
+
+// Validate a `[{ id, model }]` list (untrusted) into a Map id -> model name.
+export function parseModels(list) {
+  const out = new Map();
+  if (!Array.isArray(list)) return out;
+  for (const m of list) {
+    if (!m || !Number.isInteger(m.id) || m.id < 0 || m.id > 0xffffffff) continue;
+    if (typeof m.model !== "string" || !m.model || m.model.length > MODEL_MAX_LEN) continue;
+    out.set(m.id, m.model);
+  }
+  return out;
+}
+
 export class Net {
-  constructor({ onFrames, onEvents, onStatus }) {
+  constructor({ onFrames, onEvents, onModels, onStatus }) {
     this.onFrames = onFrames;
     this.onEvents = onEvents || (() => {});
+    this.onModels = onModels || (() => {});
     this.onStatus = onStatus || (() => {});
     this.ws = null;
   }
@@ -48,6 +67,7 @@ export class Net {
       if (!msg) return;
       if (msg.type === "frames" && Array.isArray(msg.frames)) this.onFrames(msg.frames);
       else if (msg.type === "events" && Array.isArray(msg.events)) this.onEvents(msg.events);
+      else if (msg.type === "models") this.onModels(parseModels(msg.models));
     };
   }
 
@@ -71,7 +91,8 @@ export function defaultWsUrl() {
   return `${proto}//${host}/telemetry`;
 }
 
-// Parse an astrum-web-export document. Returns { frames, events, meta } or throws.
+// Parse an astrum-web-export document. Returns { frames, events, meta, models }
+// (models: Map id -> JSBSim model, empty for exports without them) or throws.
 export async function loadExportFile(file) {
   let doc;
   try {
@@ -86,9 +107,11 @@ export async function loadExportFile(file) {
     const newest = EXPORT_VERSIONS[EXPORT_VERSIONS.length - 1];
     throw new Error(`unsupported export version ${String(doc.version)} (this viewer reads versions ${EXPORT_VERSIONS.join(", ")}; re-export the bag for version ${newest})`);
   }
+  const meta = doc.meta && typeof doc.meta === "object" ? doc.meta : null;
   return {
     frames: doc.frames,
     events: Array.isArray(doc.events) ? doc.events : [],
-    meta: doc.meta && typeof doc.meta === "object" ? doc.meta : null,
+    meta,
+    models: parseModels(meta?.models),
   };
 }

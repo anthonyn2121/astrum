@@ -2,6 +2,7 @@
   --bg: #0a0e14;
   --panel: rgba(16, 22, 32, 0.82);
   --panel-solid: #101620;
+  --panel-raised: #151d2a;
   --line: rgba(90, 130, 170, 0.22);
   --text: #dbe4ef;
   --muted: #7d8da0;
@@ -9,9 +10,12 @@
   --accent-dim: #2b3a4e;
   --live: #ff5a4d;
   --ok: #46d38a;
+  --warn: #ffb547;
+  --radius: 8px;
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 html, body {
   margin: 0;
@@ -22,50 +26,89 @@ html, body {
   font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
-#view { position: fixed; inset: 0; }
-
-/* Idle splash: the full logo, centred over the canvas, fading out once the
-   first telemetry frame arrives (main.js toggles .hidden on the fleet state).
-   Sits behind the HUD panels (later in the DOM) and never eats pointer events. */
-#splash {
-  position: fixed; inset: 0; display: grid; place-items: center;
-  pointer-events: none; transition: opacity 0.6s ease;
-}
-#splash img { width: min(520px, 46vw); height: auto; opacity: 0.92; }
-#splash.hidden { opacity: 0; }
-
-/* Panels float over the canvas; only they capture pointer events. */
-#topbar, #fleet, #readout, #transport, #toggles, #dropHint { pointer-events: none; }
-#topbar *, #fleet *, #readout *, #transport *, #toggles * { pointer-events: auto; }
-
 button, input, select {
   font: inherit;
   color: var(--text);
   background: var(--accent-dim);
   border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 5px 10px;
+  border-radius: 6px;
+  padding: 4px 10px;
   cursor: pointer;
 }
-button:hover, select:hover { border-color: var(--accent); }
-input[type="text"] { background: rgba(0,0,0,0.35); cursor: text; min-width: 220px; }
+button:hover:not(:disabled), select:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.4; cursor: default; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, .ev-list:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+button.icon { width: 34px; padding: 4px 0; text-align: center; }
+button.mini { padding: 1px 7px; font-size: 12px; border-radius: 5px; background: transparent; }
+button.mini[aria-pressed="true"] { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+input[type="text"], input[type="search"] { background: rgba(0,0,0,0.35); cursor: text; }
+kbd {
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 2px 5px; border-radius: 4px; border: 1px solid var(--line); background: var(--panel-raised);
+}
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+/* Segmented control: a row of toggle buttons sharing one border. */
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg > button { border: 0; border-radius: 0; background: transparent; padding: 4px 10px; }
+.seg > button + button { border-left: 1px solid var(--line); }
+.seg > button:hover { background: rgba(74,163,255,0.10); }
+.seg > button[aria-pressed="true"] { background: var(--accent-dim); color: var(--accent); }
+
+/* ---- Layout grid ---- */
+/* The docks are real grid cells, not overlays, so the 3-D view (and its camera
+   framing) is exactly the area left between them. Hiding a dock zeroes its
+   track; presentation mode zeroes them all. */
+#app {
+  --fleet-w: 248px;
+  --ins-w: 308px;
+  /* --plots-size is the user's dragged height (set inline by ui.js); hiding
+     the dock or presenting overrides --plots-h regardless. */
+  --plots-default: 216px;
+  --plots-h: var(--plots-size, var(--plots-default));
+  position: fixed; inset: 0;
+  display: grid;
+  grid-template-columns: var(--fleet-w) minmax(0, 1fr) var(--ins-w);
+  grid-template-rows: 44px minmax(0, 1fr) var(--plots-h) 48px;
+  grid-template-areas:
+    "top top top"
+    "fleet stage ins"
+    "plots plots plots"
+    "transport transport transport";
+}
+@media (max-width: 1280px) { #app { --fleet-w: 220px; --ins-w: 284px; } }
+@media (max-height: 780px) { #app { --plots-default: 160px; } }
+#app.no-fleet { --fleet-w: 0px; }
+#app.no-inspector { --ins-w: 0px; }
+#app.no-plots { --plots-h: 0px; }
+#app.no-fleet #fleet, #app.no-inspector #inspector, #app.no-plots #plots { display: none; }
+
+#topbar { grid-area: top; }
+#fleet { grid-area: fleet; border-right: 1px solid var(--line); }
+#stage { grid-area: stage; }
+#inspector { grid-area: ins; border-left: 1px solid var(--line); }
+#plots { grid-area: plots; border-top: 1px solid var(--line); }
+#transport { grid-area: transport; }
 
 /* ---- Top bar ---- */
 #topbar {
-  position: fixed; top: 0; left: 0; right: 0; height: 48px;
-  display: flex; align-items: center; gap: 16px; padding: 0 14px;
-  background: linear-gradient(180deg, rgba(10,14,20,0.92), rgba(10,14,20,0.55));
-  border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 14px; padding: 0 12px; min-width: 0;
+  background: var(--panel-solid); border-bottom: 1px solid var(--line);
 }
-.brand { font-weight: 700; letter-spacing: 0.5px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.brand { font-weight: 700; letter-spacing: 0.5px; font-size: 15px; display: flex; align-items: center; gap: 8px; flex: none; }
 .brand em { color: var(--muted); font-style: normal; font-weight: 500; }
-.brand .mark { height: 28px; width: auto; display: block; }
-.source { display: flex; align-items: center; gap: 8px; }
-.source-controls { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.brand .mark { height: 26px; width: auto; display: block; }
+.source { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.source-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex: none; }
 
 .pill {
-  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  display: inline-block; padding: 2px 9px; border-radius: 999px; flex: none;
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;
   border: 1px solid var(--line);
 }
@@ -75,79 +118,343 @@ input[type="text"] { background: rgba(0,0,0,0.35); cursor: text; min-width: 220p
 .pill.file { color: var(--bg); background: var(--accent); border-color: var(--accent); }
 .pill.closed, .pill.error { color: var(--live); border-color: #ff5a4d55; }
 
-/* ---- Side panels ---- */
-/* Bottom 110px stay clear for the transport (58px) and the toggle row above it,
-   so a tall readout never runs under the toggles on a laptop-height window. */
-aside {
-  position: fixed; width: 230px; max-height: calc(100vh - 170px);
-  background: var(--panel); backdrop-filter: blur(8px);
-  border: 1px solid var(--line); border-radius: 12px;
-  overflow: hidden auto;
-}
-#fleet { left: 12px; top: 60px; }
-#readout { right: 12px; top: 60px; width: 250px; }
-#readout.hidden { display: none; }
+#presentBtn[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
 
-.panel-title {
-  position: sticky; top: 0;
-  padding: 10px 12px; font-weight: 700; letter-spacing: 0.3px;
-  background: var(--panel-solid); border-bottom: 1px solid var(--line);
+/* Popover menus anchored under their button. */
+.menu-wrap { position: relative; }
+.popover {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30;
+  width: 340px; padding: 12px;
+  background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.45);
 }
+.pop-title {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); margin: 0 0 6px;
+}
+.pop-title:not(:first-child) { margin-top: 14px; }
+.pop-row { display: flex; gap: 6px; }
+.pop-row input { flex: 1; min-width: 0; }
+.pop-note { margin: 8px 0 0; font-size: 12px; }
+.keys { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 0; align-items: center; }
+.keys dt { white-space: nowrap; }
+.keys dd { margin: 0; color: var(--muted); }
+
+/* ---- Docks ---- */
+.dock {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
+  background: var(--panel-solid);
+}
+.dock-head {
+  display: flex; align-items: center; gap: 8px; flex: none;
+  min-height: 36px; padding: 6px 12px; border-bottom: 1px solid var(--line);
+}
+.dock-title { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.dock-body { flex: 1; min-height: 0; overflow: hidden auto; }
+.dock-tools { padding: 8px 10px 0; flex: none; }
+.dock-tools input { width: 100%; }
+.dock-empty { padding: 14px 12px; }
+.dock-foot { flex: none; margin-top: auto; padding: 7px 12px; border-top: 1px solid var(--line); font-size: 11px; }
 .badge {
-  float: right; background: var(--accent-dim); color: var(--text);
-  border-radius: 6px; padding: 0 7px; font-weight: 600; font-size: 12px;
+  margin-left: auto; background: var(--accent-dim); color: var(--text);
+  border-radius: 6px; padding: 0 7px; font-weight: 600; font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.swatch { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--muted); }
+.pin-glyph { color: var(--live); }
+
+/* ---- Fleet ---- */
+#fleetList { padding: 6px; }
+#fleetList:empty { display: none; }
+.team-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  margin-top: 4px; padding: 5px 6px; border: 0; background: transparent; border-radius: 6px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted);
+}
+.team-head:first-child { margin-top: 0; }
+.team-head:hover { background: rgba(74,163,255,0.08); }
+.team-head .chev { width: 10px; transition: transform 0.15s; }
+.team-head[aria-expanded="false"] .chev { transform: rotate(-90deg); }
+.team-dot { width: 8px; height: 8px; border-radius: 2px; }
+.team-head .team-count { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; letter-spacing: 0; }
+
+.frow {
+  display: grid; grid-template-columns: 10px 30px 14px 34px minmax(0, 1fr) 22px; align-items: center; gap: 6px;
+  padding: 5px 6px; border-radius: 6px; cursor: pointer; user-select: none;
+}
+.frow:hover { background: rgba(74,163,255,0.10); }
+.frow.sel { background: rgba(74,163,255,0.20); box-shadow: inset 0 0 0 1px var(--accent); }
+.frow.tgt { box-shadow: inset 0 0 0 1px var(--live); }
+.frow .fid { font-weight: 700; font-variant-numeric: tabular-nums; }
+.frow .glyph { font-size: 12px; opacity: 0.8; text-align: center; }
+.frow.dead .fid { text-decoration: line-through; color: var(--muted); }
+.frow.dead .swatch, .frow.stale .swatch { opacity: 0.35; }
+.frow.stale .fid, .frow.stale .glyph { color: var(--muted); }
+.frow .status { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.frow .fcell { min-width: 0; }
+.frow.dead .status { color: var(--live); }
+.frow .pin {
+  width: 22px; height: 20px; padding: 0; border: 0; background: transparent; color: var(--muted);
+  opacity: 0; font-size: 13px; line-height: 1;
+}
+.frow:hover .pin, .frow .pin:focus-visible { opacity: 1; }
+.frow.tgt .pin { opacity: 1; color: var(--live); }
+
+.mode-chip {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-align: center;
+  padding: 1px 0; border-radius: 4px; background: var(--accent-dim); color: var(--muted);
+}
+.mode-chip.autopilot, .mode-chip.raw { color: var(--ok); }
+.mode-chip.failsafe { color: var(--live); }
+
+.hp { position: relative; display: block; height: 6px; border-radius: 3px; background: rgba(125,141,160,0.22); overflow: hidden; }
+.hp-fill { position: absolute; inset: 0 auto 0 0; width: 100%; border-radius: 3px; background: var(--ok); }
+.hp-fill.mid { background: var(--warn); }
+.hp-fill.low { background: var(--live); }
+
+/* ---- Stage (3-D view + overlays) ---- */
+#stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg); }
+#view { position: absolute; inset: 0; }
+#view canvas { display: block; }
+.overlay { position: absolute; z-index: 5; }
+
+#splash {
+  position: absolute; inset: 0; z-index: 6;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+  pointer-events: none; transition: opacity 0.4s ease;
+}
+#splash img { width: min(440px, 52%); height: auto; opacity: 0.92; }
+#splash.hidden { opacity: 0; visibility: hidden; transition: opacity 0.4s ease, visibility 0s 0.4s; }
+.empty-card {
+  pointer-events: auto; display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 14px 18px; max-width: min(460px, 90%); text-align: center;
+  background: var(--panel); backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.empty-actions { display: flex; gap: 8px; }
+
+#sceneToolbar {
+  top: 10px; left: 10px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  max-width: calc(100% - 100px);
+}
+#sceneToolbar button { font-size: 12px; padding: 3px 9px; }
+#sceneToolbar .seg, #sceneToolbar > button, #sceneToolbar .size-ctl { background: var(--panel); backdrop-filter: blur(8px); }
+#sceneToolbar .size-ctl {
+  display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px;
+  border: 1px solid var(--line); border-radius: 6px; font-size: 12px; color: var(--muted);
+}
+#sizeRange { width: 84px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); }
+#sizeValue { min-width: 26px; color: var(--text); font-variant-numeric: tabular-nums; }
+
+#compass { top: 10px; right: 10px; width: 58px; height: 58px; pointer-events: none; }
+#compass svg { width: 100%; height: 100%; display: block; }
+.compass-ring { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
+.compass-north { fill: var(--live); }
+.compass-south { fill: var(--muted); opacity: 0.6; }
+.compass-n { fill: var(--text); font-size: 8px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; }
+
+#scaleBar { left: 12px; bottom: 30px; display: flex; align-items: flex-end; gap: 6px; pointer-events: none; }
+.scale-line { height: 6px; border: 2px solid var(--text); border-top: 0; opacity: 0.8; }
+#scaleLabel { font-size: 11px; font-variant-numeric: tabular-nums; text-shadow: 0 1px 2px #000; }
+
+#sceneMeta {
+  right: 8px; bottom: 6px; display: flex; gap: 10px; align-items: center;
+  font-size: 11px; color: rgba(200,214,230,0.6); pointer-events: none; user-select: none;
+}
+#mapAttribution { background: rgba(10,14,20,0.5); padding: 1px 6px; border-radius: 4px; }
+#fps { font-variant-numeric: tabular-nums; min-width: 44px; text-align: right; }
+
+/* Kill feed: presentation mode only (the event log covers debugging). */
+#killFeed {
+  display: none; top: 78px; right: 12px; margin: 0; padding: 0; list-style: none;
+  flex-direction: column; align-items: flex-end; gap: 6px; pointer-events: none;
+}
+#killFeed li {
+  display: flex; align-items: center; gap: 8px; padding: 5px 11px; font-weight: 700;
+  background: var(--panel); backdrop-filter: blur(8px); border: 1px solid var(--line); border-left: 3px solid var(--live);
+  border-radius: 6px; font-variant-numeric: tabular-nums; animation: kf-in 0.25s ease-out;
+}
+#killFeed li.fade { opacity: 0; transition: opacity 0.8s; }
+#killFeed .kf-x { color: var(--live); }
+@keyframes kf-in { from { transform: translateX(16px); opacity: 0; } }
+
+#presentHint {
+  display: none; top: 14px; left: 50%; transform: translateX(-50%);
+  padding: 6px 12px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line);
+  pointer-events: none; opacity: 0; transition: opacity 0.5s;
+}
+#presentHint.show { opacity: 1; }
+
+/* ---- Inspector ---- */
+#inspector { overflow: hidden auto; }
+#inspector .dock-head { flex-wrap: wrap; row-gap: 4px; }
+#inspector .dock-title { display: flex; align-items: baseline; gap: 6px; }
+#insId { font-size: 16px; color: var(--text); letter-spacing: 0; }
+.ins-tags { margin-left: auto; display: flex; gap: 4px; }
+.tag {
+  padding: 2px 6px; border-radius: 5px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; background: var(--accent-dim); color: var(--accent);
+}
+.tag.autopilot, .tag.raw { color: var(--ok); }
+.tag.failsafe, .tag.dead { color: var(--live); }
+.tag.uncommanded, .tag.unknown, .tag.stale { color: var(--muted); }
+
+.ins-body { flex: none; }
+.ins-body.stale .hv, .ins-body.stale .att-row { opacity: 0.5; }
+.ins-section { padding: 10px 12px; border-bottom: 1px solid var(--line); flex: none; }
+.sec-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.sec-title { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.sec-actions { margin-left: auto; display: flex; gap: 4px; }
+#tgtId { color: var(--text); font-size: 13px; letter-spacing: 0; }
+
+.hero-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; }
+.hero { display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; column-gap: 4px; }
+.hk { font-size: 10px; font-weight: 700; letter-spacing: 0.06em; color: var(--muted); }
+.hero .hk { grid-column: 1 / -1; }
+.hv { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.hu { font-size: 11px; color: var(--muted); align-self: end; padding-bottom: 2px; }
+
+.att-row, .combat-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin-top: 10px; font-variant-numeric: tabular-nums;
+}
+.team-chip { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 5px; border: 1px solid currentColor; }
+.hp-wrap { flex: 1; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.hp-wrap .hp { flex: 1; }
+.hp-text { font-size: 12px; white-space: nowrap; }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+#tgtBody dd { font-weight: 600; }
+
+#posSection summary {
+  cursor: pointer; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); list-style: none;
+}
+#posSection summary::before { content: "▸ "; }
+#posSection[open] summary::before { content: "▾ "; }
+#posSection[open] summary { margin-bottom: 8px; }
+
+/* Events: fills the rest of the inspector; the list is virtual (fixed rows). */
+.events { flex: 1 0 200px; display: flex; flex-direction: column; min-height: 200px; border-bottom: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.chips button { font-size: 11px; padding: 1px 8px; border-radius: 999px; background: transparent; color: var(--muted); }
+.chips button[aria-pressed="true"] { background: var(--accent-dim); color: var(--text); }
+.ev-list { position: relative; flex: 1; min-height: 0; overflow: hidden auto; margin: 0 -6px; outline-offset: -2px; }
+.ev-row {
+  position: absolute; left: 0; right: 0; height: 24px;
+  display: grid; grid-template-columns: 48px 42px minmax(0, 1fr); align-items: center; gap: 6px;
+  padding: 0 6px; border-radius: 5px; cursor: pointer; white-space: nowrap; font-size: 12px;
+}
+.ev-row:hover { background: rgba(74,163,255,0.10); }
+.ev-row.future { opacity: 0.45; }
+.ev-row.current { background: rgba(74,163,255,0.18); }
+.ev-row .ev-t { color: var(--muted); font-variant-numeric: tabular-nums; }
+.ev-row .ev-text { overflow: hidden; text-overflow: ellipsis; }
+.ev-kind { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-align: center; border-radius: 4px; padding: 1px 0; background: var(--accent-dim); }
+.ev-kind.hit { color: var(--warn); }
+.ev-kind.kill { color: var(--live); }
+.ev-kind.trigger { color: var(--muted); }
+.ev-kind.mode { color: var(--accent); }
+.ev-kind.ctrl { color: var(--ok); }
+.ev-kind.run { color: var(--text); }
+
+/* ---- Plots (js/plots.js) ----
+   Chips + "+ Channel" in the dock header, one row per channel in the body
+   (readout column + uPlot chart), and the channel menu, which lives on <body>
+   (#plotsMenu) so the dock can't clip it. */
+#plots { position: relative; }
+.dock-resize { position: absolute; left: 0; right: 0; top: 0; height: 5px; cursor: ns-resize; z-index: 4; }
+.dock-resize:hover, .dock-resize.drag { background: rgba(74,163,255,0.35); }
+#plots .dock-head { min-height: 34px; padding: 4px 12px; }
+#plotsToolbar {
+  flex: 1; display: flex; align-items: center; gap: 6px;
+  min-width: 0; overflow-x: auto; scrollbar-width: none;
+}
+#plotsToolbar::-webkit-scrollbar { display: none; }
+#plots .plots-chips { display: flex; gap: 4px; }
+#plots .plots-chip {
+  display: inline-flex; align-items: center; gap: 2px;
+  height: 20px; padding: 0 2px 0 8px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--accent-dim); color: var(--text);
+  font-size: 11px; white-space: nowrap;
+}
+#plots .plots-chip.is-relative { border-color: rgba(255, 90, 77, 0.45); }
+#plots .plots-chip-x {
+  width: 16px; height: 16px; padding: 0;
+  border: 0; border-radius: 50%; background: transparent;
+  color: var(--muted); font-size: 13px; line-height: 16px; text-align: center;
+}
+#plots .plots-chip-x:hover { color: var(--text); background: rgba(255, 255, 255, 0.08); }
+#plots .plots-add { white-space: nowrap; border-style: dashed; color: var(--muted); }
+#plots .plots-add:hover:not(:disabled), #plots .plots-add[aria-expanded="true"] { color: var(--text); }
+
+/* Rows split the body height (min 70 px each); beyond that the body scrolls.
+   The gutter is always reserved so a scrollbar appearing doesn't resize every
+   chart (and re-trigger the resize observer). */
+#plotsBody {
+  flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto;
+  scrollbar-gutter: stable; scrollbar-width: thin;
+}
+#plots .plots-hint { margin: 0; padding: 14px 12px; color: var(--muted); font-size: 12px; }
+#plots .plot-row { display: flex; position: relative; }
+#plots .plot-row + .plot-row { box-shadow: inset 0 1px var(--line); }
+#plots .plot-head {
+  flex: 0 0 128px; display: flex; flex-direction: column; gap: 2px;
+  padding: 6px 8px 6px 12px; overflow: hidden;
+}
+#plots .plot-label { font-size: 11px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#plots .plot-unit { color: var(--muted); }
+#plots .plot-values { display: flex; flex-direction: column; font-size: 13px; line-height: 1.25; font-variant-numeric: tabular-nums; }
+#plots .plot-val { white-space: nowrap; }
+#plots .plot-chart { flex: 1 1 0; min-width: 0; position: relative; overflow: hidden; }
+#plots .plot-row-hint .plot-head { justify-content: center; padding-top: 0; padding-bottom: 0; }
+#plots .plot-note { align-self: center; color: var(--muted); font-size: 11px; }
+
+/* uPlot theming (canvas colours come from plots.js). */
+#plots .uplot { font-family: inherit; }
+#plots .u-over { cursor: crosshair; }
+#plots .u-select { background: rgba(74, 163, 255, 0.16); }
+#plots .u-cursor-x { border-right: 1px dashed var(--muted); }
+#plots .plot-playhead {
+  position: absolute; top: 0; bottom: 0; left: 0; width: 0;
+  border-left: 1px solid var(--accent); pointer-events: none; will-change: transform;
 }
 
-#fleetList { list-style: none; margin: 0; padding: 6px; }
-#fleetList li {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 8px; border-radius: 8px; cursor: pointer;
+/* Channel menu: fixed, opened upwards from "+ Channel" (positioned by JS). */
+#plotsMenu {
+  position: fixed; z-index: 1000; display: flex; flex-direction: column;
+  min-width: 190px; overflow-y: auto; padding: 4px;
+  background: var(--panel-raised); border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
 }
-#fleetList li:hover { background: rgba(74,163,255,0.10); }
-#fleetList li.sel { background: rgba(74,163,255,0.22); outline: 1px solid var(--accent); }
-#fleetList .swatch { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-#fleetList .fid { font-weight: 700; min-width: 26px; }
-#fleetList .fmeta { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
-#fleetList .glyph { font-size: 12px; opacity: 0.8; }
-
-.tags { margin: 10px 12px 4px; display: flex; gap: 6px; }
-.kind-tag, .mode-tag {
-  padding: 3px 8px; display: inline-block;
-  border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.5px; background: var(--accent-dim); color: var(--accent);
+#plotsMenu .plots-menu-group { display: flex; flex-direction: column; }
+#plotsMenu .plots-menu-item {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 4px 8px; border: 0; border-radius: 4px;
+  background: transparent; color: var(--text); font-size: 12px; text-align: left;
 }
-.mode-tag.raw, .mode-tag.autopilot { color: var(--ok); }
-.mode-tag.failsafe { color: var(--live); }
-.mode-tag.uncommanded, .mode-tag.unknown { color: var(--muted); }
-#readout dl { margin: 6px 12px 14px; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
-#readout dt { color: var(--muted); }
-#readout dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-#readout dt.sep { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
-#readout dt.sep + dd { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
-
-/* ---- Toggles (one row, bottom-right, above the transport) ---- */
-#toggles {
-  position: fixed; right: 12px; bottom: 66px;
-  display: flex; gap: 6px; align-items: center;
-}
-#toggles label {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
-  padding: 4px 9px; user-select: none;
+#plotsMenu .plots-menu-item:hover, #plotsMenu .plots-menu-item:focus-visible { background: var(--accent-dim); outline: none; }
+#plotsMenu .plot-unit { color: var(--muted); }
+#plotsMenu .plots-menu-head {
+  margin-top: 4px; padding: 6px 8px 2px; border-top: 1px solid var(--line);
+  color: var(--muted); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
 }
 
 /* ---- Transport ---- */
 #transport {
-  position: fixed; left: 12px; right: 12px; bottom: 12px; height: 46px;
-  display: flex; align-items: center; gap: 12px; padding: 0 14px;
-  background: var(--panel); backdrop-filter: blur(8px);
-  border: 1px solid var(--line); border-radius: 12px;
+  display: flex; align-items: center; gap: 12px; padding: 0 12px;
+  background: var(--panel-solid); border-top: 1px solid var(--line);
 }
-button.icon { width: 38px; text-align: center; font-size: 14px; }
-button.live { font-weight: 700; letter-spacing: 0.5px; }
+#playBtn svg { width: 14px; height: 14px; fill: currentColor; display: block; margin: auto; }
+#playBtn .ico-pause, #playBtn.playing .ico-play { display: none; }
+#playBtn.playing .ico-pause { display: block; }
+button.live { font-weight: 700; letter-spacing: 0.5px; font-size: 12px; }
 button.live.active { background: var(--live); border-color: var(--live); color: #fff; }
 .time { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 54px; text-align: center; }
-#scrubWrap { flex: 1; position: relative; display: flex; align-items: center; height: 30px; }
-#scrub { flex: 1; margin: 0; accent-color: var(--accent); cursor: pointer; }
+#scrubWrap { flex: 1; position: relative; display: flex; align-items: center; height: 32px; }
+#scrub { flex: 1; margin: 0; padding: 0; border: 0; background: transparent; accent-color: var(--accent); cursor: pointer; }
+#scrub:disabled { cursor: default; }
 /* Event ticks over the scrubber, inset by half the range thumb so a tick lines
    up with the thumb at the same time. Only the ticks take pointer events. */
 #markers { position: absolute; left: 8px; right: 8px; top: 0; bottom: 0; pointer-events: none; }
@@ -155,30 +462,30 @@ button.live.active { background: var(--live); border-color: var(--live); color: 
   position: absolute; transform: translateX(-50%); pointer-events: auto; cursor: pointer;
   border-radius: 1px;
 }
-.marker.hit { top: 3px; height: 8px; width: 2px; background: #ffb547; opacity: 0.85; }
+.marker.hit { top: 3px; height: 8px; width: 2px; background: var(--warn); opacity: 0.85; }
 .marker.kill {
-  top: 0; bottom: 0; width: 3px; background: var(--live);
+  top: 1px; bottom: 1px; width: 3px; background: var(--live);
   box-shadow: 0 0 6px var(--live);
 }
 .marker.kill::before {
-  content: ""; position: absolute; left: 50%; top: -4px; width: 9px; height: 9px;
+  content: ""; position: absolute; left: 50%; top: -3px; width: 9px; height: 9px;
   transform: translateX(-50%) rotate(45deg); background: var(--live);
 }
-#fps { min-width: 58px; text-align: right; }
 
-/* ---- Map attribution (bottom-left, above the transport; the toggles hold the right) ---- */
-#mapAttribution {
-  position: fixed; left: 10px; bottom: 64px; z-index: 5;
-  font-size: 11px; color: rgba(200,214,230,0.6);
-  background: rgba(10,14,20,0.5); padding: 2px 7px; border-radius: 5px;
-  pointer-events: none; user-select: none;
-}
+/* ---- Presentation mode ---- */
+body.present #app { --fleet-w: 0px; --ins-w: 0px; --plots-h: 0px; grid-template-rows: 0 minmax(0, 1fr) 0 44px; }
+body.present #topbar, body.present #fleet, body.present #inspector, body.present #plots,
+body.present #sceneToolbar, body.present #scaleBar, body.present #fps { display: none; }
+body.present #killFeed { display: flex; top: 14px; right: 80px; }
+body.present #compass { opacity: 0.75; }
+body.present #presentHint { display: block; }
+body.present #transport { background: rgba(10,14,20,0.9); }
 
 /* ---- Drop hint ---- */
 #dropHint {
-  position: fixed; inset: 0; display: none; place-items: center;
+  position: fixed; inset: 0; display: none; place-items: center; pointer-events: none;
   background: rgba(10,14,20,0.7); font-size: 20px; color: var(--accent);
   border: 3px dashed var(--accent); z-index: 50;
 }
 #dropHint.show { display: grid; }
-#dropHint code { background: var(--accent-dim); padding: 2px 8px; border-radius: 6px; }
+#dropHint code { font-size: 18px; background: var(--accent-dim); padding: 2px 8px; border-radius: 6px; }
