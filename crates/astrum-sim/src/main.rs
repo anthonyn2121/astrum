@@ -1,19 +1,19 @@
 //! `astrum-sim` binary: load a scenario, build the app, open the Zenoh session
-//! (telemetry out, commands in, scenario queryable), optionally record to an
-//! MCAP bag, and run. Every startup failure is fatal: a sim that cannot serve
-//! anything exits non-zero. SIGINT/SIGTERM end the run cleanly (a second one
-//! exits at once).
+//! (telemetry out, commands in, controller presence, the control plane and the
+//! scenario queryable), optionally record to an MCAP bag, and run. Every
+//! startup failure is fatal: a sim that cannot serve anything exits non-zero.
+//! SIGINT/SIGTERM end the run cleanly (a second one exits at once).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 
-use astrum_net::{CommandReceiver, ScenarioServer, Session, TelemetryPublisher};
+use astrum_net::{ScenarioServer, Session};
 use astrum_sim::components::{SimClock, SimParams};
 use astrum_sim::scenario::Scenario;
 use astrum_sim::sweep::stopped_line;
 use astrum_sim::systems::StopRequested;
-use astrum_sim::{build_app, record, run_to_exit, RunMode};
+use astrum_sim::{build_app, net, record, run_to_exit, RunMode};
 use bevy::prelude::*;
 use clap::Parser;
 
@@ -73,13 +73,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let receiver = match CommandReceiver::bind(&session) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[astrum-sim] command subscribe failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
     let recording = match &cli.record {
         Some(path) => match record::start(path, &scenario_toml) {
             Ok(r) => Some(r),
@@ -114,8 +107,10 @@ fn main() -> ExitCode {
     }
 
     let mut app = build_app(scenario, RunMode::Server);
-    app.insert_non_send(TelemetryPublisher::new(&session));
-    app.insert_non_send(receiver);
+    if let Err(e) = net::connect(&mut app, &session) {
+        eprintln!("[astrum-sim] zenoh setup failed: {e}");
+        return ExitCode::FAILURE;
+    }
     app.insert_resource(stop);
     let (recorder, recording) = recording.unzip();
     if let Some(r) = recorder {

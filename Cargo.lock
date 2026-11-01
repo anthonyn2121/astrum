@@ -210,6 +210,9 @@ name = "astrum-net"
 version = "0.1.0"
 dependencies = [
  "astrum-proto",
+ "clap",
+ "serde",
+ "serde_json",
  "zenoh",
 ]
 

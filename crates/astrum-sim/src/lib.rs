@@ -8,15 +8,19 @@
 //! many runs at once; tests and the embedded RL env ([`env`]) pump the same app.
 //!
 //! # One update == one tick, in this order
-//! `ingest_commands` → `expire_leases` → `autopilot_step` → `fire_guns` (rounds
-//! leave at `t_k`) → `step_fdm` (all FDMs in parallel to `t_k+1`) →
-//! `freeze_dead` → `advance_clock` → `step_bullets` → `resolve_hits` →
-//! `apply_damage` → `end_on_elimination` → `publish_telemetry` →
-//! `report_progress` / `stop_at_max_time` → `pace` → `exit_on_fatal`.
-//! Startup spawns the fleet and publishes tick 0.
+//! `serve_control` (pause / step / speed requests; blocks while paused) →
+//! `track_controllers` → `hold_commands` while paused; otherwise `ingest_commands` →
+//! `expire_leases` → `autopilot_step` → `fire_guns` (rounds leave at `t_k`) →
+//! `step_fdm` (all FDMs in parallel to `t_k+1`) → `freeze_dead` →
+//! `advance_clock` → `step_bullets` → `resolve_hits` → `apply_damage` →
+//! `end_on_elimination` → `publish_telemetry` → `report_progress` /
+//! `stop_at_max_time` → `count_steps` → `pace`; and always `publish_status` →
+//! `exit_on_signal` → `exit_on_fatal`. Startup spawns the fleet and publishes
+//! tick 0.
 
 pub mod combat;
 pub mod components;
+pub mod control;
 pub mod env;
 pub mod net;
 pub mod pilot;
@@ -32,7 +36,11 @@ use astrum_geo::{Geodetic, LocalFrame};
 use combat::systems::{apply_damage, end_on_elimination, fire_guns, resolve_hits, step_bullets};
 use combat::{CombatParams, CombatRng, CombatState};
 use components::{SimClock, SimParams, SimStatus, WorldFrame};
-use net::{ingest_commands, publish_telemetry, LastPublished, RefusalLog};
+use control::{count_steps, publish_status, serve_control, RunControl};
+use net::{
+    hold_commands, ingest_commands, publish_telemetry, track_controllers, Controllers,
+    HeldCommands, LastPublished, RefusalLog,
+};
 use pilot::{autopilot_step, expire_leases};
 use scenario::Scenario;
 use systems::{
@@ -95,6 +103,13 @@ fn runs_to_exit(mode: Res<RunMode>) -> bool {
     matches!(*mode, RunMode::Server | RunMode::Batch)
 }
 
+/// Connected to the bus ([`net::connect`]): controller presence, run control
+/// and status. Without it (the RL env, in-process sweep runs) those systems
+/// are skipped.
+fn on_bus(board: Option<Res<control::Board>>) -> bool {
+    board.is_some()
+}
+
 /// Drive `app` one update (= one tick) at a time until it requests an exit, as
 /// the `astrum-sim` binary and the sweep runner do (tests and the RL env step it
 /// themselves). The caller keeps the app, so the final world can be inspected.
@@ -138,6 +153,9 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
         .insert_resource(CombatState { initial_living_teams: team_count(&scenario) })
         .insert_resource(LastPublished::default())
         .insert_resource(RefusalLog::default())
+        .insert_resource(Controllers::default())
+        .insert_resource(HeldCommands::default())
+        .insert_resource(RunControl::default())
         .insert_resource(scenario)
         .insert_resource(mode)
         .add_systems(
@@ -147,25 +165,34 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
         .add_systems(
             Update,
             (
+                (serve_control, track_controllers, hold_commands.run_if(not(RunControl::ticking)))
+                    .chain()
+                    .run_if(on_bus.and_then(SimStatus::running)),
                 (
-                    ingest_commands,
-                    expire_leases,
-                    autopilot_step,
-                    fire_guns,
-                    step_fdm,
-                    freeze_dead,
-                    advance_clock,
-                    step_bullets,
-                    resolve_hits,
-                    apply_damage,
-                    end_on_elimination.run_if(runs_to_exit),
-                    publish_telemetry,
-                    report_progress.run_if(is_server),
-                    stop_at_max_time.run_if(runs_to_exit),
+                    (
+                        ingest_commands,
+                        expire_leases,
+                        autopilot_step,
+                        fire_guns,
+                        step_fdm,
+                        freeze_dead,
+                        advance_clock,
+                        step_bullets,
+                        resolve_hits,
+                        apply_damage,
+                        end_on_elimination.run_if(runs_to_exit),
+                        publish_telemetry,
+                        report_progress.run_if(is_server),
+                        stop_at_max_time.run_if(runs_to_exit),
+                    )
+                        .chain()
+                        .distributive_run_if(SimStatus::running),
+                    count_steps.run_if(on_bus),
+                    pace.run_if(runs_to_exit),
                 )
                     .chain()
-                    .distributive_run_if(SimStatus::running),
-                pace.run_if(runs_to_exit),
+                    .run_if(RunControl::ticking),
+                publish_status.run_if(on_bus),
                 exit_on_signal,
                 exit_on_fatal,
             )

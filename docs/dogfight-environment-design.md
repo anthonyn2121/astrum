@@ -607,6 +607,7 @@ observability/polish. Phase 4 is the RL payoff.
 | Combat chain | `astrum-sim/src/combat/` (`systems.rs`, `ballistics.rs`, `geometry.rs`, `fire_control.rs`) |
 | Termination | `astrum-sim/src/systems.rs` (`stop_at_max_time`), `combat/systems.rs` (`end_on_elimination`) |
 | Pacing (`sim.speed`); lockstep wait (`control_rate_hz`) | `astrum-sim/src/systems.rs` (`Pacer`, `pace`); `net.rs` (`ingest_commands`) |
+| Run control (pause / step / speed), status; controller presence | `astrum-sim/src/control.rs` (`RunControl`, `serve_control`, `publish_status`); `net.rs` (`connect`, `Controllers`, `track_controllers`, `HeldCommands`); `astrum-net/src/lib.rs` (`ControlServer`, `PresenceWatcher`), `src/bin/ctl.rs` |
 | In-process recording (`--record`) | `astrum-sim/src/record.rs` (`TickRecorder`, `Recording`) |
 | Sweeps (`astrum-sweep`) | `astrum-sim/src/sweep.rs` (planning, in-process runs, summary), `src/bin/sweep.rs` (process mode) |
 | Wire schema | `astrum-proto/schema/astrum.capnp` (`Telemetry`, `Command`, `Combat`) |

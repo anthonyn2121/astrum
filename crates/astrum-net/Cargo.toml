@@ -10,6 +10,15 @@ description = "ASTRUM Zenoh transport: telemetry & command pub/sub over the astr
 [lib]
 name = "astrum_net"
 
+# Talk to a running sim's control plane (status, pause, resume, step, speed).
+[[bin]]
+name = "astrum-ctl"
+path = "src/bin/ctl.rs"
+
 [dependencies]
 astrum-proto = { path = "../astrum-proto" }
 zenoh = { workspace = true }
+# The control plane's status reply is JSON (low rate, read by people and tools).
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }

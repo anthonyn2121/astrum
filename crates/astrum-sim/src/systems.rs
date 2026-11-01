@@ -346,7 +346,21 @@ pub struct Pacer {
 impl Pacer {
     /// `speed` as validated by the scenario: `0` or at least [`MIN_SPEED`].
     pub fn new(dt: f64, speed: f64) -> Self {
-        Self { period: (speed > 0.0).then(|| Duration::from_secs_f64(dt / speed)), next: None }
+        Self { period: Self::period(dt, speed), next: None }
+    }
+
+    fn period(dt: f64, speed: f64) -> Option<Duration> {
+        (speed > 0.0).then(|| Duration::from_secs_f64(dt / speed))
+    }
+
+    /// Change the pace from the next tick on, starting a new schedule.
+    pub fn set_speed(&mut self, dt: f64, speed: f64) {
+        *self = Self::new(dt, speed);
+    }
+
+    /// Start a new schedule at the next tick (after a pause).
+    pub fn restart(&mut self) {
+        self.next = None;
     }
 }
 

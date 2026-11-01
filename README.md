@@ -32,7 +32,7 @@ Everything below is built and tested; here's what lives where:
 | `astrum-fdm` | safe JSBSim 6-DOF wrapper (C shim catches every C++ exception; crate-owned lock makes `Fdm: Send`) |
 | `astrum-geo` | WGS84 geodetic ↔ ECEF ↔ ENU mapping, local-level ↔ grid rotations |
 | `astrum-sim` | headless Bevy ECS state server — one JSBSim FDM per entity, combat, lease/failsafe, lockstep |
-| `astrum-proto` + `astrum-net` | Cap'n Proto schema v2 + Zenoh transport (telemetry, commands, scenario) |
+| `astrum-proto` + `astrum-net` | Cap'n Proto schema v2 + Zenoh transport (telemetry, commands, scenario, controller presence, run control) + `astrum-ctl` |
 | `astrum-bag` | record telemetry + commands to MCAP; replay telemetry paced by sim time |
 | `astrum-env` | Python bindings (`Env`, `BatchEnv`) + the Gymnasium-style dogfight adapter |
 | `astrum-web` + `web/` | axum telemetry bridge + tile proxy, offline exporter, browser 3-D renderer |
@@ -54,13 +54,16 @@ failure. `make replay` starts the fleet alongside the 3-D renderer.
 
 `astrum-sim` is the authoritative state server: a headless Bevy ECS where **each aircraft entity
 owns its own JSBSim instance**. Controllers, recorders and the web bridge are separate processes
-that only ever touch it through Zenoh + Cap'n Proto — never shared memory. Telemetry, commands and
-the scenario query are key expressions multiplexed over **one** Zenoh session (a single TCP
-endpoint), not separate ports.
+that only ever touch it through Zenoh + Cap'n Proto — never shared memory. Telemetry, commands,
+controller presence and the scenario, control and status queries are key expressions multiplexed
+over **one** Zenoh session (a single TCP endpoint), not separate ports.
 
 Each `Update` tick runs one chained schedule:
 
 ```
+serve_control      apply pause / resume / step / speed requests (paused: hold here, re-sending telemetry)
+track_controllers  a controller's token went away → lockstep run fails / aircraft → failsafe hold
+                   — the rest runs only while not paused —
 ingest_commands    decode astrum/command/<id>; refuse stale/future/duplicate/forged; (lockstep: wait)
 expire_leases      a raw command older than command_lease_s → failsafe hold
 autopilot_step     autopilot / failsafe targets → fcs/*-cmd-norm (per VehicleKind)
@@ -70,6 +73,7 @@ freeze_dead → advance_clock → step_bullets → resolve_hits → apply_damage
 publish_telemetry  one Telemetry per aircraft → put astrum/telemetry/<id> (at its control_rate_hz);
                    with --record every tick of every aircraft goes to the MCAP bag
 report_progress / stop_at_max_time, then pace (sim.speed > 0)
+publish_status     refresh what get astrum/status answers (every 100 ms and on any control change)
 ```
 
 Controllers write **control inputs** (`fcs/*-cmd-norm`), never state; JSBSim computes all motion
@@ -201,7 +205,14 @@ happens to arrive.
 - **Lockstep.** With `sim.lockstep = true` and `lockstep = true` on an aircraft, the sim waits each
   tick until that aircraft has a command whose `telemetryTick` equals the last published tick,
   republishing the last telemetry every 100 ms while waiting, and fails after
-  `lockstep_timeout_s`. Controllers need nothing beyond echoing `telemetryTick`.
+  `lockstep_timeout_s` — or at once if that aircraft's controller goes away (presence, below).
+  Controllers need nothing beyond echoing `telemetryTick`.
+- **Controller presence.** The C++ and Python clients hold the Zenoh liveliness token
+  `astrum/alive/controller/<id>` while they run, and the sim watches them. When a controller goes
+  away (exit, crash, `kill -9`, lost connection) a lockstep run fails within a tick (measured:
+  10 ms after a `kill -9`) instead of after `lockstep_timeout_s`, and any other commanded aircraft
+  enters the failsafe hold without waiting for its lease. A controller without a token works as
+  before; the lease and the lockstep timeout cover it.
 - **Control rate.** `control_rate_hz` on an aircraft (it must divide `rate_hz`) publishes its
   telemetry only every `rate_hz / control_rate_hz` ticks, and in lockstep the sim waits for its
   command only on those ticks; the last command holds in between (zero-order hold). Physics still
@@ -229,14 +240,14 @@ windows; a 24-core Core Ultra 9 285K that was also running other jobs, load aver
 
 | Fleet | Threads | µs/tick | × real time @ 120 Hz |
 |---|---|---|---|
-| 1 × F-16 | 1 | 7.1 | 1177× |
+| 1 × F-16 | 1 | 7.3 | 1147× |
 | 4 × F-16 | 1 | 24.5 | 340× |
 | 4 × F-16 | 4 | 12.2 | 685× |
 | 16 × F-16 | 8 | 24.2 | 345× |
 | 64 × F-16 | 8 | 183 | 45× |
 
 One JSBSim F-16 step is ~5.3 µs on its own; the rest of a 1-aircraft tick is the ECS schedule
-(~1 µs of Bevy, ~0.6 µs of our systems). Beyond ~16 aircraft the cost is JSBSim's, and grows per
+(~1 µs of Bevy, ~0.7 µs of our systems). Beyond ~16 aircraft the cost is JSBSim's, and grows per
 aircraft as the fleet outgrows the caches (5.3 µs alone, 8.5 µs per aircraft in a 16-ship, 14 µs in
 a 64-ship, on one thread).
 
@@ -252,6 +263,35 @@ End to end through the binary and Zenoh (lockstep, unpaced, low-latency transpor
 Embedded env reset: 6.0 ms (a fresh build is 10.4 ms); most of it is the JSBSim trim, which
 `trim = false` per aircraft skips. Cap'n Proto telemetry is ~170 B with ~0.1 µs encode/decode — not
 a bottleneck.
+
+### Live control (`astrum-ctl`)
+
+A running sim can be paused, single-stepped and re-paced from any client on the bus:
+
+```bash
+astrum-ctl status            # running | tick 1360 | sim 11.3 s | 4.0× real time (target 4×) | 2 aircraft | controllers [1, 2]
+astrum-ctl status --watch    # once a second; --json for the raw reply
+astrum-ctl pause             # stop after the current tick
+astrum-ctl step 120          # run 120 ticks, then pause
+astrum-ctl speed 20          # new pace from the next tick (0 = unpaced, otherwise ≥ 0.001)
+astrum-ctl resume
+```
+
+`--connect` (`ASTRUM_ZENOH_CONNECT`) picks the sim; under compose,
+`docker compose exec sim target/release/astrum-ctl status`. Requests are Zenoh queries on
+`astrum/control/<pause|resume|step|speed>` (`step?ticks=N`, `speed?value=X`); an invalid one is
+refused with the reason and changes nothing. `get astrum/status` answers JSON: `tick`,
+`sim_time_s`, `state` (`running`, `paused`, or `waiting` on lockstep controllers), `speed`,
+`achieved_speed`, `aircraft`, `controllers` (present ids) and `lockstep_waiting`.
+
+Control decides only *when* the next tick starts, never what it computes: a lockstep run that is
+paused, stepped and resumed ends bit-identical to one flown straight through (tested). While
+paused the sim re-sends the last telemetry every 100 ms, so controllers don't take the silence
+for the end of the run (a 15 s pause with the C++ and Python controllers attached resumes
+cleanly); leases count ticks, so a pause never trips the failsafe. Commands that arrive while
+paused are held, the latest per aircraft, for the next tick. Leaving the pause starts a new pacing
+schedule, so the run doesn't sprint to make up for it. Any client on the bus can send these
+requests; that is fine on one host, and restricting it is Zenoh access-control configuration.
 
 ### Sweeps (`astrum-sweep`)
 
@@ -351,6 +391,10 @@ explicit `Unknown`; a bad payload is logged/counted and skipped, never a crash.
   mismatches. A raw command overrides and disengages the autopilot.
 - **Scenario** — the sim answers `get astrum/scenario` with its scenario TOML, so any client (the
   recorder, a controller) can learn the world origin and fleet.
+- **Presence** (`astrum/alive/controller/<id>`): a Zenoh liveliness token, held by the controller
+  flying aircraft `<id>` (see [Controller presence](#lease-failsafe-and-lockstep)).
+- **Control and status** — `get astrum/control/<pause|resume|step|speed>` and `get astrum/status`
+  (JSON, low rate, for people and tools); see [Live control](#live-control-astrum-ctl).
 
 The aircraft id lives in the key, so subscribers take one aircraft (`astrum/telemetry/<id>`) or the
 whole fleet (`astrum/telemetry/*`); key matching is exact, so `.../1` never matches `.../10`.

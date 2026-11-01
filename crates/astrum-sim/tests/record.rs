@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use astrum_bag::{BagReader, TopicKind};
-use astrum_net::{keys, CommandReceiver, CommandSender, Session, TelemetryPublisher};
+use astrum_net::{keys, CommandSender, Session};
 use astrum_proto::{decode_command, decode_telemetry, Control, RawActuators};
 use astrum_sim::net::LastPublished;
 use astrum_sim::{build_app, record, RunMode};
@@ -24,8 +24,7 @@ fn recording_keeps_every_tick_and_every_received_command() {
 
     let session = Session::in_process().unwrap();
     let mut app = build_app(scenario, RunMode::Embedded);
-    app.insert_non_send(TelemetryPublisher::new(&session));
-    app.insert_non_send(CommandReceiver::bind(&session).unwrap());
+    astrum_sim::net::connect(&mut app, &session).unwrap();
     let (recorder, recording) = record::start(&path, &toml).unwrap();
     app.insert_resource(recorder);
 

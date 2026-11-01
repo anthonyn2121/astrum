@@ -86,7 +86,7 @@ enum ControlMode {
   uncommanded @0;   # no command received yet: initial (trimmed) controls held
   raw         @1;   # a controller's raw actuators, within the command lease
   autopilot   @2;   # the sim's inner loop flying commanded targets
-  failsafe    @3;   # raw lease expired: the sim holds heading/altitude/speed
+  failsafe    @3;   # lease expired or controller gone: the sim holds heading/altitude/speed
 }
 
 # One aircraft's authoritative state after sim step `tick`.

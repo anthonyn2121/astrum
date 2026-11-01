@@ -35,6 +35,9 @@ One `mode=client` Zenoh session connecting to the sim, which listens as the Zeno
   `seq` (strictly increasing per process) and `telemetryTick` (the tick it answers).
   If the sim republishes a tick it is waiting on (lockstep), the last command is
   resent with a new `seq` without re-running the law.
+- **Presence** — the command publisher holds the liveliness token
+  `astrum/alive/controller/<id>`, so the sim learns at once when the process goes away
+  (a lockstep run fails immediately; otherwise the aircraft enters the failsafe hold).
 
 ## Modes (`--mode`)
 

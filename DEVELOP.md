@@ -12,7 +12,8 @@ ASTRUM is **one server + many clients** talking over Zenoh.
   own [JSBSim](https://github.com/JSBSim-Team/jsbsim) flight-dynamics model. Every
   tick it drains the commands it received (`astrum/command/<id>`), steps physics, and
   **publishes** telemetry (`astrum/telemetry/<id>`). It also answers
-  `get astrum/scenario` with its scenario TOML.
+  `get astrum/scenario` with its scenario TOML, `get astrum/status` with its run status
+  (JSON), and `get astrum/control/<pause|resume|step|speed>` requests (`astrum-ctl`).
 - **Controllers** (`controllers/*`) are separate processes — the flight-control
   logic. They **subscribe** to telemetry and **publish** commands. They never touch
   the sim's memory; only bytes over Zenoh.
@@ -22,6 +23,8 @@ ASTRUM is **one server + many clients** talking over Zenoh.
 ```
 controllers ──put astrum/command/<id>─────►  sim (subscribes astrum/command/*)
 controllers ◄──put astrum/telemetry/<id>───  sim (publishes per aircraft; id in the key)
+controllers ──token astrum/alive/controller/<id>──►  sim (liveliness: who is connected)
+astrum-ctl  ──get astrum/control/*, astrum/status──►  sim (pause / step / speed / status)
 ```
 
 Both key spaces ride **one** Zenoh session on a single endpoint (`tcp/…:7447`). The sim (and
@@ -47,6 +50,10 @@ Rules every client follows (the shared C++ and Python clients implement them for
 - **One command per telemetry sample**, carrying `seq` (strictly increasing from 1 per process)
   and `telemetryTick` (the `Telemetry.tick` it answers). Raw commands are a **lease**: stop sending
   for `sim.command_lease_s` and the sim's failsafe hold takes over (`controlMode = failsafe`).
+- **Presence**: a controller holds the liveliness token `astrum/alive/controller/<id>` while it
+  runs. When it goes away (exit, crash, lost connection) a lockstep run fails at once and any
+  other commanded aircraft enters the failsafe hold without waiting for its lease. A controller
+  without a token still works; leases and the lockstep timeout cover it.
 - A raw control law checks `vehicleKind` and refuses (exits non-zero) any kind it wasn't written
   for, including unknown values.
 - Decoding is untrusted input: a bad payload is logged, counted and skipped.

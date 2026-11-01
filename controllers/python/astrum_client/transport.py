@@ -11,6 +11,9 @@ latest-value telemetry, and command publishers with the contract QoS.
 * Commands: declared publisher, CongestionControl DROP, express, priority
   INTERACTIVE_HIGH; every command carries a per-process ``seq`` (1, 2, ...) and
   the ``telemetryTick`` it answers.
+* Presence: a command publisher holds the liveliness token
+  ``astrum/alive/controller/<id>`` for as long as it lives, so the sim learns at
+  once when this process (or its connection) goes away.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from astrum_client.wire import (
 
 TELEMETRY_PREFIX = "astrum/telemetry/"
 COMMAND_PREFIX = "astrum/command/"
+ALIVE_PREFIX = "astrum/alive/controller/"
 TELEMETRY_ALL = "astrum/telemetry/*"
 
 log = logging.getLogger("astrum.transport")
@@ -44,6 +48,10 @@ def telemetry_key(aircraft_id: int) -> str:
 
 def command_key(aircraft_id: int) -> str:
     return f"{COMMAND_PREFIX}{aircraft_id}"
+
+
+def alive_key(aircraft_id: int) -> str:
+    return f"{ALIVE_PREFIX}{aircraft_id}"
 
 
 def id_of(key: str, prefix: str) -> int | None:
@@ -164,7 +172,8 @@ def subscribe_telemetry(
 
 class CommandPublisher:
     """Publishes commands for one aircraft with the contract QoS, numbering
-    them ``seq`` = 1, 2, ... for the life of the process."""
+    them ``seq`` = 1, 2, ... for the life of the process, and announces this
+    process as the aircraft's controller (liveliness) while it lives."""
 
     def __init__(self, session: zenoh.Session, schema, target_id: int):
         self._schema = schema
@@ -176,6 +185,7 @@ class CommandPublisher:
             priority=zenoh.Priority.INTERACTIVE_HIGH,
             express=True,
         )
+        self._token = session.liveliness().declare_token(alive_key(target_id))
 
     def send(self, control: Control, telemetry_tick: int, trigger: bool = False) -> int:
         self.seq += 1

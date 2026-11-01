@@ -16,6 +16,9 @@ the shared Cap'n Proto schema (`crates/astrum-proto/schema/astrum.capnp`, C++ na
   commands are a lease — stop sending and the sim's failsafe takes over), each carrying
   `seq` (strictly increasing from 1) and `telemetryTick` (the tick it answers). A repeated
   tick (the lockstep sim republishing while it waits) is answered again with a new `seq`;
+- presence: the client holds the liveliness token `astrum/alive/controller/<id>`, so the
+  sim learns at once when the process goes away (a lockstep run fails immediately;
+  otherwise the aircraft enters the failsafe hold);
 - untrusted input: a payload that fails to decode is counted, logged and skipped — it
   never throws through Zenoh;
 - timeouts: no telemetry within `--startup-timeout` → exit **1**; telemetry stops for

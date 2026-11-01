@@ -7,11 +7,14 @@
 //! bridge systems only assemble telemetry, so the physics-only app (tests, the
 //! embedded env) runs without a session.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use astrum_bag::wall_clock_ns;
-use astrum_net::{CommandReceiver, CommandReject, TelemetryPublisher};
+use astrum_net::{
+    CommandReceiver, CommandReject, ControlServer, Presence, PresenceWatcher, Session,
+    TelemetryPublisher,
+};
 use astrum_proto::{
     encode_command, encode_telemetry, Aero, BodyRates, CombatStatus, Command, Euler, Ned, Telemetry,
 };
@@ -21,9 +24,25 @@ use crate::combat::{Dead, Gun, Health, Team, Trigger};
 use crate::components::{
     Aircraft, AircraftIndex, AircraftState, SimClock, SimParams, SimStatus, VehicleKind,
 };
-use crate::pilot::{apply_command, Pilot, Refusal};
+use crate::control::Board;
+use crate::pilot::{apply_command, enter_failsafe, Pilot, Refusal};
 use crate::record::TickRecorder;
-use crate::systems::StopRequested;
+use crate::systems::{StopRequested, MIN_SPEED};
+use crate::RunMode;
+
+/// Put `app` on the bus: telemetry out, commands in, controller presence, and
+/// the control plane (`astrum/control/*`, `astrum/status`).
+pub fn connect(app: &mut App, session: &Session) -> astrum_net::Result<()> {
+    let receiver = CommandReceiver::bind(session)?;
+    let watcher = PresenceWatcher::watch(session)?;
+    let control = ControlServer::serve(session, MIN_SPEED)?;
+    app.insert_resource(Board(control.board()));
+    app.insert_non_send(TelemetryPublisher::new(session));
+    app.insert_non_send(receiver);
+    app.insert_non_send(watcher);
+    app.insert_non_send(control);
+    Ok(())
+}
 
 const RECORDING_FAILED: &str = "recording stopped: the bag writer failed";
 
@@ -205,6 +224,78 @@ fn record_received(
     }
 }
 
+/// Which controllers are present, by the aircraft they fly, from their
+/// liveliness tokens (`astrum/alive/controller/<id>`). A controller that
+/// announces nothing never appears here; leases and lockstep timeouts still
+/// cover it.
+#[derive(Resource, Debug, Default)]
+pub struct Controllers {
+    tokens: BTreeMap<u32, u32>,
+    /// Aircraft whose last token went away, not yet acted on.
+    lost: Vec<u32>,
+}
+
+impl Controllers {
+    /// Aircraft with a controller present, ascending.
+    pub fn present(&self) -> Vec<u32> {
+        self.tokens.iter().filter(|(_, n)| **n > 0).map(|(id, _)| *id).collect()
+    }
+
+    fn apply(&mut self, changes: &[Presence], mode: RunMode) {
+        for change in changes {
+            match *change {
+                Presence::Up(id) => {
+                    let n = self.tokens.entry(id).or_default();
+                    *n += 1;
+                    if *n == 1 && mode == RunMode::Server {
+                        println!("[astrum-sim] controller for aircraft {id} connected");
+                    }
+                }
+                Presence::Down(id) => {
+                    if let Some(n) = self.tokens.get_mut(&id).filter(|n| **n > 0) {
+                        *n -= 1;
+                        if *n == 0 {
+                            self.lost.push(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Act on controllers that went away: a lockstep run fails at once (its result
+/// would otherwise hang on `lockstep_timeout_s`), any other commanded aircraft
+/// switches to the failsafe hold without waiting for its lease.
+pub fn track_controllers(
+    watcher: Option<NonSend<PresenceWatcher>>,
+    mode: Res<RunMode>,
+    index: Res<AircraftIndex>,
+    mut controllers: ResMut<Controllers>,
+    mut status: ResMut<SimStatus>,
+    mut q: Query<(&mut Pilot, Option<&mut Trigger>, &AircraftState), Without<Dead>>,
+) {
+    if let Some(w) = watcher {
+        controllers.apply(&w.drain(), *mode);
+    }
+    for id in std::mem::take(&mut controllers.lost) {
+        let Some((mut pilot, trigger, state)) = index.0.get(&id).and_then(|e| q.get_mut(*e).ok())
+        else {
+            continue; // not one of ours, or a wreck
+        };
+        if pilot.lockstep {
+            status.fatal.get_or_insert_with(|| lost_lockstep(id));
+        } else if pilot.commanded() {
+            eprintln!("[astrum-sim] aircraft {id}: controller disconnected — failsafe hold");
+            enter_failsafe(&mut pilot, trigger.map(Mut::into_inner), state);
+        }
+    }
+}
+
+fn lost_lockstep(id: u32) -> String {
+    format!("lockstep: the controller for aircraft {id} disconnected")
+}
+
 /// How often a lockstep wait re-sends the last telemetry, so a controller that
 /// subscribed late (or lost a sample) still gets the tick it must answer.
 const LOCKSTEP_REPUBLISH: Duration = Duration::from_millis(100);
@@ -243,23 +334,61 @@ fn apply_received(
     }
 }
 
-/// Drain queued commands and apply them in arrival order (the latest command
-/// per aircraft wins). In a lockstep scenario, then block until every living
-/// lockstep aircraft due a command this tick (see `control_rate_hz`) has one
-/// answering it, re-sending that telemetry while waiting; too long a wait is
-/// fatal, and a stop request ends the wait.
+/// Commands that arrived while paused, for the next tick: the latest per
+/// aircraft. A paused sim keeps re-sending telemetry and controllers answer
+/// every copy, so the bus queue would otherwise grow for as long as the pause
+/// lasts (and, once full, stall Zenoh's receive path).
+#[derive(Resource, Debug, Default)]
+pub struct HeldCommands(Vec<Command>);
+
+/// While paused, take commands off the bus as they arrive (recorded and
+/// checked as usual), keeping the latest per aircraft for the next tick.
+pub fn hold_commands(
+    receiver: Option<NonSend<CommandReceiver>>,
+    recorder: Option<Res<TickRecorder>>,
+    mut held: ResMut<HeldCommands>,
+    mut status: ResMut<SimStatus>,
+    mut log: ResMut<RefusalLog>,
+) {
+    let Some(rx) = receiver else { return };
+    for r in rx.drain() {
+        record_received(recorder.as_deref(), &r, &mut status);
+        match r {
+            Ok(cmd) => {
+                held.0.retain(|c| c.target_id != cmd.target_id);
+                held.0.push(cmd);
+            }
+            Err(reject) => log.reject(&reject),
+        }
+    }
+}
+
+/// How often a lockstep wait checks for controllers that went away.
+const LOCKSTEP_POLL: Duration = Duration::from_millis(20);
+
+/// Apply the commands held over a pause, then drain queued ones, in arrival
+/// order (the latest command per aircraft wins). In a lockstep scenario, then
+/// block until every living lockstep aircraft due a command this tick (see
+/// `control_rate_hz`) has one answering it, re-sending that telemetry while
+/// waiting. Too long a wait, or the controller of an awaited aircraft going
+/// away, is fatal; a stop request ends the wait.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_commands(
     receiver: Option<NonSend<CommandReceiver>>,
     publisher: Option<NonSendMut<TelemetryPublisher>>,
+    watcher: Option<NonSend<PresenceWatcher>>,
+    board: Option<Res<Board>>,
     recorder: Option<Res<TickRecorder>>,
     stop: Option<Res<StopRequested>>,
+    mode: Res<RunMode>,
     last: Res<LastPublished>,
     params: Res<SimParams>,
     clock: Res<SimClock>,
     index: Res<AircraftIndex>,
+    mut controllers: ResMut<Controllers>,
     mut status: ResMut<SimStatus>,
     mut log: ResMut<RefusalLog>,
+    mut held: ResMut<HeldCommands>,
     mut q: Query<(&mut Pilot, Option<&mut Trigger>, Has<Dead>)>,
 ) {
     let Some(rx) = receiver else { return };
@@ -267,6 +396,16 @@ pub fn ingest_commands(
     let now = clock.tick;
     let lease = params.lease_ticks;
     let mut answered: BTreeSet<u32> = BTreeSet::new();
+    if !held.0.is_empty() {
+        for cmd in held.0.drain(..) {
+            if let Some((id, tick)) = apply_received(Ok(cmd), now, lease, &index, &mut q, &mut log)
+            {
+                if tick == now {
+                    answered.insert(id);
+                }
+            }
+        }
+    }
     for r in rx.drain() {
         record_received(recorder, &r, &mut status);
         if let Some((id, tick)) = apply_received(r, now, lease, &index, &mut q, &mut log) {
@@ -292,9 +431,17 @@ pub fn ingest_commands(
         let deadline = Instant::now() + Duration::from_secs_f64(params.lockstep_timeout_s);
         let mut publisher = publisher;
         let mut waiting = pending(&answered, &q);
+        let mut republished = Instant::now();
         while !waiting.is_empty() {
             if stop.as_ref().is_some_and(|s| s.requested()) {
                 return;
+            }
+            if let Some(w) = &watcher {
+                controllers.apply(&w.drain(), *mode);
+                if let Some(id) = controllers.lost.iter().find(|id| waiting.contains(id)) {
+                    status.fatal = Some(lost_lockstep(*id));
+                    return;
+                }
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -304,7 +451,7 @@ pub fn ingest_commands(
                 ));
                 return;
             }
-            match rx.recv_timeout(left.min(LOCKSTEP_REPUBLISH)) {
+            match rx.recv_timeout(left.min(LOCKSTEP_POLL)) {
                 Ok(r) => {
                     record_received(recorder, &r, &mut status);
                     if let Some((id, tick)) =
@@ -315,16 +462,21 @@ pub fn ingest_commands(
                         }
                     }
                 }
-                Err(astrum_net::NetError::Timeout) => {
-                    if let Some(p) = publisher.as_mut() {
-                        for s in last.0.iter().filter(|s| waiting.contains(&s.aircraft_id)) {
-                            let _ = p.publish(s);
-                        }
-                    }
-                }
+                Err(astrum_net::NetError::Timeout) => {}
                 Err(e) => {
                     status.fatal = Some(format!("lockstep: command intake failed: {e}"));
                     return;
+                }
+            }
+            if republished.elapsed() >= LOCKSTEP_REPUBLISH {
+                republished = Instant::now();
+                if let Some(b) = &board {
+                    b.show_waiting(&waiting);
+                }
+                if let Some(p) = publisher.as_mut() {
+                    for s in last.0.iter().filter(|s| waiting.contains(&s.aircraft_id)) {
+                        let _ = p.publish(s);
+                    }
                 }
             }
             waiting = pending(&answered, &q);

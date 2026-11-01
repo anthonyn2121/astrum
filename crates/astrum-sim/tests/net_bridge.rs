@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use astrum_net::zenoh::Wait;
 use astrum_net::{
-    keys, CommandReceiver, CommandSender, LatestTelemetry, Selection, Session, TelemetryPublisher,
+    keys, send_control, CommandSender, ControlRequest, LatestTelemetry, Selection, Session,
 };
 use astrum_proto::{
     encode_command, AutopilotTargets, Command, Control, ControlMode, RawActuators, Telemetry,
 };
-use astrum_sim::components::SimStatus;
+use astrum_sim::components::{SimClock, SimStatus};
 use astrum_sim::net::LastPublished;
 use astrum_sim::{build_app, RunMode};
 use bevy::prelude::*;
@@ -23,8 +23,7 @@ use common::{of, two_ship};
 
 fn app_on(session: &Session, scenario: astrum_sim::scenario::Scenario) -> App {
     let mut app = build_app(scenario, RunMode::Embedded);
-    app.insert_non_send(TelemetryPublisher::new(session));
-    app.insert_non_send(CommandReceiver::bind(session).unwrap());
+    astrum_sim::net::connect(&mut app, session).unwrap();
     app
 }
 
@@ -121,9 +120,14 @@ fn forged_stale_and_future_commands_are_refused() {
 }
 
 /// Run a lockstep scenario with a controller thread whose law depends only on
-/// the telemetry it receives. Returns the final telemetry and the ticks the
-/// controller answered.
-fn lockstep_run(ticks: usize, control_rate_hz: Option<f64>) -> (Vec<Telemetry>, Vec<u64>) {
+/// the telemetry it receives, for `ticks` ticks after the first update. With
+/// `interrupt`, the run is paused at tick 80, held, stepped 7 ticks, and
+/// resumed. Returns the final telemetry and the ticks the controller answered.
+fn lockstep_run(
+    ticks: u64,
+    control_rate_hz: Option<f64>,
+    interrupt: bool,
+) -> (Vec<Telemetry>, Vec<u64>) {
     let mut s = two_ship();
     s.sim.lockstep = true;
     s.sim.lockstep_timeout_s = 10.0;
@@ -155,8 +159,23 @@ fn lockstep_run(ticks: usize, control_rate_hz: Option<f64>) -> (Vec<Telemetry>, 
             answered
         })
     };
+    let tick = |app: &App| app.world().resource::<SimClock>().tick;
+    let control = |r| send_control(&session, r, Duration::from_secs(2)).unwrap();
     app.update(); // startup publishes tick 0, then waits for its answer
-    for _ in 0..ticks {
+    while tick(&app) < ticks + 1 {
+        if interrupt && tick(&app) == 80 {
+            control(ControlRequest::Pause);
+            for _ in 0..3 {
+                app.update(); // held, re-sending tick 80 to the controller
+            }
+            assert_eq!(tick(&app), 80);
+            control(ControlRequest::Step(7));
+            for _ in 0..9 {
+                app.update();
+            }
+            assert_eq!(tick(&app), 87);
+            control(ControlRequest::Resume);
+        }
         app.update();
         assert!(app.world().resource::<SimStatus>().fatal.is_none());
     }
@@ -167,8 +186,8 @@ fn lockstep_run(ticks: usize, control_rate_hz: Option<f64>) -> (Vec<Telemetry>, 
 
 #[test]
 fn lockstep_makes_networked_runs_reproducible() {
-    let (a, answered) = lockstep_run(240, None);
-    let (b, _) = lockstep_run(240, None);
+    let (a, answered) = lockstep_run(240, None, false);
+    let (b, _) = lockstep_run(240, None, false);
     assert_eq!(of(&a, 1).tick, 241);
     assert_eq!(of(&a, 1).control_mode, ControlMode::Raw);
     // The sim waited on ticks 0..=240; tick 241's answer may or may not have
@@ -178,11 +197,19 @@ fn lockstep_makes_networked_runs_reproducible() {
 }
 
 #[test]
+fn pausing_and_stepping_a_lockstep_run_does_not_change_it() {
+    let (straight, _) = lockstep_run(240, None, false);
+    let (interrupted, answered) = lockstep_run(240, None, true);
+    assert_eq!(answered[..241], (0..=240).collect::<Vec<_>>(), "each tick answered once");
+    assert_eq!(straight, interrupted, "pause and step decide only when ticks run");
+}
+
+#[test]
 fn decimated_lockstep_publishes_and_waits_only_on_control_ticks() {
     // 30 Hz control at 120 Hz physics: telemetry and the lockstep wait every 4th
     // tick, the last command held in between — and still reproducible.
-    let (a, answered) = lockstep_run(240, Some(30.0));
-    let (b, _) = lockstep_run(240, Some(30.0));
+    let (a, answered) = lockstep_run(240, Some(30.0), false);
+    let (b, _) = lockstep_run(240, Some(30.0), false);
     assert_eq!(of(&a, 1).tick, 241);
     assert_eq!(of(&a, 1).control_mode, ControlMode::Raw);
     assert_eq!(answered, (0..=240).step_by(4).collect::<Vec<_>>());

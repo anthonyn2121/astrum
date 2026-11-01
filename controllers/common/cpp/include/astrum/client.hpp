@@ -11,6 +11,8 @@
 //   * commands `astrum/command/<id>`: declared publisher with CongestionControl DROP,
 //     express, priority INTERACTIVE_HIGH; one command per telemetry sample (the raw
 //     lease), each with seq (strictly increasing from 1) and telemetryTick;
+//   * presence: the liveliness token `astrum/alive/controller/<id>`, held while the
+//     client lives, so the sim learns at once when this process goes away;
 //   * untrusted input: a payload that fails to decode is counted, logged, and skipped;
 //   * timeouts: no telemetry within --startup-timeout -> exit 1; telemetry stops for
 //     --telemetry-timeout after it started -> exit 0.

@@ -112,7 +112,10 @@ struct Client::Impl {
         session(open_session(config.connect, config.startup_timeout_s)),
         publisher(session.declare_publisher(zenoh::KeyExpr(command_key), command_qos())),
         subscriber(session.declare_subscriber(
-            zenoh::KeyExpr(telemetry_key), [this](zenoh::Sample& s) { on_sample(s); }, [] {})) {}
+            zenoh::KeyExpr(telemetry_key), [this](zenoh::Sample& s) { on_sample(s); }, [] {})),
+        // Presence: the sim learns the moment this process (or its connection) goes away.
+        token(session.liveliness_declare_token(
+            zenoh::KeyExpr("astrum/alive/controller/" + std::to_string(config.id)))) {}
 
   // Zenoh RX thread: overwrite the latest-value slot. Must never throw into zenoh-c.
   void on_sample(zenoh::Sample& sample) noexcept {
@@ -165,6 +168,7 @@ struct Client::Impl {
   zenoh::Session session;
   zenoh::Publisher publisher;
   zenoh::Subscriber<void> subscriber;
+  zenoh::LivelinessToken token;
 };
 
 Client::Client(ClientConfig config, std::string tag)

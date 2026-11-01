@@ -47,7 +47,8 @@ pub enum ControlMode {
     Raw,
     /// The sim's inner loop flying commanded targets.
     Autopilot,
-    /// The raw lease expired; the sim is holding heading/altitude/speed.
+    /// The command lease expired or the aircraft's controller went away; the
+    /// sim is holding heading/altitude/speed.
     Failsafe,
     /// A value this build's schema does not know (sent by a newer peer).
     Unknown(u16),

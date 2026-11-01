@@ -58,6 +58,17 @@ pub mod keys {
     pub const COMMAND_ALL: &str = "astrum/command/*";
     /// The sim's scenario TOML (queryable).
     pub const SCENARIO: &str = "astrum/scenario";
+    /// `astrum/alive/controller/<id>`: liveliness token of the controller
+    /// flying aircraft `<id>`.
+    pub const ALIVE_PREFIX: &str = "astrum/alive/controller";
+    /// Every controller's liveliness token.
+    pub const ALIVE_ALL: &str = "astrum/alive/controller/*";
+    /// `astrum/control/<pause|resume|step|speed>`: run control (queryable).
+    pub const CONTROL_PREFIX: &str = "astrum/control";
+    /// Every control request.
+    pub const CONTROL_ALL: &str = "astrum/control/*";
+    /// The sim's run status as JSON (queryable).
+    pub const STATUS: &str = "astrum/status";
 
     pub fn telemetry(id: u32) -> String {
         format!("{TELEMETRY_PREFIX}/{id}")
@@ -65,6 +76,10 @@ pub mod keys {
 
     pub fn command(id: u32) -> String {
         format!("{COMMAND_PREFIX}/{id}")
+    }
+
+    pub fn alive(id: u32) -> String {
+        format!("{ALIVE_PREFIX}/{id}")
     }
 
     /// The id in `<prefix>/<id>`, or `None` if `key` is not of that form.
@@ -102,6 +117,8 @@ pub enum NetError {
     Zenoh(String),
     /// A scenario reply was not UTF-8.
     BadScenario(String),
+    /// The sim refused a control request (the reason it gave).
+    Refused(String),
 }
 
 impl fmt::Display for NetError {
@@ -111,6 +128,7 @@ impl fmt::Display for NetError {
             NetError::Disconnected => write!(f, "subscription channel disconnected"),
             NetError::Zenoh(e) => write!(f, "zenoh error: {e}"),
             NetError::BadScenario(e) => write!(f, "scenario reply is not UTF-8: {e}"),
+            NetError::Refused(why) => write!(f, "refused: {why}"),
         }
     }
 }
@@ -463,4 +481,227 @@ pub fn fetch_scenario(session: &Session, timeout: Duration) -> Result<Option<Str
         // No queryable yet: the query finished early; wait out the attempt.
         std::thread::sleep(attempt.saturating_sub(started.elapsed()));
     }
+}
+
+// --- Controller presence --------------------------------------------------------
+
+/// A controller's announcement that it flies aircraft `id`: a Zenoh liveliness
+/// token on `astrum/alive/controller/<id>` that lasts as long as this value and
+/// its session. A crashed process loses its connection, so the sim learns of it
+/// at once instead of waiting for a lease or lockstep timeout.
+pub struct PresenceToken {
+    _token: zenoh::liveliness::LivelinessToken,
+}
+
+impl PresenceToken {
+    pub fn declare(session: &Session, aircraft_id: u32) -> Result<Self> {
+        let token =
+            session.z.liveliness().declare_token(keys::alive(aircraft_id)).wait().map_err(zerr)?;
+        Ok(Self { _token: token })
+    }
+}
+
+/// A change in which controllers are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Up(u32),
+    Down(u32),
+}
+
+/// Sim-side watcher of controller tokens: reports the ones already present when
+/// it starts, then every change.
+pub struct PresenceWatcher {
+    sub: Subscriber<FifoChannelHandler<Sample>>,
+}
+
+impl PresenceWatcher {
+    pub fn watch(session: &Session) -> Result<Self> {
+        let sub = session
+            .z
+            .liveliness()
+            .declare_subscriber(keys::ALIVE_ALL)
+            .history(true)
+            .with(zenoh::handlers::FifoChannel::new(COMMAND_QUEUE))
+            .wait()
+            .map_err(zerr)?;
+        Ok(Self { sub })
+    }
+
+    /// Every change since the last call, in order, without blocking. Tokens on a
+    /// key without a numeric id are ignored.
+    pub fn drain(&self) -> Vec<Presence> {
+        let mut out = Vec::new();
+        while let Ok(Some(sample)) = self.sub.try_recv() {
+            if let Some(id) = keys::id_of(sample.key_expr().as_str(), keys::ALIVE_PREFIX) {
+                out.push(match sample.kind() {
+                    zenoh::sample::SampleKind::Put => Presence::Up(id),
+                    zenoh::sample::SampleKind::Delete => Presence::Down(id),
+                });
+            }
+        }
+        out
+    }
+}
+
+// --- Run control ----------------------------------------------------------------
+
+/// A request on `astrum/control/*`. Control decides only when ticks run (pause,
+/// step, pace), never what a tick computes, so a lockstep run is unchanged by it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ControlRequest {
+    /// `astrum/control/pause`: stop after the current tick.
+    Pause,
+    /// `astrum/control/resume`: run on.
+    Resume,
+    /// `astrum/control/step?ticks=N`: run N ticks, then pause.
+    Step(u64),
+    /// `astrum/control/speed?value=X`: the new `sim.speed` (0 = unpaced).
+    Speed(f64),
+}
+
+impl ControlRequest {
+    /// The selector (`key?parameters`) a client queries.
+    pub fn selector(&self) -> String {
+        match self {
+            ControlRequest::Pause => format!("{}/pause", keys::CONTROL_PREFIX),
+            ControlRequest::Resume => format!("{}/resume", keys::CONTROL_PREFIX),
+            ControlRequest::Step(n) => format!("{}/step?ticks={n}", keys::CONTROL_PREFIX),
+            ControlRequest::Speed(x) => format!("{}/speed?value={x}", keys::CONTROL_PREFIX),
+        }
+    }
+
+    /// Parse and check a request; `min_speed` is the slowest non-zero speed.
+    fn parse(
+        key: &str,
+        param: impl Fn(&str) -> Option<String>,
+        min_speed: f64,
+    ) -> Result<Self, String> {
+        let op = key.strip_prefix(keys::CONTROL_PREFIX).and_then(|k| k.strip_prefix('/'));
+        match op {
+            Some("pause") => Ok(ControlRequest::Pause),
+            Some("resume") => Ok(ControlRequest::Resume),
+            Some("step") => match param("ticks").map(|t| t.parse::<u64>()) {
+                Some(Ok(n)) if n > 0 => Ok(ControlRequest::Step(n)),
+                _ => Err("step needs ?ticks=<N> with N >= 1".into()),
+            },
+            Some("speed") => match param("value").map(|v| v.parse::<f64>()) {
+                Some(Ok(x)) if x == 0.0 || (x.is_finite() && x >= min_speed) => {
+                    Ok(ControlRequest::Speed(x))
+                }
+                _ => Err(format!("speed needs ?value=<X> with X = 0 (unpaced) or >= {min_speed}")),
+            },
+            _ => Err(format!("unknown control {key} (pause, resume, step, speed)")),
+        }
+    }
+}
+
+/// The sim's run status, answered on `astrum/status` as JSON.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RunStatus {
+    pub tick: u64,
+    pub sim_time_s: f64,
+    /// `running`, `paused`, or `waiting` (a lockstep tick waiting on controllers).
+    pub state: String,
+    /// Target pace (× real time; 0 = unpaced).
+    pub speed: f64,
+    /// Pace actually achieved recently (× real time).
+    pub achieved_speed: f64,
+    pub aircraft: usize,
+    /// Aircraft whose controller is present (liveliness).
+    pub controllers: Vec<u32>,
+    /// While waiting: the lockstep aircraft whose command is still missing.
+    pub lockstep_waiting: Vec<u32>,
+}
+
+/// The sim's status as last written by the sim, read by the status queryable.
+pub type StatusBoard = Arc<Mutex<RunStatus>>;
+
+/// Sim side of the control plane: validates control requests on Zenoh's thread
+/// (bad ones get an error reply), queues the good ones for the sim to apply
+/// between ticks, and answers `astrum/status` from the [`StatusBoard`].
+pub struct ControlServer {
+    _control: Queryable<()>,
+    _status: Queryable<()>,
+    requests: std::sync::mpsc::Receiver<ControlRequest>,
+    board: StatusBoard,
+}
+
+impl ControlServer {
+    pub fn serve(session: &Session, min_speed: f64) -> Result<Self> {
+        let (tx, requests) = std::sync::mpsc::channel();
+        let control = session
+            .z
+            .declare_queryable(keys::CONTROL_ALL)
+            .callback(move |query| {
+                let key = query.key_expr().as_str().to_owned();
+                let params = query.parameters();
+                let param = |name: &str| params.get(name).map(str::to_owned);
+                let _ = match ControlRequest::parse(&key, param, min_speed) {
+                    Ok(req) if tx.send(req).is_ok() => query.reply(key.clone(), "ok").wait(),
+                    Ok(_) => query.reply_err("the sim is shutting down").wait(),
+                    Err(why) => query.reply_err(why).wait(),
+                };
+            })
+            .wait()
+            .map_err(zerr)?;
+        let board = StatusBoard::default();
+        let shown = Arc::clone(&board);
+        let status = session
+            .z
+            .declare_queryable(keys::STATUS)
+            .callback(move |query| {
+                let json = {
+                    let s = shown.lock().unwrap_or_else(PoisonError::into_inner);
+                    serde_json::to_string(&*s).unwrap_or_default()
+                };
+                let _ = query.reply(keys::STATUS, json).wait();
+            })
+            .wait()
+            .map_err(zerr)?;
+        Ok(Self { _control: control, _status: status, requests, board })
+    }
+
+    /// Requests received since the last call, in order.
+    pub fn drain(&self) -> Vec<ControlRequest> {
+        self.requests.try_iter().collect()
+    }
+
+    /// Like [`drain`](Self::drain), but wait up to `timeout` for the first one.
+    pub fn wait(&self, timeout: Duration) -> Vec<ControlRequest> {
+        match self.requests.recv_timeout(timeout) {
+            Ok(first) => std::iter::once(first).chain(self.requests.try_iter()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// The board the sim writes its status to.
+    pub fn board(&self) -> StatusBoard {
+        Arc::clone(&self.board)
+    }
+}
+
+/// One query, one reply: its payload, or the sim's refusal.
+fn query_one(session: &Session, selector: &str, timeout: Duration) -> Result<Vec<u8>> {
+    let replies = session.z.get(selector).timeout(timeout).wait().map_err(zerr)?;
+    match replies.recv_timeout(timeout + Duration::from_millis(100)) {
+        Ok(Some(reply)) => match reply.result() {
+            Ok(sample) => Ok(sample.payload().to_bytes().into_owned()),
+            Err(e) => {
+                Err(NetError::Refused(String::from_utf8_lossy(&e.payload().to_bytes()).into()))
+            }
+        },
+        _ => Err(NetError::Timeout),
+    }
+}
+
+/// Ask the sim to apply `request`; an invalid request comes back as
+/// [`NetError::Refused`], no sim as [`NetError::Timeout`].
+pub fn send_control(session: &Session, request: ControlRequest, timeout: Duration) -> Result<()> {
+    query_one(session, &request.selector(), timeout).map(drop)
+}
+
+/// The sim's current [`RunStatus`].
+pub fn fetch_status(session: &Session, timeout: Duration) -> Result<RunStatus> {
+    let bytes = query_one(session, keys::STATUS, timeout)?;
+    serde_json::from_slice(&bytes).map_err(|e| NetError::Zenoh(format!("bad status reply: {e}")))
 }

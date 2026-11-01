@@ -81,6 +81,11 @@ impl Pilot {
     pub fn due(&self, tick: u64) -> bool {
         tick.is_multiple_of(self.control_period_ticks)
     }
+
+    /// Flown by a controller's commands (raw or autopilot), not by the sim alone.
+    pub fn commanded(&self) -> bool {
+        matches!(self.mode, PilotMode::Raw(_) | PilotMode::Autopilot(_))
+    }
 }
 
 /// Why a command was refused.
@@ -170,6 +175,15 @@ pub fn hold_targets(s: &FdmState) -> AutopilotTargets {
     AutopilotTargets { heading_rad: s.psi_rad, alt_hae_m: s.alt_hae_m, tas_mps: s.tas_mps }
 }
 
+/// Switch to the failsafe hold of the current state and release the trigger.
+pub fn enter_failsafe(pilot: &mut Pilot, trigger: Option<&mut Trigger>, state: &AircraftState) {
+    pilot.mode = PilotMode::Failsafe(hold_targets(&state.fdm));
+    pilot.integrators = Integrators::default();
+    if let Some(t) = trigger {
+        t.0 = false;
+    }
+}
+
 /// Expire command leases: a commanded aircraft with no fresh command for longer
 /// than the lease switches to the failsafe hold and releases its trigger.
 pub fn expire_leases(
@@ -179,18 +193,13 @@ pub fn expire_leases(
 ) {
     let Some(lease) = params.lease_ticks else { return };
     for (ac, mut pilot, trigger, state) in &mut q {
-        let commanded = matches!(pilot.mode, PilotMode::Raw(_) | PilotMode::Autopilot(_));
-        if commanded && clock.tick - pilot.last_command_tick > lease {
+        if pilot.commanded() && clock.tick - pilot.last_command_tick > lease {
             eprintln!(
                 "[astrum-sim] aircraft {}: no command for {:.2} s — failsafe hold",
                 ac.id,
                 (clock.tick - pilot.last_command_tick) as f64 * params.dt
             );
-            pilot.mode = PilotMode::Failsafe(hold_targets(&state.fdm));
-            pilot.integrators = Integrators::default();
-            if let Some(mut t) = trigger {
-                t.0 = false;
-            }
+            enter_failsafe(&mut pilot, trigger.map(Mut::into_inner), state);
         }
     }
 }
