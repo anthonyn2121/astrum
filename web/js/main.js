@@ -404,7 +404,7 @@ function emptyText() {
   const url = state.wsUrl || defaultWsUrl();
   if (state.status === "connecting") return `Connecting to ${url}…`;
   if (state.connected) return `Connected to ${url}. Waiting for the first frame.`;
-  return `No live stream at ${url}. Start one with make replay, or open a recording.`;
+  return `No live stream at ${url}. Start one with astrum run <scenario> --watch, or open a recording.`;
 }
 
 let lastFleetAt = -Infinity;

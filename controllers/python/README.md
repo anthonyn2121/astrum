@@ -25,7 +25,7 @@ controllers/optimal/python`). The schema is resolved relative to the checkout.
 ## Transport
 
 One `mode=client` Zenoh session connecting to the sim, which listens as the Zenoh router
-(`tcp/sim:7447` under compose):
+(default `tcp/127.0.0.1:7447`):
 
 - **SUB** `astrum/telemetry/<id>` — a callback keeps only the **newest** sample per
   aircraft, so a slow law always acts on fresh state (never a FIFO of stale data).
@@ -109,7 +109,7 @@ Exit codes: `0` telemetry stopped, `1` no telemetry at startup, `2` refused to f
 
 ```bash
 python controllers/python/example.py --heading 0 --id 1
-make demo-python     # bounded single-ship demo with auto teardown
+astrum run config/demos/python.toml   # bounded single-ship demo with auto teardown
 ```
 
 ## Tests and wire fixtures

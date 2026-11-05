@@ -51,7 +51,7 @@ usage error (exit 2).
 
 | Flag | Env fallback | Default | Meaning |
 |---|---|---|---|
-| `--connect` | `ASTRUM_ZENOH_CONNECT` | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (`tcp/sim:7447` under compose) |
+| `--connect` | `ASTRUM_ZENOH_CONNECT` | `tcp/127.0.0.1:7447` | sim Zenoh endpoint |
 | `--id` | `ASTRUM_TARGET_ID` | `1` | aircraft id to fly |
 | `--heading` | `ASTRUM_TARGET_HEADING_DEG` | `0` | target true heading, degrees (0 = north) |
 | `--alt` | `ASTRUM_TARGET_ALT_M` | `1500` | target altitude, m above the WGS84 ellipsoid (HAE) |
@@ -73,8 +73,8 @@ ctest --test-dir build/controllers --output-on-failure
 ./build/controllers/cpp/astrum-controller --heading 90 --id 1
 ```
 
-Under compose the `controller` service runs this binary against the `sim` service (`make up`,
-or `make demo`). `make test-cpp` runs the build + ctest above.
+`astrum run config/demos/cpp.toml` runs this binary against a fresh sim (C++ hold,
+aircraft 1 north at 1500 m / 50 m/s). `make test-cpp` runs the build + ctest above.
 
 ## Notes
 

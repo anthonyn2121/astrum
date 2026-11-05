@@ -2,10 +2,10 @@
 # trim across the envelope? 4 speeds x 3 altitudes = 12 runs of 60 s, flown at
 # once, one thread each, as fast as possible.
 #
-#   cargo run --release -p astrum-sim --bin astrum-sweep -- config/sweep.trim.toml
+#   astrum sweep config/sweep.trim.toml
 #
 # Results: runs/sweep.trim/summary.csv plus one MCAP bag per run (export one
-# with `make export BAG=runs/sweep.trim/run-0001.mcap` to look at it).
+# with `astrum export runs/sweep.trim/run-0001.mcap` to look at it).
 
 base = "config/scenario.example.toml"
 

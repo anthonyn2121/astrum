@@ -20,8 +20,8 @@ fixed-wing aircraft and sUAS quadrotors, each with its own high-fidelity flight 
 
 Telemetry and commands can be recorded to an **MCAP** bag and the telemetry replayed to any
 subscriber with the recorded payload bytes, and a browser-based **3-D replay renderer**
-(Three.js, procedural meshes) visualises the fleet live or from an exported bag — `make replay`,
-then open http://localhost:8080.
+(Three.js, procedural meshes) visualises the fleet live or from an exported bag — `astrum run
+config/scenario.example.toml --watch`, then open http://localhost:8080.
 
 ## Status
 
@@ -32,7 +32,7 @@ Everything below is built and tested; here's what lives where:
 | `astrum-fdm` | safe JSBSim 6-DOF wrapper (C shim catches every C++ exception; crate-owned lock makes `Fdm: Send`) |
 | `astrum-geo` | WGS84 geodetic ↔ ECEF ↔ ENU mapping, local-level ↔ grid rotations |
 | `astrum-sim` | headless Bevy ECS state server — one JSBSim FDM per entity, combat, lease/failsafe, lockstep |
-| `astrum-proto` + `astrum-net` | Cap'n Proto schema v2 + Zenoh transport (telemetry, commands, events, scenario, controller presence, run control) + `astrum-ctl` |
+| `astrum-proto` + `astrum-net` | Cap'n Proto schema v2 + Zenoh transport (telemetry, commands, events, scenario, controller presence, run control) + `astrum ctl` |
 | `astrum-bag` | record telemetry, commands and events to MCAP; replay telemetry and events paced by sim time |
 | `astrum-env` | Python bindings (`Env`, `BatchEnv`) + the Gymnasium-style dogfight adapter |
 | `astrum-web` + `web/` | axum telemetry bridge + tile proxy, offline exporter, browser 3-D renderer |
@@ -41,12 +41,13 @@ Everything below is built and tested; here's what lives where:
 | `controllers/optimal` | C++/Python runtime + law split: LQR, MPC, figure-eight, formation |
 | `docs/` | architecture diagram, dogfight environment design + onboarding |
 
-`make demo` brings up the sim and a C++ controller that flies an aircraft to a commanded
-heading/altitude over Zenoh (`make demo-python` runs the equivalent Python controller).
-`make demo-quad` flies ASTRUM's second vehicle class — an **F450 quadrotor** that climbs and yaws
-under the built-in multirotor hover-hold autopilot. `make demo-formation` flies a figure-eight
-leader with three decentralized MPC followers. `make smoke` runs all four and fails on the first
-failure. `make replay` starts the fleet alongside the 3-D renderer.
+`astrum run config/demos/cpp.toml` brings up the sim and a C++ controller that flies an aircraft
+to a commanded heading/altitude over Zenoh (`config/demos/python.toml` runs the equivalent Python
+controller). `config/demos/quad.toml` flies ASTRUM's second vehicle class — an **F450 quadrotor**
+that climbs and yaws under the built-in multirotor hover-hold autopilot.
+`config/demos/formation.toml` flies a figure-eight leader with three decentralized MPC followers.
+`make smoke` runs every `config/demos/*.toml` and fails on the first failure. `--watch` adds the
+3-D renderer to any run.
 
 ## Architecture & data flow
 
@@ -107,23 +108,27 @@ aircraft.
 
 ## Quick start
 
+On the host:
+
 ```bash
-make build          # build the dev image (compiles JSBSim from source — first run is slow)
-make verify         # confirm the toolchain (pinned versions agree, JSBSim/zenoh link + run)
-make demo           # integration demo: C++ controller flies aircraft 1, then tears down
-make demo-python    # same demo, flown by the Python controller
-make demo-quad      # quadrotor demo: an F450 climbs + yaws under the built-in multirotor autopilot
-make demo-formation # figure-eight leader + 3 MPC followers
-make smoke          # every bounded demo; fails on the first failure
-make ci             # the full gate: fmt-check + lint + all tests + cargo deny
-make shell          # one-off dev shell (SERVICE=sim|controller)
-make up / make down # start (detached) / stop sim + replay + C++ controller
-make help           # list all targets
+make dev            # build the astrum-dev image if needed (JSBSim from source — first run is slow),
+                    # start the dev container, open a shell in it (again = another shell, same container)
 ```
 
-Under compose a one-shot `build` service compiles the release binaries and the C++ controllers
-once (`scripts/build-release.sh`); every other service waits for it, and controllers also wait for
-the sim's healthcheck (its Zenoh port accepting TCP).
+Inside the dev container (`/workspace`):
+
+```bash
+astrum list                                    # every scenario / run / sweep file under config/
+astrum run config/demos/cpp.toml               # C++ controller flies aircraft 1, then tears down
+astrum run config/demos/formation.toml --watch # figure-eight leader + 3 MPC followers, live at http://localhost:8080
+make verify                                    # confirm the toolchain (pinned versions agree, JSBSim/zenoh link + run)
+make test                                      # all tests
+make ci                                        # the full gate: fmt-check + lint + all tests + cargo deny
+```
+
+`astrum` rebuilds the release binaries and C++ controllers when their sources changed (a no-op
+otherwise). `make build` rebuilds the image, `make down` stops the dev container, `make clean`
+also drops its volumes and the image.
 
 ## Running the simulation
 
@@ -131,7 +136,6 @@ The headless ECS state server (`astrum-sim`) spawns one aircraft entity — each
 JSBSim instance — per `[[aircraft]]` entry in a scenario file:
 
 ```bash
-make shell                                  # into a dev container
 cargo run -p astrum-sim                     # uses config/scenario.example.toml
 cargo run -p astrum-sim -- config/my.toml   # scenario is a positional argument
 cargo run -p astrum-sim -- --threads 8      # FDM stepping threads (0 = all cores)
@@ -225,15 +229,15 @@ happens to arrive.
 ### Running fast, recording, and watching
 
 - **Speed.** `--speed 0` (or `sim.speed = 0`) runs as fast as the host allows; `--speed 1` is real
-  time (watch it live with `make replay`); any factor in between works (`--speed 10`).
+  time (watch it live with `astrum run FILE --watch`); any factor in between works (`--speed 10`).
 - **Threads.** For fleets of about four or more, `--threads N`: each aircraft's FDM stays on one
   worker (so its working set stays in that core's cache) and idle workers spin briefly between
   unpaced ticks. Keep `N` at or below the cores that are actually free — spinning workers on an
   oversubscribed host are slower than fewer of them.
 - **Recording.** `--record run.mcap` writes every tick of every aircraft (and the commands the sim
   received, and every event) in-process, on a writer thread: lossless at any speed. Watch it afterwards in real time
-  with `astrum-bag-play run.mcap --rate 1` (any subscriber, including the viewer bridge), or bake it
-  with `make export BAG=run.mcap` and scrub it in the viewer. SIGINT/SIGTERM finish the bag.
+  with `astrum play run.mcap --rate 1` (any subscriber, including the viewer bridge), or bake it
+  with `astrum export run.mcap --out run.json` and scrub it in the viewer. SIGINT/SIGTERM finish the bag.
 - **External controllers.** Faster than real time only makes sense in **lockstep**; the sim then
   waits for a controller round trip every control tick, which bounds the speed. A
   `control_rate_hz` below `rate_hz` cuts the round trips per simulated second.
@@ -267,21 +271,20 @@ Embedded env reset: 6.0 ms (a fresh build is 10.4 ms); most of it is the JSBSim 
 `trim = false` per aircraft skips. Cap'n Proto telemetry is ~170 B with ~0.1 µs encode/decode — not
 a bottleneck.
 
-### Live control (`astrum-ctl`)
+### Live control (`astrum ctl`)
 
 A running sim can be paused, single-stepped and re-paced from any client on the bus:
 
 ```bash
-astrum-ctl status            # running | tick 1360 | sim 11.3 s | 4.0× real time (target 4×) | 2 aircraft | controllers [1, 2]
-astrum-ctl status --watch    # once a second; --json for the raw reply
-astrum-ctl pause             # stop after the current tick
-astrum-ctl step 120          # run 120 ticks, then pause
-astrum-ctl speed 20          # new pace from the next tick (0 = unpaced, otherwise ≥ 0.001)
-astrum-ctl resume
+astrum ctl status            # running | tick 1360 | sim 11.3 s | 4.0× real time (target 4×) | 2 aircraft | controllers [1, 2]
+astrum ctl status --watch    # once a second; --json for the raw reply
+astrum ctl pause             # stop after the current tick
+astrum ctl step 120          # run 120 ticks, then pause
+astrum ctl speed 20          # new pace from the next tick (0 = unpaced, otherwise ≥ 0.001)
+astrum ctl resume
 ```
 
-`--connect` (`ASTRUM_ZENOH_CONNECT`) picks the sim; under compose,
-`docker compose exec sim target/release/astrum-ctl status`. Requests are Zenoh queries on
+`--connect` (`ASTRUM_ZENOH_CONNECT`) picks the sim (default `tcp/127.0.0.1:7447`). Requests are Zenoh queries on
 `astrum/control/<pause|resume|step|speed>` (`step?ticks=N`, `speed?value=X`); an invalid one is
 refused with the reason and changes nothing. `get astrum/status` answers JSON: `tick`,
 `sim_time_s`, `state` (`running`, `paused`, or `waiting` on lockstep controllers), `speed`,
@@ -317,20 +320,20 @@ tick). Within a tick, events come in the order the tick chain ran. They are dete
 rest of the sim: the same scenario and commands report the same events (tested on a gun pass).
 The table's JSON shape is the one the replay export, the viewer's WebSocket, the RL env's
 `info.events` and the Python client's `Event.as_dict()` all use; on the wire it is the schema's
-`Event` union. `astrum-bag-record` records them, `astrum-bag-play` replays them, and the viewer
+`Event` union. `astrum record` records them, `astrum play` replays them, and the viewer
 marks hits and kills on its timeline. Reporting adds ~0.1 µs to a 1-ship tick (`make bench`,
 within run-to-run noise); a tick without events encodes and sends nothing.
 
-### Sweeps (`astrum-sweep`)
+### Run files and sweeps (`astrum run`, `astrum sweep`)
 
 Many runs of one scenario — a parameter study, a Monte Carlo set, a regression suite — are faster
-side by side than one at a time: `astrum-sweep` flies a grid of scenario variants, many at once,
+side by side than one at a time: `astrum sweep` flies a grid of scenario variants, many at once,
 and collects every run.
 
 ```bash
-make sweep SWEEP=config/sweep.demo.toml                 # 12 runs: C++ controller, 4 headings × 3 speeds
-cargo run --release -p astrum-sim --bin astrum-sweep -- config/sweep.trim.toml --jobs 8
-astrum-sweep config/sweep.demo.toml --dry-run           # list the planned runs, fly nothing
+astrum sweep config/sweep.demo.toml             # 12 runs: C++ controller, 4 headings × 3 speeds
+astrum sweep config/sweep.trim.toml --jobs 8
+astrum sweep config/sweep.demo.toml --dry-run   # list the planned runs, fly nothing
 ```
 
 A sweep file names a `base` scenario, fixed overrides (`[set]`) and a grid (`[vary]`: every
@@ -346,11 +349,34 @@ controller commands). Every run's scenario is built and validated before anythin
   `{endpoint}`, `{run}`, `{seed}` and `{param.<name>}` are filled in. Unpaced runs with controllers
   must be lockstep, so they are reproducible.
 
-Results land in `runs/<sweep name>/`: per run its scenario, bag and logs, and `summary.csv` (run,
+Results land in `runs/<file stem>/`: per run its scenario, bag and logs, and `summary.csv` (run,
 status, seed, the varied values, sim time, wall time, speed, bag). Ctrl-C stops starting runs and
 ends the running ones cleanly; the summary marks them. Exit status 0 means every run was ok.
 Bundled sweeps: `sweep.trim.toml` (in-process), `sweep.demo.toml` (C++ controller),
-`sweep.formation.toml` (four Python controllers at a 30 Hz control rate).
+`sweep.formation.toml` (four Python controllers at a 30 Hz control rate). Other flags:
+`--out DIR`, `--overwrite`, `--base-port P`, `--sim PATH`.
+
+A **run file** is a sweep file without a grid: `base`, `controllers`, `[set]` and an optional
+`speed` — one run. The demos under `config/demos/` are run files. `astrum run` flies one (or a
+bare scenario TOML) in the foreground and refuses files that plan more than one run:
+
+```bash
+astrum run config/demos/formation.toml --watch               # + the viewer at http://localhost:8080
+astrum run config/scenario.demo.toml --speed 0 --set aircraft.1.tas_mps=60
+astrum run config/demos/cpp.toml --record recordings/session.mcap
+astrum run config/demos/quad.toml --dry-run                  # print the resolved scenario TOML
+```
+
+It starts `astrum-sim` on `--listen` (default `$ASTRUM_ZENOH_LISTEN` or `tcp/0.0.0.0:7447`), then
+with `--watch` the viewer, then the run file's controllers (each gets `ASTRUM_ZENOH_CONNECT`), and
+streams every process's output prefixed `[sim]`, `[web]`, `[ctl1]`, `[ctl2]`…. `--set` takes the
+sweep keys above; values parse as TOML (`200`, `true`, `"f16"`; bare words become strings). Pace:
+`--speed` > the run file's `speed` > the scenario's `sim.speed`. `--record BAG` records in-process
+(lossless). The run ends when the sim does (`sim.max_time_s`; `0` runs until Ctrl-C) or on Ctrl-C,
+which stops the sim cleanly (finishing any bag), then the controllers. A lockstep scenario with no
+controllers is allowed: attach your own from another shell. Exit status: `0` ok, `1` failed (sim
+error, or a controller exited non-zero while the sim ran), `2` invalid file or arguments, `130`
+stopped by Ctrl-C.
 
 Measured on the 24-core host while it ran other jobs: 24 concurrent single-aircraft in-process runs
 total ~11,800× real time (one alone: ~1,180×); the 12-run C++ demo sweep takes 1.3 s; the 9-run
@@ -375,16 +401,16 @@ fixed-wing they are control-surface (on the f16, FLCS) commands, on a **multirot
 roll/pitch/yaw **rate** demands plus collective throttle. A raw control law is not portable across
 classes, so raw controllers check `Telemetry.vehicleKind` and refuse (exit non-zero) any kind they
 were not written for, including unknown values. Either send **autopilot** targets and let the sim
-run the matching law (`make demo-quad` flies an F450 this way), or send **raw** actuators with a
+run the matching law (`config/demos/quad.toml` flies an F450 this way), or send **raw** actuators with a
 law written for that class.
 
 ```bash
-# whole stack over the compose network (sim + controller by service name)
-docker compose up sim controller
+# sim + C++ controller from a run file
+astrum run config/demos/cpp.toml
 
-# or standalone in one dev shell against a bounded demo scenario:
-cargo run --release -p astrum-sim -- config/scenario.demo.toml &     # aircraft 1 heads east
-cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release && cmake --build build/controllers -j
+# or your own controller: shell 1 runs the sim on a bounded demo scenario (aircraft 1 heads east)
+astrum run config/scenario.demo.toml
+# shell 2 (another `make dev`) connects on the default tcp/127.0.0.1:7447
 build/controllers/cpp/astrum-controller --heading 0                  # commands it north
 # ...or the Python controller, no build step:
 python controllers/python/example.py --heading 0
@@ -443,14 +469,14 @@ Python clients ask for it (`transport/unicast/lowlatency = true`, `qos/enabled =
 more lockstep throughput. A client that doesn't ask, or a sim that doesn't offer it, falls back to
 the default transport.
 
-**Topology.** The sim (or `astrum-bag-play`) **listens as a Zenoh router** on
+**Topology.** The sim (or `astrum play`) **listens as a Zenoh router** on
 `tcp/0.0.0.0:7447`; every other process — recorder, web bridge, C++ and Python controllers —
-opens one `mode=client` session (multicast scouting off) connecting to it: `tcp/sim:7447` under
-compose, `tcp/127.0.0.1:7447` by default. The router routes between its clients, so e.g. the
+opens one `mode=client` session (multicast scouting off) connecting to it: `tcp/127.0.0.1:7447` by
+default (host-side tools reach the dev container's published port on the same address). The router routes between its clients, so e.g. the
 recorder sees the commands a controller sends (Zenoh 1.10 routers do not forward between two
 *peers*). A client's open waits for a sim that is still starting, up to its connect timeout, then
-fails with a clear message: controllers exit 1 after `--startup-timeout`; `astrum-bag-record` and
-`astrum-web` take `--connect-timeout` (`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s). Endpoints are
+fails with a clear message: controllers exit 1 after `--startup-timeout`; `astrum record` and
+`astrum web` take `--connect-timeout` (`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s). Endpoints are
 overridable via `$ASTRUM_ZENOH_LISTEN` (sim / replay) and `$ASTRUM_ZENOH_CONNECT` (everyone else);
 the endpoint syntax is `proto/host:port`.
 
@@ -471,13 +497,13 @@ The recorder is just another subscriber and replay is just another publisher.
 
 ```bash
 # record telemetry, commands and events to an MCAP bag (Ctrl-C / SIGTERM, or --seconds N, to stop)
-cargo run -p astrum-bag --bin astrum-bag-record -- recordings/session.mcap
+astrum record recordings/session.mcap
 
 # replay telemetry and events, listening where the sim would, paced by recorded sim time
-cargo run -p astrum-bag --bin astrum-bag-play -- recordings/session.mcap
+astrum play recordings/session.mcap
 
-# under compose: record the sim's streams to recordings/session.mcap
-docker compose --profile record up recorder
+# or record a run in-process (lossless) while it flies
+astrum run config/demos/formation.toml --record recordings/session.mcap
 ```
 
 A bag has one MCAP channel per Zenoh key (topic = key, message encoding `capnp`, the full
@@ -485,14 +511,14 @@ A bag has one MCAP channel per Zenoh key (topic = key, message encoding `capnp`,
 scenario fetched from `astrum/scenario` as metadata. The recorder never blocks Zenoh and finishes
 the file on SIGINT/SIGTERM (a SIGKILL leaves it unfinished).
 
-`astrum-bag-play` serves the recorded scenario on `astrum/scenario` and republishes every
+`astrum play` serves the recorded scenario on `astrum/scenario` and republishes every
 telemetry and event payload in recorded order; recorded commands are kept for analysis and not
 replayed. Flags: positional bag
 path (`ASTRUM_BAG`), `--rate` (sim-time speed multiplier, default `1.0`; ≤ 0 = unpaced; a single
 gap is capped at 5 s; `ASTRUM_REPLAY_RATE`), `--listen` (`ASTRUM_ZENOH_LISTEN`), `--warmup-ms`
 (default 300; `ASTRUM_REPLAY_WARMUP_MS`). Legacy pre-MCAP `.bag` files are not readable — re-record.
 
-## 3-D replay renderer (`astrum-web` + `web/`)
+## 3-D replay renderer (`astrum web` + `web/`)
 
 A browser-based renderer visualises the fleet on the ENU grid — procedurally-generated F-16-style
 jet and F450 quad meshes (no external model assets), tinted per vehicle class and per id (per team,
@@ -523,26 +549,26 @@ drift:
 
 ```bash
 # LIVE — start the fleet + the bridge, then open http://localhost:8080
-make replay          # docker compose up -d sim replay
-# (the bridge equally serves a bag being replayed by astrum-bag-play)
+astrum run config/scenario.example.toml --watch
+# (the bridge equally serves a bag being replayed: `astrum play b.mcap` in one shell, `astrum web` in another)
 
 # OFFLINE — bake an MCAP bag into one JSON the renderer opens via Source ▸ "Open export file…" (no services)
-make export BAG=recordings/session.mcap OUT=recordings/session.json
+astrum export recordings/session.mcap --out recordings/session.json
 ```
 
-`astrum-web` is an axum/tokio server. A latest-value Zenoh subscriber feeds one batched JSON
+`astrum web` is an axum/tokio server. A latest-value Zenoh subscriber feeds one batched JSON
 snapshot of the whole fleet at most `--max-hz` times per second (default 30), fanned out to every
 browser over the WebSocket `GET /telemetry` (a slow browser skips to the newest snapshot). Events
 are never dropped or throttled: each batch goes to every browser as `{"type":"events","events":[…]}`
 on the same socket, from the moment it connected. The fleet's JSBSim models, which telemetry does
-not carry, come from the sim's (or `astrum-bag-play`'s) `astrum/scenario` reply, polled every 5 s:
+not carry, come from the sim's (or `astrum play`'s) `astrum/scenario` reply, polled every 5 s:
 each browser gets `{"type":"models","models":[{"id":1,"model":"f16"},…]}` (sorted by id) on
 connect once known, and again whenever the fleet changes. WebSocket
 upgrades whose `Origin` does not match the request's `Host` are rejected. The same port serves the static `web/` app and
 the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags: `--connect` (default `tcp/127.0.0.1:7447`),
-`--bind` (default `127.0.0.1:8080`; compose binds 0.0.0.0 inside the container and publishes on
-host loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache` — each with an
-`ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback. `astrum-web-export` takes
+`--bind` (default `127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`,
+published on host loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache` — each with an
+`ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback. `astrum export` takes
 the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,
 `events`, and `meta` with their counts, the embedded `scenario` TOML and its aircraft `models`
 as `[{"id","model"},…]`, `[]` without a scenario) to `--out` (env fallbacks `ASTRUM_BAG` /
@@ -593,7 +619,7 @@ fixed-wing, `autopilot_profile`. A scenario can mix classes freely.
 **Add a controller** — in any language with Zenoh + Cap'n Proto bindings:
 
 1. Generate (or load) bindings from `crates/astrum-proto/schema/astrum.capnp`.
-2. Open one `mode=client` Zenoh session connecting to the sim (`tcp/sim:7447` under compose) and
+2. Open one `mode=client` Zenoh session connecting to the sim (`tcp/127.0.0.1:7447` by default) and
    subscribe latest-value to `astrum/telemetry/<id>` (or `astrum/telemetry/*`).
 3. For every telemetry sample, check `vehicleKind`, compute your control, and put a `Command` on
    `astrum/command/<id>` with `targetId == <id>`, the next `seq`, `telemetryTick` = the sample's
@@ -601,24 +627,24 @@ fixed-wing, `autopilot_profile`. A scenario can mix classes freely.
    low-latency transport (above) to shorten each lockstep round trip.
 
 `controllers/common` + `controllers/cpp` and `controllers/python/astrum_client` are worked
-references. New controllers can run as extra compose services on the `astrum` network or as any
-process that reaches the sim's endpoint.
+references. New controllers can be listed in a run file's `controllers` or run as any process that
+reaches the sim's endpoint.
 
 ## Layout
 
 ```
 assets/            logos
-config/            scenarios (example, demo, quad, formation, smoke)
+config/            scenarios (example, demo, quad, formation, smoke), sweeps, demos/ run files
 controllers/       out-of-sim flight controllers: common/ (shared C++), cpp/, python/, optimal/
 crates/            Rust workspace — astrum-fdm/geo/proto/net/bag/sim/env/web
 docker/            Dockerfile, entrypoint, pinned Python requirements
 docs/              architecture diagram, dogfight env design + onboarding
-scripts/           build, demo, toolchain verification, wire fixtures, astrum-env build
+scripts/           build, bin/astrum wrapper, toolchain verification, wire fixtures, astrum-env build
 web/               browser 3-D renderer (static app served by astrum-web)
 .github/workflows/ CI (make verify, make ci, make smoke)
-docker-compose.yml build/sim/replay/recorder/controller services
-Makefile           dev workflow entrypoints (make help)
-recordings/        MCAP bags written by astrum-bag-record (git-ignored)
+docker-compose.yml the long-lived dev service
+Makefile           dev workflow entrypoints
+recordings/        MCAP bags written by astrum record / --record (git-ignored)
 ```
 
 JSBSim inside the image: library/headers/pkg-config under `/opt/jsbsim`, aircraft data at

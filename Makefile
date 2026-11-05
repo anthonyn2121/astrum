@@ -1,24 +1,38 @@
 # ASTRUM — Docker-based dev environment
 #
 # Everything runs inside the `astrum-dev` image so nothing is installed on the
-# host. Containers run as the unprivileged image user, built with the host's
-# UID/GID (exported below) so files written into the bind mount stay yours.
-# Run `make` (or `make help`) for the target list. `make ci` is the full gate.
+# host. `make dev` builds the image (if missing or out of date), starts the
+# long-lived `dev` container and opens a shell in it; inside, `astrum …` runs
+# scenarios, run files and sweeps. Containers run as the unprivileged image
+# user, built with the host's UID/GID (exported below) so files written into
+# the bind mount stay yours. Run `make` (or `make help`) for the target list.
+# `make ci` is the full gate.
+#
+# The task targets (verify … ci) work on the host — each in a fresh container —
+# and inside the dev container (the image sets ASTRUM_DEV=1), where they run in
+# place. The container targets (dev, build, down, ps, clean) are host-only.
 
 COMPOSE ?= docker compose
-SERVICE ?= sim
 
 UID ?= $(shell id -u)
 GID ?= $(shell id -g)
 export UID GID
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down demo demo-python demo-quad demo-formation smoke replay export \
-        shell exec verify fmt fmt-check lint test test-rust test-cpp test-python \
-        wire-fixtures deny bench sweep ci logs ps clean
+.PHONY: help dev build down ps clean verify fmt fmt-check lint test test-rust test-cpp \
+        test-python wire-fixtures deny bench smoke ci
 
-# One-off command in a fresh container (no deps, no TTY): $(IN) '<bash script>'.
-IN = $(COMPOSE) run --rm --no-deps -T $(SERVICE) bash -c
+# Run a bash script: in place inside the dev container, else in a fresh one
+# (no TTY): $(IN) '<bash script>'.
+ifeq ($(ASTRUM_DEV),1)
+IN = bash -c
+else
+IN = $(COMPOSE) run --rm -T dev bash -c
+endif
+
+# First line of every container target's recipe: they drive docker, which the
+# dev container doesn't have.
+HOST_ONLY = $(if $(filter 1,$(ASTRUM_DEV)),$(error make $@ runs on the host, not inside the dev container))
 
 # Hand-written sources from git (see scripts/sources.sh), NUL-separated.
 CPP_FILES = bash scripts/sources.sh cpp
@@ -31,45 +45,30 @@ help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-build: ## Build the ASTRUM dev image (compiles JSBSim from source)
+# The first image build shows its progress (it compiles JSBSim: minutes); after
+# that the image is only rebuilt when docker/ changed, quietly, before the
+# shell opens. Shells get TERM=xterm-256color (docker's default `xterm` means 8
+# colours; this one is in the image's terminfo whatever the host terminal is)
+# and the host's COLORTERM (truecolor support), for the Catppuccin prompt and
+# `ls` colours. Leaving the shell is never a make error, whatever its last
+# command returned.
+dev: ## Build the image if needed, start the dev container, open a shell in it (again: another shell)
+	$(HOST_ONLY)
+	@docker image inspect astrum-dev:latest >/dev/null 2>&1 || $(COMPOSE) build dev
+	@$(COMPOSE) --progress quiet up -d --build dev
+	@$(COMPOSE) exec -e TERM=xterm-256color -e COLORTERM --user astrum dev bash || true
+
+build: ## Rebuild the ASTRUM dev image (compiles JSBSim from source)
+	$(HOST_ONLY)
 	$(COMPOSE) build
 
-up: ## Build the binaries, then start sim + replay + C++ controller (detached)
-	$(COMPOSE) up -d
-
-down: ## Stop and remove services
+down: ## Stop and remove the dev container (and every shell in it)
+	$(HOST_ONLY)
 	$(COMPOSE) down
 
-demo: ## Integration demo: C++ controller flies aircraft 1 in a bounded scenario; fails if the sim or controller fails
-	bash scripts/demo.sh config/scenario.demo.toml - controller
-
-demo-python: ## Same demo, but the Python controller flies aircraft 1
-	bash scripts/demo.sh config/scenario.demo.toml python controller-python
-
-demo-quad: ## Quadrotor demo: an F450 hovers/climbs under the built-in multirotor autopilot
-	bash scripts/demo.sh config/scenario.quad.toml quad controller-quad
-
-demo-formation: ## Formation demo: a leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
-	bash scripts/demo.sh config/scenario.formation.toml formation \
-	  controller-lead controller-wing-left controller-wing-right controller-trail
-
-smoke: demo demo-python demo-quad demo-formation ## Run every bounded demo; fails on the first failing one
-
-replay: ## Start the fleet sim + the 3-D replay renderer, then open http://localhost:8080
-	$(COMPOSE) up -d sim replay
-	@echo "ASTRUM replay renderer → http://localhost:8080  (Ctrl-C-safe; run 'make down' to stop)"
-
-export: ## Bake a bag to a replay JSON the browser can open offline (BAG=path OUT=path)
-	$(COMPOSE) run --rm --no-deps -T \
-	  -e ASTRUM_BAG=$(or $(BAG),recordings/session.mcap) \
-	  -e ASTRUM_WEB_EXPORT=$(or $(OUT),recordings/session.json) \
-	  $(SERVICE) cargo run --release --locked -p astrum-web --bin astrum-web-export
-
-shell: ## Open a one-off shell in a fresh container (SERVICE=sim|controller)
-	$(COMPOSE) run --rm --no-deps $(SERVICE) bash
-
-exec: ## Exec a shell into an already-running container (SERVICE=sim|controller)
-	$(COMPOSE) exec --user astrum $(SERVICE) bash
+ps: ## Show whether the dev container is running
+	$(HOST_ONLY)
+	$(COMPOSE) ps
 
 verify: ## Verify the toolchain (pinned versions agree, JSBSim/zenoh link + run)
 	$(IN) 'bash scripts/verify-toolchain.sh'
@@ -119,17 +118,11 @@ deny: ## Dependency audit: licenses, advisories, bans, sources (cargo deny)
 bench: ## Headless sim throughput (µs/tick, × real time) for fixed fleets and thread counts
 	$(IN) 'cargo run --release --locked -q -p astrum-sim --example throughput 2>/dev/null | grep "^|"'
 
-sweep: ## Fly a sweep of scenario variants, many at once (SWEEP=config/sweep.demo.toml, ARGS="--jobs 8 --overwrite")
-	$(IN) 'set -euo pipefail; bash scripts/build-release.sh >/dev/null; \
-	  target/release/astrum-sweep $(or $(SWEEP),config/sweep.demo.toml) $(ARGS)'
+smoke: ## Fly every demo (config/demos/*.toml) with `astrum run`; fails on the first failing one
+	$(IN) 'set -euo pipefail; for demo in config/demos/*.toml; do astrum run "$$demo"; done'
 
 ci: fmt-check lint test deny ## Full gate: fmt-check + lint + all tests + deny (fails on any failure)
 
-logs: ## Follow service logs
-	$(COMPOSE) logs -f
-
-ps: ## Show service status
-	$(COMPOSE) ps
-
-clean: ## Stop services and remove volumes + the local image
+clean: ## Remove the dev container, the volumes and the local image
+	$(HOST_ONLY)
 	$(COMPOSE) down -v --rmi local

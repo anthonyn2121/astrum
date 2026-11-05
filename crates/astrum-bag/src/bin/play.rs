@@ -8,7 +8,7 @@
 //! sim. Recorded commands are for analysis and are not replayed.
 //!
 //! Config (CLI arg > env > default): see `--help`. Each flag falls back to its
-//! `ASTRUM_*` env var, so compose/CI keep working.
+//! `ASTRUM_*` env var, so scripts and CI can configure them.
 
 use std::error::Error;
 use std::path::PathBuf;

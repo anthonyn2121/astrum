@@ -228,6 +228,49 @@ ENV PYTHONPATH=/workspace/controllers/python:/workspace/controllers/optimal/pyth
     RUFF_NO_CACHE=true \
     PYTEST_ADDOPTS="-p no:cacheprovider"
 
+# Inside the container: `astrum` (scripts/bin/astrum — rebuild what changed,
+# then run the CLI) is on PATH, and ASTRUM_DEV=1 makes `make` run its task
+# targets in place instead of through `docker compose`.
+ENV PATH=/workspace/scripts/bin:${PATH} \
+    ASTRUM_DEV=1
+
+# The interactive shell's look (`make dev` shells), Catppuccin Mocha: a
+# powerline prompt (starship's catppuccin-powerline preset; its glyphs need a
+# Nerd Font in the host terminal) and `ls` colours (vivid). Both release
+# binaries, pinned + checksummed. docker/shell/bashrc wires them up from the
+# end of ~/.bashrc; desktop notifications for long commands are off (no
+# desktop in here).
+ARG STARSHIP_VERSION=1.27.0
+ARG STARSHIP_SHA256_AMD64=10c8eb4cb3b761d9bf59ea828444c2dab36c900b7d69a69e08814b286969df89
+ARG STARSHIP_SHA256_ARM64=341f5cbf24699fa0b27ec88965ad25f862ea09e15d35a543fd6ffdff1d2aa00d
+ARG VIVID_VERSION=0.11.1
+ARG VIVID_SHA256_AMD64=7060e45ba1fc5b25d521704e65d2e5d92c1b219c06b7183ec120a87e1fc376d7
+ARG VIVID_SHA256_ARM64=99bf6438b3403bc9255a83363fe5ed49a0f8bd86377a561420836af14dc8e9ee
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) arch=x86_64;  starship_sha="${STARSHIP_SHA256_AMD64}"; vivid_sha="${VIVID_SHA256_AMD64}" ;; \
+      arm64) arch=aarch64; starship_sha="${STARSHIP_SHA256_ARM64}"; vivid_sha="${VIVID_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH '${TARGETARCH}' (amd64|arm64)" >&2; exit 1 ;; \
+    esac; \
+    cd /tmp; \
+    curl -fsSL -o starship.tar.gz \
+      "https://github.com/starship/starship/releases/download/v${STARSHIP_VERSION}/starship-${arch}-unknown-linux-musl.tar.gz"; \
+    printf '%s  %s\n' "${starship_sha}" starship.tar.gz | sha256sum -c -; \
+    tar -xzf starship.tar.gz starship; \
+    install -m 0755 starship /usr/local/bin/starship; \
+    vivid="vivid-v${VIVID_VERSION}-${arch}-unknown-linux-gnu"; \
+    curl -fsSL -o vivid.tar.gz \
+      "https://github.com/sharkdp/vivid/releases/download/v${VIVID_VERSION}/${vivid}.tar.gz"; \
+    printf '%s  %s\n' "${vivid_sha}" vivid.tar.gz | sha256sum -c -; \
+    tar -xzf vivid.tar.gz "${vivid}/vivid"; \
+    install -m 0755 "${vivid}/vivid" /usr/local/bin/vivid; \
+    rm -rf starship.tar.gz starship vivid.tar.gz "${vivid}"; \
+    mkdir -p /etc/astrum; \
+    starship preset catppuccin-powerline -o /etc/astrum/starship.toml; \
+    STARSHIP_CONFIG=/etc/astrum/starship.toml starship config cmd_duration.show_notifications false; \
+    echo '. /etc/astrum/bashrc' >> /home/astrum/.bashrc
+COPY docker/shell/bashrc /etc/astrum/bashrc
+
 WORKDIR /workspace
 COPY docker/entrypoint.sh /usr/local/bin/astrum-entrypoint
 RUN chmod 0755 /usr/local/bin/astrum-entrypoint

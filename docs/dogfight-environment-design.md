@@ -289,8 +289,8 @@ two-`f16` scenarios this way, and `tests/common/mod.rs` has `two_f16_opposing()`
 living aircraft (server mode writes `AppExit`; the embedded env reports `terminated`), and
 `stop_at_max_time` checks the sim clock (`SimClock`, `tick · dt`).
 
-**Demo wiring** (not built): a `make demo-dogfight` target + compose profile with one
-controller per jet, mirroring `demo-formation`.
+**Demo wiring** (not built): a `config/demos/dogfight.toml` run file with one
+controller per jet, mirroring `config/demos/formation.toml`.
 
 ---
 
@@ -562,7 +562,7 @@ Combat and env tests live in `crates/astrum-sim/tests/` (shared builders such as
 |---|---|---|---|
 | **0** | Lock decisions (§12) | — | discussion |
 | **1** | Sim mechanics: `Gun`/`Health`/`Team`/`Bullet` components; `fire_guns`/`step_bullets`/`resolve_hits`/`apply_damage`/`end_on_elimination` systems; dogfight scenario; full test suite. Validatable headless with a scripted "fire straight" — no controller/wire needed. | No | **M** (core) |
-| **2** | `Command.trigger`; `Telemetry.combat`; populate/ingest; C++/Python pick-up; web HUD (HP/ammo). **Done** (as schema v2). `make demo-dogfight` + a scripted pursuit-and-fire compose controller: **not built**. | Yes | **M** |
+| **2** | `Command.trigger`; `Telemetry.combat`; populate/ingest; C++/Python pick-up; web HUD (HP/ammo). **Done** (as schema v2). `config/demos/dogfight.toml` + a scripted pursuit-and-fire controller: **not built**. | Yes | **M** |
 | **3** | Tracers + hit/kill events (new keys, recorded as extra MCAP channels; `astrum-web` render). **Not built.** | Yes | **M–L** |
 | **4** | RL env (embedded PyO3), obs/action/reward, vectorization, curriculum. **Done** except self-play/training. | binding | **L** |
 
@@ -610,7 +610,7 @@ observability/polish. Phase 4 is the RL payoff.
 | Run control (pause / step / speed), status; controller presence | `astrum-sim/src/control.rs` (`RunControl`, `serve_control`, `publish_status`); `net.rs` (`connect`, `Controllers`, `track_controllers`, `HeldCommands`); `astrum-net/src/lib.rs` (`ControlServer`, `PresenceWatcher`), `src/bin/ctl.rs` |
 | Event stream (hits, kills, trigger, mode changes, run end) | `astrum-sim/src/events.rs` (`EventLog`, `publish_events`); emitted in `combat/systems.rs` (`fire_guns`, `resolve_hits`, `on_kill`), `pilot.rs` (`log_mode_changes`), `net.rs` (`Controllers`), `systems.rs` (exit systems); `SimEnv::events`; schema `Event` |
 | In-process recording (`--record`) | `astrum-sim/src/record.rs` (`TickRecorder`, `Recording`) |
-| Sweeps (`astrum-sweep`) | `astrum-sim/src/sweep.rs` (planning, in-process runs, summary), `src/bin/sweep.rs` (process mode) |
+| Sweeps (`astrum sweep`) | `astrum-sim/src/sweep.rs` (planning, in-process runs, summary), `src/bin/astrum.rs` (process mode + `astrum run`) |
 | Wire schema | `astrum-proto/schema/astrum.capnp` (`Telemetry`, `Command`, `Combat`) |
 | Encode / decode | `astrum-proto/src/lib.rs` |
 | Zenoh keys / transport | `astrum-net/src/lib.rs` (`keys`, `qos`, `LatestTelemetry`, `CommandSender`) |

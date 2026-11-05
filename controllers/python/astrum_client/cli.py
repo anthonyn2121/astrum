@@ -1,7 +1,7 @@
 """Command-line helpers shared by the ASTRUM Python controllers.
 
 Every flag falls back to an ``ASTRUM_*`` environment variable, then a default
-(precedence: CLI arg > env > default), so the compose wiring keeps working.
+(precedence: CLI arg > env > default), so scripts and run files can configure them.
 """
 
 from __future__ import annotations

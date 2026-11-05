@@ -1,0 +1,13 @@
+# An F450 quadrotor climbs from 100 m to 130 m HAE and yaws to 180° under the built-in hover-hold autopilot.
+#
+#   astrum run config/demos/quad.toml --watch
+#
+# The Python example controller, unchanged, hands the sim one high-level target
+# (climb + heading) and monitors: the wire protocol is vehicle-agnostic; only
+# the sim's autopilot law differs. Speed is ignored for a hovering rotorcraft.
+
+base = "config/scenario.quad.toml"
+
+controllers = [
+  "python controllers/python/example.py --id 1 --heading 180 --alt 130 --speed 0 --mode autopilot",
+]

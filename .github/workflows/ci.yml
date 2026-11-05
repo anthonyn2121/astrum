@@ -50,10 +50,10 @@ jobs:
       - name: make ci
         run: make ci
 
-      # Every bounded compose demo against a live sim.
+      # Every demo run file (config/demos/*.toml) against a live sim.
       - name: make smoke
         run: make smoke
 
       - name: Tear down
         if: always()
-        run: docker compose --profile python --profile quad --profile formation --profile record down -v --remove-orphans
+        run: docker compose down -v --remove-orphans

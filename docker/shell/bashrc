@@ -1,0 +1,13 @@
+# ASTRUM dev container: the interactive shell's look, sourced at the end of
+# ~/.bashrc (so it wins over Ubuntu's defaults). Catppuccin Mocha throughout.
+# Non-interactive shells (make targets, CI) never get here: ~/.bashrc returns
+# before.
+
+# `ls` colours: vivid's Catppuccin Mocha theme (24-bit when $COLORTERM says the
+# terminal can, 8-bit otherwise).
+LS_COLORS="$(vivid generate catppuccin-mocha)" && export LS_COLORS
+
+# Prompt: starship's catppuccin-powerline preset — its separators and icons
+# need a Nerd Font in the host terminal. Set STARSHIP_CONFIG to use your own.
+export STARSHIP_CONFIG="${STARSHIP_CONFIG:-/etc/astrum/starship.toml}"
+eval "$(starship init bash)"
