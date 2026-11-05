@@ -46,8 +46,8 @@ to a commanded heading/altitude over Zenoh (`config/demos/python.toml` runs the 
 controller). `config/demos/quad.toml` flies ASTRUM's second vehicle class — an **F450 quadrotor**
 that climbs and yaws under the built-in multirotor hover-hold autopilot.
 `config/demos/formation.toml` flies a figure-eight leader with three decentralized MPC followers.
-`make smoke` runs every `config/demos/*.toml` and fails on the first failure. `--watch` adds the
-3-D renderer to any run.
+`make smoke` flies every `config/demos/*.toml` in lockstep, as fast as possible, and fails on the
+first failure. `--watch` adds the 3-D renderer to any run.
 
 ## Architecture & data flow
 
@@ -607,7 +607,8 @@ Everything runs in the dev image; see [DEVELOP.md](DEVELOP.md) for the workflow.
 full gate: `fmt-check` (rustfmt, clang-format, ruff format) + `lint` (clippy `-D warnings`, ruff)
 + `test-rust` + `test-cpp` (CMake + ctest) + `test-python` (pytest + the `astrum_env` smoke) +
 `deny` (cargo deny). GitHub Actions (`.github/workflows/ci.yml`) builds the image, then runs `make
-verify`, `make ci` and `make smoke`.
+verify`, `make ci` and `make smoke`, with the cargo registry and target dir cached between runs
+(`.github/compose.ci.yml`).
 
 ## Extending ASTRUM
 
@@ -639,9 +640,9 @@ controllers/       out-of-sim flight controllers: common/ (shared C++), cpp/, py
 crates/            Rust workspace — astrum-fdm/geo/proto/net/bag/sim/env/web
 docker/            Dockerfile, entrypoint, pinned Python requirements
 docs/              architecture diagram, dogfight env design + onboarding
-scripts/           build, bin/astrum wrapper, toolchain verification, wire fixtures, astrum-env build
+scripts/           build, bin/astrum wrapper, toolchain verification, smoke, wire fixtures, astrum-env build
 web/               browser 3-D renderer (static app served by astrum-web)
-.github/workflows/ CI (make verify, make ci, make smoke)
+.github/           CI: workflows/ (make verify, make ci, make smoke), compose.ci.yml (cached cargo dirs)
 docker-compose.yml the long-lived dev service
 Makefile           dev workflow entrypoints
 recordings/        MCAP bags written by astrum record / --record (git-ignored)

@@ -157,7 +157,7 @@ controllers/       # flight controllers (clients); controllers/CMakeLists.txt is
 web/               # browser 3-D replay renderer (Three.js, vendored; served by astrum-web)
 config/            # scenario files (*.toml) — the fleet + world origin
 docker/            # Dockerfile, entrypoint, pinned Python requirements
-scripts/           # bin/astrum, build-release, verify-toolchain, wire-fixtures, build-astrum-env, sources
+scripts/           # bin/astrum, build-release, verify-toolchain, smoke, wire-fixtures, build-astrum-env, sources
 docs/              # architecture diagram, dogfight env design + onboarding
 docker-compose.yml # the one long-lived `dev` service
 Makefile           # the commands you'll actually type
@@ -323,7 +323,7 @@ astrum run config/demos/cpp.toml           # C++ controller flies aircraft 1 in 
 astrum run config/demos/python.toml        # same, with the Python controller
 astrum run config/demos/quad.toml          # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
 astrum run config/demos/formation.toml     # leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
-make smoke                                 # every config/demos/*.toml; fails on the first failure (CI runs this)
+make smoke                                 # every config/demos/*.toml in lockstep, as fast as possible; fails on the first failure (CI runs this)
 ```
 
 `astrum` rebuilds the release binaries and the C++ controllers first when their sources
@@ -444,4 +444,5 @@ make ci    # fmt-check + lint + all tests + cargo deny
 ```
 
 `make ci` must pass — that's the bar, and it's what GitHub Actions runs
-(`.github/workflows/ci.yml`: build the image, `make verify`, `make ci`, `make smoke`).
+(`.github/workflows/ci.yml`: build the image, `make verify`, `make ci`, `make smoke`, with the
+cargo registry and target dir cached between runs via `.github/compose.ci.yml`).

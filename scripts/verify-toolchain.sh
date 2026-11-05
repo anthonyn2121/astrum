@@ -93,7 +93,9 @@ echo
 echo "-- zenoh C/C++ bindings --"
 # The shipped zenohc.pc has a stale /usr/local prefix, so check the actual
 # installed artifacts: the runtime lib (dynamic linker) and the C++ header.
-ldconfig -p | grep -q 'libzenohc\.so' || fail "libzenohc.so not registered with ldconfig"
+# (Not `ldconfig -p | grep -q`: grep exits at the first match, and under
+# pipefail ldconfig's SIGPIPE on its next write fails the check.)
+grep -q 'libzenohc\.so' <<<"$(ldconfig -p)" || fail "libzenohc.so not registered with ldconfig"
 test -f /usr/include/zenoh.hxx || fail "/usr/include/zenoh.hxx missing"
 echo "  libzenohc.so registered; /usr/include/zenoh.hxx present"
 
