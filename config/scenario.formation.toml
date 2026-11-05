@@ -6,8 +6,8 @@
 # leader's telemetry off the bus and driving its own slot error to zero with a
 # per-follower MPC — a fully decentralized formation.
 #
-# The controllers are wired up by the `formation` compose profile
-# (`make demo-formation`). Initial positions put each follower roughly at its
+# The controllers are wired up by the run file config/demos/formation.toml
+# (`astrum run config/demos/formation.toml`). Initial positions put each follower roughly at its
 # slot (left / right / trail) behind the leader; the MPC captures the rest.
 
 [world]
@@ -18,7 +18,7 @@ origin_alt_hae_m = 0.0
 
 [sim]
 rate_hz = 120.0
-# Bounded so `make demo-formation` self-terminates: 220 s covers the formation
+# Bounded so `astrum run config/demos/formation.toml` self-terminates: 220 s covers the formation
 # capture plus both lobes and the crossover of the 8 km x 4 km pattern at 120 m/s.
 max_time_s = 220.0
 # Real time so the run is watchable in the 3-D replay renderer.
@@ -26,7 +26,7 @@ speed = 1.0
 
 # --- Fleet -------------------------------------------------------------------
 # All F-16s at 4572 m HAE, trimmed at 120 m/s TAS — the leader's commanded speed
-# (compose `--speed=120`), so there is no speed transient at the start. At 100 m/s
+# (the run file's `--speed=120`), so there is no speed transient at the start. At 100 m/s
 # a 30° turn already needs ~16° alpha here, and the slower inside follower sinks.
 
 [[aircraft]]

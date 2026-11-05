@@ -228,6 +228,12 @@ ENV PYTHONPATH=/workspace/controllers/python:/workspace/controllers/optimal/pyth
     RUFF_NO_CACHE=true \
     PYTEST_ADDOPTS="-p no:cacheprovider"
 
+# Inside the container: `astrum` (scripts/bin/astrum — rebuild what changed,
+# then run the CLI) is on PATH, and ASTRUM_DEV=1 makes `make` run its task
+# targets in place instead of through `docker compose`.
+ENV PATH=/workspace/scripts/bin:${PATH} \
+    ASTRUM_DEV=1
+
 WORKDIR /workspace
 COPY docker/entrypoint.sh /usr/local/bin/astrum-entrypoint
 RUN chmod 0755 /usr/local/bin/astrum-entrypoint

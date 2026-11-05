@@ -13,7 +13,7 @@ ASTRUM is **one server + many clients** talking over Zenoh.
   tick it drains the commands it received (`astrum/command/<id>`), steps physics, and
   **publishes** telemetry (`astrum/telemetry/<id>`). It also answers
   `get astrum/scenario` with its scenario TOML, `get astrum/status` with its run status
-  (JSON), and `get astrum/control/<pause|resume|step|speed>` requests (`astrum-ctl`).
+  (JSON), and `get astrum/control/<pause|resume|step|speed>` requests (`astrum ctl`).
 - **Controllers** (`controllers/*`) are separate processes — the flight-control
   logic. They **subscribe** to telemetry and **publish** commands. They never touch
   the sim's memory; only bytes over Zenoh.
@@ -25,16 +25,16 @@ controllers ──put astrum/command/<id>─────►  sim (subscribes ast
 controllers ◄──put astrum/telemetry/<id>───  sim (publishes per aircraft; id in the key)
 subscribers ◄──put astrum/events───────────  sim (hits, kills, mode changes, ...; one per event)
 controllers ──token astrum/alive/controller/<id>──►  sim (liveliness: who is connected)
-astrum-ctl  ──get astrum/control/*, astrum/status──►  sim (pause / step / speed / status)
+astrum ctl  ──get astrum/control/*, astrum/status──►  sim (pause / step / speed / status)
 ```
 
 Both key spaces ride **one** Zenoh session on a single endpoint (`tcp/…:7447`). The sim (and
-`astrum-bag-play`) **listens as a Zenoh router**; every other process (recorder, web bridge, C++
+`astrum play`) **listens as a Zenoh router**; every other process (recorder, web bridge, C++
 and Python controllers) opens a `mode=client` session that connects to it. The router routes
 between its clients, so the recorder sees the commands a controller sends (Zenoh 1.10 routers do
 not forward between two *peers*, which is why clients are not peers). A client's open waits for a
 sim that is still starting, up to its connect timeout, then fails with a clear message:
-controllers exit 1 after `--startup-timeout`; `astrum-bag-record` and `astrum-web` take
+controllers exit 1 after `--startup-timeout`; `astrum record` and `astrum web` take
 `--connect-timeout` (`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s).
 
 Each entity is addressed by its id *in the key* — not a socket or a port — so **one endpoint serves
@@ -67,30 +67,31 @@ in the `astrum-dev` image. You run commands *inside* a container, as the unprivi
 the bind mount stay yours.
 
 ```bash
-make build      # build the image once (compiles JSBSim from source — slow first time)
-make verify     # sanity-check the toolchain (pinned versions agree, JSBSim/zenoh link + run)
-make shell      # open a shell in a fresh container (workspace mounted, on the network)
-make help       # list all make targets
+make dev        # build the astrum-dev image if missing or changed, start the long-lived dev
+                # container, open a bash shell in it at /workspace (rerun: another shell, same container)
+make build      # rebuild the image explicitly (compiles JSBSim from source — slow first time)
+make down       # stop and remove the dev container
+make clean      # down + volumes + the local image
+make ps         # container status
 ```
 
 Your source is bind-mounted at `/workspace`, so **edit files on the host in your
-normal editor**, and build/run/test them in a container. One-off commands:
+normal editor**, and build/run/test them in the container. Shells opened by `make dev`
+share one container, so their processes see each other on loopback. `verify fmt fmt-check
+lint test test-rust test-cpp test-python wire-fixtures deny bench smoke ci` work both on the
+host (each in a fresh `docker compose run --rm -T dev` container) and inside the dev
+container (run in place); `dev build down clean ps` are host-only.
 
-```bash
-docker compose run --rm --no-deps sim bash -lc '<command>'
-```
-
-Published ports (7447 Zenoh, 8080 web) bind to **127.0.0.1** on the host only.
+The container publishes 7447 (Zenoh) and 8080 (web viewer) on **127.0.0.1** on the host only.
 
 ## Quick start
 
 The fast path from a fresh checkout to a running sim. Every command below runs
-**inside the dev container** (§2). Do the one-time image build, then open a container
-shell and run steps 1–3 inside it:
+**inside the dev container** (§2). Open a container shell (the first run builds the image)
+and run steps 1–3 inside it:
 
 ```bash
-make build      # one time — builds the astrum-dev image (compiles JSBSim; slow first run)
-make shell      # open a shell in the container; run the steps below there
+make dev        # on the host; run the steps below in the shell it opens
 ```
 
 **1. Build the Rust code** (the sim + every crate in the workspace):
@@ -118,8 +119,8 @@ cargo run --release -p astrum-sim -- config/scenario.demo.toml             # pic
 cargo run -p astrum-sim -- --help                                          # list every flag + its env fallback
 ```
 
-Every binary honours an `ASTRUM_*` env var per flag as a fallback (so `docker compose` and
-`make` work unchanged). Precedence is **CLI arg > `$ENV` > default** — see `--help`.
+Every binary honours an `ASTRUM_*` env var per flag as a fallback (so scripts and
+`make` can configure them). Precedence is **CLI arg > `$ENV` > default** — see `--help`.
 
 The sim loads the fleet from the TOML, spins up (and, for fixed-wing, trims) one JSBSim
 model per aircraft, then publishes telemetry over Zenoh until `max_time_s` is reached (or
@@ -127,7 +128,8 @@ you Ctrl-C). Any startup failure — bad scenario, model load, trim, network —
 non-zero with a message. Scenario format + the bundled examples are in §5.
 
 To see everything working together — sim + controller + the 3-D browser view —
-the demos do it in one command: `make demo` and `make replay` (§7).
+the demos do it in one command: `astrum run config/demos/cpp.toml` and
+`astrum run config/scenario.example.toml --watch` (§7).
 
 ## 3. Repo layout — where files go
 
@@ -148,9 +150,9 @@ controllers/       # flight controllers (clients); controllers/CMakeLists.txt is
 web/               # browser 3-D replay renderer (Three.js, vendored; served by astrum-web)
 config/            # scenario files (*.toml) — the fleet + world origin
 docker/            # Dockerfile, entrypoint, pinned Python requirements
-scripts/           # build-release, demo, verify-toolchain, wire-fixtures, build-astrum-env, sources
+scripts/           # bin/astrum, build-release, verify-toolchain, wire-fixtures, build-astrum-env, sources
 docs/              # architecture diagram, dogfight env design + onboarding
-docker-compose.yml # service presets: build, sim, replay, recorder, controllers
+docker-compose.yml # the one long-lived `dev` service
 Makefile           # the commands you'll actually type
 ```
 
@@ -158,15 +160,15 @@ Makefile           # the commands you'll actually type
 | I want to add… | Put it in… | Then… |
 |---|---|---|
 | A new Rust library crate | `crates/<name>/` | add it to `members` in the root `Cargo.toml` |
-| A new controller | `controllers/<name>/` | C++: `add_subdirectory` in `controllers/CMakeLists.txt`; (optional) a compose service for demos |
-| A new scenario | `config/<name>.toml` | run with `cargo run -p astrum-sim -- config/<name>.toml` |
+| A new controller | `controllers/<name>/` | C++: `add_subdirectory` in `controllers/CMakeLists.txt`; (optional) a run file under `config/demos/` |
+| A new scenario | `config/<name>.toml` | run with `astrum run config/<name>.toml` |
 | A scenario field | `crates/astrum-sim/src/scenario.rs` | see §5 |
 | A schema field | `crates/astrum-proto/schema/astrum.capnp` | see §8 |
 | A test | `crates/<crate>/tests/<name>.rs` | see §6 |
 
 ## 4. Build & run the sim
 
-Inside a shell (`make shell`) or via `docker compose run`:
+Inside a dev shell (`make dev`):
 
 ```bash
 cargo build --workspace                                          # compile everything
@@ -188,7 +190,7 @@ fallback). Every flag falls back to the env var, then the default:
 SIGINT/SIGTERM end the run cleanly at the end of the tick (a `--record` bag is finished); a
 second signal exits at once. `make bench` measures the headless tick cost for a few fleet sizes
 and thread counts. To fly many variants of a scenario at once, write a sweep file and run
-`make sweep SWEEP=config/sweep.<name>.toml` (`ARGS="--jobs 8 --overwrite"`; README §Sweeps).
+`astrum sweep config/sweep.<name>.toml --jobs 8 --overwrite` (README §Run files and sweeps).
 
 ## 5. Scenarios
 
@@ -305,31 +307,32 @@ regression test.
 
 ## 7. Running the whole stack (sim + controller)
 
-The demos are one-command, self-terminating, and tear themselves down:
+The demos are run files under `config/demos/` (README §Run files and sweeps); each is one
+command, self-terminating, and tears itself down:
 
 ```bash
-make demo           # C++ controller flies aircraft 1 in the bounded scenario
-make demo-python    # same, with the Python controller
-make demo-quad      # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
-make demo-formation # leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
-make smoke          # all four; fails on the first failure (CI runs this)
+astrum list                                # every scenario / run / sweep file, with its kind
+astrum run config/demos/cpp.toml           # C++ controller flies aircraft 1 in the bounded scenario
+astrum run config/demos/python.toml        # same, with the Python controller
+astrum run config/demos/quad.toml          # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
+astrum run config/demos/formation.toml     # leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
+make smoke                                 # every config/demos/*.toml; fails on the first failure (CI runs this)
 ```
 
-Under compose a one-shot `build` service compiles the release binaries and the C++
-controllers once; the other services wait for it, and controllers also wait for the sim's
-healthcheck.
+`astrum` rebuilds the release binaries and the C++ controllers first when their sources
+changed (a no-op otherwise). Run it from `/workspace`: paths in files are relative to it.
 
-**Watch it in 3-D.** `make replay` starts the fleet sim + the `astrum-web` bridge; open
-http://localhost:8080 to see every aircraft on the ENU grid (orbit/follow cameras, trails,
-playback transport). It works against a *live* sim or a bag being replayed by `astrum-bag-play`
+**Watch it in 3-D.** `--watch` (e.g. `astrum run config/scenario.example.toml --watch`)
+also starts the `astrum web` bridge; open http://localhost:8080 to see every aircraft on the ENU grid (orbit/follow cameras, trails,
+playback transport). It works against a *live* sim or a bag being replayed by `astrum play`
 (both listen on the endpoint the bridge connects to). For an offline, service-free view,
 bake an MCAP bag to JSON and drag it onto the page (or use Source ▸ "Open export file…"):
 
 ```bash
-docker compose --profile record up recorder           # record to recordings/session.mcap
-make replay                                           # sim + renderer at http://localhost:8080
-make export BAG=recordings/session.mcap OUT=out.json  # MCAP → astrum-replay (v3) JSON
-make down                                             # stop the sim + renderer
+astrum run config/scenario.example.toml --watch --record recordings/session.mcap  # sim + renderer, recorded
+astrum record recordings/session.mcap                 # or record an already-running sim
+astrum play recordings/session.mcap                   # replay it (run `astrum web` in another shell)
+astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (v3) JSON
 ```
 
 The renderer is static files under `web/` (Three.js and uPlot vendored in `web/vendor/`; the
@@ -351,44 +354,41 @@ in level-of-detail rings around the ground point below the camera — fine tiles
 ones out to ~150 km — each tile placed at its exact WGS84 position in the scenario's ENU frame, so
 the map follows the Earth's curvature and stays under the aircraft however far they fly. Every other
 platform (c172x, F450, unknown) keeps the dark ENU grid with no map. Tiles are served by
-`astrum-web` at `/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every
+`astrum web` at `/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every
 tile under `tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling,
 and an area viewed once while online works **offline** afterward; a tile that 404s (offline +
-uncached) is skipped and the coarser level or the haze shows through. Compose passes
-`ASTRUM_TILE_URL`, `ASTRUM_TILE_CACHE` and `ASTRUM_WEB_MAX_HZ` through from your shell when set:
+uncached) is skipped and the coarser level or the haze shows through. Set
+`ASTRUM_TILE_URL`, `ASTRUM_TILE_CACHE` or `ASTRUM_WEB_MAX_HZ` in the dev shell to override them:
 
 ```bash
 # Default: Esri World Imagery (global aerial, no key). Point elsewhere with:
-ASTRUM_TILE_URL='https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}' make replay  # public-domain, US-only
-ASTRUM_TILE_URL='' make replay                   # cache-only: serve tiles already cached, never fetch
-ASTRUM_TILE_CACHE=/workspace/mytiles make replay # relocate the on-disk cache (default ./tilecache)
+ASTRUM_TILE_URL='https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}' astrum web  # public-domain, US-only
+ASTRUM_TILE_URL='' astrum web                    # cache-only: serve tiles already cached, never fetch
+ASTRUM_TILE_CACHE=/workspace/mytiles astrum web  # relocate the on-disk cache (default ./tilecache)
 ```
 
 Imagery is © its provider (the page footer credits the Esri default); mind the tile source's terms
 of service if you redistribute or use it beyond evaluation.
 
-**To develop your own controller**, don't add a compose service — treat it as a
-process you run in a dev shell against a running sim:
+**To develop your own controller**, treat it as a process you run in a dev shell against
+a running sim:
 
 ```bash
-# 1. start just the sim (bounded scenario), detached
-ASTRUM_SCENARIO=config/scenario.demo.toml docker compose up -d sim
+# 1. shell 1: start just the sim (bounded scenario; add --watch for the viewer)
+astrum run config/scenario.demo.toml
 
-# 2. open a shell on the same network (sim resolves by name)
-make shell
+# 2. shell 2: another `make dev` on the host (same container, same loopback)
 
-# 3. build + run YOUR controller, pointing at the sim; rerun as you iterate.
+# 3. build + run YOUR controller against the default tcp/127.0.0.1:7447; rerun as you iterate.
 #    The bundled controllers take flags (env vars still work as a fallback):
-python controllers/python/example.py --connect tcp/sim:7447 --id 1
-build/controllers/cpp/astrum-controller --connect tcp/sim:7447 --id 1
+python controllers/python/example.py --id 1
+build/controllers/cpp/astrum-controller --id 1
 
-# 4. when done
-docker compose down
+# 4. when done: Ctrl-C in shell 1
 ```
 
-Compose services (`controller`, `controller-python`, …) are just **canned demo
-presets** — add one only when you want a controller to be a permanent part of the
-topology. See `controllers/cpp/README.md` and `controllers/python/README.md` for
+Run files (`config/demos/*.toml`) are just **canned demo presets** — add your controller to
+one's `controllers` when you want it launched with the sim. See `controllers/cpp/README.md` and `controllers/python/README.md` for
 how a controller subscribes, decodes telemetry, and publishes commands.
 
 **RL environment.** `bash scripts/build-astrum-env.sh` builds the `astrum_env` module and prints

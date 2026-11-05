@@ -1,0 +1,12 @@
+# Python hold controller flies aircraft 1 (c172x) from east to north at 1500 m HAE, 50 m/s TAS.
+#
+#   astrum run config/demos/python.toml --watch
+#
+# The Python twin of config/demos/cpp.toml: same scenario, same target, the
+# loop closed in controllers/python (raw actuators).
+
+base = "config/scenario.demo.toml"
+
+controllers = [
+  "python controllers/python/example.py --id 1 --heading 0 --alt 1500 --speed 50 --mode raw",
+]

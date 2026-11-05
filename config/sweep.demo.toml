@@ -3,7 +3,7 @@
 # as fast as possible. Each run gets its own sim on its own Zenoh endpoint
 # (exported to the controller as $ASTRUM_ZENOH_CONNECT).
 #
-#   make sweep SWEEP=config/sweep.demo.toml
+#   astrum sweep config/sweep.demo.toml
 #
 # Results: runs/sweep.demo/summary.csv, plus per run its scenario (.toml), bag
 # (.mcap) and the sim's and controller's logs.

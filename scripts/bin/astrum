@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#
+# `astrum` on the dev container's PATH: rebuild the release binaries and the C++
+# controllers if their sources changed (cargo's one-line no-op otherwise, on
+# stderr), then run the CLI with these arguments.
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+bash "${root}/scripts/build-release.sh" >/dev/null
+exec "${root}/target/release/astrum" "$@"

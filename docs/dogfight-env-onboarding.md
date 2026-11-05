@@ -7,10 +7,10 @@ is the *why* and the full design; this page is the *how do I start*.
 **Date:** 2026-08-25
 
 Everything here runs inside the `astrum-dev` Docker image — the host has no Rust,
-JSBSim, or Python deps. Prefix commands with:
+JSBSim, or Python deps. Open a shell in the dev container and run commands there:
 
 ```bash
-docker compose run --rm --no-deps sim bash -lc '<command>'
+make dev
 ```
 
 ---

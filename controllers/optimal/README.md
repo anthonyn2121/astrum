@@ -145,7 +145,7 @@ regulates `x = [angle − target, body rate]` per axis
 ## Formation demo
 
 `figure8` and `formation` compose into a 4-ship, fully **decentralized** formation
-— `make demo-formation` (scenario `config/scenario.formation.toml`):
+— `astrum run config/demos/formation.toml --watch` (scenario `config/scenario.formation.toml`):
 
 - **`figure8`** flies the *leader*: pure guidance that traces a horizontal
   figure-eight (a Gerono lemniscate). It emits heading/alt/airspeed targets and
@@ -172,8 +172,8 @@ The leader carves an 8 km × 4 km pattern (lobe-end radius `Ry²/Rx` = 2 km, so
 run with `--max-bank-deg 60` to match the f16. At 120 m/s the F-16 at 4572 m has
 α margin to spare; at 100 m/s it flies a 30° turn at ~16° α, and a follower on the
 inside of the turn (slower) runs out of lift and sinks. Watch
-it live with `make replay` in a second shell, or record it and scrub the replay
-offline (`make export`, then drag the exported JSON onto the renderer — see
+it live with `--watch` (http://localhost:8080), or record it and scrub the replay
+offline (`astrum export <bag> --out <file>`, then drag the exported JSON onto the renderer — see
 DEVELOP.md §7). Because the formation is fixed-wing, the replay lays a real aerial
 map under the ground track (centred on the scenario datum, ~37.62 N, −122.38 E
 over the SF Bay), so the figure-eight reads against actual geography — see the

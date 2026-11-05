@@ -6,7 +6,9 @@
 use std::path::Path;
 
 use astrum_bag::{BagReader, TopicKind};
-use astrum_sim::sweep::{execute, run_in_process, write_summary, Status, Sweep};
+use astrum_sim::sweep::{
+    execute, run_in_process, write_summary, Purpose, Status, Sweep, SweepFile,
+};
 use astrum_sim::systems::StopRequested;
 
 const BASE: &str = r#"
@@ -108,6 +110,29 @@ fn invalid_sweeps_fail_before_any_run() {
         let e = plan(dir.path(), body).err().unwrap_or_else(|| panic!("accepted: {body}"));
         assert!(e.contains(expected), "{body:?}: expected {expected:?} in {e:?}");
     }
+}
+
+#[test]
+fn a_run_may_run_until_stopped_at_the_scenarios_pace() {
+    let dir = tempfile::tempdir().unwrap();
+    let unbounded = BASE
+        .replace("max_time_s = 1.0", "max_time_s = 0.0\nspeed = 2.0\nlockstep = true")
+        .replace("tas_mps = 55.0", "tas_mps = 55.0\nlockstep = true");
+    let mut file = SweepFile::for_scenario(base_file(dir.path(), &unbounded).into());
+    let plan = |file: &SweepFile, purpose| Sweep::plan(file.clone(), "t", purpose).map_err(|e| e.0);
+
+    // `astrum run`: unbounded and lockstep without listed controllers are fine,
+    // and the pace is the scenario's own unless `speed` says otherwise.
+    let run = plan(&file, Purpose::Run).unwrap();
+    assert_eq!(run.runs.len(), 1);
+    assert_eq!(run.runs[0].scenario.sim.speed, 2.0);
+    // A sweep of the same file must end by itself and needs controllers for lockstep.
+    assert!(plan(&file, Purpose::Sweep).unwrap_err().contains("max_time_s must be > 0"));
+    file.set.insert("sim.max_time_s".into(), toml::Value::Float(1.0));
+    assert!(plan(&file, Purpose::Sweep).unwrap_err().contains("needs controllers"));
+
+    file.speed = Some(0.5);
+    assert_eq!(plan(&file, Purpose::Run).unwrap().runs[0].scenario.sim.speed, 0.5);
 }
 
 #[test]

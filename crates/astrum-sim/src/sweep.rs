@@ -1,13 +1,16 @@
-//! Sweeps (`astrum-sweep`): fly one base scenario many times — a grid of
-//! overrides × repeats — many runs at once, and collect every run's bag plus a
-//! `summary.csv`.
+//! Run and sweep files (`astrum run`, `astrum sweep`): fly one base scenario
+//! once, or many times — a grid of overrides × repeats — many runs at once,
+//! collecting every run's bag plus a `summary.csv`.
 //!
-//! This module plans a sweep (parse the sweep file, expand its grid, build and
-//! validate every run's scenario up front, so a typo fails before anything
-//! flies), runs runs in-process ([`run_in_process`], for scenarios nothing
-//! external controls), drives a pool of runs ([`execute`]) and writes the
-//! summary. The binary adds process mode: a sim plus external controllers per
-//! run, each on its own Zenoh endpoint.
+//! This module plans a file (parse it, expand its grid, build and validate
+//! every run's scenario up front, so a typo fails before anything flies), runs
+//! runs in-process ([`run_in_process`], for scenarios nothing external
+//! controls), drives a pool of runs ([`execute`]) and writes the summary. The
+//! `astrum` binary adds process mode: a sim plus external controllers per run,
+//! each on its own Zenoh endpoint, and `astrum run`'s single live run.
+//!
+//! A run file is a sweep file without a grid (no `vary`, one repeat); a bare
+//! scenario is a run file with nothing but `base` ([`SweepFile::for_scenario`]).
 //!
 //! Override keys: `sim.<field>`, `world.<field>`, `aircraft.<id>.<field>`
 //! (scenario values, checked like the scenario itself) and `param.<name>`
@@ -29,7 +32,7 @@ use crate::scenario::Scenario;
 use crate::systems::StopRequested;
 use crate::{build_app, run_to_exit, RunMode};
 
-/// A sweep file (TOML). Paths are relative to the working directory.
+/// A run or sweep file (TOML). Paths are relative to the working directory.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SweepFile {
@@ -42,9 +45,10 @@ pub struct SweepFile {
     /// scenario's `sim.threads`.
     #[serde(default)]
     pub jobs: usize,
-    /// Every run's `sim.speed`: 0 (the default) = as fast as possible.
+    /// Every run's `sim.speed`. Unset: 0 (as fast as possible) in a sweep, the
+    /// scenario's own in `astrum run`.
     #[serde(default)]
-    pub speed: f64,
+    pub speed: Option<f64>,
     /// Stop a run that takes longer than this many wall seconds; 0 = never.
     #[serde(default)]
     pub run_timeout_s: f64,
@@ -66,6 +70,36 @@ pub struct SweepFile {
 
 fn one() -> u64 {
     1
+}
+
+impl SweepFile {
+    /// The run file of a bare scenario: `base` and nothing else.
+    pub fn for_scenario(base: PathBuf) -> Self {
+        Self {
+            base,
+            repeats: 1,
+            jobs: 0,
+            speed: None,
+            run_timeout_s: 0.0,
+            out: None,
+            controllers: Vec::new(),
+            set: BTreeMap::new(),
+            vary: BTreeMap::new(),
+        }
+    }
+}
+
+/// What a plan is for; the rules a run must meet differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// `astrum sweep`: unattended batches. Every run must end by itself
+    /// (`sim.max_time_s > 0`), a lockstep run needs listed controllers, and the
+    /// pace defaults to 0 (as fast as possible).
+    Sweep,
+    /// `astrum run`: one live run. It may run until stopped, a lockstep
+    /// scenario may wait for controllers started elsewhere, and the pace
+    /// defaults to the scenario's own.
+    Run,
 }
 
 /// One planned run.
@@ -135,7 +169,7 @@ enum Target<'k> {
 fn target(key: &str) -> Result<Target<'_>, SweepError> {
     let parts: Vec<&str> = key.split('.').collect();
     match parts.as_slice() {
-        ["sim", "speed"] => Err(err("sim.speed is set by the sweep's `speed`")),
+        ["sim", "speed"] => Err(err("sim.speed is set by `speed` (the file's, or --speed)")),
         [section @ ("sim" | "world"), field] => Ok(Target::Section(section, field)),
         ["aircraft", id, field] => id
             .parse()
@@ -206,6 +240,12 @@ impl Sweep {
     pub fn from_toml_str(text: &str, name: &str) -> Result<Self, SweepError> {
         let file: SweepFile =
             toml::from_str(text).map_err(|e| err(format!("parsing the sweep: {e}")))?;
+        Self::plan(file, name, Purpose::Sweep)
+    }
+
+    /// Plan `file` for `purpose`; `name` sets the default output directory
+    /// (`runs/<name>`).
+    pub fn plan(file: SweepFile, name: &str, purpose: Purpose) -> Result<Self, SweepError> {
         if file.repeats == 0 {
             return Err(err("repeats must be >= 1"));
         }
@@ -222,6 +262,10 @@ impl Sweep {
         for (key, value) in &file.set {
             apply(&mut base_value, &mut base_params, key, value)?;
         }
+        let speed = file.speed.or(match purpose {
+            Purpose::Sweep => Some(0.0),
+            Purpose::Run => None,
+        });
 
         let vary_keys: Vec<String> = file.vary.keys().cloned().collect();
         let axes: Vec<&Vec<toml::Value>> = file.vary.values().collect();
@@ -245,11 +289,13 @@ impl Sweep {
             })?;
             for r in 0..file.repeats {
                 let mut scenario = scenario.clone();
-                scenario.sim.speed = file.speed;
+                if let Some(speed) = speed {
+                    scenario.sim.speed = speed;
+                }
                 scenario.sim.seed = scenario.sim.seed.wrapping_add(r);
                 let index = runs.len();
                 let run = Run { index, scenario, values: values.clone(), params: params.clone() };
-                check_run(&file, &run).map_err(|e| {
+                check_run(&file, purpose, &run).map_err(|e| {
                     err(format!("run {} ({}): {e}", index + 1, describe(&vary_keys, &values)))
                 })?;
                 runs.push(run);
@@ -286,14 +332,14 @@ fn describe(keys: &[String], values: &[toml::Value]) -> String {
 }
 
 /// Rules a run must satisfy beyond the scenario's own validation.
-fn check_run(file: &SweepFile, run: &Run) -> Result<(), String> {
+fn check_run(file: &SweepFile, purpose: Purpose, run: &Run) -> Result<(), String> {
     let s = &run.scenario;
     s.validate().map_err(|e| e.to_string())?;
-    if s.sim.max_time_s <= 0.0 {
+    if purpose == Purpose::Sweep && s.sim.max_time_s <= 0.0 {
         return Err("sim.max_time_s must be > 0 so the run ends".into());
     }
     if file.controllers.is_empty() {
-        if s.sim.lockstep {
+        if purpose == Purpose::Sweep && s.sim.lockstep {
             return Err("sim.lockstep needs controllers to answer it (none are listed)".into());
         }
         if !run.params.is_empty() {
