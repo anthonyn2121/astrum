@@ -118,8 +118,8 @@ deny: ## Dependency audit: licenses, advisories, bans, sources (cargo deny)
 bench: ## Headless sim throughput (µs/tick, × real time) for fixed fleets and thread counts
 	$(IN) 'cargo run --release --locked -q -p astrum-sim --example throughput 2>/dev/null | grep "^|"'
 
-smoke: ## Fly every demo (config/demos/*.toml) with `astrum run`; fails on the first failing one
-	$(IN) 'set -euo pipefail; for demo in config/demos/*.toml; do astrum run "$$demo"; done'
+smoke: ## Fly every demo (config/demos/*.toml) in lockstep, as fast as possible; fails on the first failing one
+	$(IN) 'bash scripts/smoke.sh'
 
 ci: fmt-check lint test deny ## Full gate: fmt-check + lint + all tests + deny (fails on any failure)
 

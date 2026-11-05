@@ -17,6 +17,10 @@ jobs:
   ci:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      # docker-compose.yml plus the CI overrides: cached cargo dirs, no
+      # incremental compilation or debuginfo (.github/compose.ci.yml).
+      COMPOSE_FILE: docker-compose.yml:.github/compose.ci.yml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -43,6 +47,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The cargo registry and target dir, bind-mounted into every container
+      # (.github/compose.ci.yml). Keyed on the toolchain and Cargo.lock; a
+      # changed Cargo.lock starts from the newest cache for the same toolchain,
+      # so only the changed dependencies compile. Saved only on a key miss.
+      - name: Cache cargo registry + target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ hashFiles('rust-toolchain.toml') }}-
+
+      # Created as the runner user (on a cache miss docker would create them
+      # as root).
+      - name: Cargo dirs
+        run: |
+          echo "ASTRUM_CI_CARGO=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/cargo/registry" "$RUNNER_TEMP/cargo/target"
+
       - name: Verify toolchain
         run: make verify
 
@@ -50,10 +72,6 @@ jobs:
       - name: make ci
         run: make ci
 
-      # Every demo run file (config/demos/*.toml) against a live sim.
+      # Every demo run file (config/demos/*.toml) against a live sim, in lockstep.
       - name: make smoke
         run: make smoke
-
-      - name: Tear down
-        if: always()
-        run: docker compose down -v --remove-orphans

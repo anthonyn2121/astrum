@@ -1,0 +1,15 @@
+# CI overrides for docker-compose.yml, selected by COMPOSE_FILE in
+# .github/workflows/ci.yml. The cargo registry and the target dir are bind
+# mounts of $ASTRUM_CI_CARGO, which the workflow restores and saves with
+# actions/cache, instead of named volumes that start empty on every runner: the
+# dependencies compile once per Cargo.lock, not on every run. Incremental
+# compilation and debuginfo are off; CI reuses or debugs neither, and together
+# they make the target dir over three times larger.
+services:
+  dev:
+    volumes:
+      - ${ASTRUM_CI_CARGO:?set by .github/workflows/ci.yml}/registry:/usr/local/cargo/registry
+      - ${ASTRUM_CI_CARGO:?set by .github/workflows/ci.yml}/target:/workspace/target
+    environment:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
