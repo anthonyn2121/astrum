@@ -84,6 +84,13 @@ container (run in place); `dev build down clean ps` are host-only.
 
 The container publishes 7447 (Zenoh) and 8080 (web viewer) on **127.0.0.1** on the host only.
 
+The dev shell's prompt is starship's Catppuccin Mocha powerline preset, with Catppuccin `ls`
+colours (vivid). Its separators and icons are Nerd Font glyphs: set a
+[Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) in your host terminal,
+or they show as boxes; a [Catppuccin](https://catppuccin.com/ports) theme for the terminal
+itself matches the rest. Point `STARSHIP_CONFIG` at your own `starship.toml` to change it
+(the image's is `/etc/astrum/starship.toml`, the wiring `docker/shell/bashrc`).
+
 ## Quick start
 
 The fast path from a fresh checkout to a running sim. Every command below runs

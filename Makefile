@@ -45,10 +45,18 @@ help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
+# The first image build shows its progress (it compiles JSBSim: minutes); after
+# that the image is only rebuilt when docker/ changed, quietly, before the
+# shell opens. Shells get TERM=xterm-256color (docker's default `xterm` means 8
+# colours; this one is in the image's terminfo whatever the host terminal is)
+# and the host's COLORTERM (truecolor support), for the Catppuccin prompt and
+# `ls` colours. Leaving the shell is never a make error, whatever its last
+# command returned.
 dev: ## Build the image if needed, start the dev container, open a shell in it (again: another shell)
 	$(HOST_ONLY)
-	$(COMPOSE) up -d --build dev
-	$(COMPOSE) exec --user astrum dev bash
+	@docker image inspect astrum-dev:latest >/dev/null 2>&1 || $(COMPOSE) build dev
+	@$(COMPOSE) --progress quiet up -d --build dev
+	@$(COMPOSE) exec -e TERM=xterm-256color -e COLORTERM --user astrum dev bash || true
 
 build: ## Rebuild the ASTRUM dev image (compiles JSBSim from source)
 	$(HOST_ONLY)
