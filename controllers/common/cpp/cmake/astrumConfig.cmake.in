@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+# The ASTRUM C++ controller SDK: astrum::wire, astrum::control, astrum::cli,
+# astrum::client, astrum::runtime (controllers/README.md). CapnProto probes libatomic
+# with a C test program, so a consumer project enables C as well as CXX.
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(CapnProto CONFIG)
+find_dependency(zenohc CONFIG)
+find_dependency(zenohcxx CONFIG)
+
+include("${CMAKE_CURRENT_LIST_DIR}/astrumTargets.cmake")
+check_required_components(astrum)

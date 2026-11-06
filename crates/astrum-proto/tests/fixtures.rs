@@ -2,42 +2,25 @@
 //! values (`tests/fixtures/<kind>.<lang>.bin`, written by `scripts/wire-fixtures.sh`)
 //! must decode in Rust to exactly those values.
 
+// Shared with the `wire_fixture` example, which uses the encode half.
+#[allow(dead_code)]
 #[path = "fixture/mod.rs"]
 mod fixture;
-
-use astrum_proto::{decode_command, decode_event, decode_telemetry};
-
-fn read(kind: &str, lang: &str) -> Vec<u8> {
-    let path = fixture::fixtures_dir().join(format!("{kind}.{lang}.bin"));
-    std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("{}: {e} (run scripts/wire-fixtures.sh)", path.display()))
-}
 
 #[test]
 fn every_language_fixture_decodes_to_the_canonical_values() {
     let values = fixture::values();
+    let mut failures = Vec::new();
     for lang in fixture::LANGS {
         for kind in fixture::KINDS {
-            let bytes = read(kind, lang);
-            if kind == "telemetry" {
-                let got = decode_telemetry(&bytes).unwrap_or_else(|e| panic!("{lang} {kind}: {e}"));
-                assert_eq!(got, fixture::telemetry(&values[kind]), "{lang} {kind}");
-            } else {
-                let got = decode_command(&bytes).unwrap_or_else(|e| panic!("{lang} {kind}: {e}"));
-                assert_eq!(got, fixture::command(&values[kind]), "{lang} {kind}");
+            let path = fixture::fixtures_dir().join(format!("{kind}.{lang}.bin"));
+            let result = std::fs::read(&path)
+                .map_err(|e| format!("{e} (run scripts/wire-fixtures.sh)"))
+                .and_then(|bytes| fixture::check(&values, kind, &bytes));
+            if let Err(e) = result {
+                failures.push(format!("{}: {e}", path.display()));
             }
         }
     }
-}
-
-#[test]
-fn every_language_event_fixture_decodes_to_the_canonical_values() {
-    let values = fixture::values();
-    for lang in fixture::EVENT_LANGS {
-        for kind in fixture::EVENT_KINDS {
-            let got =
-                decode_event(&read(kind, lang)).unwrap_or_else(|e| panic!("{lang} {kind}: {e}"));
-            assert_eq!(got, fixture::event(&values[kind]), "{lang} {kind}");
-        }
-    }
+    assert!(failures.is_empty(), "{} fixture(s) failed:\n{}", failures.len(), failures.join("\n"));
 }

@@ -15,11 +15,14 @@ use std::collections::BTreeSet;
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
-use astrum_net::{ControlRequest, ControlServer, RunStatus, StatusBoard, TelemetryPublisher};
+use astrum_net::{
+    ControlRequest, ControlServer, RunStatus, StatusBoard, TelemetryPublisher, TickPublisher,
+};
 use bevy::prelude::*;
 
-use crate::components::{Aircraft, SimClock, SimParams};
-use crate::net::{Controllers, LastPublished};
+use crate::components::{Aircraft, AircraftIndex, SimClock, SimParams};
+use crate::net::{refreshed, send_tick_end, Controllers, LastPublished};
+use crate::pilot::Pilot;
 use crate::systems::{Pacer, StopRequested};
 use crate::RunMode;
 
@@ -63,13 +66,17 @@ impl Board {
 
 /// Apply the control requests received since the last tick. While paused,
 /// block (up to [`PAUSED_POLL`]) for the next one, re-sending the last
-/// telemetry each time.
+/// telemetry (with each aircraft's current command status), then its
+/// `TickEnd`, each time.
 #[allow(clippy::too_many_arguments)]
 pub fn serve_control(
     server: Option<NonSend<ControlServer>>,
     publisher: Option<NonSendMut<TelemetryPublisher>>,
+    tick: Option<NonSend<TickPublisher>>,
     stop: Option<Res<StopRequested>>,
     last: Res<LastPublished>,
+    index: Res<AircraftIndex>,
+    pilots: Query<&Pilot>,
     mode: Res<RunMode>,
     clock: Res<SimClock>,
     mut control: ResMut<RunControl>,
@@ -80,7 +87,11 @@ pub fn serve_control(
     let requests = if control.paused && !stop.is_some_and(|s| s.requested()) {
         if let Some(mut p) = publisher {
             for s in &last.0 {
-                let _ = p.publish(s);
+                let pilot = index.0.get(&s.aircraft_id).and_then(|e| pilots.get(*e).ok());
+                let _ = p.publish(&refreshed(s, pilot));
+            }
+            if let Some(t) = &tick {
+                send_tick_end(t, &clock, &params);
             }
         }
         server.wait(PAUSED_POLL)

@@ -59,7 +59,7 @@
     <circle cx="66" cy="272" r="5" fill="#22D3EE"/>
     <text class="cName" x="80" y="277">astrum-geo</text><text class="cDesc" x="80" y="292">WGS84 ↔ ECEF ↔ ENU · local-level ↔ grid</text>
     <circle cx="66" cy="308" r="5" fill="#A78BFA"/>
-    <text class="cName" x="80" y="313">astrum-proto</text><text class="cDesc" x="80" y="328">Cap'n Proto schema v2 · zero-copy decode</text>
+    <text class="cName" x="80" y="313">astrum-proto</text><text class="cDesc" x="80" y="328">Cap'n Proto schema v3 · zero-copy decode</text>
     <circle cx="66" cy="344" r="5" fill="#34D399"/>
     <text class="cName" x="80" y="349">astrum-net</text><text class="cDesc" x="80" y="364">Zenoh router/client · LatestTelemetry · events</text>
     <circle cx="66" cy="380" r="5" fill="#FB7185"/>
@@ -94,7 +94,7 @@
   <text class="boxD" x="480" y="332">Update tick   ·   chained systems, left to right</text>
   <rect x="480" y="342" width="316" height="52" rx="7" fill="#12202A" stroke="#2C4657" stroke-width="1.1"/>
   <text class="boxT" x="638" y="366" text-anchor="middle">ingest_commands → autopilot</text>
-  <text class="boxD" x="638" y="384" text-anchor="middle">seq/tick checks · lockstep · lease failsafe</text>
+  <text class="boxD" x="638" y="384" text-anchor="middle">ownership · tick checks · lockstep · lease</text>
   <rect x="804" y="342" width="320" height="52" rx="7" fill="#12202A" stroke="#2C4657" stroke-width="1.1"/>
   <text class="boxT" x="964" y="366" text-anchor="middle">fire_guns → step_fdm (parallel)</text>
   <text class="boxD" x="964" y="384" text-anchor="middle">→ step_bullets → swept hit test → damage</text>
@@ -102,7 +102,7 @@
 
   <rect class="box" x="468" y="420" width="664" height="40" rx="8"/>
   <rect x="468" y="420" width="5" height="40" rx="2.5" fill="#34D399"/>
-  <text class="boxT" x="800" y="445" text-anchor="middle">publish_telemetry  ·  one assembly for Zenoh and the embedded env</text>
+  <text class="boxT" x="800" y="445" text-anchor="middle">publish_telemetry → events → TickEnd  ·  shared with the embedded env</text>
 
   <!-- RIGHT: wire schema -->
   <rect class="panel" x="1188" y="128" width="372" height="364" rx="14" filter="url(#sh)"/>
@@ -110,16 +110,16 @@
   <text class="chip" x="1218" y="163">WIRE SCHEMA · astrum.capnp</text>
 
   <text class="monoK" x="1206" y="200">struct Telemetry {</text>
-  <text class="mono"  x="1206" y="220">  id · simTime · tick · geo(HAE)</text>
-  <text class="mono"  x="1206" y="240">  enu · velEnu · velNed · attitude</text>
-  <text class="mono"  x="1206" y="260">  tas · rates · aero · combat · mode }</text>
+  <text class="mono"  x="1206" y="220">  id · simTime · tick · geo(HAE) · enu</text>
+  <text class="mono"  x="1206" y="240">  vel · attitude · tas · rates · aero</text>
+  <text class="mono"  x="1206" y="260">  combat · mode · period · command }</text>
   <text class="monoK" x="1206" y="294">struct Command {</text>
-  <text class="mono"  x="1206" y="314">  targetId · seq · telemetryTick</text>
-  <text class="mono"  x="1206" y="334">  raw | autopilot · trigger }</text>
+  <text class="mono"  x="1206" y="314">  targetId · epoch · seq · telemetryTick</text>
+  <text class="mono"  x="1206" y="334">  raw | multirotor | autopilot · trigger }</text>
   <text class="monoK" x="1206" y="368">struct Event {</text>
   <text class="mono"  x="1206" y="388">  tick · hit | kill | mode | … }</text>
   <line x1="1206" y1="410" x2="1542" y2="410" stroke="#26324A" stroke-width="1.2"/>
-  <text class="cDesc" x="1206" y="432">One schema: Rust sim, C++ / Python clients</text>
+  <text class="cDesc" x="1206" y="432">One schema: Rust sim, C++ / Python SDKs</text>
   <text class="cDesc" x="1206" y="450">(wire fixtures) · bags: MCAP, raw payloads.</text>
   <line x1="1374" y1="492" x2="1374" y2="514" stroke="#5B4B86" stroke-width="1.6" stroke-dasharray="5 4"/>
   <text class="tag" x="1374" y="508" text-anchor="middle">payload</text>
@@ -133,7 +133,7 @@
   <!-- ============ ZENOH BUS ============ -->
   <rect x="40" y="516" width="1520" height="62" rx="14" fill="url(#busGrad)" stroke="#A78BFA" stroke-width="1.6" filter="url(#sh)"/>
   <text class="busT" x="800" y="544" text-anchor="middle">ZENOH 1.10.0  ·  TRANSPORT BUS</text>
-  <text class="busS" x="800" y="566" text-anchor="middle">one TCP endpoint :7447 (127.0.0.1)  ·  Drop · express · InteractiveHigh (events: Block)  ·  keys astrum/telemetry/&lt;id&gt; + astrum/command/&lt;id&gt; + astrum/events  ·  sim = router, all others connect as clients</text>
+  <text class="busS" x="800" y="566" text-anchor="middle">one TCP endpoint :7447 (127.0.0.1)  ·  Drop · express · InteractiveHigh (events, tick ends: Block)  ·  keys astrum/telemetry/&lt;id&gt; + command/&lt;id&gt; + events + tick  ·  sim = router, all others connect as clients</text>
 
   <!-- bus -> controllers -->
   <line x1="392" y1="578" x2="392" y2="604" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
@@ -153,22 +153,22 @@
   <rect class="panel" x="40" y="606" width="760" height="452" rx="14" filter="url(#sh)"/>
   <rect x="56" y="620" width="372" height="30" rx="8" fill="#38BDF8"/>
   <text class="chip" x="70" y="641">FLIGHT CONTROLLERS · external processes</text>
-  <text class="psub" x="56" y="672">C++ / Python clients · latest-value telemetry · one command per tick (lease)</text>
+  <text class="psub" x="56" y="672">C++ / Python SDKs, one contract · latest-value telemetry · one command per tick (lease)</text>
 
   <rect class="box" x="64" y="686" width="712" height="50" rx="8"/>
   <rect x="64" y="686" width="5" height="50" rx="2.5" fill="#38BDF8"/>
   <text class="cName" x="82" y="708">controllers/cpp</text>
-  <text class="cDesc" x="82" y="726">example hold law · raw | autopilot · on controllers/common (zenoh-cpp + capnp)</text>
+  <text class="cDesc" x="82" y="726">laws hold | autopilot · on the C++ SDK in controllers/common (astrum::runtime)</text>
 
   <rect class="box" x="64" y="742" width="712" height="50" rx="8"/>
   <rect x="64" y="742" width="5" height="50" rx="2.5" fill="#38BDF8"/>
   <text class="cName" x="82" y="764">controllers/python</text>
-  <text class="cDesc" x="82" y="782">example hold law · eclipse-zenoh + pycapnp (no codegen)</text>
+  <text class="cDesc" x="82" y="782">laws hold | autopilot · on the Python SDK astrum_client (eclipse-zenoh + pycapnp)</text>
 
   <rect class="box" x="64" y="798" width="712" height="128" rx="8"/>
   <rect x="64" y="798" width="5" height="128" rx="2.5" fill="#F5B301"/>
-  <text class="cName" x="82" y="820">controllers/optimal   —   runtime + law split (LQR / MPC)</text>
-  <text class="cDesc" x="82" y="842">runtime ▸ Zenoh client · Cap'n Proto codec · state decode · kind check · clamp · seq/tick</text>
+  <text class="cName" x="82" y="820">controllers/optimal   —   laws on the SDK runtime (LQR / MPC)</text>
+  <text class="cDesc" x="82" y="842">runtime ▸ session · codec · fleet snapshot · events · ownership · kind check · clamp · dt</text>
   <text class="cDesc" x="82" y="862">laws (the only files you write) ▸</text>
   <g font-family="DejaVu Sans Mono, monospace" font-weight="700" font-size="13">
     <rect x="86" y="876" width="70" height="30" rx="15" fill="#23304a" stroke="#3A4C6E"/><text x="121" y="896" text-anchor="middle" fill="#CFE0FF">lqr</text>

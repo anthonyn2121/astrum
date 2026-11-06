@@ -5,9 +5,11 @@
 //! * Observations are the sim's own [`Telemetry`] samples — exactly what the
 //!   Zenoh bridge publishes — sorted by aircraft id.
 //! * Actions are commands applied through the same [`apply_command`] the bridge
-//!   uses (raw actuators or autopilot targets, plus the trigger), so the lease
-//!   and failsafe rules are identical: an aircraft left out of `step` keeps its
-//!   last command until the scenario's `command_lease_s` expires, then holds.
+//!   uses (raw actuators, multirotor demands or autopilot targets, plus the
+//!   trigger), all from one controller epoch ([`ENV_EPOCH`]), so the ownership,
+//!   lease and failsafe rules are identical: an aircraft left out of `step`
+//!   keeps its last command until the scenario's `command_lease_s` expires,
+//!   then holds.
 //! * One `step` is one physics tick. The first observation (after construction
 //!   or `reset`) is at tick 1.
 //! * [`SimEnv::events`] are the events of the latest tick (hits, kills, mode
@@ -27,7 +29,8 @@ use crate::combat::{
     gun_solution, Bullet, CombatParams, CombatRng, CombatState, Dead, Gun, GunSolution, Team,
 };
 use crate::components::{
-    AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus, WorldFrame,
+    AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus, VehicleKind,
+    WorldFrame,
 };
 use crate::events::EventLog;
 use crate::net::{LastPublished, RefusalLog};
@@ -35,6 +38,10 @@ use crate::pilot::{apply_command, Pilot};
 use crate::scenario::{Scenario, ScenarioError};
 use crate::systems::{grid_state, initial_components, reset_fdm, Diag, Pacer};
 use crate::{build_app, sim_params, team_count, world_frame, RunMode};
+
+/// The controller epoch of every command the env applies (the env is the only
+/// controller of its in-process sim).
+pub const ENV_EPOCH: u64 = 1;
 
 /// One agent's input for a tick.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -235,6 +242,9 @@ impl SimEnv {
             self.world = fresh_world(&next)?;
         }
         self.scenario = next;
+        // Every pilot starts unowned with no seq: number commands afresh, so a
+        // reset env reports the same command status as a fresh one.
+        self.seq = 0;
         Ok(self.observe())
     }
 
@@ -254,6 +264,7 @@ impl SimEnv {
                 seq: self.seq,
                 telemetry_tick: now,
                 trigger: a.trigger,
+                epoch: ENV_EPOCH,
                 control: a.control,
             };
             let mut ent = self.world.entity_mut(entity);
@@ -261,8 +272,9 @@ impl SimEnv {
                 continue; // a wreck takes no commands
             }
             let mut pilot = *ent.get::<Pilot>().expect("aircraft entities have a Pilot");
+            let kind = *ent.get::<VehicleKind>().expect("aircraft entities have a VehicleKind");
             let mut trigger = ent.get::<crate::combat::Trigger>().copied();
-            apply_command(&mut pilot, trigger.as_mut(), &cmd, now, lease)
+            apply_command(&mut pilot, trigger.as_mut(), kind, &cmd, now, lease)
                 .map_err(|e| EnvError::Refused { id: *id, reason: e.to_string() })?;
             ent.insert(pilot);
             if let Some(t) = trigger {

@@ -1,6 +1,10 @@
-"""ASTRUM wire format (schema v2) for Python: load ``astrum.capnp``, decode
-untrusted ``Telemetry`` payloads into a plain :class:`VehicleState` and
-``Event`` payloads into an :class:`Event`, and encode ``Command`` messages.
+"""ASTRUM wire format (schema v3) for Python: decode untrusted ``Telemetry``,
+``Event`` and ``TickEnd`` payloads into plain dataclasses and encode ``Command``
+messages. The names match controllers/README.md ("Names") and the Rust mirror.
+
+The schema ships inside this package (``astrum_client/astrum.capnp``) and is
+loaded once, lazily, on the first codec call; every codec function takes only
+the payload or value.
 
 Every decode validates the Cap'n Proto framing (segment table, exact length,
 no trailing bytes) and reads every field inside one ``try``, so a malformed
@@ -10,6 +14,8 @@ payload surfaces as a single :class:`DecodeError` the caller can count and skip.
 from __future__ import annotations
 
 import enum
+import functools
+import importlib.resources
 import math
 import os
 import re
@@ -22,25 +28,19 @@ import capnp
 
 from astrum_client.mathutil import clamp
 
-# pycapnp resolves `import "/capnp/c++.capnp"` against these directories.
-CAPNP_IMPORTS = ["/usr/include"]
-
 # Generous bounds for one telemetry/command/event message; anything bigger is hostile.
 _TRAVERSAL_LIMIT_WORDS = 1 << 16
 _NESTING_LIMIT = 16
 
 
-def default_schema_path() -> str:
-    """``crates/astrum-proto/schema/astrum.capnp`` of the checkout this package lives in."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(
-        os.path.join(here, "..", "..", "..", "crates", "astrum-proto", "schema", "astrum.capnp")
-    )
-
-
-def load_schema(path: str | None = None):
-    """Load the shared schema at runtime (no codegen step)."""
-    return capnp.load(path or default_schema_path(), imports=CAPNP_IMPORTS)
+@functools.cache
+def _schema():
+    """The packaged ``astrum.capnp``, loaded on first use. Its ``/capnp/c++.capnp``
+    import resolves against pycapnp's own install (``site-packages/capnp/``)."""
+    capnp_root = os.path.dirname(os.path.dirname(capnp.__file__))
+    resource = importlib.resources.files("astrum_client").joinpath("astrum.capnp")
+    with importlib.resources.as_file(resource) as path:
+        return capnp.load(str(path), imports=[capnp_root])
 
 
 class VehicleKind(enum.IntEnum):
@@ -77,6 +77,20 @@ class EndReason(enum.IntEnum):
     STOPPED = 3
 
 
+class Refusal(enum.IntEnum):
+    """``astrum.capnp`` ``Refusal`` ordinals: why the sim refused a command
+    (unknown values stay raw ``int``)."""
+
+    NONE = 0
+    FROM_THE_FUTURE = 1
+    STALE = 2
+    OUT_OF_ORDER = 3
+    NOT_OWNER = 4
+    MISSING_EPOCH = 5
+    NON_FINITE = 6
+    WRONG_VEHICLE_KIND = 7
+
+
 def _known(enum_cls, value):
     """Map a pycapnp enum reader (or raw ordinal) to ``enum_cls``, keeping unknown
     ordinals as plain ``int``."""
@@ -94,11 +108,30 @@ def enum_name(value) -> str:
     return f"unknown({value})"
 
 
+def enum_member(enum_cls, name: str):
+    """The member of ``enum_cls`` whose :func:`enum_name` is ``name``."""
+    for m in enum_cls:
+        if enum_name(m) == name:
+            return m
+    raise ValueError(f"{name!r} is not a {enum_cls.__name__} name")
+
+
+@dataclass(frozen=True)
+class CommandStatus:
+    """The sim's command bookkeeping for one aircraft (``Telemetry.command``)."""
+
+    owner_epoch: int = 0  # epoch of the controller flying it; 0 = unowned
+    last_seq: int = 0  # seq of the owner's last applied command; 0 = none
+    refusals: int = 0  # commands refused for this aircraft so far (u32, wraps)
+    last_refusal: Refusal | int = Refusal.NONE
+    last_refused_epoch: int = 0  # the epoch that sent the last refused command
+
+
 @dataclass(frozen=True)
 class VehicleState:
-    """One aircraft's telemetry sample, every schema-v2 field, SI units.
+    """One aircraft's telemetry sample, every schema-v3 field, SI units.
 
-    Angles rad, distances m, speeds m/s; ``alt_m`` is height above the WGS84
+    Angles rad, distances m, speeds m/s; ``alt_hae_m`` is height above the WGS84
     ellipsoid; ``e/n/u`` + ``vel_enu_*`` are the scenario's world grid,
     ``vel_ned_*`` the local level at the aircraft; ``p/q/r`` are the body rates
     the sim measured (not estimates).
@@ -106,10 +139,10 @@ class VehicleState:
 
     aircraft_id: int
     tick: int
-    t: float  # sim time (s) = tick * dt
+    sim_time_s: float  # tick * dt
     lat_deg: float
     lon_deg: float
-    alt_m: float  # HAE
+    alt_hae_m: float
     e: float
     n: float
     u: float
@@ -125,7 +158,7 @@ class VehicleState:
     p: float
     q: float
     r: float
-    airspeed: float  # true airspeed
+    tas_mps: float  # true airspeed
     alpha: float
     beta: float
     nz_g: float
@@ -138,11 +171,14 @@ class VehicleState:
     hit_points_max: float
     alive: bool
     ammo: int
+    control_period_s: float  # sim time between this aircraft's samples: a law's dt
+    command: CommandStatus
 
 
 @dataclass(frozen=True)
 class RawActuators:
-    """Raw actuator setpoints (aileron/elevator/rudder in [-1, 1], throttle in [0, 1])."""
+    """Raw fixed-wing actuator setpoints (aileron/elevator/rudder in [-1, 1],
+    throttle in [0, 1]). Aileron+ rolls right, elevator+ pitches nose DOWN."""
 
     aileron: float = 0.0
     elevator: float = 0.0
@@ -150,10 +186,7 @@ class RawActuators:
     throttle: float = 0.0
 
     def saturated(self) -> RawActuators:
-        """Clamped to the valid ranges; a non-finite channel is a law bug and raises."""
-        vals = (self.aileron, self.elevator, self.rudder, self.throttle)
-        if not all(math.isfinite(v) for v in vals):
-            raise ValueError(f"non-finite raw actuator command {self}")
+        """Clamped to the valid ranges (NaN passes through: it is a law bug)."""
         return RawActuators(
             clamp(self.aileron, -1.0, 1.0),
             clamp(self.elevator, -1.0, 1.0),
@@ -163,32 +196,69 @@ class RawActuators:
 
 
 @dataclass(frozen=True)
+class MultirotorRaw:
+    """Raw multirotor demands: normalized body-rate demands in [-1, 1] (+ rolls
+    right, + pitches nose UP, + yaws nose right) and collective thrust in [0, 1]."""
+
+    roll_rate: float = 0.0
+    pitch_rate: float = 0.0
+    yaw_rate: float = 0.0
+    collective: float = 0.0
+
+    def saturated(self) -> MultirotorRaw:
+        """Clamped to the valid ranges (NaN passes through: it is a law bug)."""
+        return MultirotorRaw(
+            clamp(self.roll_rate, -1.0, 1.0),
+            clamp(self.pitch_rate, -1.0, 1.0),
+            clamp(self.yaw_rate, -1.0, 1.0),
+            clamp(self.collective, 0.0, 1.0),
+        )
+
+
+@dataclass(frozen=True)
 class AutopilotTargets:
-    """Targets for the sim's inner loop: true heading, altitude HAE, true airspeed."""
+    """Targets for the sim's inner loop: true heading, altitude HAE, true airspeed
+    (ignored by multirotors)."""
 
     heading_rad: float
     alt_hae_m: float
     tas_mps: float
 
-    def checked(self) -> AutopilotTargets:
-        vals = (self.heading_rad, self.alt_hae_m, self.tas_mps)
-        if not all(math.isfinite(v) for v in vals):
-            raise ValueError(f"non-finite autopilot command {self}")
-        return self
+
+Control = RawActuators | MultirotorRaw | AutopilotTargets
 
 
-Control = RawActuators | AutopilotTargets
+def is_finite(control: Control) -> bool:
+    """Whether every channel of ``control`` is finite."""
+    return all(math.isfinite(v) for v in vars(control).values())
+
+
+@dataclass(frozen=True)
+class Action:
+    """What a law returns for one step: the control and the gun trigger."""
+
+    control: Control
+    trigger: bool = False
 
 
 @dataclass(frozen=True)
 class Command:
-    """A decoded/encodable ``Command``."""
+    """A decoded/encodable ``Command`` (the wire message)."""
 
     target_id: int
     seq: int
     telemetry_tick: int
     trigger: bool
+    epoch: int
     control: Control
+
+
+@dataclass(frozen=True)
+class TickEnd:
+    """The end of a tick's publications on ``astrum/tick``."""
+
+    tick: int
+    sim_time_s: float
 
 
 Vec3 = tuple[float, float, float]
@@ -280,14 +350,6 @@ EventDetail = (
 _DETAIL_BY_KIND = {_kebab(c.WIRE): c for c in get_args(EventDetail)}
 
 
-def _member(enum_cls, name: str):
-    """The member of ``enum_cls`` whose :func:`enum_name` is ``name``."""
-    for m in enum_cls:
-        if enum_name(m) == name:
-            return m
-    raise ValueError(f"{name!r} is not a {enum_cls.__name__} name")
-
-
 @dataclass(frozen=True)
 class Event:
     """Something that happened during a run: ``tick`` is the ``Telemetry.tick``
@@ -331,12 +393,12 @@ class Event:
         if detail_cls is ModeChange:
             detail = ModeChange(
                 d["aircraft_id"],
-                _member(ControlMode, d["from"]),
-                _member(ControlMode, d["to"]),
-                _member(ModeReason, d["reason"]),
+                enum_member(ControlMode, d["from"]),
+                enum_member(ControlMode, d["to"]),
+                enum_member(ModeReason, d["reason"]),
             )
         elif detail_cls is RunEnded:
-            detail = RunEnded(_member(EndReason, d["reason"]), d["message"])
+            detail = RunEnded(enum_member(EndReason, d["reason"]), d["message"])
         else:
             kw = {f.name: d[f.name] for f in fields(detail_cls)}
             if "pos_enu" in kw:
@@ -368,26 +430,26 @@ def _check_framing(payload: bytes) -> None:
         raise DecodeError(f"payload is {n} bytes, message framing says {expected}")
 
 
-def _reader(struct_schema, payload: bytes):
+def _reader(struct_name: str, payload: bytes):
     _check_framing(payload)
-    return struct_schema.from_bytes(
+    return getattr(_schema(), struct_name).from_bytes(
         payload, traversal_limit_in_words=_TRAVERSAL_LIMIT_WORDS, nesting_limit=_NESTING_LIMIT
     )
 
 
-def decode_telemetry(schema, payload: bytes) -> VehicleState:
+def decode_telemetry(payload: bytes) -> VehicleState:
     """Decode one untrusted ``Telemetry`` payload; raises :class:`DecodeError`."""
     try:
-        with _reader(schema.Telemetry, payload) as t:
+        with _reader("Telemetry", payload) as t:
             geo, enu, ned, venu = t.geo, t.enu, t.velNed, t.velEnu
-            att, rates, aero, combat = t.attitude, t.bodyRates, t.aero, t.combat
+            att, rates, aero, combat, cmd = t.attitude, t.bodyRates, t.aero, t.combat, t.command
             return VehicleState(
                 aircraft_id=t.aircraftId,
                 tick=t.tick,
-                t=t.simTimeS,
+                sim_time_s=t.simTimeS,
                 lat_deg=geo.latDeg,
                 lon_deg=geo.lonDeg,
-                alt_m=geo.altHaeM,
+                alt_hae_m=geo.altHaeM,
                 e=enu.e,
                 n=enu.n,
                 u=enu.u,
@@ -403,7 +465,7 @@ def decode_telemetry(schema, payload: bytes) -> VehicleState:
                 p=rates.pRadS,
                 q=rates.qRadS,
                 r=rates.rRadS,
-                airspeed=t.tasMps,
+                tas_mps=t.tasMps,
                 alpha=aero.alphaRad,
                 beta=aero.betaRad,
                 nz_g=aero.nzG,
@@ -416,6 +478,14 @@ def decode_telemetry(schema, payload: bytes) -> VehicleState:
                 hit_points_max=combat.hitPointsMax,
                 alive=combat.alive,
                 ammo=combat.ammo,
+                control_period_s=t.controlPeriodS,
+                command=CommandStatus(
+                    owner_epoch=cmd.ownerEpoch,
+                    last_seq=cmd.lastSeq,
+                    refusals=cmd.refusals,
+                    last_refusal=_known(Refusal, cmd.lastRefusal),
+                    last_refused_epoch=cmd.lastRefusedEpoch,
+                ),
             )
     except DecodeError:
         raise
@@ -423,24 +493,38 @@ def decode_telemetry(schema, payload: bytes) -> VehicleState:
         raise DecodeError(f"bad Telemetry payload: {e}") from e
 
 
-def decode_command(schema, payload: bytes) -> Command:
+def decode_command(payload: bytes) -> Command:
     """Decode one untrusted ``Command`` payload; raises :class:`DecodeError`."""
     try:
-        with _reader(schema.Command, payload) as c:
+        with _reader("Command", payload) as c:
             which = c.control.which()
             if which == "raw":
                 r = c.control.raw
                 control = RawActuators(r.aileron, r.elevator, r.rudder, r.throttle)
+            elif which == "multirotor":
+                m = c.control.multirotor
+                control = MultirotorRaw(m.rollRate, m.pitchRate, m.yawRate, m.collective)
             elif which == "autopilot":
                 a = c.control.autopilot
                 control = AutopilotTargets(a.headingRad, a.altHaeM, a.tasMps)
             else:
                 raise DecodeError(f"unknown Command.control variant {which!r}")
-            return Command(c.targetId, c.seq, c.telemetryTick, c.trigger, control)
+            return Command(c.targetId, c.seq, c.telemetryTick, c.trigger, c.epoch, control)
     except DecodeError:
         raise
     except Exception as e:
         raise DecodeError(f"bad Command payload: {e}") from e
+
+
+def decode_tick_end(payload: bytes) -> TickEnd:
+    """Decode one untrusted ``TickEnd`` payload; raises :class:`DecodeError`."""
+    try:
+        with _reader("TickEnd", payload) as t:
+            return TickEnd(t.tick, t.simTimeS)
+    except DecodeError:
+        raise
+    except Exception as e:
+        raise DecodeError(f"bad TickEnd payload: {e}") from e
 
 
 def _enu(v) -> Vec3:
@@ -480,11 +564,11 @@ def _decode_detail(k) -> EventDetail:
     raise DecodeError(f"unknown Event.kind variant {which!r}")
 
 
-def decode_event(schema, payload: bytes) -> Event:
+def decode_event(payload: bytes) -> Event:
     """Decode one untrusted ``Event`` payload; raises :class:`DecodeError` (also
     for a kind this schema predates: the caller skips it)."""
     try:
-        with _reader(schema.Event, payload) as e:
+        with _reader("Event", payload) as e:
             return Event(e.tick, e.simTimeS, _decode_detail(e.kind))
     except DecodeError:
         raise
@@ -492,13 +576,14 @@ def decode_event(schema, payload: bytes) -> Event:
         raise DecodeError(f"bad Event payload: {e}") from e
 
 
-def encode_command(schema, cmd: Command) -> bytes:
+def encode_command(cmd: Command) -> bytes:
     """Encode a :class:`Command` exactly as given (callers saturate first)."""
-    msg = schema.Command.new_message()
+    msg = _schema().Command.new_message()
     msg.targetId = cmd.target_id
     msg.seq = cmd.seq
     msg.telemetryTick = cmd.telemetry_tick
     msg.trigger = cmd.trigger
+    msg.epoch = cmd.epoch
     c = cmd.control
     if isinstance(c, RawActuators):
         raw = msg.control.init("raw")
@@ -508,6 +593,14 @@ def encode_command(schema, cmd: Command) -> bytes:
             c.rudder,
             c.throttle,
         )
+    elif isinstance(c, MultirotorRaw):
+        mr = msg.control.init("multirotor")
+        mr.rollRate, mr.pitchRate, mr.yawRate, mr.collective = (
+            c.roll_rate,
+            c.pitch_rate,
+            c.yaw_rate,
+            c.collective,
+        )
     elif isinstance(c, AutopilotTargets):
         ap = msg.control.init("autopilot")
         ap.headingRad, ap.altHaeM, ap.tasMps = c.heading_rad, c.alt_hae_m, c.tas_mps
@@ -516,20 +609,20 @@ def encode_command(schema, cmd: Command) -> bytes:
     return msg.to_bytes()
 
 
-def encode_telemetry(schema, s: VehicleState) -> bytes:
+def encode_telemetry(s: VehicleState) -> bytes:
     """Encode a :class:`VehicleState` as ``Telemetry`` (fixtures and tests; the sim
     is the only real telemetry publisher)."""
-    m = schema.Telemetry.new_message()
+    m = _schema().Telemetry.new_message()
     m.aircraftId = s.aircraft_id
     m.tick = s.tick
-    m.simTimeS = s.t
-    m.geo.latDeg, m.geo.lonDeg, m.geo.altHaeM = s.lat_deg, s.lon_deg, s.alt_m
+    m.simTimeS = s.sim_time_s
+    m.geo.latDeg, m.geo.lonDeg, m.geo.altHaeM = s.lat_deg, s.lon_deg, s.alt_hae_m
     m.enu.e, m.enu.n, m.enu.u = s.e, s.n, s.u
     m.velNed.n, m.velNed.e, m.velNed.d = s.vel_ned_n, s.vel_ned_e, s.vel_ned_d
     m.velEnu.e, m.velEnu.n, m.velEnu.u = s.vel_enu_e, s.vel_enu_n, s.vel_enu_u
     m.attitude.phiRad, m.attitude.thetaRad, m.attitude.psiRad = s.roll, s.pitch, s.yaw
     m.bodyRates.pRadS, m.bodyRates.qRadS, m.bodyRates.rRadS = s.p, s.q, s.r
-    m.tasMps = s.airspeed
+    m.tasMps = s.tas_mps
     m.aero.alphaRad, m.aero.betaRad, m.aero.nzG, m.aero.mach = s.alpha, s.beta, s.nz_g, s.mach
     m.faultFlags = s.fault_flags
     m.vehicleKind = int(s.vehicle_kind)
@@ -539,13 +632,28 @@ def encode_telemetry(schema, s: VehicleState) -> bytes:
     m.combat.hitPointsMax = s.hit_points_max
     m.combat.alive = s.alive
     m.combat.ammo = s.ammo
+    m.controlPeriodS = s.control_period_s
+    c = s.command
+    m.command.ownerEpoch = c.owner_epoch
+    m.command.lastSeq = c.last_seq
+    m.command.refusals = c.refusals
+    m.command.lastRefusal = int(c.last_refusal)
+    m.command.lastRefusedEpoch = c.last_refused_epoch
     return m.to_bytes()
 
 
-def encode_event(schema, ev: Event) -> bytes:
+def encode_tick_end(t: TickEnd) -> bytes:
+    """Encode a :class:`TickEnd` (fixtures and tests; the sim is its only publisher)."""
+    m = _schema().TickEnd.new_message()
+    m.tick = t.tick
+    m.simTimeS = t.sim_time_s
+    return m.to_bytes()
+
+
+def encode_event(ev: Event) -> bytes:
     """Encode an :class:`Event` (fixtures and tests; the sim is the only real
     event publisher). Enum fields must be members, not raw ordinals."""
-    m = schema.Event.new_message()
+    m = _schema().Event.new_message()
     m.tick = ev.tick
     m.simTimeS = ev.sim_time_s
     d = ev.detail

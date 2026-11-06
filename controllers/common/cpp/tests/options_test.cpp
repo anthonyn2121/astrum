@@ -4,8 +4,12 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "astrum/cli.hpp"
+#include "astrum/math.hpp"
 
 namespace astrum {
 namespace {
@@ -72,6 +76,77 @@ TEST_F(OptionsTest, UnknownFlagsAndMissingValuesAreUsageErrors) {
 }
 
 TEST_F(OptionsTest, HelpExitsZero) { EXPECT_EQ(parse({"--help"}).exit, 0); }
+
+TEST_F(OptionsTest, HelpWinsOverAnInvalidEnvironment) {
+  setenv("ASTRUM_TEST_ALT_M", "high", 1);
+  EXPECT_EQ(parse({"--help"}).exit, 0);
+}
+
+TEST_F(OptionsTest, RequiredOptionMustBeGivenByFlagOrEnv) {
+  const auto run = [](std::vector<const char*> args) {
+    std::uint32_t id = 0;
+    Options options("prog", "test");
+    options.add("--id", "n", "id", "ASTRUM_TEST_ID", &id).required();
+    args.insert(args.begin(), "prog");
+    return options.parse(static_cast<int>(args.size()), args.data());
+  };
+  EXPECT_EQ(run({}), 2);
+  EXPECT_FALSE(run({"--id", "3"}));
+  setenv("ASTRUM_TEST_ID", "3", 1);
+  EXPECT_FALSE(run({}));
+}
+
+TEST_F(OptionsTest, AddingAFlagTwiceIsAProgrammingError) {
+  double a = 0.0;
+  Options options("prog", "test");
+  options.add("--a", "x", "a", nullptr, &a);
+  EXPECT_THROW(options.add("--a", "x", "a", nullptr, &a), std::logic_error);
+}
+
+TEST(Cli, ConnectionOptionsRequireAnIdAndPositiveTimeouts) {
+  ConnectionOptions c;
+  EXPECT_TRUE(validate(c));  // id 0
+  c.id = 4294967295U;
+  EXPECT_FALSE(validate(c));
+  c.startup_timeout_s = 0.0;
+  EXPECT_TRUE(validate(c));
+  c.startup_timeout_s = 1.0;
+  c.telemetry_timeout_s = -1.0;
+  EXPECT_TRUE(validate(c));
+}
+
+TEST(Cli, IdFlagIsRequiredAndParsed) {
+  unsetenv("ASTRUM_TARGET_ID");
+  ConnectionOptions c;
+  Options options("prog", "test");
+  add_connection_options(options, c);
+  const char* none[] = {"prog"};
+  EXPECT_EQ(options.parse(1, none), 2);
+  const char* some[] = {"prog", "--id", "7", "--connect=tcp/10.0.0.1:7447"};
+  EXPECT_FALSE(options.parse(4, some));
+  EXPECT_EQ(c.id, 7U);
+  EXPECT_EQ(c.connect, "tcp/10.0.0.1:7447");
+}
+
+TEST(Cli, ReferenceIsWrappedRadiansAndSpeedIsNonNegative) {
+  ReferenceOptions r;
+  r.heading_deg = 270.0;
+  r.alt_hae_m = 1200.0;
+  r.tas_mps = 60.0;
+  const Reference ref = r.reference();
+  EXPECT_NEAR(ref.heading_rad, -kPi / 2.0, 1e-12);
+  EXPECT_EQ(ref.alt_hae_m, 1200.0);
+  EXPECT_EQ(ref.tas_mps, 60.0);
+  EXPECT_FALSE(validate(r));
+  r.tas_mps = -1.0;
+  EXPECT_TRUE(validate(r));
+}
+
+TEST(Cli, AttitudeLimitsMustBeInsideZeroToNinetyDegrees) {
+  EXPECT_FALSE(validate(AttitudeLimits{}));
+  EXPECT_TRUE(validate(AttitudeLimits{0.0, 10.0}));
+  EXPECT_TRUE(validate(AttitudeLimits{25.0, 90.0}));
+}
 
 }  // namespace
 }  // namespace astrum

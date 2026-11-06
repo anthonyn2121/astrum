@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace astrum {
@@ -43,8 +44,12 @@ Options::Options(std::string program, std::string summary)
 Options& Options::add_option(std::string flag, std::string meta, std::string help, const char* env,
                              std::string default_text,
                              std::function<bool(const std::string&)> set) {
+  for (const Option& opt : options_) {
+    if (opt.flag == flag) throw std::logic_error("option " + flag + " added twice");
+  }
   options_.push_back(Option{std::move(flag), std::move(meta), std::move(help),
-                            env != nullptr ? env : "", std::move(default_text), std::move(set)});
+                            env != nullptr ? env : "", std::move(default_text), std::move(set),
+                            false});
   return *this;
 }
 
@@ -94,8 +99,24 @@ Options& Options::add(std::string flag, std::string meta, std::string help, cons
                     });
 }
 
+Options& Options::required() {
+  if (options_.empty()) throw std::logic_error("Options::required() before any add()");
+  options_.back().required = true;
+  return *this;
+}
+
 std::optional<int> Options::parse(int argc, const char* const* argv) {
-  for (const Option& opt : options_) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "-h" || arg == "--help") {
+      std::cout << usage();
+      return 0;
+    }
+  }
+
+  std::vector<bool> given(options_.size(), false);
+  for (std::size_t k = 0; k < options_.size(); ++k) {
+    const Option& opt = options_[k];
     if (opt.env.empty()) continue;
     const char* value = std::getenv(opt.env.c_str());
     if (value == nullptr) continue;
@@ -103,25 +124,22 @@ std::optional<int> Options::parse(int argc, const char* const* argv) {
       std::cerr << program_ << ": invalid value '" << value << "' in $" << opt.env << "\n";
       return 2;
     }
+    given[k] = true;
   }
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
-    if (arg == "-h" || arg == "--help") {
-      std::cout << usage();
-      return 0;
-    }
     std::string key = arg;
     std::optional<std::string> value;
     if (const auto eq = arg.find('='); arg.rfind("--", 0) == 0 && eq != std::string::npos) {
       key = arg.substr(0, eq);
       value = arg.substr(eq + 1);
     }
-    const Option* match = nullptr;
-    for (const Option& opt : options_) {
-      if (opt.flag == key) match = &opt;
+    std::size_t match = options_.size();
+    for (std::size_t k = 0; k < options_.size(); ++k) {
+      if (options_[k].flag == key) match = k;
     }
-    if (match == nullptr) {
+    if (match == options_.size()) {
       std::cerr << program_ << ": unknown argument '" << arg << "'\n" << usage();
       return 2;
     }
@@ -132,8 +150,18 @@ std::optional<int> Options::parse(int argc, const char* const* argv) {
       }
       value = argv[++i];
     }
-    if (!match->set(*value)) {
+    if (!options_[match].set(*value)) {
       std::cerr << program_ << ": invalid value '" << *value << "' for " << key << "\n";
+      return 2;
+    }
+    given[match] = true;
+  }
+
+  for (std::size_t k = 0; k < options_.size(); ++k) {
+    const Option& opt = options_[k];
+    if (opt.required && !given[k]) {
+      std::cerr << program_ << ": " << opt.flag << " is required"
+                << (opt.env.empty() ? "" : " (or $" + opt.env + ")") << "\n";
       return 2;
     }
   }
@@ -146,7 +174,7 @@ std::string Options::usage() const {
   for (const Option& opt : options_) {
     std::string lhs = "  " + opt.flag + " <" + opt.meta + ">";
     if (lhs.size() < 28) lhs.resize(28, ' ');
-    os << lhs << " " << opt.help << " [default " << opt.default_text;
+    os << lhs << " " << opt.help << (opt.required ? " [required" : " [default " + opt.default_text);
     if (!opt.env.empty()) os << ", env " << opt.env;
     os << "]\n";
   }

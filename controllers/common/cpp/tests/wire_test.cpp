@@ -9,14 +9,15 @@
 namespace astrum {
 namespace {
 
+// Every field distinct and non-default, so a swapped or dropped field cannot round-trip.
 VehicleState sample_state() {
   VehicleState s;
-  s.t = 12.5;
+  s.sim_time_s = 12.5;
   s.tick = 1500;
   s.aircraft_id = 4;
   s.lat_deg = 37.6;
   s.lon_deg = -122.4;
-  s.alt_m = 1524.0;
+  s.alt_hae_m = 1524.0;
   s.e = 10.0;
   s.n = -20.0;
   s.u = 1500.0;
@@ -32,7 +33,7 @@ VehicleState sample_state() {
   s.p = 0.01;
   s.q = -0.02;
   s.r = 0.03;
-  s.airspeed = 55.0;
+  s.tas_mps = 55.0;
   s.alpha = 0.04;
   s.beta = -0.001;
   s.nz_g = 1.02;
@@ -45,6 +46,8 @@ VehicleState sample_state() {
   s.hit_points_max = 100.0F;
   s.alive = true;
   s.ammo = 200;
+  s.control_period_s = 1.0 / 30.0;
+  s.command = CommandStatus{0xAAAAAAAAAAAAAAAAULL, 41, 4294967295U, Refusal::NotOwner, 7};
   return s;
 }
 
@@ -55,9 +58,13 @@ TEST(Wire, GarbageBytesAreAnErrorNotAThrow) {
     for (auto& b : bytes) b = static_cast<std::uint8_t>(rng());
     const auto telemetry = decode_telemetry(bytes);
     const auto command = decode_command(bytes);
+    const auto event = decode_event(bytes);
+    const auto tick_end = decode_tick_end(bytes);
     // Reaching here means no exception escaped; each result is a value XOR an error.
     EXPECT_EQ(telemetry.value.has_value(), telemetry.error.empty());
     EXPECT_EQ(command.value.has_value(), command.error.empty());
+    EXPECT_EQ(event.value.has_value(), event.error.empty());
+    EXPECT_EQ(tick_end.value.has_value(), tick_end.error.empty());
   }
   // A segment table claiming a huge segment is the classic hostile header.
   const std::vector<std::uint8_t> hostile = {0, 0, 0, 0, 0xff, 0xff, 0xff, 0x7f};
@@ -91,41 +98,11 @@ TEST(Wire, TelemetryRoundTripsEveryField) {
   const VehicleState s = sample_state();
   const auto decoded = decode_telemetry(encode_telemetry(s));
   ASSERT_TRUE(decoded) << decoded.error;
-  const VehicleState& d = *decoded.value;
-  EXPECT_EQ(d.t, s.t);
-  EXPECT_EQ(d.tick, s.tick);
-  EXPECT_EQ(d.aircraft_id, s.aircraft_id);
-  EXPECT_EQ(d.lat_deg, s.lat_deg);
-  EXPECT_EQ(d.lon_deg, s.lon_deg);
-  EXPECT_EQ(d.alt_m, s.alt_m);
-  EXPECT_EQ(d.e, s.e);
-  EXPECT_EQ(d.n, s.n);
-  EXPECT_EQ(d.u, s.u);
-  EXPECT_EQ(d.vel_ned_n, s.vel_ned_n);
-  EXPECT_EQ(d.vel_ned_e, s.vel_ned_e);
-  EXPECT_EQ(d.vel_ned_d, s.vel_ned_d);
-  EXPECT_EQ(d.vel_enu_e, s.vel_enu_e);
-  EXPECT_EQ(d.vel_enu_n, s.vel_enu_n);
-  EXPECT_EQ(d.vel_enu_u, s.vel_enu_u);
-  EXPECT_EQ(d.roll, s.roll);
-  EXPECT_EQ(d.pitch, s.pitch);
-  EXPECT_EQ(d.yaw, s.yaw);
-  EXPECT_EQ(d.p, s.p);
-  EXPECT_EQ(d.q, s.q);
-  EXPECT_EQ(d.r, s.r);
-  EXPECT_EQ(d.airspeed, s.airspeed);
-  EXPECT_EQ(d.alpha, s.alpha);
-  EXPECT_EQ(d.beta, s.beta);
-  EXPECT_EQ(d.nz_g, s.nz_g);
-  EXPECT_EQ(d.mach, s.mach);
-  EXPECT_EQ(d.fault_flags, s.fault_flags);
-  EXPECT_EQ(d.vehicle_kind, s.vehicle_kind);
-  EXPECT_EQ(d.control_mode, s.control_mode);
-  EXPECT_EQ(d.team, s.team);
-  EXPECT_EQ(d.hit_points, s.hit_points);
-  EXPECT_EQ(d.hit_points_max, s.hit_points_max);
-  EXPECT_EQ(d.alive, s.alive);
-  EXPECT_EQ(d.ammo, s.ammo);
+  EXPECT_TRUE(*decoded.value == s);
+  EXPECT_EQ(decoded.value->control_period_s, 1.0 / 30.0);
+  EXPECT_EQ(decoded.value->command.owner_epoch, 0xAAAAAAAAAAAAAAAAULL);
+  EXPECT_EQ(decoded.value->command.refusals, 4294967295U);
+  EXPECT_EQ(decoded.value->command.last_refusal, Refusal::NotOwner);
 }
 
 TEST(Wire, DecodesFromAnUnalignedBuffer) {
@@ -141,37 +118,68 @@ TEST(Wire, UnknownEnumValuesSurviveAsUnknown) {
   VehicleState s = sample_state();
   s.vehicle_kind = static_cast<VehicleKind>(7);
   s.control_mode = static_cast<ControlMode>(9);
+  s.command.last_refusal = static_cast<Refusal>(11);
   const auto decoded = decode_telemetry(encode_telemetry(s));
   ASSERT_TRUE(decoded) << decoded.error;
   EXPECT_EQ(to_string(decoded.value->vehicle_kind), "unknown(7)");
   EXPECT_EQ(to_string(decoded.value->control_mode), "unknown(9)");
+  EXPECT_EQ(to_string(decoded.value->command.last_refusal), "unknown(11)");
+
+  const Event e{3, 0.5,
+                ModeChange{1, ControlMode::Raw, ControlMode::Failsafe, static_cast<ModeReason>(6)}};
+  const auto ev = decode_event(encode_event(e));
+  ASSERT_TRUE(ev) << ev.error;
+  EXPECT_EQ(to_string(std::get<ModeChange>(ev.value->detail).reason), "unknown(6)");
+  const auto end =
+      decode_event(encode_event(Event{3, 0.5, RunEnded{static_cast<EndReason>(9), ""}}));
+  ASSERT_TRUE(end) << end.error;
+  EXPECT_EQ(to_string(std::get<RunEnded>(end.value->detail).reason), "unknown(9)");
 }
 
-TEST(Wire, CommandRoundTripsBothControlVariants) {
-  CommandMessage raw{3, 42, 1000, Command::raw(0.25, -0.5, 0.125, 0.75)};
-  raw.command.trigger = true;
-  const auto r = decode_command(encode_command(raw));
-  ASSERT_TRUE(r) << r.error;
-  EXPECT_EQ(r.value->target_id, 3U);
-  EXPECT_EQ(r.value->seq, 42U);
-  EXPECT_EQ(r.value->telemetry_tick, 1000U);
-  EXPECT_TRUE(r.value->command.trigger);
-  const auto* act = std::get_if<RawActuators>(&r.value->command.control);
-  ASSERT_NE(act, nullptr);
-  EXPECT_EQ(act->aileron, 0.25);
-  EXPECT_EQ(act->elevator, -0.5);
-  EXPECT_EQ(act->rudder, 0.125);
-  EXPECT_EQ(act->throttle, 0.75);
+TEST(Wire, EnumNamesAreKebabCase) {
+  EXPECT_EQ(to_string(VehicleKind::FixedWing), "fixed-wing");
+  EXPECT_EQ(to_string(Refusal::FromTheFuture), "from-the-future");
+  EXPECT_EQ(to_string(Refusal::WrongVehicleKind), "wrong-vehicle-kind");
+  EXPECT_EQ(to_string(ModeReason::LeaseExpired), "lease-expired");
+  EXPECT_EQ(to_string(EndReason::EngagementDecided), "engagement-decided");
+}
 
-  const CommandMessage ap{9, 7, 5, Command::autopilot(1.5, 1500.0, 120.0)};
-  const auto a = decode_command(encode_command(ap));
-  ASSERT_TRUE(a) << a.error;
-  EXPECT_FALSE(a.value->command.trigger);
-  const auto* targets = std::get_if<AutopilotTargets>(&a.value->command.control);
-  ASSERT_NE(targets, nullptr);
-  EXPECT_EQ(targets->heading_rad, 1.5);
-  EXPECT_EQ(targets->alt_m, 1500.0);
-  EXPECT_EQ(targets->tas_mps, 120.0);
+TEST(Wire, CommandRoundTripsEveryControlVariant) {
+  const Command raw{
+      3, 42, 1000, true, 0xFFFFFFFFFFFFFFFFULL, RawActuators{0.25, -0.5, 0.125, 0.75}};
+  const Command multirotor{4, 9, 33, false, 5, MultirotorRaw{0.25, -0.5, 0.125, 0.4375}};
+  const Command autopilot{9, 7, 5, false, 1, AutopilotTargets{1.5, 1500.0, 120.0}};
+  for (const Command& c : {raw, multirotor, autopilot}) {
+    const auto decoded = decode_command(encode_command(c));
+    ASSERT_TRUE(decoded) << decoded.error;
+    EXPECT_TRUE(*decoded.value == c) << "control index " << c.control.index();
+  }
+}
+
+TEST(Wire, TickEndRoundTrips) {
+  const TickEnd t{1234567890123ULL, 10288065.6875};
+  const auto decoded = decode_tick_end(encode_tick_end(t));
+  ASSERT_TRUE(decoded) << decoded.error;
+  EXPECT_TRUE(*decoded.value == t);
+}
+
+TEST(Wire, EveryEventKindRoundTrips) {
+  const std::vector<Event> events = {
+      {120, 1.0, TriggerPressed{2, 300}},
+      {121, 1.0083, TriggerReleased{2, 41, 259}},
+      {1234, 10.28125, Hit{2, 1, 2.5F, 97.5F, Enu{1234.5, -6789.25, 4572.125}}},
+      {4000, 33.3125, Kill{1, 2U, Enu{-10.75, 20.5, 1499.0}}},
+      {17, 0.140625, Kill{4294967295U, std::nullopt, Enu{}}},
+      {600, 5.0, ModeChange{3, ControlMode::Raw, ControlMode::Failsafe, ModeReason::LeaseExpired}},
+      {0, 0.0, ControllerUp{5}},
+      {999, 8.3125, ControllerDown{7}},
+      {7200, 60.0, RunEnded{EndReason::Fatal, "aircraft 3: non-finite state"}},
+  };
+  for (const Event& e : events) {
+    const auto decoded = decode_event(encode_event(e));
+    ASSERT_TRUE(decoded) << decoded.error;
+    EXPECT_TRUE(*decoded.value == e) << "event kind " << e.detail.index();
+  }
 }
 
 }  // namespace

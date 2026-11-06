@@ -1,4 +1,4 @@
-// The example's raw hold law: heading / altitude / airspeed hold for a fixed-wing.
+// The raw hold law (`--law hold`): heading / altitude / airspeed hold for a fixed-wing.
 //
 // Outer loops (shared astrum::OuterLoops): heading PI -> bank target within
 // --max-bank-deg, altitude PI -> pitch target within --max-pitch-deg, airspeed PI ->
@@ -9,17 +9,21 @@
 #ifndef ASTRUM_EXAMPLE_HOLD_LAW_HPP
 #define ASTRUM_EXAMPLE_HOLD_LAW_HPP
 
+#include <vector>
+
 #include "astrum/control.hpp"
-#include "astrum/types.hpp"
+#include "astrum/runtime.hpp"
 
 namespace astrum {
 
-class HoldLaw {
+class HoldLaw : public Law {
  public:
   HoldLaw(const AttitudeLimits& limits, const Reference& reference);
 
-  // One control step; outputs are within their actuator ranges.
-  RawActuators control(const VehicleState& s);
+  std::vector<VehicleKind> vehicle_kinds() const override { return {VehicleKind::FixedWing}; }
+
+  // RawActuators within their actuator ranges.
+  LawResult step(const StepInput& input) override;
 
  private:
   OuterLoops outer_;

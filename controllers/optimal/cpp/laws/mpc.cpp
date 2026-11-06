@@ -1,4 +1,4 @@
-// MPC control law.
+// MPC control law (`--law mpc`).
 //
 // Same cascade as laws/lqr.cpp — astrum::OuterLoops supplies saturated bank / pitch /
 // throttle targets — but each attitude axis is flown by a receding-horizon controller
@@ -8,9 +8,10 @@
 //   subject to x_{k+1} = A x_k + B u_k,  -1 <= u_k <= 1
 //
 // with x = [angle - target, rate] (include/attitude_axes.hpp). The prediction step IS
-// the control period: (A, B) is the exact zero-order-hold discretization at
-// dt = 1 / --rate-hz, the horizon is N = round(--horizon-s / dt) steps of dt, and each
-// sample re-plans and applies u_0. The terminal weight P is the axis's discrete Riccati
+// the control period: (A, B) is the exact zero-order-hold discretization at the
+// telemetry's controlPeriodS dt (in configure()), the horizon is
+// N = round(--horizon-s / dt) steps of dt, and each sample re-plans and applies u_0.
+// The terminal weight P is the axis's discrete Riccati
 // solution, so when no limit is active the first move equals the LQR law's exactly; when
 // the plan saturates, the box-constrained QP is solved by accelerated projected gradient,
 // warm-started from the previous plan shifted by one step.
@@ -22,9 +23,12 @@
 #include <Eigen/Eigenvalues>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
+#include "astrum/control.hpp"
 #include "attitude_axes.hpp"
 #include "laws.hpp"
 
@@ -105,28 +109,56 @@ class AxisMpc {
 
 class MpcLaw : public Law {
  public:
-  explicit MpcLaw(const LawConfig& config)
-      : outer_(config.limits),
-        roll_(roll_axis(), config.dt, horizon_steps(config.horizon_s, config.dt)),
-        pitch_(pitch_axis(), config.dt, horizon_steps(config.horizon_s, config.dt)) {}
+  MpcLaw(const LawContext& context, double horizon_s)
+      : outer_(context.limits), reference_(context.reference), horizon_s_(horizon_s) {
+    if (!(std::isfinite(horizon_s) && horizon_s > 0.0)) {
+      throw std::invalid_argument("--horizon-s must be finite and > 0, got " +
+                                  std::to_string(horizon_s));
+    }
+  }
 
-  Command control(const VehicleState& s, const Reference& ref) override {
-    const AttitudeTargets target = outer_.update(s, ref);
-    const double aileron = roll_.move(Eigen::Vector2d(s.roll - target.bank_rad, s.p));
-    const double elevator = pitch_.move(Eigen::Vector2d(s.pitch - target.pitch_rad, s.q));
-    return Command::raw(aileron, elevator, /*rudder=*/0.0, target.throttle);
+  std::vector<VehicleKind> vehicle_kinds() const override { return {VehicleKind::FixedWing}; }
+
+  void configure(double control_period_s) override {
+    const int steps = horizon_steps(horizon_s_, control_period_s);
+    roll_.emplace(roll_axis(), control_period_s, steps);
+    pitch_.emplace(pitch_axis(), control_period_s, steps);
+  }
+
+  LawResult step(const StepInput& input) override {
+    if (!roll_ || !pitch_) throw std::logic_error("mpc: step before configure");
+    const VehicleState& s = input.state;
+    const AttitudeTargets target = outer_.update(s, reference_);
+    const double aileron = roll_->move(Eigen::Vector2d(s.roll - target.bank_rad, s.p));
+    const double elevator = pitch_->move(Eigen::Vector2d(s.pitch - target.pitch_rad, s.q));
+    return Action{RawActuators{aileron, elevator, /*rudder=*/0.0, target.throttle}};
   }
 
  private:
   OuterLoops outer_;
-  AxisMpc roll_;
-  AxisMpc pitch_;
+  Reference reference_;
+  double horizon_s_;
+  std::optional<AxisMpc> roll_;
+  std::optional<AxisMpc> pitch_;
 };
 
 }  // namespace
 
-std::unique_ptr<Law> make_mpc_law(const LawConfig& config) {
-  return std::make_unique<MpcLaw>(config);
+std::unique_ptr<Law> make_mpc_law(const LawContext& context, double horizon_s) {
+  return std::make_unique<MpcLaw>(context, horizon_s);
+}
+
+LawEntry mpc_law_entry() {
+  // Shared by the flag registration and the factory (both live as long as the entry).
+  auto horizon_s = std::make_shared<double>(0.5);
+  return LawEntry{
+      "mpc", "box-constrained MPC attitude loops under saturated outer loops (fixed-wing)",
+      [horizon_s](Options& options) {
+        options.add("--horizon-s", "s",
+                    "MPC look-ahead (mpc only): round(horizon-s / control period) steps",
+                    "ASTRUM_MPC_HORIZON_S", horizon_s.get());
+      },
+      [horizon_s](const LawContext& context) { return make_mpc_law(context, *horizon_s); }};
 }
 
 }  // namespace astrum

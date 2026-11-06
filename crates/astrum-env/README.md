@@ -36,7 +36,8 @@ obs, terminated, truncated, tick = batch.step(actions)   # actions (K, n, 5)
 
 - **Actions** `(n, 5)`: `[aileron, elevator, rudder, throttle, trigger]` per row
   (surfaces `[-1, 1]`, throttle `[0, 1]`, trigger fires at `>= 0.5` — a learned
-  fire gate, not auto-aim). Optional `autopilot` `(n, 4)` =
+  fire gate, not auto-aim); on a multirotor the four channels are its raw
+  `[roll_rate, pitch_rate, yaw_rate, collective]` demands. Optional `autopilot` `(n, 4)` =
   `[engage, heading_rad, alt_hae_m, tas_mps]` replaces the raw channels where
   `engage >= 0.5`. Rows with `commanded[i] == False` send nothing (the aircraft
   keeps its last command until the raw-command lease expires).

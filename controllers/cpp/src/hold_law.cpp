@@ -14,14 +14,15 @@ constexpr double kPitchDamping = 0.5;  // elevator / (rad/s) pitch rate
 HoldLaw::HoldLaw(const AttitudeLimits& limits, const Reference& reference)
     : outer_(limits), reference_(reference) {}
 
-RawActuators HoldLaw::control(const VehicleState& s) {
+LawResult HoldLaw::step(const StepInput& input) {
+  const VehicleState& s = input.state;
   const AttitudeTargets target = outer_.update(s, reference_);
   RawActuators out;
   out.aileron = clamp(kRollGain * (target.bank_rad - s.roll) - kRollDamping * s.p, -1.0, 1.0);
   out.elevator = clamp(-kPitchGain * (target.pitch_rad - s.pitch) + kPitchDamping * s.q, -1.0, 1.0);
   out.rudder = 0.0;
   out.throttle = target.throttle;
-  return out;
+  return Action{out};
 }
 
 }  // namespace astrum

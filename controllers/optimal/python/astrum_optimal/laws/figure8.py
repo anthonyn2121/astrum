@@ -34,39 +34,60 @@ from __future__ import annotations
 
 import math
 
+from astrum_client import cli
 from astrum_client.mathutil import integration_step
-from astrum_client.wire import AutopilotTargets, VehicleKind, VehicleState
+from astrum_client.runtime import Law, Reference, StepInput
+from astrum_client.wire import Action, AutopilotTargets, VehicleKind
 
 from astrum_optimal.laws._guidance import true_heading_for_grid_track
-from astrum_optimal.runtime import Fleet, Reference
-from astrum_optimal.runtime import Law as BaseLaw
 
 
-def add_args(p) -> None:
-    p.add_argument("--fig-rx", type=float, default=8000.0, help="half-width along East (m)")
-    p.add_argument("--fig-ry", type=float, default=4000.0, help="lobe height along North (m)")
-    p.add_argument("--fig-center-e", type=float, default=0.0, help="pattern centre, ENU East (m)")
-    p.add_argument("--fig-center-n", type=float, default=0.0, help="pattern centre, ENU North (m)")
-    p.add_argument(
-        "--fig-xtrack",
-        type=float,
-        default=0.05,
-        help="cross-track gain (1/s): commanded pull-back speed per metre off the path",
-    )
-
-
-class Law(BaseLaw):
+class Figure8Law(Law):
     """Speed-paced lemniscate follower (fixed-wing only)."""
 
     vehicle_kinds = frozenset({VehicleKind.FIXED_WING})
 
-    def __init__(self, args):
-        super().__init__(args)
-        self.rx = args.fig_rx
-        self.ry = args.fig_ry
-        self.ce = args.fig_center_e
-        self.cn = args.fig_center_n
-        self.kxt = args.fig_xtrack
+    @classmethod
+    def add_args(cls, p) -> None:
+        f = cli.finite_float
+        p.add_argument("--fig-rx", type=f, default=8000.0, help="half-width along East (m)")
+        p.add_argument("--fig-ry", type=f, default=4000.0, help="lobe height along North (m)")
+        p.add_argument("--fig-center-e", type=f, default=0.0, help="pattern centre, ENU East (m)")
+        p.add_argument("--fig-center-n", type=f, default=0.0, help="pattern centre, ENU North (m)")
+        p.add_argument(
+            "--fig-xtrack",
+            type=f,
+            default=0.05,
+            help="cross-track gain (1/s): commanded pull-back speed per metre off the path",
+        )
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            args.reference,
+            rx=args.fig_rx,
+            ry=args.fig_ry,
+            center_e=args.fig_center_e,
+            center_n=args.fig_center_n,
+            xtrack=args.fig_xtrack,
+        )
+
+    def __init__(
+        self,
+        ref: Reference,
+        *,
+        rx: float = 8000.0,
+        ry: float = 4000.0,
+        center_e: float = 0.0,
+        center_n: float = 0.0,
+        xtrack: float = 0.05,
+    ):
+        self.ref = ref
+        self.rx = rx
+        self.ry = ry
+        self.ce = center_e
+        self.cn = center_n
+        self.kxt = xtrack
         self.tau = 0.0  # path parameter; advanced by arc length flown
         self._prev_t: float | None = None
 
@@ -74,10 +95,11 @@ class Law(BaseLaw):
         """dP/dtau at the current tau."""
         return self.rx * math.cos(self.tau), self.ry * math.cos(2.0 * self.tau)
 
-    def control(self, s: VehicleState, ref: Reference, fleet: Fleet) -> AutopilotTargets:
+    def step(self, inp: StepInput) -> Action:
+        s = inp.state
         gs = math.hypot(s.vel_enu_e, s.vel_enu_n)
-        dt = integration_step(self._prev_t, s.t)
-        self._prev_t = s.t
+        dt = integration_step(self._prev_t, s.sim_time_s)
+        self._prev_t = s.sim_time_s
         speed_dpdtau = math.hypot(*self._tangent()) or 1.0
         self.tau += gs * dt / speed_dpdtau
 
@@ -92,4 +114,4 @@ class Law(BaseLaw):
         v_e = gs * de / norm + self.kxt * (ref_e - s.e)
         v_n = gs * dn / norm + self.kxt * (ref_n - s.n)
         heading = true_heading_for_grid_track(s, math.atan2(v_e, v_n))
-        return AutopilotTargets(heading, ref.alt_m, ref.airspeed_mps)
+        return Action(AutopilotTargets(heading, self.ref.alt_hae_m, self.ref.tas_mps))

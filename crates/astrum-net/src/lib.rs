@@ -9,10 +9,15 @@
 //!   viewers: a control law must act on the freshest state, never on a queue of
 //!   stale frames.
 //! * **Commands** — a controller's [`CommandSender`] publishes on
-//!   `astrum/command/<id>`; the sim's [`CommandReceiver`] drains them each tick
-//!   and rejects any whose payload `target_id` disagrees with the key.
+//!   `astrum/command/<id>`, stamping a random non-zero `epoch` (its instance
+//!   id: the sim lets one epoch own an aircraft) and a strictly increasing
+//!   `seq`; the sim's [`CommandReceiver`] drains them each tick and rejects any
+//!   whose payload `target_id` disagrees with the key.
 //! * **Events** — the sim publishes each [`Event`] (hit, kill, mode change, ...)
 //!   on `astrum/events` ([`EventPublisher`]); [`EventReceiver`] queues them.
+//! * **Tick end** — after a tick's telemetry and events the sim publishes one
+//!   [`TickEnd`] on `astrum/tick` ([`TickPublisher`]); [`TickReceiver`] keeps
+//!   the newest.
 //! * **Scenario** — the sim answers `get astrum/scenario` with its scenario TOML
 //!   ([`ScenarioServer`] / [`fetch_scenario`]), so recorders can embed it.
 //! * **Presence** — a controller announces itself with a liveliness token
@@ -26,15 +31,26 @@
 //! between clients (a recorder sees the controllers' commands, a follower sees
 //! the leader's telemetry).
 //!
+//! Per tick on which any telemetry is due the sim publishes, in this order:
+//! every due telemetry sample (aircraft id ascending), then the tick's events,
+//! then one [`TickEnd`]. So a subscriber that has received `TickEnd` N has
+//! received every telemetry sample and event of tick N that reached it, and can
+//! act on a whole, tick-aligned fleet.
+//!
 //! QoS ([`qos`]): telemetry and commands carry latest-value state, so a
 //! congested link drops the older sample (`CongestionControl::Drop`), samples
-//! are not batched (`express`), and they ride above bulk data
-//! (`InteractiveHigh`). Events are one-off, so they are reliable and block
-//! rather than drop. The sim's router also offers Zenoh's low-latency transport
-//! (no batching, no QoS lanes), which the C++ and Python controller clients ask
-//! for: every lockstep round trip counts. Clients that don't ask (the recorder,
-//! the web bridge) get the default transport, with fragmentation for large
-//! replies.
+//! are not batched (`express`) and are marked `InteractiveHigh`. Events and
+//! tick ends must not be lost, so they block rather than drop and are marked
+//! `Data`. What the priority buys depends on the link's transport. The sim's
+//! router offers Zenoh's low-latency transport, which the C++ and Python
+//! controller clients ask for (every lockstep round trip counts): it has ONE
+//! lane per link, no batching and no fragmentation, so priorities reorder
+//! nothing — messages arrive in the order the sim sent them — and every message
+//! must fit in one transport frame. Clients that don't ask (the recorder, the
+//! web bridge) get the default transport: one lane per priority (a higher one
+//! is sent first) and fragmentation for large replies. Either way a link
+//! delivers the messages of one priority in send order, which is what the
+//! per-tick order above relies on.
 //!
 //! Every call uses Zenoh's synchronous `.wait()` resolver; Zenoh runs its own
 //! runtime internally, so these wrappers drop into synchronous code as-is.
@@ -45,9 +61,10 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use astrum_proto::{
-    decode_command, decode_event, decode_telemetry, encode_command, encode_telemetry,
+    decode_command, decode_event, decode_telemetry, decode_tick_end, encode_command,
+    encode_telemetry, encode_tick_end,
 };
-pub use astrum_proto::{Command, Control, Event, EventKind, Telemetry};
+pub use astrum_proto::{Command, Control, Event, EventKind, Telemetry, TickEnd};
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::{Publisher, Subscriber};
 use zenoh::query::Queryable;
@@ -71,6 +88,8 @@ pub mod keys {
     pub const SCENARIO: &str = "astrum/scenario";
     /// Every event the sim reports.
     pub const EVENTS: &str = "astrum/events";
+    /// The end of each tick's publications ([`TickEnd`](crate::TickEnd)).
+    pub const TICK: &str = "astrum/tick";
     /// `astrum/alive/controller/<id>`: liveliness token of the controller
     /// flying aircraft `<id>`.
     pub const ALIVE_PREFIX: &str = "astrum/alive/controller";
@@ -113,8 +132,14 @@ pub mod qos {
     pub const EXPRESS: bool = true;
     /// Events are one-off: block rather than drop one.
     pub const EVENT_CONGESTION: CongestionControl = CongestionControl::Block;
-    /// Below telemetry and commands.
+    /// Marked below telemetry and commands.
     pub const EVENT_PRIORITY: Priority = Priority::Data;
+    /// A lost tick end would stall a tick-aligned reader: block rather than drop.
+    pub const TICK_CONGESTION: CongestionControl = CongestionControl::Block;
+    /// The same priority as events, so it follows the tick's events on any link.
+    pub const TICK_PRIORITY: Priority = Priority::Data;
+    /// Sent at once: readers wait on it.
+    pub const TICK_EXPRESS: bool = true;
 }
 
 /// Default endpoint the sim (and bag replay) LISTENS on. Zenoh endpoints use
@@ -425,25 +450,56 @@ impl CommandReceiver {
 }
 
 /// Controller-side command publisher for one aircraft. Stamps every command
-/// with a strictly increasing `seq`.
+/// with this sender's random non-zero `epoch` and a strictly increasing `seq`.
 pub struct CommandSender {
     target_id: u32,
+    epoch: u64,
     seq: u64,
     publisher: Publisher<'static>,
+}
+
+/// A random non-zero epoch (std's per-process random hash keys, mixed with the
+/// clock so two senders in one process differ too).
+fn random_epoch() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        h.write_u32(std::process::id());
+        let epoch = h.finish();
+        if epoch != 0 {
+            return epoch;
+        }
+    }
 }
 
 impl CommandSender {
     pub fn new(session: &Session, target_id: u32) -> Result<Self> {
         let publisher = session.declare_publisher(keys::command(target_id))?;
-        Ok(Self { target_id, seq: 0, publisher })
+        Ok(Self { target_id, epoch: random_epoch(), seq: 0, publisher })
+    }
+
+    /// This sender's epoch (non-zero), stamped on every command it sends.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Send `control` computed from telemetry tick `telemetry_tick`. Returns the
     /// sequence number used.
     pub fn send(&mut self, control: Control, trigger: bool, telemetry_tick: u64) -> Result<u64> {
         self.seq += 1;
-        let cmd =
-            Command { target_id: self.target_id, seq: self.seq, telemetry_tick, trigger, control };
+        let cmd = Command {
+            target_id: self.target_id,
+            seq: self.seq,
+            telemetry_tick,
+            trigger,
+            epoch: self.epoch,
+            control,
+        };
         self.publisher.put(encode_command(&cmd)).wait().map_err(zerr)?;
         Ok(self.seq)
     }
@@ -524,6 +580,104 @@ impl EventReceiver {
     /// Payloads skipped so far (undecodable, or a kind unknown to this build).
     pub fn skipped(&self) -> u64 {
         self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+// --- Tick end -------------------------------------------------------------------
+
+/// Sim-side publisher of [`TickEnd`] on `astrum/tick`.
+pub struct TickPublisher {
+    publisher: Publisher<'static>,
+}
+
+impl TickPublisher {
+    pub fn new(session: &Session) -> Result<Self> {
+        let publisher = session
+            .z
+            .declare_publisher(keys::TICK)
+            .congestion_control(qos::TICK_CONGESTION)
+            .priority(qos::TICK_PRIORITY)
+            .express(qos::TICK_EXPRESS)
+            .wait()
+            .map_err(zerr)?;
+        Ok(Self { publisher })
+    }
+
+    /// Publish the end of tick `t.tick`'s publications.
+    pub fn publish(&self, t: &TickEnd) -> Result<()> {
+        self.publisher.put(encode_tick_end(t)).wait().map_err(zerr)
+    }
+}
+
+#[derive(Default)]
+struct TickState {
+    latest: Option<TickEnd>,
+    generation: u64,
+    decode_errors: u64,
+}
+
+/// The newest [`TickEnd`] on `astrum/tick` (tests and tools; controllers use
+/// their own SDK). Decoded on Zenoh's receive thread, overwriting the previous.
+pub struct TickReceiver {
+    shared: Arc<(Mutex<TickState>, Condvar)>,
+    seen_generation: u64,
+    _sub: Subscriber<()>,
+}
+
+impl TickReceiver {
+    pub fn subscribe(session: &Session) -> Result<Self> {
+        let shared: Arc<(Mutex<TickState>, Condvar)> = Arc::default();
+        let sink = Arc::clone(&shared);
+        let sub = session
+            .z
+            .declare_subscriber(keys::TICK)
+            .callback(move |sample: Sample| {
+                let decoded = decode_tick_end(&sample.payload().to_bytes());
+                let (lock, cv) = &*sink;
+                let mut st = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                match decoded {
+                    Ok(t) => {
+                        st.latest = Some(t);
+                        st.generation += 1;
+                    }
+                    Err(_) => st.decode_errors += 1,
+                }
+                drop(st);
+                cv.notify_all();
+            })
+            .wait()
+            .map_err(zerr)?;
+        Ok(Self { shared, seen_generation: 0, _sub: sub })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, TickState> {
+        self.shared.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The newest tick end, if any arrived.
+    pub fn latest(&self) -> Option<TickEnd> {
+        self.state().latest
+    }
+
+    /// Payloads that failed to decode so far.
+    pub fn decode_errors(&self) -> u64 {
+        self.state().decode_errors
+    }
+
+    /// Block until a tick end newer than the last `wait` arrives; returns it.
+    pub fn wait(&mut self, timeout: Duration) -> Result<TickEnd> {
+        let (lock, cv) = &*self.shared;
+        let deadline = Instant::now() + timeout;
+        let mut st = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while st.generation == self.seen_generation {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(NetError::Timeout);
+            }
+            st = cv.wait_timeout(st, left).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        self.seen_generation = st.generation;
+        Ok(st.latest.expect("a generation bump stores a tick end"))
     }
 }
 

@@ -9,5 +9,5 @@
 base = "config/scenario.quad.toml"
 
 controllers = [
-  "python controllers/python/example.py --id 1 --heading 180 --alt 130 --speed 0 --mode autopilot",
+  "python controllers/python/example.py --id 1 --heading 180 --alt 130 --speed 0 --law autopilot",
 ]

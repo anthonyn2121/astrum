@@ -11,7 +11,7 @@
 base = "config/scenario.demo.toml"
 
 controllers = [
-  "build/controllers/cpp/astrum-controller --id 1 --heading {param.heading} --alt 1500 --speed 50",
+  "build/controllers/cpp/astrum-controller --law hold --id 1 --heading {param.heading} --alt 1500 --speed 50",
 ]
 
 [set]

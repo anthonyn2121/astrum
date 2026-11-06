@@ -56,14 +56,14 @@ from __future__ import annotations
 import logging
 import math
 
+from astrum_client import cli
 from astrum_client.mathutil import clamp, wrap_pi
-from astrum_client.wire import AutopilotTargets, VehicleKind, VehicleState
+from astrum_client.runtime import AttitudeLimits, Law, Reference, StepInput
+from astrum_client.wire import Action, AutopilotTargets, VehicleKind, VehicleState
 
 from astrum_optimal.laws._guidance import grid_track
 from astrum_optimal.laws.mpc import horizon_steps
 from astrum_optimal.linear import ChannelMPC, discretize_zoh
-from astrum_optimal.runtime import Fleet, Reference
-from astrum_optimal.runtime import Law as BaseLaw
 
 G = 9.80665
 
@@ -75,39 +75,6 @@ SLOTS = {
 }
 
 log = logging.getLogger("formation")
-
-
-def add_args(p) -> None:
-    p.add_argument("--leader", type=int, default=1, help="aircraft id of the leader to follow")
-    p.add_argument("--slot", choices=sorted(SLOTS), default="trail", help="named slot")
-    p.add_argument("--slot-fwd", type=float, help="override slot forward offset (m, +ahead)")
-    p.add_argument("--slot-right", type=float, help="override slot right offset (m, +starboard)")
-    p.add_argument("--slot-up", type=float, help="override slot up offset (m, +above)")
-    p.add_argument("--horizon-s", type=float, default=4.0, help="MPC prediction horizon (s)")
-    p.add_argument("--q-pos", type=float, default=0.8, help="MPC weight on slot position error")
-    p.add_argument("--q-vel", type=float, default=3.0, help="MPC weight on slot velocity error")
-    p.add_argument("--r-acc", type=float, default=2.0, help="MPC weight on commanded acceleration")
-    p.add_argument(
-        "--cmd-lead-s",
-        type=float,
-        default=2.5,
-        help="lead time turning the along-track acceleration into a speed command (s)",
-    )
-    p.add_argument(
-        "--ap-heading-gain",
-        type=float,
-        default=2.5,
-        help="the sim autopilot's bank per rad of heading error, inverted to command a "
-        "bank (fighter profile 2.5, trainer 1.2)",
-    )
-    p.add_argument("--v-min", type=float, default=80.0, help="min commanded airspeed (m/s)")
-    p.add_argument("--v-max", type=float, default=250.0, help="max commanded airspeed (m/s)")
-    p.add_argument(
-        "--leader-max-age-s",
-        type=float,
-        default=0.5,
-        help="reject leader telemetry older than this (sim time) and hold",
-    )
 
 
 def leader_turn_rate(lead: VehicleState) -> float:
@@ -132,57 +99,135 @@ def slot_state(
     v_e = lead.vel_enu_e + w * r_n
     v_n = lead.vel_enu_n - w * r_e
     a_e, a_n = w * v_n, -w * v_e
-    age = t - lead.t
+    age = t - lead.sim_time_s
     e = lead.e + r_e + v_e * age
     n = lead.n + r_n + v_n * age
-    alt = lead.alt_m + up + lead.vel_enu_u * age
+    alt = lead.alt_hae_m + up + lead.vel_enu_u * age
     return e, n, alt, v_e, v_n, a_e, a_n
 
 
-class Law(BaseLaw):
+class FormationLaw(Law):
     """Per-follower formation MPC (fixed-wing only)."""
 
     vehicle_kinds = frozenset({VehicleKind.FIXED_WING})
     needs_fleet = True
 
-    def __init__(self, args):
-        super().__init__(args)
-        self.leader_id = args.leader
+    @classmethod
+    def add_args(cls, p) -> None:
+        f, pos = cli.finite_float, cli.positive_float
+        p.add_argument(
+            "--leader", type=cli.aircraft_id, default=1, help="aircraft id of the leader to follow"
+        )
+        p.add_argument("--slot", choices=sorted(SLOTS), default="trail", help="named slot")
+        p.add_argument("--slot-fwd", type=f, help="override slot forward offset (m, +ahead)")
+        p.add_argument("--slot-right", type=f, help="override slot right offset (m, +starboard)")
+        p.add_argument("--slot-up", type=f, help="override slot up offset (m, +above)")
+        p.add_argument("--horizon-s", type=pos, default=4.0, help="MPC prediction horizon (s)")
+        p.add_argument("--q-pos", type=f, default=0.8, help="MPC weight on slot position error")
+        p.add_argument("--q-vel", type=f, default=3.0, help="MPC weight on slot velocity error")
+        p.add_argument(
+            "--r-acc", type=pos, default=2.0, help="MPC weight on commanded acceleration"
+        )
+        p.add_argument(
+            "--cmd-lead-s",
+            type=f,
+            default=2.5,
+            help="lead time turning the along-track acceleration into a speed command (s)",
+        )
+        p.add_argument(
+            "--ap-heading-gain",
+            type=pos,
+            default=2.5,
+            help="the sim autopilot's bank per rad of heading error, inverted to command a "
+            "bank (fighter profile 2.5, trainer 1.2)",
+        )
+        p.add_argument("--v-min", type=f, default=80.0, help="min commanded airspeed (m/s)")
+        p.add_argument("--v-max", type=f, default=250.0, help="max commanded airspeed (m/s)")
+        p.add_argument(
+            "--leader-max-age-s",
+            type=pos,
+            default=0.5,
+            help="reject leader telemetry older than this (sim time) and hold",
+        )
+
+    @classmethod
+    def from_args(cls, args):
         if args.leader == args.id:
-            raise SystemExit("error: --leader must differ from --id")
+            raise ValueError("--leader must differ from --id")
         fwd, right, up = SLOTS[args.slot]
-        self.off_fwd = fwd if args.slot_fwd is None else args.slot_fwd
-        self.off_right = right if args.slot_right is None else args.slot_right
-        self.off_up = up if args.slot_up is None else args.slot_up
-        self.cmd_lead = args.cmd_lead_s
-        if not args.ap_heading_gain > 0.0:
-            raise SystemExit("error: --ap-heading-gain must be > 0")
-        self.ap_heading_gain = args.ap_heading_gain
-        self.v_min, self.v_max = args.v_min, args.v_max
-        self.max_age = args.leader_max_age_s
-        self.max_bank = math.radians(args.max_bank_deg)
+        return cls(
+            args.reference,
+            args.limits,
+            leader_id=args.leader,
+            slot=(
+                fwd if args.slot_fwd is None else args.slot_fwd,
+                right if args.slot_right is None else args.slot_right,
+                up if args.slot_up is None else args.slot_up,
+            ),
+            horizon_s=args.horizon_s,
+            q_pos=args.q_pos,
+            q_vel=args.q_vel,
+            r_acc=args.r_acc,
+            cmd_lead_s=args.cmd_lead_s,
+            ap_heading_gain=args.ap_heading_gain,
+            v_min=args.v_min,
+            v_max=args.v_max,
+            leader_max_age_s=args.leader_max_age_s,
+        )
+
+    def __init__(
+        self,
+        ref: Reference,
+        limits: AttitudeLimits,
+        *,
+        leader_id: int,
+        slot: tuple[float, float, float] = SLOTS["trail"],
+        horizon_s: float = 4.0,
+        q_pos: float = 0.8,
+        q_vel: float = 3.0,
+        r_acc: float = 2.0,
+        cmd_lead_s: float = 2.5,
+        ap_heading_gain: float = 2.5,
+        v_min: float = 80.0,
+        v_max: float = 250.0,
+        leader_max_age_s: float = 0.5,
+    ):
+        if not ap_heading_gain > 0.0:
+            raise ValueError("--ap-heading-gain must be > 0")
+        self.leader_id = leader_id
+        self.off_fwd, self.off_right, self.off_up = slot
+        self.horizon_s = horizon_s
+        self.q_pos, self.q_vel, self.r_acc = q_pos, q_vel, r_acc
+        self.cmd_lead = cmd_lead_s
+        self.ap_heading_gain = ap_heading_gain
+        self.v_min, self.v_max = v_min, v_max
+        self.max_age = leader_max_age_s
+        self.max_bank = math.radians(limits.max_bank_deg)
         self.max_acc = G * math.tan(self.max_bank)
-        self.hold_alt = args.alt
+        self.hold_alt = ref.alt_hae_m
         self.mpc: ChannelMPC | None = None
         self._holding: str | None = None
 
     def configure(self, control_period_s: float) -> None:
         a, b = discretize_zoh([[0.0, 1.0], [0.0, 0.0]], [[0.0], [1.0]], control_period_s)
-        q = [[self.args.q_pos, 0.0], [0.0, self.args.q_vel]]
-        n = horizon_steps(self.args.horizon_s, control_period_s)
-        self.mpc = ChannelMPC(a, b, q, [[self.args.r_acc]], n)
+        q = [[self.q_pos, 0.0], [0.0, self.q_vel]]
+        n = horizon_steps(self.horizon_s, control_period_s)
+        self.mpc = ChannelMPC(a, b, q, [[self.r_acc]], n)
 
-    def _hold(self, s: VehicleState, why: str) -> AutopilotTargets:
+    def _hold(self, s: VehicleState, why: str) -> Action:
         if self._holding != why:
             log.warning("holding: %s", why)
             self._holding = why
-        return AutopilotTargets(s.yaw, self.hold_alt, clamp(s.airspeed, self.v_min, self.v_max))
+        return Action(
+            AutopilotTargets(s.yaw, self.hold_alt, clamp(s.tas_mps, self.v_min, self.v_max))
+        )
 
-    def control(self, s: VehicleState, ref: Reference, fleet: Fleet) -> AutopilotTargets:
-        lead = fleet.latest(self.leader_id)
+    def step(self, inp: StepInput) -> Action:
+        s = inp.state
+        lead = inp.fleet.get(self.leader_id)
         if lead is None:
             return self._hold(s, f"no telemetry from leader {self.leader_id} yet")
-        age = s.t - lead.t
+        age = s.sim_time_s - lead.sim_time_s
         if abs(age) > self.max_age:
             return self._hold(s, f"leader telemetry is {age:.2f} s old (> {self.max_age} s)")
         if self._holding is not None:
@@ -190,7 +235,7 @@ class Law(BaseLaw):
             self._holding = None
 
         slot_e, slot_n, slot_alt, slot_ve, slot_vn, slot_ae, slot_an = slot_state(
-            lead, self.off_fwd, self.off_right, self.off_up, s.t
+            lead, self.off_fwd, self.off_right, self.off_up, s.sim_time_s
         )
         self.hold_alt = slot_alt
 
@@ -211,4 +256,4 @@ class Law(BaseLaw):
         bank = clamp(math.atan2(a_right, G), -self.max_bank, self.max_bank)
         heading = wrap_pi(s.yaw + bank / self.ap_heading_gain)
         tas = clamp(speed + a_along * self.cmd_lead, self.v_min, self.v_max)
-        return AutopilotTargets(heading, slot_alt, tas)
+        return Action(AutopilotTargets(heading, slot_alt, tas))

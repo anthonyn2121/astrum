@@ -13,7 +13,7 @@ fixed-wing aircraft and sUAS quadrotors, each with its own high-fidelity flight 
 - **Geodetic ↔ Cartesian (ENU)** coordinate mapping so global lat/lon/height state lives on a local grid.
 - **Zenoh** messaging backbone: the sim broadcasts telemetry and ingests flight-control commands.
 - Flight controllers live **outside** the sim (C++ and Python) and talk only over Zenoh.
-- **Cap'n Proto** wire format (schema v2), shared across Rust / C++ / Python and pinned by
+- **Cap'n Proto** wire format (schema v3), shared across Rust / C++ / Python and pinned by
   cross-language wire fixtures.
 - An **embedded multi-agent RL environment** (`astrum_env`, Python) that steps the same sim
   in-process with no network.
@@ -32,13 +32,13 @@ Everything below is built and tested; here's what lives where:
 | `astrum-fdm` | safe JSBSim 6-DOF wrapper (C shim catches every C++ exception; crate-owned lock makes `Fdm: Send`) |
 | `astrum-geo` | WGS84 geodetic ↔ ECEF ↔ ENU mapping, local-level ↔ grid rotations |
 | `astrum-sim` | headless Bevy ECS state server — one JSBSim FDM per entity, combat, lease/failsafe, lockstep |
-| `astrum-proto` + `astrum-net` | Cap'n Proto schema v2 + Zenoh transport (telemetry, commands, events, scenario, controller presence, run control) + `astrum ctl` |
+| `astrum-proto` + `astrum-net` | Cap'n Proto schema v3 + Zenoh transport (telemetry, commands, events, tick ends, scenario, controller presence, run control) + `astrum ctl` |
 | `astrum-bag` | record telemetry, commands and events to MCAP; replay telemetry and events paced by sim time |
 | `astrum-env` | Python bindings (`Env`, `BatchEnv`) + the Gymnasium-style dogfight adapter |
 | `astrum-web` + `web/` | axum telemetry bridge + tile proxy, offline exporter, browser 3-D renderer |
-| `controllers/common` | shared C++ wire codec + Zenoh client (and the wire-fixture tool) |
-| `controllers/cpp`, `controllers/python` | out-of-sim example flight controllers |
-| `controllers/optimal` | C++/Python runtime + law split: LQR, MPC, figure-eight, formation |
+| `controllers/common`, `controllers/python/astrum_client` | the C++ and Python controller SDKs: one contract ([controllers/README.md](controllers/README.md)) — wire codec, transport, control loop, law runtime |
+| `controllers/cpp`, `controllers/python` | out-of-sim example flight controllers (`hold`, `autopilot`) |
+| `controllers/optimal` | C++/Python laws on the SDK runtime: LQR, MPC, figure-eight, formation |
 | `docs/` | architecture diagram, dogfight environment design + onboarding |
 
 `astrum run config/demos/cpp.toml` brings up the sim and a C++ controller that flies an aircraft
@@ -196,7 +196,8 @@ clock (1 = real time, 10 = ten times faster, 0.5 = half speed, 0 = as fast as th
 The sim itself is deterministic: for a given scenario, seed and command sequence the result is
 identical at any speed and for any `threads` value (tested). With external controllers over Zenoh,
 a run is reproducible only in **lockstep** mode — otherwise each command lands on whichever tick it
-happens to arrive.
+happens to arrive. In lockstep the SDK steps a law only once the tick's `TickEnd` has arrived, so a
+law that reads other aircraft (`needs_fleet`) sees the same snapshot on every run.
 
 ### Lease, failsafe and lockstep
 
@@ -205,26 +206,34 @@ happens to arrive.
   sim's **failsafe hold** (current heading, altitude and airspeed) and releases its trigger;
   telemetry then reports `controlMode = failsafe`. Autopilot commands refresh the lease too, so
   send them every tick as well.
-- **Command validation.** Commands whose key id differs from `targetId`, whose `seq` is not newer
-  than the last accepted one, whose `telemetryTick` is stale or in the future, that carry
-  non-finite values, or that target an unknown aircraft are refused (logged, with rate-limited
-  summaries).
+- **Command validation.** Commands whose key id differs from `targetId`, whose `telemetryTick` is
+  stale or in the future, that carry non-finite autopilot targets, that use the other vehicle
+  class's raw variant (`raw` is fixed-wing only, `multirotor` multirotor only), or that target an
+  unknown aircraft are refused (logged, with rate-limited summaries). Every refusal for an aircraft
+  is also reported in its telemetry (`Telemetry.command`: count, last reason, the sending epoch).
+- **Ownership.** Every command carries the random `epoch` of the controller instance (one per
+  command publisher) that sent it. The first epoch whose command the sim applies owns the aircraft;
+  another epoch's commands are refused (`notOwner`) until the owner lets go — its presence token
+  disappears or its lease expires (failsafe). Within the owner's epoch `seq` must strictly
+  increase (`outOfOrder` otherwise). A second controller started on the same `--id` sees the
+  refusal in telemetry and exits 2, so it fails the run instead of fighting the first.
 - **Lockstep.** With `sim.lockstep = true` and `lockstep = true` on an aircraft, the sim waits each
-  tick until that aircraft has a command whose `telemetryTick` equals the last published tick,
-  republishing the last telemetry every 100 ms while waiting, and fails after
-  `lockstep_timeout_s` — or at once if that aircraft's controller goes away (presence, below).
-  Controllers need nothing beyond echoing `telemetryTick`.
+  tick until that aircraft's owner has a command whose `telemetryTick` equals the last published
+  tick, re-sending the tick's telemetry (every aircraft due) and its `TickEnd` every 100 ms while
+  waiting, and fails after `lockstep_timeout_s` — or at once if that aircraft's controller goes
+  away (presence, below). The SDK's control loop handles all of it.
 - **Controller presence.** The C++ and Python clients hold the Zenoh liveliness token
   `astrum/alive/controller/<id>` while they run, and the sim watches them. When a controller goes
   away (exit, crash, `kill -9`, lost connection) a lockstep run fails within a tick (measured:
   10 ms after a `kill -9`) instead of after `lockstep_timeout_s`, and any other commanded aircraft
-  enters the failsafe hold without waiting for its lease. A controller without a token works as
-  before; the lease and the lockstep timeout cover it.
+  enters the failsafe hold (releasing ownership) without waiting for its lease. A controller
+  without a token works as before; the lease and the lockstep timeout cover it.
 - **Control rate.** `control_rate_hz` on an aircraft (it must divide `rate_hz`) publishes its
   telemetry only every `rate_hz / control_rate_hz` ticks, and in lockstep the sim waits for its
   command only on those ticks; the last command holds in between (zero-order hold). Physics still
-  steps at `rate_hz`, and `--record` still records every tick. Controllers need no change (the
-  optimal laws take the control rate as `--rate-hz`); the lease must cover two control periods.
+  steps at `rate_hz`, and `--record` still records every tick. Telemetry carries the period
+  (`controlPeriodS`) and the SDK hands it to the law as its `dt`, so controllers need no flag; the
+  lease must cover two control periods.
 
 ### Running fast, recording, and watching
 
@@ -319,8 +328,9 @@ so a kill lines up with the first frame in which the victim is dead (while pause
 tick). Within a tick, events come in the order the tick chain ran. They are deterministic like the
 rest of the sim: the same scenario and commands report the same events (tested on a gun pass).
 The table's JSON shape is the one the replay export, the viewer's WebSocket, the RL env's
-`info.events` and the Python client's `Event.as_dict()` all use; on the wire it is the schema's
-`Event` union. `astrum record` records them, `astrum play` replays them, and the viewer
+`info.events` and the Python SDK's `Event.as_dict()` all use; on the wire it is the schema's
+`Event` union, and a controller's law receives them in `StepInput.events`. `astrum record`
+records them, `astrum play` replays them, and the viewer
 marks hits and kills on its timeline. Reporting adds ~0.1 µs to a 1-ship tick (`make bench`,
 within run-to-run noise); a tick without events encodes and sends nothing.
 
@@ -385,24 +395,27 @@ wall-second with 3 / 5 / 9 runs at once, against 65–79× for one run alone.
 
 ## Flight controllers
 
-Controllers run **outside** the sim and speak only Zenoh + Cap'n Proto. The reference example is
-`controllers/cpp` ([README](controllers/cpp/README.md)), built on the shared C++ library in
-`controllers/common` (wire codec + a Zenoh client implementing the transport contract). It
-subscribes to one aircraft's telemetry and either closes a heading/altitude/airspeed hold loop
-itself (**raw** actuators — you own the control law) or hands a high-level target to the sim's
-built-in autopilot (**autopilot**).
+Controllers run **outside** the sim and speak only Zenoh + Cap'n Proto. Two SDKs implement one
+contract — the same names, control loop, outcomes and exit codes — described in
+[`controllers/README.md`](controllers/README.md): C++ in `controllers/common/cpp`
+(`astrum::wire`, `astrum::client`, `astrum::runtime`, installable with `find_package(astrum)`) and
+Python in the `astrum_client` package (`pip install controllers/python`; the schema ships inside
+it). You write a **law** — `step(StepInput) → Action` — and hand a table of laws to the runtime,
+which owns the session, latest-value telemetry, the fleet snapshot, events, ownership, the lease,
+saturation, the vehicle-kind check and the timeouts.
 
-`controllers/python` ([README](controllers/python/README.md)) is the Python twin, the
-`astrum_client` package on `eclipse-zenoh` + `pycapnp` (no codegen — it `capnp.load()`s the same
-`astrum.capnp` at runtime), proving any language with Zenoh + Cap'n Proto bindings plugs in.
+The examples are `controllers/cpp` ([README](controllers/cpp/README.md), `astrum-controller`) and
+`controllers/python/example.py` ([README](controllers/python/README.md)), each with two laws:
+**`hold`** closes a heading/altitude/airspeed hold loop itself (**raw** actuators — you own the
+control law) and **`autopilot`** hands the target to the sim's built-in autopilot.
 
-**Vehicle classes.** The same four `fcs/*-cmd-norm` inputs mean different things per class: on a
-fixed-wing they are control-surface (on the f16, FLCS) commands, on a **multirotor** body
-roll/pitch/yaw **rate** demands plus collective throttle. A raw control law is not portable across
-classes, so raw controllers check `Telemetry.vehicleKind` and refuse (exit non-zero) any kind they
-were not written for, including unknown values. Either send **autopilot** targets and let the sim
-run the matching law (`config/demos/quad.toml` flies an F450 this way), or send **raw** actuators with a
-law written for that class.
+**Vehicle classes.** Raw control is class-specific: `raw` {aileron, elevator, rudder, throttle}
+drives a fixed-wing's control surfaces (on the f16, FLCS commands); `multirotor` {rollRate,
+pitchRate, yawRate, collective} drives a multirotor's body-rate loops. The sim refuses the other
+class's variant, and every law declares the vehicle kinds it flies — the runtime refuses (exit 2)
+any other kind, including unknown values. Either send **autopilot** targets and let the sim run
+the matching law (`config/demos/quad.toml` flies an F450 this way), or send raw commands with a law
+written for that class.
 
 ```bash
 # sim + C++ controller from a run file
@@ -411,42 +424,48 @@ astrum run config/demos/cpp.toml
 # or your own controller: shell 1 runs the sim on a bounded demo scenario (aircraft 1 heads east)
 astrum run config/scenario.demo.toml
 # shell 2 (another `make dev`) connects on the default tcp/127.0.0.1:7447
-build/controllers/cpp/astrum-controller --heading 0                  # commands it north
+build/controllers/cpp/astrum-controller --id 1 --heading 0          # commands it north
 # ...or the Python controller, no build step:
-python controllers/python/example.py --heading 0
+python controllers/python/example.py --id 1 --heading 0
 ```
 
-The controller's target aircraft and setpoints are `--id` / `--heading` (deg) / `--alt` (m HAE) /
-`--speed` (m/s TAS) flags (defaults: id 1, heading 0°/north, 1500 m, 50 m/s) and `--mode raw`
-(default) or `--mode autopilot`; run with `--help` for the full list. Each flag honours an env
-fallback (`ASTRUM_TARGET_ID`, `ASTRUM_TARGET_HEADING_DEG`, `ASTRUM_TARGET_ALT_M`,
-`ASTRUM_TARGET_SPD_MPS`, `ASTRUM_CONTROL_MODE`, `ASTRUM_ZENOH_CONNECT`).
+Flags: `--id` (required) picks the aircraft, `--law hold` (default) or `--law autopilot` the law,
+`--heading` (deg) / `--alt` (m HAE) / `--speed` (m/s TAS) the reference (defaults: north, 1500 m,
+50 m/s); run with `--help` for the full list. Each flag honours an env fallback
+(`ASTRUM_TARGET_ID`, `ASTRUM_LAW`, `ASTRUM_TARGET_HEADING_DEG`, `ASTRUM_TARGET_ALT_M`,
+`ASTRUM_TARGET_SPD_MPS`, `ASTRUM_ZENOH_CONNECT`). Exit status: `0` the run ended, `1` no sim /
+no telemetry / the sim failed, `2` refused (usage, vehicle kind, another controller owns the
+aircraft), `3` the law faulted.
 
 For developing real control laws there's [`controllers/optimal/`](controllers/optimal/README.md)
-(C++ and Python): a **runtime + law split** where a reusable runtime owns Zenoh/Cap'n Proto and
-hands your law a clean vehicle state + reference, so you write only the control law. It ships
-**LQR** and **MPC** laws (`--law lqr|mpc`), and in Python also `figure8` and `formation`.
+(C++ and Python laws on the same runtime): **LQR** and **MPC** (`--law lqr|mpc`), and in Python
+also `figure8` and `formation` (a follower that reads its leader from the fleet snapshot).
 
 ## Wire protocol, telemetry & commands
 
-One Cap'n Proto schema (`crates/astrum-proto/schema/astrum.capnp`, **v2**) is shared by Rust, C++
+One Cap'n Proto schema (`crates/astrum-proto/schema/astrum.capnp`, **v3**) is shared by Rust, C++
 and Python. Rust decoding is zero-copy and rejects trailing bytes; unknown enum values decode to an
 explicit `Unknown`; a bad payload is logged/counted and skipped, never a crash.
 
-- **Telemetry** (`astrum/telemetry/<id>`, one message per aircraft per tick): `aircraftId`,
+- **Telemetry** (`astrum/telemetry/<id>`, one message per aircraft per control tick): `aircraftId`,
   `simTimeS` (= `tick · dt`), `geo` {latDeg, lonDeg, altHaeM}, `enu` (world-grid position),
   `velNed`, `velEnu`, `attitude` {phiRad, thetaRad, psiRad}, `tasMps`, `faultFlags`, `vehicleKind`,
   `tick`, `bodyRates` {p, q, r}, `aero` {alpha, beta, nzG, mach}, `combat` {team, hitPoints,
-  hitPointsMax, alive, ammo}, `controlMode` {uncommanded, raw, autopilot, failsafe}.
+  hitPointsMax, alive, ammo}, `controlMode` {uncommanded, raw, autopilot, failsafe},
+  `controlPeriodS` (the sim time between this aircraft's samples — a law's `dt`) and `command`
+  {ownerEpoch, lastSeq, refusals, lastRefusal, lastRefusedEpoch}.
 - **Command** (`astrum/command/<id>`): `targetId` + a `control` union of `raw` {aileron, elevator,
-  rudder ∈ [-1,1], throttle ∈ [0,1]} | `autopilot` {headingRad, altHaeM, tasMps}, plus `seq`
-  (strictly increasing from 1 per sender), `telemetryTick` (the `Telemetry.tick` the command was
-  computed from) and `trigger` (gun). The key id **must** equal `targetId`; the sim refuses
-  mismatches. A raw command overrides and disengages the autopilot.
+  rudder ∈ [-1,1], throttle ∈ [0,1]} (fixed-wing) | `multirotor` {rollRate, pitchRate, yawRate ∈
+  [-1,1], collective ∈ [0,1]} | `autopilot` {headingRad, altHaeM, tasMps}, plus `epoch` (random,
+  per controller instance), `seq` (strictly increasing within the epoch), `telemetryTick` (the
+  `Telemetry.tick` the command was computed from) and `trigger` (gun). The key id **must** equal
+  `targetId`; the sim refuses mismatches. A raw command overrides and disengages the autopilot.
 - **Event** (`astrum/events`, one message per event): `tick`, `simTimeS` and a `kind` union
   (`triggerPressed`, `triggerReleased`, `hit`, `kill`, `modeChange`, `controllerUp`,
   `controllerDown`, `runEnded`); see [Events](#events). Published with `CongestionControl::Block`
   (an event is lost for good if dropped) and read with a FIFO, never a latest-value slot.
+- **TickEnd** (`astrum/tick`): `tick`, `simTimeS`, published after a tick's telemetry and events —
+  a subscriber holding `TickEnd N` has everything of tick N that reached it.
 - **Scenario** — the sim answers `get astrum/scenario` with its scenario TOML, so any client (the
   recorder, a controller) can learn the world origin and fleet.
 - **Presence** (`astrum/alive/controller/<id>`): a Zenoh liveliness token, held by the controller
@@ -462,12 +481,14 @@ whole fleet (`astrum/telemetry/*`); key matching is exact, so `.../1` never matc
 visualisation are **latest-value** (one slot per aircraft that the newest sample overwrites —
 `astrum_net::LatestTelemetry` in Rust), never a FIFO that queues stale state. A dropped message is
 harmless because the next tick supersedes it; the lease turns a silent controller into a safe hold.
-Events are the exception: one-off facts, published with `Block` at priority `Data` and read with a
-FIFO (`astrum_net::EventReceiver`, Python `transport.subscribe_events`).
-The sim also offers Zenoh's **low-latency transport** (no batching, no QoS lanes) and the C++ and
-Python clients ask for it (`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 %
-more lockstep throughput. A client that doesn't ask, or a sim that doesn't offer it, falls back to
-the default transport.
+Events and `TickEnd` are the exception: published with `Block` at priority `Data`, events read
+with a FIFO (`astrum_net::EventReceiver`, the SDKs' `EventSubscriber`). Per tick the sim sends the
+due telemetry (aircraft id ascending), then the events, then `TickEnd`.
+The sim also offers Zenoh's **low-latency transport** (no batching, no fragmentation, and a single
+lane per link — priorities reorder nothing on it) and the C++ and Python clients ask for it
+(`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 % more lockstep throughput for
+the C++ demo sweep (~2 % with Python controllers). A client that doesn't ask, or a sim that
+doesn't offer it, falls back to the default transport.
 
 **Topology.** The sim (or `astrum play`) **listens as a Zenoh router** on
 `tcp/0.0.0.0:7447`; every other process — recorder, web bridge, C++ and Python controllers —
@@ -486,10 +507,9 @@ a monitor, a swarm coordinator — can watch one aircraft or the whole fleet wit
 State flows through the sim, which stays the single authoritative hub (a **star**).
 
 **Cross-language fixtures.** `crates/astrum-proto/tests/fixtures` holds canonical values
-(`values.json`) and each language's encoding of a telemetry, a raw command and an autopilot
-command (nine `.bin` files, decoded by all three languages), plus nine events (`event_*`,
-Rust and Python: the C++ client has no event codec, as no C++ consumer needs one). `make
-wire-fixtures` regenerates them.
+(`values.json`) and each language's encoding of a telemetry, a raw, an autopilot and a multirotor
+command, a tick end, and nine events (`<kind>.<lang>.bin` for Rust, C++ and Python), every file
+decoded by all three languages. `make wire-fixtures` regenerates them.
 
 ## Recording & replay (MCAP bags)
 
@@ -617,26 +637,31 @@ verify`, `make ci` and `make smoke`, with the cargo registry and target dir cach
 `tas_mps`). For a model outside the known table (`c172x`, `f16`, `F450`) also set `kind` and, for a
 fixed-wing, `autopilot_profile`. A scenario can mix classes freely.
 
-**Add a controller** — in any language with Zenoh + Cap'n Proto bindings:
+**Add a controller** — with the SDKs, write a law and a five-line `main` (see
+[controllers/README.md](controllers/README.md)); an out-of-tree C++ project links
+`find_package(astrum)`'s `astrum::runtime`, a Python one depends on `astrum-client`. In any other
+language with Zenoh + Cap'n Proto bindings:
 
 1. Generate (or load) bindings from `crates/astrum-proto/schema/astrum.capnp`.
 2. Open one `mode=client` Zenoh session connecting to the sim (`tcp/127.0.0.1:7447` by default) and
-   subscribe latest-value to `astrum/telemetry/<id>` (or `astrum/telemetry/*`).
-3. For every telemetry sample, check `vehicleKind`, compute your control, and put a `Command` on
-   `astrum/command/<id>` with `targetId == <id>`, the next `seq`, `telemetryTick` = the sample's
-   `tick`, using Drop / express / InteractiveHigh on a declared publisher. Optionally ask for the
-   low-latency transport (above) to shorten each lockstep round trip.
+   subscribe latest-value to `astrum/telemetry/<id>` (or `astrum/telemetry/*`), plus
+   `astrum/events` and `astrum/tick` if you need events or a tick-aligned fleet.
+3. Pick a random non-zero `epoch`. For every telemetry sample, check `vehicleKind`, compute your
+   control, and put a `Command` on `astrum/command/<id>` with `targetId == <id>`, the epoch, the
+   next `seq`, `telemetryTick` = the sample's `tick`, using Drop / express / InteractiveHigh on a
+   declared publisher. Watch `Telemetry.command` for refusals (another epoch owning the aircraft,
+   a stale tick). Optionally ask for the low-latency transport (above) to shorten each lockstep
+   round trip.
 
-`controllers/common` + `controllers/cpp` and `controllers/python/astrum_client` are worked
-references. New controllers can be listed in a run file's `controllers` or run as any process that
-reaches the sim's endpoint.
+New controllers can be listed in a run file's `controllers` or run as any process that reaches the
+sim's endpoint.
 
 ## Layout
 
 ```
 assets/            logos
 config/            scenarios (example, demo, quad, formation, smoke), sweeps, demos/ run files
-controllers/       out-of-sim flight controllers: common/ (shared C++), cpp/, python/, optimal/
+controllers/       out-of-sim flight controllers: README.md (the SDK contract), common/ (C++ SDK), cpp/, python/ (Python SDK + example), optimal/, examples/out_of_tree/
 crates/            Rust workspace — astrum-fdm/geo/proto/net/bag/sim/env/web
 docker/            Dockerfile, entrypoint, pinned Python requirements
 docs/              architecture diagram, dogfight env design + onboarding

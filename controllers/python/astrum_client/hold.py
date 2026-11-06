@@ -12,11 +12,18 @@ a pure-P bank command leaves on an airframe that needs a standing aileron.
 
 from __future__ import annotations
 
+import math
+
 from astrum_client.mathutil import clamp, integrate_conditionally, integration_step, wrap_pi
-from astrum_client.wire import RawActuators, VehicleState
+from astrum_client.runtime import AttitudeLimits, Law, Reference, StepInput
+from astrum_client.wire import Action, RawActuators, VehicleKind
 
 
-class HoldLaw:
+class HoldLaw(Law):
+    """Raw-actuator heading / altitude / airspeed hold (fixed-wing only)."""
+
+    vehicle_kinds = frozenset({VehicleKind.FIXED_WING})
+
     K_HDG = 1.2  # bank target per rad of heading error
     KI_HDG = 0.05  # bank target per rad*s of heading error
     K_ROLL = 1.5  # aileron per rad of bank error
@@ -29,39 +36,35 @@ class HoldLaw:
     K_SPD = 0.02  # throttle per m/s of airspeed error
     KI_SPD = 0.005  # throttle per m of airspeed error integral
 
-    def __init__(
-        self,
-        heading_rad: float,
-        alt_m: float,
-        airspeed_mps: float,
-        max_bank_rad: float,
-        max_pitch_rad: float,
-    ):
-        self.heading_rad = heading_rad
-        self.alt_m = alt_m
-        self.airspeed_mps = airspeed_mps
-        self.max_bank = max_bank_rad
-        self.max_pitch = max_pitch_rad
+    @classmethod
+    def from_args(cls, args) -> HoldLaw:
+        return cls(args.reference, args.limits)
+
+    def __init__(self, ref: Reference, limits: AttitudeLimits):
+        self.ref = ref
+        self.max_bank = math.radians(limits.max_bank_deg)
+        self.max_pitch = math.radians(limits.max_pitch_deg)
         self.i_hdg = 0.0  # bank-target contribution (rad)
         self.i_alt = 0.0  # pitch-target contribution (rad)
         self.i_spd = 0.0  # throttle contribution
         self._prev_t: float | None = None
 
-    def compute(self, s: VehicleState) -> RawActuators:
-        dt = integration_step(self._prev_t, s.t)
-        self._prev_t = s.t
+    def step(self, inp: StepInput) -> Action:
+        s, ref = inp.state, self.ref
+        dt = integration_step(self._prev_t, s.sim_time_s)
+        self._prev_t = s.sim_time_s
 
-        hdg_err = wrap_pi(self.heading_rad - s.yaw)
+        hdg_err = wrap_pi(ref.heading_rad - s.yaw)
         roll_unsat = self.K_HDG * hdg_err + self.i_hdg
         roll_target = clamp(roll_unsat, -self.max_bank, self.max_bank)
         aileron = self.K_ROLL * (roll_target - s.roll) - self.K_P * s.p
 
-        alt_err = self.alt_m - s.alt_m
+        alt_err = ref.alt_hae_m - s.alt_hae_m
         pitch_unsat = self.K_ALT * alt_err + self.i_alt
         pitch_target = clamp(pitch_unsat, -self.max_pitch, self.max_pitch)
         elevator = -self.K_PITCH * (pitch_target - s.pitch) + self.K_Q * s.q
 
-        spd_err = self.airspeed_mps - s.airspeed
+        spd_err = ref.tas_mps - s.tas_mps
         throttle_unsat = self.THROTTLE_TRIM + self.K_SPD * spd_err + self.i_spd
 
         self.i_hdg = integrate_conditionally(
@@ -85,4 +88,4 @@ class HoldLaw:
         self.i_spd = integrate_conditionally(
             self.i_spd, self.KI_SPD * spd_err, dt, throttle_unsat, 0.0, 1.0, 1.0
         )
-        return RawActuators(aileron, elevator, 0.0, throttle_unsat).saturated()
+        return Action(RawActuators(aileron, elevator, 0.0, throttle_unsat).saturated())

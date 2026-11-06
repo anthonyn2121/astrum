@@ -1,15 +1,18 @@
 import dataclasses
 
 import pytest
-from astrum_client.wire import ControlMode, VehicleKind, VehicleState, load_schema
+from astrum_client.runtime import StepInput
+from astrum_client.wire import CommandStatus, ControlMode, VehicleKind, VehicleState
+
+DT = 1.0 / 120.0
 
 LEVEL_FLIGHT = VehicleState(
     aircraft_id=1,
     tick=1,
-    t=1.0 / 120.0,
+    sim_time_s=DT,
     lat_deg=37.6,
     lon_deg=-122.4,
-    alt_m=1500.0,
+    alt_hae_m=1500.0,
     e=0.0,
     n=0.0,
     u=1500.0,
@@ -25,7 +28,7 @@ LEVEL_FLIGHT = VehicleState(
     p=0.0,
     q=0.0,
     r=0.0,
-    airspeed=50.0,
+    tas_mps=50.0,
     alpha=0.03,
     beta=0.0,
     nz_g=1.0,
@@ -38,6 +41,8 @@ LEVEL_FLIGHT = VehicleState(
     hit_points_max=100.0,
     alive=True,
     ammo=0,
+    control_period_s=DT,
+    command=CommandStatus(),
 )
 
 
@@ -47,6 +52,7 @@ def make_state():
     return lambda **overrides: dataclasses.replace(LEVEL_FLIGHT, **overrides)
 
 
-@pytest.fixture(scope="session")
-def schema():
-    return load_schema()
+@pytest.fixture
+def make_input():
+    """Factory: the StepInput of one state (no fleet, no events, 120 Hz)."""
+    return lambda state, fleet=None: StepInput(state, fleet or {}, (), state.control_period_s)

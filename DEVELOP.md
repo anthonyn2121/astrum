@@ -17,13 +17,14 @@ ASTRUM is **one server + many clients** talking over Zenoh.
 - **Controllers** (`controllers/*`) are separate processes — the flight-control
   logic. They **subscribe** to telemetry and **publish** commands. They never touch
   the sim's memory; only bytes over Zenoh.
-- **The wire** is [Cap'n Proto](https://capnproto.org/), one schema (v2,
+- **The wire** is [Cap'n Proto](https://capnproto.org/), one schema (v3,
   `crates/astrum-proto/schema/astrum.capnp`) shared by Rust, C++, and Python.
 
 ```
 controllers ──put astrum/command/<id>─────►  sim (subscribes astrum/command/*)
 controllers ◄──put astrum/telemetry/<id>───  sim (publishes per aircraft; id in the key)
 subscribers ◄──put astrum/events───────────  sim (hits, kills, mode changes, ...; one per event)
+subscribers ◄──put astrum/tick─────────────  sim (TickEnd: after a tick's telemetry and events)
 controllers ──token astrum/alive/controller/<id>──►  sim (liveliness: who is connected)
 astrum ctl  ──get astrum/control/*, astrum/status──►  sim (pause / step / speed / status)
 ```
@@ -42,21 +43,28 @@ the whole fleet no matter how many aircraft you add**, and any client can subscr
 aircraft (`astrum/telemetry/<id>`) or the entire fleet (`astrum/telemetry/*`). The command key id
 must equal `Command.targetId`; the sim refuses mismatches.
 
-Rules every client follows (the shared C++ and Python clients implement them for you):
+Rules every client follows (the C++ and Python SDKs implement them for you — see
+[`controllers/README.md`](controllers/README.md)):
 
-- QoS for both streams: CongestionControl `Drop`, express, priority `InteractiveHigh`, declared
-  publishers; controller sessions ask for Zenoh's low-latency transport
-  (`transport/unicast/lowlatency = true`, `transport/unicast/qos/enabled = false`).
+- QoS for telemetry and commands: CongestionControl `Drop`, express, priority `InteractiveHigh`,
+  declared publishers; events and `TickEnd`: `Block`, priority `Data`. Controller sessions ask for
+  Zenoh's low-latency transport (`transport/unicast/lowlatency = true`,
+  `transport/unicast/qos/enabled = false`), which has one lane per link: priorities reorder nothing
+  on it.
 - Telemetry subscriptions are **latest-value** (one slot per aircraft), never a FIFO.
-- **One command per telemetry sample**, carrying `seq` (strictly increasing from 1 per process)
-  and `telemetryTick` (the `Telemetry.tick` it answers). Raw commands are a **lease**: stop sending
-  for `sim.command_lease_s` and the sim's failsafe hold takes over (`controlMode = failsafe`).
+- **One command per telemetry sample**, carrying the controller instance's random `epoch`, `seq`
+  (strictly increasing from 1 within the epoch) and `telemetryTick` (the `Telemetry.tick` it
+  answers). Raw commands are a **lease**: stop sending for `sim.command_lease_s` and the sim's
+  failsafe hold takes over (`controlMode = failsafe`).
+- **Ownership**: the first epoch whose command the sim applies owns the aircraft; other epochs are
+  refused until the owner's token disappears or its lease expires. `Telemetry.command` reports the
+  owner and every refusal — a controller that finds itself refused as `notOwner` stops (exit 2).
 - **Presence**: a controller holds the liveliness token `astrum/alive/controller/<id>` while it
   runs. When it goes away (exit, crash, lost connection) a lockstep run fails at once and any
   other commanded aircraft enters the failsafe hold without waiting for its lease. A controller
   without a token still works; leases and the lockstep timeout cover it.
-- A raw control law checks `vehicleKind` and refuses (exits non-zero) any kind it wasn't written
-  for, including unknown values.
+- A law declares the vehicle kinds it flies; the runtime refuses (exit 2) any other kind,
+  including unknown values. A law's `dt` is `Telemetry.controlPeriodS`, never a flag.
 - Decoding is untrusted input: a bad payload is logged, counted and skipped.
 
 ## 2. The golden rule: everything runs in Docker
@@ -144,16 +152,17 @@ the demos do it in one command: `astrum run config/demos/cpp.toml` and
 crates/            # Rust workspace (one crate per responsibility)
   astrum-fdm/       #   JSBSim FFI: safe `Fdm` wrapper (C shim, crate-owned lock, `Fdm: Send`)
   astrum-geo/       #   WGS84 geodetic ↔ ECEF ↔ ENU math, local-level ↔ grid rotations
-  astrum-proto/     #   the Cap'n Proto schema v2 + encode/decode + wire fixtures
-  astrum-net/       #   Zenoh transport (keys, QoS, LatestTelemetry, CommandSender, events, presence, control, scenario)
+  astrum-proto/     #   the Cap'n Proto schema v3 + encode/decode + wire fixtures
+  astrum-net/       #   Zenoh transport (keys, QoS, LatestTelemetry, CommandSender, events, tick ends, presence, control, scenario)
   astrum-bag/       #   MCAP record (telemetry + commands + events) / replay (telemetry + events)
   astrum-web/       #   axum bridge + tile proxy (astrum-web) + MCAP→JSON exporter (astrum-web-export)
   astrum-sim/       #   the Bevy ECS app — the sim binary + the embedded env seam (env.rs)
   astrum-env/       #   PyO3 module `astrum_env` + the dogfight Gym adapter (python/)
-controllers/       # flight controllers (clients); controllers/CMakeLists.txt is the one C++ project
-  common/cpp/       #   shared C++ wire codec + Zenoh client + wire-fixture tool
-  cpp/  python/     #   example controllers (python/astrum_client is the shared Python client)
-  optimal/          #   runtime + law split (cpp/, python/astrum_optimal)
+controllers/       # flight controllers (clients); README.md is the SDK contract, CMakeLists.txt the one C++ project
+  common/cpp/       #   the C++ SDK: astrum::wire / control / cli / client / runtime + wire-fixture tool
+  cpp/  python/     #   example controllers (python/astrum_client is the Python SDK)
+  optimal/          #   LQR / MPC / figure-eight / formation laws on the SDK runtime (cpp/, python/astrum_optimal)
+  examples/         #   out_of_tree/: a C++ controller built against an installed SDK
 web/               # browser 3-D replay renderer (Three.js, vendored; served by astrum-web)
 config/            # scenario files (*.toml) — the fleet + world origin
 docker/            # Dockerfile, entrypoint, pinned Python requirements
@@ -388,15 +397,16 @@ astrum run config/scenario.demo.toml
 
 # 3. build + run YOUR controller against the default tcp/127.0.0.1:7447; rerun as you iterate.
 #    The bundled controllers take flags (env vars still work as a fallback):
-python controllers/python/example.py --id 1
+python controllers/python/example.py --id 1                 # --law hold (default) | autopilot
 build/controllers/cpp/astrum-controller --id 1
 
 # 4. when done: Ctrl-C in shell 1
 ```
 
 Run files (`config/demos/*.toml`) are just **canned demo presets** — add your controller to
-one's `controllers` when you want it launched with the sim. See `controllers/cpp/README.md` and `controllers/python/README.md` for
-how a controller subscribes, decodes telemetry, and publishes commands.
+one's `controllers` when you want it launched with the sim. [`controllers/README.md`](controllers/README.md)
+is the SDK contract (the law API, the control loop, outcomes and exit codes);
+`controllers/cpp/README.md` and `controllers/python/README.md` cover each SDK.
 
 **RL environment.** `bash scripts/build-astrum-env.sh` builds the `astrum_env` module and prints
 its staging directory for `PYTHONPATH`; `make test-python` does that and runs its tests. See
@@ -404,37 +414,39 @@ its staging directory for `PYTHONPATH`; `make test-python` does that and runs it
 
 ## 8. Cap'n Proto wire quick reference
 
-The schema (`crates/astrum-proto/schema/astrum.capnp`, v2) defines three messages:
+The schema (`crates/astrum-proto/schema/astrum.capnp`, v3) defines four messages:
 - **`Telemetry`** — sim → subscribers (`astrum/telemetry/<id>`; the id is in the key). Geodetic
   position (HAE), world-grid `enu` + `velEnu`, local-level `velNed`, attitude, `tasMps`,
-  `faultFlags`, `vehicleKind`, `tick`, `bodyRates`, `aero`, `combat`, `controlMode`.
+  `faultFlags`, `vehicleKind`, `tick`, `bodyRates`, `aero`, `combat`, `controlMode`,
+  `controlPeriodS`, `command` (owner epoch, last applied seq, refusals).
 - **`Command`** — controllers → sim; `targetId` (must equal the key id), a union of **`raw`**
-  actuator setpoints (`fcs/*-cmd-norm`) *or* high-level **`autopilot`** targets (heading, HAE
-  altitude, TAS), plus `seq`, `telemetryTick` and `trigger`.
+  fixed-wing actuator setpoints (`fcs/*-cmd-norm`), **`multirotor`** body-rate demands +
+  collective, *or* high-level **`autopilot`** targets (heading, HAE altitude, TAS), plus `epoch`,
+  `seq`, `telemetryTick` and `trigger`.
 - **`Event`** — sim → subscribers (`astrum/events`); `tick`, `simTimeS` and a `kind` union
   (trigger pressed / released, hit, kill, mode change, controller up / down, run ended). See the
   README's "Events".
+- **`TickEnd`** — sim → subscribers (`astrum/tick`); `tick`, `simTimeS`, sent after the tick's
+  telemetry and events.
 
 Recordings are MCAP files (one channel per Zenoh key, raw payload bytes); there is no
 recording message in the schema.
 
 Change the schema in **one** place; Rust regenerates on build, C++ regenerates via its
-CMake step, and Python loads it at runtime (`capnp.load(...)`).
+CMake step, and Python loads it at runtime (`capnp.load(...)` of the copy packaged with
+`astrum_client`, a symlink to the schema in the checkout).
 
 **Adding a schema field.** Changes must be **additive**: append a field with the next ordinal
 (never renumber, retype or reuse one), so old and new peers stay wire-compatible. Then:
 
 1. Rust: extend the types and encode/decode in `crates/astrum-proto/src/lib.rs`.
 2. C++: extend the codec in `controllers/common/cpp` (`wire.cpp`); Python: `astrum_client/wire.py`.
-   (`Event` has no C++ codec: nothing in C++ consumes it.)
 3. Add the canonical value to `crates/astrum-proto/tests/fixtures/values.json` and teach the
    fixture writers about it (`crates/astrum-proto/examples/wire_fixture.rs`,
    `controllers/common/cpp/tools/wire_fixture.cpp`, `astrum_client/wire_fixture.py`). A new event
-   kind is an `event_<kind>` entry plus its name in `EVENT_KINDS` in
-   `crates/astrum-proto/tests/fixture/mod.rs` and `astrum_client/wire_fixture.py`.
-4. `make wire-fixtures` regenerates every `<kind>.<lang>.bin` file (nine telemetry/command files
-   in three languages, the events in Rust and Python); `make test` checks that every language
-   decodes every file to `values.json` exactly.
+   kind is an `event_<kind>` entry plus its name in the event kind lists of all three writers.
+4. `make wire-fixtures` regenerates every `<kind>.<lang>.bin` file (every kind in Rust, C++ and
+   Python); `make test` checks that every language decodes every file to `values.json` exactly.
 
 ## 9. Before you commit
 

@@ -16,8 +16,8 @@
 //! `apply_damage` (the `on_kill` observer reports each kill) →
 //! `end_on_elimination` → `publish_telemetry` → `report_progress` /
 //! `stop_at_max_time` → `count_steps` → `pace`; and always `publish_status` →
-//! `exit_on_signal` → `exit_on_fatal` → `publish_events`. Startup spawns the
-//! fleet and publishes tick 0.
+//! `exit_on_signal` → `exit_on_fatal` → `publish_events` → `publish_tick_end`.
+//! Startup spawns the fleet and publishes tick 0 (telemetry, then its tick end).
 
 pub mod combat;
 pub mod components;
@@ -43,8 +43,8 @@ use components::{SimClock, SimParams, SimStatus, WorldFrame};
 use control::{count_steps, publish_status, serve_control, RunControl};
 use events::{publish_events, EventLog};
 use net::{
-    hold_commands, ingest_commands, publish_telemetry, track_controllers, Controllers,
-    HeldCommands, LastPublished, RefusalLog,
+    hold_commands, ingest_commands, publish_telemetry, publish_tick_end, track_controllers,
+    Controllers, HeldCommands, LastPublished, RefusalLog, TickPublication,
 };
 use pilot::{autopilot_step, expire_leases, log_mode_changes};
 use scenario::Scenario;
@@ -157,6 +157,7 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
         .insert_resource(CombatRng::seeded(scenario.sim.seed))
         .insert_resource(CombatState { initial_living_teams: team_count(&scenario) })
         .insert_resource(LastPublished::default())
+        .insert_resource(TickPublication::default())
         .insert_resource(RefusalLog::default())
         .insert_resource(Controllers::default())
         .insert_resource(HeldCommands::default())
@@ -167,7 +168,12 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
         .add_observer(on_kill)
         .add_systems(
             Startup,
-            (spawn_fleet, publish_telemetry.run_if(SimStatus::running), exit_on_fatal).chain(),
+            (
+                spawn_fleet,
+                (publish_telemetry, publish_tick_end).chain().run_if(SimStatus::running),
+                exit_on_fatal,
+            )
+                .chain(),
         )
         .add_systems(
             Update,
@@ -204,6 +210,7 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
                 exit_on_signal,
                 exit_on_fatal,
                 publish_events,
+                publish_tick_end,
             )
                 .chain(),
         );
