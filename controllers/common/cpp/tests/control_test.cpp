@@ -9,12 +9,12 @@
 namespace astrum {
 namespace {
 
-VehicleState level(double t, double yaw, double alt, double airspeed) {
+VehicleState level(double t, double yaw, double alt, double tas) {
   VehicleState s;
-  s.t = t;
+  s.sim_time_s = t;
   s.yaw = yaw;
-  s.alt_m = alt;
-  s.airspeed = airspeed;
+  s.alt_hae_m = alt;
+  s.tas_mps = tas;
   return s;
 }
 

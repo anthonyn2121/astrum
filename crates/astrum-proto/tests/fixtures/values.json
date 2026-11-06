@@ -1,5 +1,5 @@
 {
-  "_comment": "Canonical cross-language wire fixture values (schema v2). Each language encodes these into tests/fixtures/<kind>.<lang>.bin and every language's test decodes every file and compares against these values exactly. The event_* kinds use the shared event JSON shape and have Rust and Python files only (C++ has no Event codec). Regenerate the .bin files with scripts/wire-fixtures.sh after a schema change.",
+  "_comment": "Canonical cross-language wire fixture values (schema v3). Each language encodes these into tests/fixtures/<kind>.<lang>.bin and every language's test decodes every file and compares against these values exactly. The event_* kinds use the shared event JSON shape. Regenerate the .bin files with scripts/wire-fixtures.sh after a schema change.",
   "telemetry": {
     "aircraft_id": 7,
     "tick": 1234567890123,
@@ -17,13 +17,22 @@
     "fault_flags": 3,
     "vehicle_kind": "multirotor",
     "control_mode": "failsafe",
-    "combat": { "team": 2, "hit_points": 62.5, "hit_points_max": 100.0, "alive": true, "ammo": 311 }
+    "combat": { "team": 2, "hit_points": 62.5, "hit_points_max": 100.0, "alive": true, "ammo": 311 },
+    "control_period_s": 0.03125,
+    "command": {
+      "owner_epoch": 12297829382473034410,
+      "last_seq": 41,
+      "refusals": 4294967295,
+      "last_refusal": "not-owner",
+      "last_refused_epoch": 7
+    }
   },
   "command_raw": {
     "target_id": 3,
     "seq": 42,
     "telemetry_tick": 1000,
     "trigger": true,
+    "epoch": 12297829382473034410,
     "control": { "raw": { "aileron": 0.25, "elevator": -0.5, "rudder": 0.125, "throttle": 0.75 } }
   },
   "command_autopilot": {
@@ -31,8 +40,18 @@
     "seq": 7,
     "telemetry_tick": 5,
     "trigger": false,
+    "epoch": 1,
     "control": { "autopilot": { "heading_rad": 1.5, "alt_hae_m": 1500.0, "tas_mps": 120.0 } }
   },
+  "command_multirotor": {
+    "target_id": 4,
+    "seq": 9,
+    "telemetry_tick": 33,
+    "trigger": false,
+    "epoch": 18446744073709551615,
+    "control": { "multirotor": { "roll_rate": 0.25, "pitch_rate": -0.5, "yaw_rate": 0.125, "collective": 0.4375 } }
+  },
+  "tick_end": { "tick": 1234567890123, "sim_time_s": 10288065.6875 },
   "event_trigger_pressed": { "tick": 120, "sim_time_s": 1.0, "kind": "trigger-pressed", "aircraft_id": 2, "ammo": 300 },
   "event_trigger_released": {
     "tick": 1234567890123,

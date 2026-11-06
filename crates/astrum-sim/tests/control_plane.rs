@@ -162,7 +162,7 @@ fn a_lost_lockstep_controller_fails_the_run_at_once() {
 }
 
 #[test]
-fn a_lost_controller_puts_its_aircraft_in_failsafe_before_its_lease_ends() {
+fn a_lost_controller_puts_its_aircraft_in_failsafe_and_releases_it_before_its_lease_ends() {
     let mut s = two_ship();
     s.sim.command_lease_s = 30.0;
     let session = Session::in_process().unwrap();
@@ -172,11 +172,13 @@ fn a_lost_controller_puts_its_aircraft_in_failsafe_before_its_lease_ends() {
     let mut tx = CommandSender::new(&session, 1).unwrap();
     let raw =
         Control::Raw(RawActuators { aileron: 0.1, elevator: 0.0, rudder: 0.0, throttle: 0.7 });
-    let mode = |app: &App| of(&app.world().resource::<LastPublished>().0, 1).control_mode;
+    let latest = |app: &App| of(&app.world().resource::<LastPublished>().0, 1);
+    let mode = |app: &App| latest(app).control_mode;
     app.update();
     tx.send(raw, false, tick(&app)).unwrap();
     update_until(&mut app, T, |app| mode(app) == ControlMode::Raw);
     assert_eq!(mode(&app), ControlMode::Raw);
+    assert_eq!(latest(&app).command.owner_epoch, tx.epoch());
     let present = || fetch_status(&session, T).unwrap().controllers;
     update_until(&mut app, T, |_| present() == [1]);
     assert_eq!(present(), [1], "the status lists the present controller");
@@ -199,4 +201,13 @@ fn a_lost_controller_puts_its_aircraft_in_failsafe_before_its_lease_ends() {
             mode_change(ControlMode::Raw, ControlMode::Failsafe, ModeReason::ControllerLost),
         ]
     );
+
+    // Released: a new controller instance (epoch) claims the aircraft.
+    assert_eq!(latest(&app).command.owner_epoch, 0);
+    let mut next = CommandSender::new(&session, 1).unwrap();
+    next.send(raw, false, tick(&app)).unwrap();
+    update_until(&mut app, T, |app| mode(app) == ControlMode::Raw);
+    assert_eq!(mode(&app), ControlMode::Raw);
+    assert_eq!(latest(&app).command.owner_epoch, next.epoch());
+    assert_eq!(latest(&app).command.last_seq, 1);
 }

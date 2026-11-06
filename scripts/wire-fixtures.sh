@@ -2,11 +2,10 @@
 #
 # Regenerate the cross-language wire fixtures in crates/astrum-proto/tests/fixtures:
 # each language encodes the canonical values (values.json) into <kind>.<lang>.bin.
-# Telemetry/commands (kind ∈ {telemetry, command_raw, command_autopilot}) are
-# written by Rust, C++ and Python; events (kind ∈ event_*) by Rust and Python only
-# (C++ has no Event codec). The Rust test crates/astrum-proto/tests/fixtures.rs and
-# the Python tests decode every file (the C++ `wire_fixtures` ctest the nine
-# telemetry/command files) and compare them to values.json.
+# Every kind (telemetry, command_raw, command_autopilot, command_multirotor, tick_end
+# and the event_* kinds) is written by Rust, C++ and Python. The Rust test
+# crates/astrum-proto/tests/fixtures.rs, the C++ `wire_fixtures` ctest and the Python
+# tests decode every file and compare it to values.json.
 # Run inside the dev container (`make wire-fixtures`).
 set -euo pipefail
 cd "$(dirname "$0")/.."

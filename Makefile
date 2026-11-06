@@ -96,11 +96,18 @@ test: test-rust test-cpp test-python ## Run every test suite
 test-rust: ## Rust tests (cargo test --workspace)
 	$(IN) 'cargo test --workspace --locked'
 
-test-cpp: ## C++ controller tests (CMake + ctest)
+test-cpp: ## C++ controller tests (CMake + ctest), then install the SDK and build the out-of-tree example against it
 	$(IN) 'set -euo pipefail; \
 	  $(CMAKE_CONTROLLERS); \
 	  cmake --build build/controllers -j"$$(nproc)"; \
-	  ctest --test-dir build/controllers --output-on-failure'
+	  ctest --test-dir build/controllers --output-on-failure; \
+	  prefix="$$(mktemp -d)"; trap "rm -rf \"$$prefix\"" EXIT; \
+	  cmake --install build/controllers --prefix "$$prefix/install" >/dev/null; \
+	  cmake -S controllers/examples/out_of_tree -B "$$prefix/build" -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_PREFIX_PATH="$$prefix/install" >/dev/null; \
+	  cmake --build "$$prefix/build" -j"$$(nproc)"; \
+	  "$$prefix/build/hold-controller" --help >/dev/null; \
+	  echo "out-of-tree example: built and ran against the installed SDK"'
 
 test-python: ## Python tests: controllers + astrum-env adapter (builds the astrum_env module)
 	$(IN) 'set -euo pipefail; \

@@ -18,8 +18,8 @@ coordination (no sideslip). Three decoupled channels:
         v_err'   = -a_v v_err + b_v (throttle - trim)
 
 The continuous model is discretized exactly (zero-order hold) at the control
-period ``1/--rate-hz`` — the spacing of this aircraft's telemetry (its
-``control_rate_hz``, by default every sim step), since a command answers each sample. The
+period the telemetry carries (``StepInput.control_period_s``: the spacing of this
+aircraft's samples, its ``control_rate_hz``), since a command answers each sample. The
 airframe constants below are placeholders for the c172x trainer; replace them
 with your own linearization (JSBSim trim + finite differences).
 
@@ -41,9 +41,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from astrum_client.mathutil import clamp, integrate_conditionally, integration_step, wrap_pi
-from astrum_client.wire import RawActuators, VehicleKind, VehicleState
-
-from astrum_optimal.runtime import Fleet, Law, Reference
+from astrum_client.runtime import AttitudeLimits, Law, Reference, StepInput
+from astrum_client.wire import Action, RawActuators, VehicleKind
 
 G = 9.80665
 # Heading integral (rad bank per rad*s of heading error), outside the LQR/MPC
@@ -104,26 +103,31 @@ class LimitedFixedWingLaw(Law):
 
     vehicle_kinds = frozenset({VehicleKind.FIXED_WING})
 
-    def __init__(self, args, model: FixedWingModel | None = None):
-        super().__init__(args)
+    def __init__(self, ref: Reference, limits: AttitudeLimits, model: FixedWingModel | None = None):
+        self.ref = ref
         self.model = model or FixedWingModel()
-        self.max_bank = math.radians(args.max_bank_deg)
-        self.max_pitch = math.radians(args.max_pitch_deg)
+        self.max_bank = math.radians(limits.max_bank_deg)
+        self.max_pitch = math.radians(limits.max_pitch_deg)
         self.i_bank = 0.0  # heading integrator, as its bank-reference contribution (rad)
         self.i_pitch = 0.0  # altitude integrator, as its pitch-reference contribution (rad)
         self.i_throttle = 0.0  # airspeed integrator, as its throttle contribution
         self._prev_t: float | None = None
         self.k_lat = self.k_lon = self.k_spd = None
 
+    @classmethod
+    def from_args(cls, args):
+        return cls(args.reference, args.limits)
+
     def configure(self, control_period_s: float) -> None:
-        self.design(control_period_s, self.args.speed)
+        self.design(control_period_s, self.ref.tas_mps)
 
     def design(self, dt: float, v: float) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
 
-    def control(self, s: VehicleState, ref: Reference, fleet: Fleet) -> RawActuators:
-        dt = integration_step(self._prev_t, s.t)
-        self._prev_t = s.t
+    def step(self, inp: StepInput) -> Action:
+        s, ref = inp.state, self.ref
+        dt = integration_step(self._prev_t, s.sim_time_s)
+        self._prev_t = s.sim_time_s
 
         # Lateral: heading PI -> limited bank reference -> aileron. The heading
         # integral removes the steady error a pure-P bank reference leaves when the
@@ -136,14 +140,14 @@ class LimitedFixedWingLaw(Law):
 
         # Longitudinal: altitude PI -> limited pitch reference -> elevator.
         k_ih, k_h, k_th, k_q = self.k_lon
-        h_err = s.alt_m - ref.alt_m
+        h_err = s.alt_hae_m - ref.alt_hae_m
         theta_unsat = self.i_pitch - k_h * h_err / k_th
         theta_ref = clamp(theta_unsat, -self.max_pitch, self.max_pitch)
         elevator = -(k_th * (s.pitch - theta_ref) + k_q * s.q)
 
         # Speed: airspeed PI -> throttle about trim.
         k_iv, k_v = self.k_spd
-        v_err = s.airspeed - ref.airspeed_mps
+        v_err = s.tas_mps - ref.tas_mps
         throttle_unsat = self.model.throttle_trim + self.i_throttle - k_v * v_err
 
         p_lim = self.max_pitch
@@ -157,4 +161,4 @@ class LimitedFixedWingLaw(Law):
         self.i_throttle = integrate_conditionally(
             self.i_throttle, -k_iv * v_err, dt, throttle_unsat, 0.0, 1.0, 1.0
         )
-        return RawActuators(aileron, elevator, 0.0, throttle_unsat).saturated()
+        return Action(RawActuators(aileron, elevator, 0.0, throttle_unsat).saturated())

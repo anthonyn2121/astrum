@@ -3,8 +3,9 @@
 # Verify the ASTRUM toolchain image end-to-end. Run inside the dev container via
 # `make verify`. Every check is hard (aborts on failure):
 #   * pinned versions agree: rustc == rust-toolchain.toml; the Rust `zenoh`
-#     crate (Cargo.lock) == zenoh-c/zenoh-cpp debs == eclipse-zenoh wheel (Zenoh
-#     only guarantees protocol compatibility within a release); the venv ==
+#     crate (Cargo.lock) == zenoh-c/zenoh-cpp debs == eclipse-zenoh wheel ==
+#     the astrum-client pyproject pin (Zenoh only guarantees protocol
+#     compatibility within a release); the venv ==
 #     docker/requirements.txt exactly;
 #   * the tools exist (compilers, capnp, clang-format, ruff, pytest, cargo-deny);
 #   * C++ programs link and run against libJSBSim and libzenohc, and the JSBSim
@@ -60,6 +61,17 @@ same "libzenohc-dev deb" "${zenoh_rust}" "$(dpkg-query -W -f '${Version}' libzen
 same "libzenohcpp-dev deb" "${zenoh_rust}" "$(dpkg-query -W -f '${Version}' libzenohcpp-dev)"
 same "eclipse-zenoh wheel" "${zenoh_rust}" \
     "$(python -c 'import importlib.metadata as m; print(m.version("eclipse-zenoh"))')"
+zenoh_pin="$(python - <<'PY'
+import re
+import tomllib
+deps = tomllib.load(open("controllers/python/pyproject.toml", "rb"))["project"]["dependencies"]
+pins = [m.group(1) for d in deps if (m := re.fullmatch(r"eclipse-zenoh\s*==\s*(\S+)", d))]
+if len(pins) != 1:
+    raise SystemExit(f"controllers/python/pyproject.toml must pin eclipse-zenoh==<v> once: {deps}")
+print(pins[0])
+PY
+)"
+same "astrum-client zenoh pin" "${zenoh_rust}" "${zenoh_pin}"
 
 # The venv must hold exactly docker/requirements.txt (pip itself excluded).
 python - <<'PY'

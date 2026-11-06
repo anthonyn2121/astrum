@@ -13,7 +13,6 @@
 
 #include <optional>
 
-#include "astrum/options.hpp"
 #include "astrum/types.hpp"
 
 namespace astrum {
@@ -35,28 +34,6 @@ class SaturatedPi {
   double kp_, ki_, lo_, hi_, bias_;
   double integral_ = 0.0;
 };
-
-// Attitude command limits (degrees on the CLI). Defaults suit the trainer (c172x);
-// the F-16 formation demo flies 60 / 24.
-struct AttitudeLimits {
-  double max_bank_deg = 25.0;
-  double max_pitch_deg = 10.0;
-};
-
-// --max-bank-deg / --max-pitch-deg (env ASTRUM_MAX_BANK_DEG / ASTRUM_MAX_PITCH_DEG).
-void add_attitude_limit_options(Options& options, AttitudeLimits& limits);
-
-// The setpoint on the CLI: --heading (deg, true), --alt (m HAE), --speed (m/s TAS).
-struct ReferenceOptions {
-  double heading_deg = 0.0;
-  double alt_m = 1500.0;
-  double speed_mps = 50.0;
-
-  Reference reference() const;
-};
-
-// --heading / --alt / --speed (env ASTRUM_TARGET_HEADING_DEG / _ALT_M / _SPD_MPS).
-void add_reference_options(Options& options, ReferenceOptions& reference);
 
 // Outer-loop gains. The proportional terms are the hold law verified on the c172x;
 // heading follows psi_dot = (g / V) tan(phi), so bank = 1.2 * heading_err gives a
@@ -97,7 +74,7 @@ class OuterLoops {
   SaturatedPi heading_;
   SaturatedPi altitude_;
   SaturatedPi airspeed_;
-  std::optional<double> prev_t_;
+  std::optional<double> prev_sim_time_s_;
 };
 
 }  // namespace astrum

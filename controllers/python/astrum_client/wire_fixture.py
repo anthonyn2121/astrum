@@ -3,10 +3,9 @@
 ``values.json`` holds canonical values; each language writes
 ``<kind>.<lang>.bin`` and every language's test decodes every file present and
 compares it to ``values.json`` exactly. The ``event_*`` kinds hold the shared
-event JSON shape (:meth:`Event.as_dict`) and exist for Rust and Python only.
-Write the Python files with::
+event JSON shape (:meth:`Event.as_dict`). Write the Python files with::
 
-    python -m astrum_client.wire_fixture [--dir DIR] [--schema PATH]
+    python -m astrum_client.wire_fixture [--dir DIR]
 """
 
 from __future__ import annotations
@@ -19,19 +18,24 @@ import sys
 from astrum_client.wire import (
     AutopilotTargets,
     Command,
+    CommandStatus,
     ControlMode,
     Event,
+    MultirotorRaw,
     RawActuators,
+    Refusal,
+    TickEnd,
     VehicleKind,
     VehicleState,
     encode_command,
     encode_event,
     encode_telemetry,
-    load_schema,
+    encode_tick_end,
+    enum_member,
 )
 
-KINDS = ("telemetry", "command_raw", "command_autopilot")
-LANGS = ("rust", "cpp", "python")
+COMMAND_KINDS = ("command_raw", "command_autopilot", "command_multirotor")
+KINDS = ("telemetry", *COMMAND_KINDS, "tick_end")
 EVENT_KINDS = (
     "event_trigger_pressed",
     "event_trigger_released",
@@ -43,10 +47,7 @@ EVENT_KINDS = (
     "event_controller_down",
     "event_run_ended",
 )
-EVENT_LANGS = ("rust", "python")
-
-_VEHICLE_KINDS = {"fixed-wing": VehicleKind.FIXED_WING, "multirotor": VehicleKind.MULTIROTOR}
-_CONTROL_MODES = {m.name.lower(): m for m in ControlMode}
+LANGS = ("rust", "cpp", "python")
 
 
 def default_fixtures_dir() -> str:
@@ -64,13 +65,14 @@ def load_values(fixtures_dir: str) -> dict:
 def expected_telemetry(v: dict) -> VehicleState:
     pos, venu, vned = v["pos_enu"], v["vel_enu"], v["vel_ned"]
     att, rates, aero, combat = v["attitude"], v["rates"], v["aero"], v["combat"]
+    cmd = v["command"]
     return VehicleState(
         aircraft_id=v["aircraft_id"],
         tick=v["tick"],
-        t=v["sim_time_s"],
+        sim_time_s=v["sim_time_s"],
         lat_deg=v["lat_deg"],
         lon_deg=v["lon_deg"],
-        alt_m=v["alt_hae_m"],
+        alt_hae_m=v["alt_hae_m"],
         e=pos["e"],
         n=pos["n"],
         u=pos["u"],
@@ -86,19 +88,27 @@ def expected_telemetry(v: dict) -> VehicleState:
         p=rates["p_rad_s"],
         q=rates["q_rad_s"],
         r=rates["r_rad_s"],
-        airspeed=v["tas_mps"],
+        tas_mps=v["tas_mps"],
         alpha=aero["alpha_rad"],
         beta=aero["beta_rad"],
         nz_g=aero["nz_g"],
         mach=aero["mach"],
         fault_flags=v["fault_flags"],
-        vehicle_kind=_VEHICLE_KINDS[v["vehicle_kind"]],
-        control_mode=_CONTROL_MODES[v["control_mode"]],
+        vehicle_kind=enum_member(VehicleKind, v["vehicle_kind"]),
+        control_mode=enum_member(ControlMode, v["control_mode"]),
         team=combat["team"],
         hit_points=float(combat["hit_points"]),
         hit_points_max=float(combat["hit_points_max"]),
         alive=combat["alive"],
         ammo=combat["ammo"],
+        control_period_s=v["control_period_s"],
+        command=CommandStatus(
+            owner_epoch=cmd["owner_epoch"],
+            last_seq=cmd["last_seq"],
+            refusals=cmd["refusals"],
+            last_refusal=enum_member(Refusal, cmd["last_refusal"]),
+            last_refused_epoch=cmd["last_refused_epoch"],
+        ),
     )
 
 
@@ -107,31 +117,38 @@ def expected_command(v: dict) -> Command:
     if "raw" in ctrl:
         r = ctrl["raw"]
         control = RawActuators(r["aileron"], r["elevator"], r["rudder"], r["throttle"])
+    elif "multirotor" in ctrl:
+        m = ctrl["multirotor"]
+        control = MultirotorRaw(m["roll_rate"], m["pitch_rate"], m["yaw_rate"], m["collective"])
     else:
         a = ctrl["autopilot"]
         control = AutopilotTargets(a["heading_rad"], a["alt_hae_m"], a["tas_mps"])
-    return Command(v["target_id"], v["seq"], v["telemetry_tick"], v["trigger"], control)
+    return Command(v["target_id"], v["seq"], v["telemetry_tick"], v["trigger"], v["epoch"], control)
 
 
-def encode_kind(schema, kind: str, values: dict) -> bytes:
+def expected_tick_end(v: dict) -> TickEnd:
+    return TickEnd(v["tick"], float(v["sim_time_s"]))
+
+
+def encode_kind(kind: str, values: dict) -> bytes:
     if kind == "telemetry":
-        return encode_telemetry(schema, expected_telemetry(values[kind]))
+        return encode_telemetry(expected_telemetry(values[kind]))
+    if kind == "tick_end":
+        return encode_tick_end(expected_tick_end(values[kind]))
     if kind in EVENT_KINDS:
-        return encode_event(schema, Event.from_dict(values[kind]))
-    return encode_command(schema, expected_command(values[kind]))
+        return encode_event(Event.from_dict(values[kind]))
+    return encode_command(expected_command(values[kind]))
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Write the Python wire fixtures (<kind>.python.bin).")
     p.add_argument("--dir", default=default_fixtures_dir(), help="fixtures directory")
-    p.add_argument("--schema", default=None, help="path to astrum.capnp")
     args = p.parse_args(argv)
-    schema = load_schema(args.schema)
     values = load_values(args.dir)
     for kind in KINDS + EVENT_KINDS:
         path = os.path.join(args.dir, f"{kind}.python.bin")
         with open(path, "wb") as f:
-            f.write(encode_kind(schema, kind, values))
+            f.write(encode_kind(kind, values))
         print(f"wrote {path}")
     return 0
 

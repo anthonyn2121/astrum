@@ -21,7 +21,7 @@ from astrum_optimal.laws._fixed_wing import (
 from astrum_optimal.linear import discretize_zoh, dlqr
 
 
-class Law(LimitedFixedWingLaw):
+class LqrLaw(LimitedFixedWingLaw):
     """Limited LQR state feedback (fixed-wing only)."""
 
     def design(self, dt: float, v: float) -> None:

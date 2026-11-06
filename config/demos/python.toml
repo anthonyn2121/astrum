@@ -8,5 +8,5 @@
 base = "config/scenario.demo.toml"
 
 controllers = [
-  "python controllers/python/example.py --id 1 --heading 0 --alt 1500 --speed 50 --mode raw",
+  "python controllers/python/example.py --id 1 --heading 0 --alt 1500 --speed 50 --law hold",
 ]

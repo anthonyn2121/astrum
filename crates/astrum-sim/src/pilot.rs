@@ -1,10 +1,13 @@
-//! Who flies each aircraft: commands → [`PilotMode`], the command lease and its
-//! failsafe hold, and the built-in autopilot laws. The Zenoh bridge
-//! ([`crate::net`]) and the RL env ([`crate::env`]) apply commands through the
-//! same [`apply_command`], so both front doors behave identically.
+//! Who flies each aircraft: commands → [`PilotMode`], command ownership (one
+//! controller epoch per aircraft), the command lease and its failsafe hold, and
+//! the built-in autopilot laws. The Zenoh bridge ([`crate::net`]) and the RL env
+//! ([`crate::env`]) apply commands through the same [`apply_command`], so both
+//! front doors behave identically.
 
 use astrum_fdm::{Controls, FdmState};
-use astrum_proto::{AutopilotTargets, Command, Control, ControlMode, EventKind, ModeReason};
+use astrum_proto::{
+    AutopilotTargets, Command, CommandStatus, Control, ControlMode, EventKind, ModeReason,
+};
 use bevy::prelude::*;
 
 use crate::combat::{Dead, Trigger};
@@ -18,7 +21,8 @@ use crate::events::EventLog;
 pub enum PilotMode {
     /// Never commanded: the controls JSBSim trimmed at spawn are held.
     Uncommanded,
-    /// A controller's raw actuators.
+    /// A controller's raw actuators (fixed-wing) or rate demands and
+    /// collective (multirotor), as FCS inputs.
     Raw(Controls),
     /// The built-in autopilot flying commanded targets.
     Autopilot(AutopilotTargets),
@@ -52,8 +56,15 @@ pub struct Pilot {
     pub mode: PilotMode,
     /// Tick at which the last command was applied.
     pub last_command_tick: u64,
-    /// `seq` of the last applied command.
-    pub last_seq: Option<u64>,
+    /// The epoch that owns the aircraft: the first whose command was applied
+    /// since the last failsafe (`None` = unowned).
+    pub owner: Option<u64>,
+    /// `seq` of the owner's last applied command (0 = none).
+    pub last_seq: u64,
+    /// Commands refused so far (wraps), the latest reason and its epoch.
+    pub refusals: u32,
+    pub last_refusal: astrum_proto::Refusal,
+    pub last_refused_epoch: u64,
     /// In a lockstep scenario, the sim waits for this aircraft's commands.
     pub lockstep: bool,
     /// Ticks between this aircraft's telemetry samples (and, in lockstep, the
@@ -72,7 +83,11 @@ impl Pilot {
         Self {
             mode: PilotMode::Uncommanded,
             last_command_tick: 0,
-            last_seq: None,
+            owner: None,
+            last_seq: 0,
+            refusals: 0,
+            last_refusal: astrum_proto::Refusal::None,
+            last_refused_epoch: 0,
             lockstep,
             control_period_ticks: 1,
             integrators: Integrators::default(),
@@ -91,6 +106,25 @@ impl Pilot {
     pub fn commanded(&self) -> bool {
         matches!(self.mode, PilotMode::Raw(_) | PilotMode::Autopilot(_))
     }
+
+    /// Ownership and refusals, as reported in telemetry.
+    pub fn command_status(&self) -> CommandStatus {
+        CommandStatus {
+            owner_epoch: self.owner.unwrap_or(0),
+            last_seq: self.last_seq,
+            refusals: self.refusals,
+            last_refusal: self.last_refusal,
+            last_refused_epoch: self.last_refused_epoch,
+        }
+    }
+
+    /// Count a refusal of `epoch`'s command; returns `why` for `?`-style use.
+    fn refuse(&mut self, epoch: u64, why: Refusal) -> Refusal {
+        self.refusals = self.refusals.wrapping_add(1);
+        self.last_refusal = why.wire();
+        self.last_refused_epoch = epoch;
+        why
+    }
 }
 
 /// Why a command was refused.
@@ -100,12 +134,40 @@ pub enum Refusal {
     FromTheFuture { telemetry_tick: u64, now: u64 },
     /// Answers telemetry older than the command lease.
     Stale { telemetry_tick: u64, now: u64 },
-    /// The same `seq` was already applied.
-    Duplicate { seq: u64 },
+    /// `seq` not above the owner's last applied one.
+    OutOfOrder { seq: u64, last_seq: u64 },
+    /// Another epoch owns the aircraft.
+    NotOwner { epoch: u64, owner: u64 },
+    /// Epoch 0.
+    MissingEpoch,
     /// A NaN/inf autopilot target.
     NonFinite,
-    /// No aircraft with that id.
+    /// Raw control of the other vehicle class.
+    WrongVehicleKind { kind: VehicleKind },
+    /// No aircraft with that id (logged only: there is no telemetry to report it in).
     UnknownAircraft { id: u32 },
+}
+
+impl Refusal {
+    /// The wire reason reported in `Telemetry.command`.
+    ///
+    /// # Panics
+    /// For [`Refusal::UnknownAircraft`], which has no aircraft to report it.
+    pub fn wire(&self) -> astrum_proto::Refusal {
+        use astrum_proto::Refusal as W;
+        match self {
+            Refusal::FromTheFuture { .. } => W::FromTheFuture,
+            Refusal::Stale { .. } => W::Stale,
+            Refusal::OutOfOrder { .. } => W::OutOfOrder,
+            Refusal::NotOwner { .. } => W::NotOwner,
+            Refusal::MissingEpoch => W::MissingEpoch,
+            Refusal::NonFinite => W::NonFinite,
+            Refusal::WrongVehicleKind { .. } => W::WrongVehicleKind,
+            Refusal::UnknownAircraft { .. } => {
+                unreachable!("an unknown aircraft has no command status")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for Refusal {
@@ -117,35 +179,64 @@ impl std::fmt::Display for Refusal {
             Refusal::Stale { telemetry_tick, now } => {
                 write!(f, "stale: answers tick {telemetry_tick} at tick {now}")
             }
-            Refusal::Duplicate { seq } => write!(f, "duplicate seq {seq}"),
+            Refusal::OutOfOrder { seq, last_seq } => {
+                write!(f, "out of order: seq {seq} after {last_seq}")
+            }
+            Refusal::NotOwner { epoch, owner } => {
+                write!(f, "epoch {epoch:#x} is not the owner (epoch {owner:#x} is)")
+            }
+            Refusal::MissingEpoch => write!(f, "epoch 0"),
+            Refusal::WrongVehicleKind { kind } => {
+                write!(f, "wrong raw control for a {}", kind_name(*kind))
+            }
             Refusal::NonFinite => write!(f, "non-finite autopilot target"),
             Refusal::UnknownAircraft { id } => write!(f, "no aircraft {id}"),
         }
     }
 }
 
-/// Apply one command to an aircraft at sim tick `now`. A raw command's
-/// channels are clamped (NaN → neutral); autopilot targets must be finite.
+fn kind_name(kind: VehicleKind) -> &'static str {
+    match kind {
+        VehicleKind::FixedWing => "fixed-wing",
+        VehicleKind::Multirotor => "multirotor",
+    }
+}
+
+/// Apply one command to an aircraft of class `kind` at sim tick `now`. Checks,
+/// in order: a non-zero epoch, ownership (another epoch owns it), the telemetry
+/// tick (not ahead, not older than the lease), `seq` above the owner's last,
+/// the raw arm matching `kind`, finite autopilot targets. Raw channels are
+/// clamped (NaN → neutral). An applied command claims an unowned aircraft for
+/// its epoch; every refusal is counted in the pilot's command status.
 pub fn apply_command(
     pilot: &mut Pilot,
     trigger: Option<&mut Trigger>,
+    kind: VehicleKind,
     cmd: &Command,
     now: u64,
     lease_ticks: Option<u64>,
 ) -> Result<(), Refusal> {
+    let epoch = cmd.epoch;
+    if epoch == 0 {
+        return Err(pilot.refuse(epoch, Refusal::MissingEpoch));
+    }
+    if let Some(owner) = pilot.owner.filter(|&o| o != epoch) {
+        return Err(pilot.refuse(epoch, Refusal::NotOwner { epoch, owner }));
+    }
     if cmd.telemetry_tick > now {
-        return Err(Refusal::FromTheFuture { telemetry_tick: cmd.telemetry_tick, now });
+        let why = Refusal::FromTheFuture { telemetry_tick: cmd.telemetry_tick, now };
+        return Err(pilot.refuse(epoch, why));
     }
-    if let Some(lease) = lease_ticks {
-        if now - cmd.telemetry_tick > lease {
-            return Err(Refusal::Stale { telemetry_tick: cmd.telemetry_tick, now });
-        }
+    if lease_ticks.is_some_and(|lease| now - cmd.telemetry_tick > lease) {
+        let why = Refusal::Stale { telemetry_tick: cmd.telemetry_tick, now };
+        return Err(pilot.refuse(epoch, why));
     }
-    if pilot.last_seq == Some(cmd.seq) {
-        return Err(Refusal::Duplicate { seq: cmd.seq });
+    if pilot.owner == Some(epoch) && cmd.seq <= pilot.last_seq {
+        let why = Refusal::OutOfOrder { seq: cmd.seq, last_seq: pilot.last_seq };
+        return Err(pilot.refuse(epoch, why));
     }
-    let mode = match cmd.control {
-        Control::Raw(r) => PilotMode::Raw(
+    let mode = match (cmd.control, kind) {
+        (Control::Raw(r), VehicleKind::FixedWing) => PilotMode::Raw(
             Controls {
                 aileron: r.aileron,
                 elevator: r.elevator,
@@ -154,9 +245,22 @@ pub fn apply_command(
             }
             .clamped(),
         ),
-        Control::Autopilot(t) => {
+        // The channels the multirotor autopilot writes (see [`multirotor`]).
+        (Control::Multirotor(m), VehicleKind::Multirotor) => PilotMode::Raw(
+            Controls {
+                aileron: m.roll_rate,
+                elevator: m.pitch_rate,
+                rudder: m.yaw_rate,
+                throttle: m.collective,
+            }
+            .clamped(),
+        ),
+        (Control::Raw(_) | Control::Multirotor(_), kind) => {
+            return Err(pilot.refuse(epoch, Refusal::WrongVehicleKind { kind }));
+        }
+        (Control::Autopilot(t), _) => {
             if !(t.heading_rad.is_finite() && t.alt_hae_m.is_finite() && t.tas_mps.is_finite()) {
-                return Err(Refusal::NonFinite);
+                return Err(pilot.refuse(epoch, Refusal::NonFinite));
             }
             PilotMode::Autopilot(t)
         }
@@ -167,7 +271,8 @@ pub fn apply_command(
         pilot.integrators = Integrators::default();
     }
     pilot.mode = mode;
-    pilot.last_seq = Some(cmd.seq);
+    pilot.owner = Some(epoch);
+    pilot.last_seq = cmd.seq;
     pilot.last_command_tick = now;
     if let Some(t) = trigger {
         t.0 = cmd.trigger;
@@ -180,7 +285,8 @@ pub fn hold_targets(s: &FdmState) -> AutopilotTargets {
     AutopilotTargets { heading_rad: s.psi_rad, alt_hae_m: s.alt_hae_m, tas_mps: s.tas_mps }
 }
 
-/// Switch to the failsafe hold of the current state and release the trigger.
+/// Switch to the failsafe hold of the current state, release the trigger and
+/// release ownership (the next epoch whose command is applied owns it).
 pub fn enter_failsafe(
     pilot: &mut Pilot,
     trigger: Option<&mut Trigger>,
@@ -189,6 +295,8 @@ pub fn enter_failsafe(
 ) {
     pilot.mode = PilotMode::Failsafe(hold_targets(&state.fdm), reason);
     pilot.integrators = Integrators::default();
+    pilot.owner = None;
+    pilot.last_seq = 0;
     if let Some(t) = trigger {
         t.0 = false;
     }

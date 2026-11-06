@@ -1,9 +1,10 @@
-//! Wire-format behaviour tests: round-trips for both payloads and both command
-//! arms, plus the decoder's rejection rules.
+//! Wire-format behaviour tests: round-trips for every payload and every command
+//! arm, plus the decoder's rejection rules.
 
 use astrum_proto::{
-    decode_command, decode_telemetry, encode_command, encode_telemetry, AutopilotTargets, Command,
-    Control, ControlMode, RawActuators, Telemetry, VehicleKind,
+    decode_command, decode_telemetry, decode_tick_end, encode_command, encode_telemetry,
+    encode_tick_end, AutopilotTargets, Command, CommandStatus, Control, ControlMode, MultirotorRaw,
+    RawActuators, Refusal, Telemetry, TickEnd, VehicleKind,
 };
 
 #[test]
@@ -18,6 +19,14 @@ fn telemetry_roundtrip_preserves_every_field() {
         tas_mps: 120.0,
         vehicle_kind: VehicleKind::Multirotor,
         control_mode: ControlMode::Failsafe,
+        control_period_s: 0.05,
+        command: CommandStatus {
+            owner_epoch: u64::MAX,
+            last_seq: 12,
+            refusals: 3,
+            last_refusal: Refusal::WrongVehicleKind,
+            last_refused_epoch: 5,
+        },
         ..Default::default()
     };
     t.pos_enu.e = 1.0;
@@ -32,14 +41,38 @@ fn telemetry_roundtrip_preserves_every_field() {
 }
 
 #[test]
-fn command_roundtrips_both_arms_with_header_fields() {
+fn command_roundtrips_every_arm_with_header_fields() {
     for control in [
         Control::Raw(RawActuators { aileron: 0.1, elevator: -0.2, rudder: 0.0, throttle: 0.75 }),
         Control::Autopilot(AutopilotTargets { heading_rad: 1.2, alt_hae_m: 1500.0, tas_mps: 60.0 }),
+        Control::Multirotor(MultirotorRaw {
+            roll_rate: 0.5,
+            pitch_rate: -0.25,
+            yaw_rate: 0.125,
+            collective: 0.6,
+        }),
     ] {
-        let c = Command { target_id: 3, seq: 41, telemetry_tick: 9000, trigger: true, control };
+        let c = Command {
+            target_id: 3,
+            seq: 41,
+            telemetry_tick: 9000,
+            trigger: true,
+            epoch: 0xdead_beef,
+            control,
+        };
         assert_eq!(decode_command(&encode_command(&c)).unwrap(), c);
     }
+}
+
+#[test]
+fn tick_end_roundtrips_and_rejects_garbage() {
+    let t = TickEnd { tick: 1 << 40, sim_time_s: 12.5 };
+    let bytes = encode_tick_end(&t);
+    assert_eq!(decode_tick_end(&bytes).unwrap(), t);
+    assert!(decode_tick_end(&bytes[..bytes.len() - 8]).is_err());
+    let mut long = bytes.clone();
+    long.extend_from_slice(&[0u8; 8]);
+    assert!(decode_tick_end(&long).is_err());
 }
 
 #[test]
@@ -49,6 +82,7 @@ fn trailing_bytes_are_rejected() {
         seq: 1,
         telemetry_tick: 0,
         trigger: false,
+        epoch: 1,
         control: Control::Raw(RawActuators::default()),
     };
     let mut bytes = encode_command(&c);

@@ -1,21 +1,40 @@
 @0x8ce66e85b6cf0006;
 #
-# ASTRUM wire schema (v2) — the single source of truth shared by the Rust sim,
+# ASTRUM wire schema (v3) — the single source of truth shared by the Rust sim,
 # the C++/Python controllers, the bag tools and the web bridge.
 #
 # Transport (Zenoh, one session per process):
-#   * Telemetry : sim --put--> astrum/telemetry/<aircraftId>   (one per aircraft per tick)
+#   * Telemetry : sim --put--> astrum/telemetry/<aircraftId>   (one per aircraft per
+#                 control tick, aircraft id ascending)
 #   * Command   : controller --put--> astrum/command/<targetId> (the key's id MUST equal
 #                 targetId; the sim rejects mismatches)
 #   * Event     : sim --put--> astrum/events (one per event, in the order they happened)
+#   * TickEnd   : sim --put--> astrum/tick, after the tick's telemetry and events
 #   * Scenario  : the sim answers `get astrum/scenario` with its scenario TOML (UTF-8 text)
 #   * Presence, control and status (astrum/alive/controller/<id>, astrum/control/*,
 #     astrum/status) carry no Cap'n Proto: a liveliness token and JSON / text replies.
-# Telemetry and commands are latest-value state: publish with CongestionControl::DROP,
-# express, priority INTERACTIVE_HIGH, and read with a latest-value (ring) handler — a
-# stale sample is worse than a dropped one. Events are discrete and must not be lost:
-# CongestionControl::BLOCK, read with a FIFO. Controllers may ask for Zenoh's
-# low-latency transport (the sim offers it).
+#
+# Per tick the sim publishes, in this order: every due Telemetry, then the tick's
+# Events, then one TickEnd. Zenoh delivers a link's messages of one priority in send
+# order and sends a higher priority first, so a subscriber that has received TickEnd N
+# has received every Telemetry and Event of tick N that reached it. While a lockstep
+# tick (or a pause) waits, the sim re-sends every due Telemetry of the tick and its
+# TickEnd about every 100 ms, so a controller that subscribed late still sees the whole
+# tick — its own sample and every other aircraft's.
+#
+# QoS. Telemetry and commands are latest-value state: CongestionControl::DROP, express,
+# priority INTERACTIVE_HIGH, read with a latest-value handler — a stale sample is worse
+# than a dropped one. Events and TickEnd must not be lost: CongestionControl::BLOCK,
+# priority DATA (events read with a FIFO; TickEnd needs only the newest). Controllers use
+# Zenoh's low-latency transport (the sim offers it): it has ONE lane per link, so
+# priorities reorder nothing on it — messages arrive in the order the sim sent them.
+#
+# Ownership. Every Command carries the `epoch` of the controller instance that sent it.
+# The first epoch whose command the sim applies owns the aircraft; commands from any
+# other epoch are refused (Refusal.notOwner) until the owner lets go — its presence
+# token disappears or its command lease expires (the aircraft enters failsafe). Within
+# the owner's epoch `seq` must strictly increase. Telemetry.command reports the owner
+# and the last refusal, so a controller learns it is not flying the aircraft.
 #
 # Framing: one unpacked flat message per Zenoh payload (Rust write_message /
 # C++ messageToFlatArray / pycapnp to_bytes).
@@ -78,8 +97,9 @@ struct Combat {
   ammo         @4 :UInt16;    # rounds left; 0 for unarmed aircraft
 }
 
-# Flight-vehicle class. The four raw actuator channels mean different things per
-# class, so a raw control law MUST check this and refuse an unknown value.
+# Flight-vehicle class. Raw control is class-specific (Command.control.raw is
+# fixed-wing only, .multirotor multirotor only), so a raw control law MUST check this
+# and refuse an unknown value.
 enum VehicleKind {
   fixedWing  @0;
   multirotor @1;
@@ -88,7 +108,7 @@ enum VehicleKind {
 # Who is flying the aircraft this tick.
 enum ControlMode {
   uncommanded @0;   # no command received yet: initial (trimmed) controls held
-  raw         @1;   # a controller's raw actuators, within the command lease
+  raw         @1;   # a controller's raw commands (raw or multirotor), within the lease
   autopilot   @2;   # the sim's inner loop flying commanded targets
   failsafe    @3;   # lease expired or controller gone: the sim holds heading/altitude/speed
 }
@@ -110,14 +130,29 @@ struct Telemetry {
   velEnu      @12 :Enu;          # velocity relative to the Earth, world grid (m/s)
   combat      @13 :Combat;
   controlMode @14 :ControlMode;
+  # Sim time between this aircraft's telemetry samples (1 / its control_rate_hz,
+  # default 1 / sim.rate_hz); in lockstep, a command is awaited every period. The dt
+  # a discretized control law runs at.
+  controlPeriodS @15 :Float64;
+  command        @16 :CommandStatus;   # ownership and command refusals
 }
 
-# Raw actuator setpoints — the controller owns the control law.
+# Raw fixed-wing actuator setpoints — the controller owns the control law. Signs (as
+# measured in the sim): aileron+ rolls right, elevator+ pitches nose DOWN.
 struct RawActuators {
   aileron  @0 :Float64;   # [-1, 1]
   elevator @1 :Float64;   # [-1, 1]
   rudder   @2 :Float64;   # [-1, 1]
   throttle @3 :Float64;   # [0, 1]
+}
+
+# Raw multirotor demands: normalized body-rate demands and collective thrust, the
+# inputs of the multirotor's own rate loops. The controller owns the attitude law.
+struct MultirotorRaw {
+  rollRate   @0 :Float64;   # [-1, 1], + rolls right
+  pitchRate  @1 :Float64;   # [-1, 1], + pitches nose UP
+  yawRate    @2 :Float64;   # [-1, 1], + yaws nose right
+  collective @3 :Float64;   # [0, 1]
 }
 
 # Targets for the sim's built-in inner loop (vehicle-class specific).
@@ -127,18 +162,49 @@ struct AutopilotTargets {
   tasMps     @2 :Float64;   # ignored by multirotors
 }
 
-# A command for one aircraft. Raw actuators are a lease: the sim falls back to its
-# failsafe hold if no fresh raw command arrives within the scenario's lease, so a
-# raw controller must keep sending every tick it receives telemetry.
+# A command for one aircraft. Raw commands are a lease: the sim falls back to its
+# failsafe hold if no fresh command arrives within the scenario's lease, so a raw
+# controller must keep sending every tick it receives telemetry.
 struct Command {
   targetId @0 :UInt32;
   control :union {
-    raw       @1 :RawActuators;
-    autopilot @2 :AutopilotTargets;
+    raw        @1 :RawActuators;       # fixed-wing aircraft only
+    autopilot  @2 :AutopilotTargets;
+    multirotor @7 :MultirotorRaw;      # multirotor aircraft only
   }
-  seq           @3 :UInt64;   # per-sender, strictly increasing; older seqs are ignored
+  seq           @3 :UInt64;   # strictly increasing within one epoch
   telemetryTick @4 :UInt64;   # Telemetry.tick this command was computed from
   trigger       @5 :Bool;     # gun trigger (armed aircraft only)
+  # Random non-zero id of the controller instance (one per command publisher) that
+  # sent this command; 0 is refused. See "Ownership" above.
+  epoch         @6 :UInt64;
+}
+
+# Why the sim refused a command.
+enum Refusal {
+  none             @0;   # no command refused yet
+  fromTheFuture    @1;   # telemetryTick is ahead of the sim (sender bug or sim restart)
+  stale            @2;   # telemetryTick is older than the command lease
+  outOfOrder       @3;   # seq not above the owner's last applied seq
+  notOwner         @4;   # another controller instance (epoch) owns the aircraft
+  missingEpoch     @5;   # epoch 0
+  nonFinite        @6;   # a NaN / infinite autopilot target
+  wrongVehicleKind @7;   # raw on a multirotor, or multirotor on a fixed-wing
+}
+
+# The sim's command bookkeeping for one aircraft (Telemetry.command).
+struct CommandStatus {
+  ownerEpoch       @0 :UInt64;    # epoch of the controller flying it; 0 = unowned
+  lastSeq          @1 :UInt64;    # seq of the owner's last applied command; 0 = none
+  refusals         @2 :UInt32;    # commands refused for this aircraft so far (wraps)
+  lastRefusal      @3 :Refusal;   # why the most recent one was refused
+  lastRefusedEpoch @4 :UInt64;    # the epoch that sent it
+}
+
+# The end of a tick's publications on astrum/tick (see the ordering note above).
+struct TickEnd {
+  tick     @0 :UInt64;    # the Telemetry.tick just published
+  simTimeS @1 :Float64;   # tick * dt
 }
 
 # Why an aircraft's controlMode changed.

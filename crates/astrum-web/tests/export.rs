@@ -52,6 +52,7 @@ fn export_keeps_every_telemetry_frame_and_event_and_summarises_the_bag() {
             seq: tick,
             telemetry_tick: tick,
             trigger: false,
+            epoch: 1,
             control: Control::Raw(RawActuators::default()),
         };
         write(&mut w, &keys::command(1), tick, &encode_command(&cmd));

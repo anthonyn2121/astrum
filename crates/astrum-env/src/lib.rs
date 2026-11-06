@@ -19,7 +19,8 @@
 
 use astrum_fdm::FdmState;
 use astrum_proto::{
-    AutopilotTargets, Control, ControlMode, Event, EventKind, RawActuators, Telemetry, VehicleKind,
+    AutopilotTargets, Control, ControlMode, Event, EventKind, MultirotorRaw, RawActuators,
+    Telemetry, VehicleKind,
 };
 use astrum_sim::combat::{CombatParams, Gun};
 use astrum_sim::components::AutopilotProfile;
@@ -192,36 +193,44 @@ fn parse_scenario(toml: &str) -> PyResult<Scenario> {
     Scenario::from_toml_str(toml).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Turn one env's action rows (aligned with its sorted agent ids) into commands.
+/// Each agent's id and vehicle class, sorted by id (the row order of every
+/// observation and action array).
+fn agents_of(env: &SimEnv) -> Vec<(u32, VehicleKind)> {
+    env.observe().iter().map(|t| (t.aircraft_id, t.vehicle_kind)).collect()
+}
+
+/// Turn one env's action rows (aligned with its sorted agents) into commands.
+/// The four raw channels are the class's raw arm: actuators on a fixed-wing,
+/// rate demands and collective on a multirotor.
 fn actions_for(
-    ids: &[u32],
+    agents: &[(u32, VehicleKind)],
     raw: ArrayView2<f64>,
     autopilot: Option<ArrayView2<f64>>,
     commanded: Option<ArrayView1<bool>>,
 ) -> Result<Vec<(u32, Action)>, String> {
-    if raw.dim() != (ids.len(), N_ACT) {
+    if raw.dim() != (agents.len(), N_ACT) {
         return Err(format!(
             "actions must have shape ({}, {N_ACT}), got {:?}",
-            ids.len(),
+            agents.len(),
             raw.dim()
         ));
     }
     if let Some(ap) = &autopilot {
-        if ap.dim() != (ids.len(), N_AP) {
+        if ap.dim() != (agents.len(), N_AP) {
             return Err(format!(
                 "autopilot must have shape ({}, {N_AP}), got {:?}",
-                ids.len(),
+                agents.len(),
                 ap.dim()
             ));
         }
     }
     if let Some(c) = &commanded {
-        if c.len() != ids.len() {
-            return Err(format!("commanded must have length {}, got {}", ids.len(), c.len()));
+        if c.len() != agents.len() {
+            return Err(format!("commanded must have length {}, got {}", agents.len(), c.len()));
         }
     }
-    let mut out = Vec::with_capacity(ids.len());
-    for (i, id) in ids.iter().enumerate() {
+    let mut out = Vec::with_capacity(agents.len());
+    for (i, &(id, kind)) in agents.iter().enumerate() {
         if commanded.as_ref().is_some_and(|c| !c[i]) {
             continue;
         }
@@ -232,6 +241,12 @@ fn actions_for(
                 alt_hae_m: ap[[i, 2]],
                 tas_mps: ap[[i, 3]],
             }),
+            _ if kind == VehicleKind::Multirotor => Control::Multirotor(MultirotorRaw {
+                roll_rate: r[0],
+                pitch_rate: r[1],
+                yaw_rate: r[2],
+                collective: r[3],
+            }),
             _ => Control::Raw(RawActuators {
                 aileron: r[0],
                 elevator: r[1],
@@ -239,7 +254,7 @@ fn actions_for(
                 throttle: r[3],
             }),
         };
-        out.push((*id, Action { control, trigger: r[4] >= 0.5 }));
+        out.push((id, Action { control, trigger: r[4] >= 0.5 }));
     }
     Ok(out)
 }
@@ -343,7 +358,7 @@ impl StepInfo {
 #[pyclass]
 pub struct Env {
     inner: SimEnv,
-    ids: Vec<u32>,
+    agents: Vec<(u32, VehicleKind)>,
 }
 
 #[pymethods]
@@ -352,14 +367,14 @@ impl Env {
     fn new(py: Python<'_>, scenario_toml: &str) -> PyResult<Self> {
         let scenario = parse_scenario(scenario_toml)?;
         let inner = py.detach(|| SimEnv::new(scenario)).map_err(env_err)?;
-        let ids = inner.agent_ids();
-        Ok(Env { inner, ids })
+        let agents = agents_of(&inner);
+        Ok(Env { inner, agents })
     }
 
     /// Sorted aircraft ids; the row order of every observation and action array.
     #[getter]
     fn agent_ids(&self) -> Vec<u32> {
-        self.ids.clone()
+        self.agents.iter().map(|(id, _)| *id).collect()
     }
 
     /// Physics step (s).
@@ -386,12 +401,13 @@ impl Env {
         let scenario = scenario_toml.map(parse_scenario).transpose()?;
         let inner = &mut self.inner;
         let obs = py.detach(|| inner.reset(seed, scenario)).map_err(env_err)?;
-        self.ids = self.inner.agent_ids();
+        self.agents = agents_of(&self.inner);
         Ok(obs_matrix(&obs).into_pyarray(py))
     }
 
     /// Advance one tick. `actions[i]` = `[aileron, elevator, rudder, throttle,
-    /// trigger]` for `agent_ids[i]` (trigger fires at ≥ 0.5). Optional
+    /// trigger]` for `agent_ids[i]` (on a multirotor: `[roll_rate, pitch_rate,
+    /// yaw_rate, collective, trigger]`; trigger fires at ≥ 0.5). Optional
     /// `autopilot[i]` = `[engage, heading_rad, alt_hae_m, tas_mps]` replaces the
     /// raw channels with autopilot targets where `engage` ≥ 0.5. Rows with
     /// `commanded[i] == False` send nothing (the aircraft keeps its last command
@@ -405,7 +421,7 @@ impl Env {
         commanded: Option<PyReadonlyArray1<'py, bool>>,
     ) -> PyResult<(Bound<'py, PyArray2<f64>>, StepInfo)> {
         let parsed = actions_for(
-            &self.ids,
+            &self.agents,
             actions.as_array(),
             autopilot.as_ref().map(|a| a.as_array()),
             commanded.as_ref().map(|c| c.as_array()),
@@ -461,12 +477,12 @@ impl Env {
 #[pyclass]
 pub struct BatchEnv {
     envs: Vec<SimEnv>,
-    ids: Vec<Vec<u32>>,
+    agents: Vec<Vec<(u32, VehicleKind)>>,
 }
 
 impl BatchEnv {
     fn stack(&self, obs: &[Vec<Telemetry>]) -> Array3<f64> {
-        let n = self.ids[0].len();
+        let n = self.agents[0].len();
         let mut out = Array3::zeros((obs.len(), n, N_OBS));
         for (k, o) in obs.iter().enumerate() {
             out.index_axis_mut(numpy::ndarray::Axis(0), k).assign(&obs_matrix(o));
@@ -493,8 +509,8 @@ impl BatchEnv {
         let envs = py
             .detach(|| scenarios.into_par_iter().map(SimEnv::new).collect::<Result<Vec<_>, _>>())
             .map_err(env_err)?;
-        let ids = envs.iter().map(SimEnv::agent_ids).collect();
-        Ok(BatchEnv { envs, ids })
+        let agents = envs.iter().map(agents_of).collect();
+        Ok(BatchEnv { envs, agents })
     }
 
     fn __len__(&self) -> usize {
@@ -504,7 +520,7 @@ impl BatchEnv {
     /// Per-env sorted aircraft ids.
     #[getter]
     fn agent_ids(&self) -> Vec<Vec<u32>> {
-        self.ids.clone()
+        self.agents.iter().map(|a| a.iter().map(|(id, _)| *id).collect()).collect()
     }
 
     /// Reset every env (optionally with per-env seeds); returns `(K, n, F)`.
@@ -564,7 +580,7 @@ impl BatchEnv {
             let a = act.index_axis(numpy::ndarray::Axis(0), k);
             let p = ap.as_ref().map(|x| x.index_axis(numpy::ndarray::Axis(0), k));
             parsed.push(
-                actions_for(&self.ids[k], a, p, None)
+                actions_for(&self.agents[k], a, p, None)
                     .map_err(|e| PyValueError::new_err(format!("env {k}: {e}")))?,
             );
         }

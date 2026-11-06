@@ -442,8 +442,12 @@ fn supervise(
 }
 
 /// A run's status from how it ended; `sim_log` hints where the sim's output is.
+/// A sim that failed by itself (it exits 0 when asked to stop) is the run's
+/// problem even if a controller exited first: a controller that quits on the
+/// sim's `RunEnded(fatal)` must not hide the sim's reason.
 fn status_of(ending: Ending, sim_log: &str) -> Status {
     match (ending.problem, ending.stopped, ending.sim) {
+        (_, None, Some(s)) if !s.success() => Status::Failed(format!("sim exited ({s}){sim_log}")),
         (Some(why), ..) => Status::Failed(why),
         (None, Some(why), _) => Status::Stopped(why),
         (None, None, Some(s)) if s.success() => Status::Ok,
@@ -874,4 +878,32 @@ fn list(dir: &Path) -> ExitCode {
         println!("{:<8}  {path:<width$}  {about}", kind.name());
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
+    use super::*;
+
+    fn exited(code: i32) -> Option<ExitStatus> {
+        Some(ExitStatus::from_raw(code << 8))
+    }
+
+    #[test]
+    fn a_failed_sim_is_the_problem_even_if_a_controller_exited_first() {
+        let ending =
+            Ending { problem: Some("controller 1 exited".into()), stopped: None, sim: exited(1) };
+        match status_of(ending, "; see run.sim.log") {
+            Status::Failed(why) => assert!(why.starts_with("sim exited"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_controller_failure_is_the_problem_when_the_sim_stopped_cleanly() {
+        let ending =
+            Ending { problem: Some("controller 1 exited".into()), stopped: None, sim: exited(0) };
+        assert_eq!(status_of(ending, ""), Status::Failed("controller 1 exited".into()));
+    }
 }

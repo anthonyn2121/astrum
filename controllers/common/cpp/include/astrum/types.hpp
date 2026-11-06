@@ -1,46 +1,82 @@
-// Plain-data controller types: what a law reads (VehicleState) and returns (Command).
+// Plain-data ASTRUM types: what a law reads (VehicleState, Event) and returns (Action),
+// and the wire messages (Command, TickEnd) — no Cap'n Proto.
 //
-// These mirror the wire schema v2 (crates/astrum-proto/schema/astrum.capnp) field for
-// field, flattened and in SI units, so control code never touches Cap'n Proto. The field
-// names match the Python client (controllers/python/astrum_client/wire.py, VehicleState).
+// They mirror the wire schema v3 (crates/astrum-proto/schema/astrum.capnp) field for
+// field, flattened and in SI units (angles in radians). The names are the SDK contract
+// shared with the Python client and the Rust mirror (controllers/README.md, "Names").
+// Enum values outside the named enumerants come from a newer schema: they are kept as
+// is (to_string gives "unknown(<n>)") and never mapped onto a known value.
 
 #ifndef ASTRUM_TYPES_HPP
 #define ASTRUM_TYPES_HPP
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 
 namespace astrum {
 
-// Flight-vehicle class. Values outside the named enumerants are kinds this build does
-// not know (a newer schema); a raw law must refuse them.
+// Flight-vehicle class; raw control is class-specific (RawActuators: fixed-wing,
+// MultirotorRaw: multirotor).
 enum class VehicleKind : std::uint16_t { FixedWing = 0, Multirotor = 1 };
 
-// Who flies the aircraft this tick (Telemetry.controlMode). Unnamed values: newer schema.
+// Who flies the aircraft this tick (Telemetry.controlMode).
 enum class ControlMode : std::uint16_t { Uncommanded = 0, Raw = 1, Autopilot = 2, Failsafe = 3 };
 
-// "fixed-wing" / "multirotor" / "unknown(<n>)".
-std::string to_string(VehicleKind kind);
-// "uncommanded" / "raw" / "autopilot" / "failsafe" / "unknown(<n>)".
-std::string to_string(ControlMode mode);
+// Why the sim refused a command (CommandStatus.lastRefusal).
+enum class Refusal : std::uint16_t {
+  None = 0,
+  FromTheFuture = 1,
+  Stale = 2,
+  OutOfOrder = 3,
+  NotOwner = 4,
+  MissingEpoch = 5,
+  NonFinite = 6,
+  WrongVehicleKind = 7,
+};
 
-// One aircraft's state after sim step `tick`. Angles rad, distances m, speeds m/s.
+// Why an aircraft's control mode changed (ModeChange.reason).
+enum class ModeReason : std::uint16_t { Command = 0, LeaseExpired = 1, ControllerLost = 2 };
+
+// Why a run ended (RunEnded.reason).
+enum class EndReason : std::uint16_t { MaxTime = 0, EngagementDecided = 1, Fatal = 2, Stopped = 3 };
+
+// Kebab-case names as in values.json ("fixed-wing", "not-owner", "max-time", ...);
+// "unknown(<n>)" for a value this build does not know.
+std::string to_string(VehicleKind kind);
+std::string to_string(ControlMode mode);
+std::string to_string(Refusal refusal);
+std::string to_string(ModeReason reason);
+std::string to_string(EndReason reason);
+
+// The sim's command bookkeeping for one aircraft (Telemetry.command).
+struct CommandStatus {
+  std::uint64_t owner_epoch = 0;  // epoch of the controller flying it; 0 = unowned
+  std::uint64_t last_seq = 0;     // the owner's last applied seq; 0 = none
+  std::uint32_t refusals = 0;     // commands refused so far (wraps)
+  Refusal last_refusal = Refusal::None;
+  std::uint64_t last_refused_epoch = 0;  // the epoch that sent the last refused command
+
+  bool operator==(const CommandStatus&) const = default;
+};
+
+// One aircraft's state after sim step `tick` (one decoded Telemetry).
 struct VehicleState {
-  double t = 0.0;                    // sim time (s) = tick * dt
-  std::uint64_t tick = 0;            // sim step index (echoed as Command.telemetryTick)
   std::uint32_t aircraft_id = 0;     //
+  std::uint64_t tick = 0;            // sim step index (echoed as Command.telemetry_tick)
+  double sim_time_s = 0.0;           // tick * dt
   double lat_deg = 0.0;              // geodetic latitude
   double lon_deg = 0.0;              // geodetic longitude
-  double alt_m = 0.0;                // height above the WGS84 ellipsoid (HAE)
-  double e = 0.0, n = 0.0, u = 0.0;  // world-grid ENU position
+  double alt_hae_m = 0.0;            // height above the WGS84 ellipsoid
+  double e = 0.0, n = 0.0, u = 0.0;  // world-grid ENU position (m)
   double vel_ned_n = 0.0, vel_ned_e = 0.0, vel_ned_d = 0.0;  // local-level NED velocity
   double vel_enu_e = 0.0, vel_enu_n = 0.0, vel_enu_u = 0.0;  // world-grid ENU velocity
   double roll = 0.0;                                         // phi, +right wing down
   double pitch = 0.0;                                        // theta, +nose up
   double yaw = 0.0;                                          // psi, true heading (0 = North, +East)
   double p = 0.0, q = 0.0, r = 0.0;  // body rates (rad/s), x nose / y starboard / z down
-  double airspeed = 0.0;             // true airspeed
+  double tas_mps = 0.0;              // true airspeed
   double alpha = 0.0;                // angle of attack
   double beta = 0.0;                 // sideslip
   double nz_g = 0.0;                 // normal load factor (~ +1 in level flight)
@@ -53,55 +89,175 @@ struct VehicleState {
   float hit_points_max = 0.0F;
   bool alive = false;
   std::uint16_t ammo = 0;
+  double control_period_s = 0.0;  // sim time between this aircraft's samples: the law's dt
+  CommandStatus command;          // ownership and command refusals
+
+  bool operator==(const VehicleState&) const = default;
 };
 
-// The setpoint a law tracks (from the CLI): true heading, HAE altitude, TAS.
+// The setpoint a law tracks (from --heading / --alt / --speed): true heading, HAE
+// altitude, true airspeed.
 struct Reference {
   double heading_rad = 0.0;
-  double alt_m = 0.0;
-  double airspeed_mps = 0.0;
+  double alt_hae_m = 0.0;
+  double tas_mps = 0.0;
+
+  bool operator==(const Reference&) const = default;
 };
 
-// Raw actuator setpoints; the client clamps them to aileron/elevator/rudder [-1, 1] and
-// throttle [0, 1] before sending. Signs (measured in the sim): aileron+ rolls right,
-// elevator+ pitches nose DOWN.
+// Attitude command limits in degrees (--max-bank-deg / --max-pitch-deg), each in (0, 90).
+// Defaults suit the trainer (c172x); the F-16 formation demo flies 60 / 24.
+struct AttitudeLimits {
+  double max_bank_deg = 25.0;
+  double max_pitch_deg = 10.0;
+
+  bool operator==(const AttitudeLimits&) const = default;
+};
+
+// Raw fixed-wing actuator setpoints: aileron / elevator / rudder in [-1, 1], throttle in
+// [0, 1] (the loop clamps them). Signs: aileron+ rolls right, elevator+ pitches nose DOWN.
 struct RawActuators {
   double aileron = 0.0;
   double elevator = 0.0;
   double rudder = 0.0;
   double throttle = 0.0;
+
+  bool operator==(const RawActuators&) const = default;
+};
+
+// Raw multirotor demands: normalized body rates in [-1, 1] (+ rolls right, + pitches
+// nose UP, + yaws nose right) and collective thrust in [0, 1].
+struct MultirotorRaw {
+  double roll_rate = 0.0;
+  double pitch_rate = 0.0;
+  double yaw_rate = 0.0;
+  double collective = 0.0;
+
+  bool operator==(const MultirotorRaw&) const = default;
 };
 
 // Targets for the sim's built-in inner loop (tas_mps is ignored by multirotors).
 struct AutopilotTargets {
   double heading_rad = 0.0;
-  double alt_m = 0.0;
+  double alt_hae_m = 0.0;
   double tas_mps = 0.0;
+
+  bool operator==(const AutopilotTargets&) const = default;
 };
 
-// What a controller sends for one telemetry sample.
-struct Command {
-  std::variant<RawActuators, AutopilotTargets> control;
+using Control = std::variant<RawActuators, MultirotorRaw, AutopilotTargets>;
+
+// What a law returns for one telemetry sample.
+struct Action {
+  Control control;
   bool trigger = false;  // gun trigger (armed aircraft only)
 
-  static Command raw(double aileron, double elevator, double rudder, double throttle) {
-    Command c;
-    c.control = RawActuators{aileron, elevator, rudder, throttle};
-    return c;
-  }
-  static Command autopilot(double heading_rad, double alt_m, double tas_mps) {
-    Command c;
-    c.control = AutopilotTargets{heading_rad, alt_m, tas_mps};
-    return c;
-  }
+  bool operator==(const Action&) const = default;
 };
 
-// A Command as it travels on the wire, with the transport fields the client fills in.
-struct CommandMessage {
+// The wire command (astrum/command/<target_id>).
+struct Command {
   std::uint32_t target_id = 0;
-  std::uint64_t seq = 0;             // per-sender, strictly increasing from 1
+  std::uint64_t seq = 0;             // strictly increasing within one epoch, from 1
   std::uint64_t telemetry_tick = 0;  // Telemetry.tick the command answers
-  Command command;
+  bool trigger = false;
+  std::uint64_t epoch = 0;  // random non-zero id of the sending publisher
+  Control control;
+
+  bool operator==(const Command&) const = default;
+};
+
+// World-grid vector (m).
+struct Enu {
+  double e = 0.0, n = 0.0, u = 0.0;
+
+  bool operator==(const Enu&) const = default;
+};
+
+struct TriggerPressed {
+  std::uint32_t aircraft_id = 0;
+  std::uint16_t ammo = 0;  // rounds left when pressed
+
+  bool operator==(const TriggerPressed&) const = default;
+};
+
+struct TriggerReleased {
+  std::uint32_t aircraft_id = 0;
+  std::uint16_t rounds_fired = 0;  // since the matching TriggerPressed
+  std::uint16_t ammo = 0;          // rounds left
+
+  bool operator==(const TriggerReleased&) const = default;
+};
+
+// A round struck an aircraft.
+struct Hit {
+  std::uint32_t shooter_id = 0;
+  std::uint32_t target_id = 0;
+  float damage = 0.0F;
+  float hit_points = 0.0F;  // the target's, after this hit
+  Enu pos_enu;              // where the round struck
+
+  bool operator==(const Hit&) const = default;
+};
+
+// An aircraft was destroyed.
+struct Kill {
+  std::uint32_t victim_id = 0;
+  std::optional<std::uint32_t> killer_id;  // nullopt: no hit recorded
+  Enu pos_enu;                             // the victim's position
+
+  bool operator==(const Kill&) const = default;
+};
+
+struct ModeChange {
+  std::uint32_t aircraft_id = 0;
+  ControlMode from = ControlMode::Uncommanded;
+  ControlMode to = ControlMode::Uncommanded;
+  ModeReason reason = ModeReason::Command;
+
+  bool operator==(const ModeChange&) const = default;
+};
+
+// An aircraft's controller connected (its presence token appeared).
+struct ControllerUp {
+  std::uint32_t aircraft_id = 0;
+
+  bool operator==(const ControllerUp&) const = default;
+};
+
+// An aircraft's controller went away.
+struct ControllerDown {
+  std::uint32_t aircraft_id = 0;
+
+  bool operator==(const ControllerDown&) const = default;
+};
+
+struct RunEnded {
+  EndReason reason = EndReason::MaxTime;
+  std::string message;  // the fatal error; empty otherwise
+
+  bool operator==(const RunEnded&) const = default;
+};
+
+using EventDetail = std::variant<TriggerPressed, TriggerReleased, Hit, Kill, ModeChange,
+                                 ControllerUp, ControllerDown, RunEnded>;
+
+// Something that happened (astrum/events).
+struct Event {
+  std::uint64_t tick = 0;  // the Telemetry.tick that first shows it
+  double sim_time_s = 0.0;
+  EventDetail detail;
+
+  bool operator==(const Event&) const = default;
+};
+
+// The end of a tick's publications (astrum/tick): every Telemetry and Event of `tick`
+// that reached this subscriber arrived before it.
+struct TickEnd {
+  std::uint64_t tick = 0;
+  double sim_time_s = 0.0;
+
+  bool operator==(const TickEnd&) const = default;
 };
 
 }  // namespace astrum

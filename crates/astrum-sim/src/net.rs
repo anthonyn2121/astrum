@@ -1,5 +1,5 @@
-//! The Zenoh bridge: commands in (with optional lockstep), telemetry out, and
-//! controller presence.
+//! The Zenoh bridge: commands in (with optional lockstep), telemetry and tick
+//! ends out, and controller presence.
 //!
 //! Telemetry is assembled once per tick by [`publish_telemetry`] into
 //! [`LastPublished`] whether or not a publisher is installed — the RL env reads
@@ -7,6 +7,10 @@
 //! state. The transport wrappers are `NonSend` resources ([`Bus`]); without
 //! them the bridge systems only assemble telemetry, so the physics-only app
 //! (tests, the embedded env) runs without a session.
+//!
+//! On a tick that published telemetry, [`publish_tick_end`] closes it with a
+//! `TickEnd` after the tick's events; every re-publish of a tick's telemetry
+//! (lockstep wait, pause) is followed by its `TickEnd` again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -14,11 +18,11 @@ use std::time::{Duration, Instant};
 use astrum_bag::wall_clock_ns;
 use astrum_net::{
     CommandReceiver, CommandReject, ControlServer, EventPublisher, Presence, PresenceWatcher,
-    Session, TelemetryPublisher,
+    Session, TelemetryPublisher, TickPublisher,
 };
 use astrum_proto::{
     encode_command, encode_telemetry, Aero, BodyRates, CombatStatus, Command, Euler, EventKind,
-    ModeReason, Ned, Telemetry,
+    ModeReason, Ned, Telemetry, TickEnd,
 };
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -41,9 +45,11 @@ pub fn connect(app: &mut App, session: &Session) -> astrum_net::Result<()> {
     let watcher = PresenceWatcher::watch(session)?;
     let control = ControlServer::serve(session, MIN_SPEED)?;
     let events = EventPublisher::new(session)?;
+    let tick = TickPublisher::new(session)?;
     app.insert_resource(Board(control.board()));
     app.insert_non_send(TelemetryPublisher::new(session));
     app.insert_non_send(events);
+    app.insert_non_send(tick);
     app.insert_non_send(receiver);
     app.insert_non_send(watcher);
     app.insert_non_send(control);
@@ -55,6 +61,7 @@ pub fn connect(app: &mut App, session: &Session) -> astrum_net::Result<()> {
 pub struct Bus<'w> {
     receiver: Option<NonSend<'w, CommandReceiver>>,
     publisher: Option<NonSendMut<'w, TelemetryPublisher>>,
+    tick: Option<NonSend<'w, TickPublisher>>,
     watcher: Option<NonSend<'w, PresenceWatcher>>,
     board: Option<Res<'w, Board>>,
 }
@@ -64,6 +71,50 @@ pub(crate) const RECORDING_FAILED: &str = "recording stopped: the bag writer fai
 /// The telemetry of the latest tick, one sample per aircraft, sorted by id.
 #[derive(Resource, Debug, Clone, Default)]
 pub struct LastPublished(pub Vec<Telemetry>);
+
+/// The aircraft whose samples [`publish_telemetry`] put on the bus for the
+/// latest tick (ascending; empty off the bus or when none was due), and
+/// whether that tick's `TickEnd` is still to be sent.
+#[derive(Resource, Debug, Default)]
+pub struct TickPublication {
+    ids: Vec<u32>,
+    end_pending: bool,
+}
+
+/// A re-sent copy of a tick's sample: the tick's state, with the command status
+/// of `pilot` now, so refusals during a lockstep wait or a pause reach the
+/// controller without waiting for the next tick.
+pub(crate) fn refreshed(sample: &Telemetry, pilot: Option<&Pilot>) -> Telemetry {
+    let mut s = *sample;
+    if let Some(p) = pilot {
+        s.command = p.command_status();
+    }
+    s
+}
+
+/// Publish `TickEnd` for the current tick (after re-publishing its telemetry).
+pub(crate) fn send_tick_end(publisher: &TickPublisher, clock: &SimClock, params: &SimParams) {
+    let end = TickEnd { tick: clock.tick, sim_time_s: clock.time_s(params) };
+    if let Err(e) = publisher.publish(&end) {
+        eprintln!("[astrum-sim] tick end publish failed for tick {}: {e}", clock.tick);
+    }
+}
+
+/// Close a tick that published telemetry with its `TickEnd`, after the tick's
+/// events ([`crate::events::publish_events`] runs first).
+pub fn publish_tick_end(
+    publisher: Option<NonSend<TickPublisher>>,
+    clock: Res<SimClock>,
+    params: Res<SimParams>,
+    mut publication: ResMut<TickPublication>,
+) {
+    if !std::mem::take(&mut publication.end_pending) {
+        return;
+    }
+    if let Some(p) = publisher {
+        send_tick_end(&p, &clock, &params);
+    }
+}
 
 /// Command refusals since the last report, by aircraft id.
 #[derive(Resource, Debug, Default)]
@@ -112,11 +163,12 @@ impl RefusalLog {
     }
 }
 
-/// Build one aircraft's telemetry sample.
+/// Build one aircraft's telemetry sample; `dt` is the sim step (s).
 #[allow(clippy::too_many_arguments)]
 pub fn telemetry(
     tick: u64,
     sim_time_s: f64,
+    dt: f64,
     ac: &Aircraft,
     st: &AircraftState,
     kind: &VehicleKind,
@@ -151,6 +203,8 @@ pub fn telemetry(
             alive: !dead,
             ammo: gun.map_or(0, |g| g.ammo),
         },
+        control_period_s: pilot.control_period_ticks as f64 * dt,
+        command: pilot.command_status(),
     }
 }
 
@@ -172,8 +226,8 @@ pub type TelemetryQuery<'w, 's> = Query<
 
 /// Assemble this tick's telemetry into [`LastPublished`] (every aircraft, every
 /// tick), record all of it, and publish the samples of aircraft whose control
-/// tick this is (`control_rate_hz`; default every tick). Each published or
-/// recorded sample is encoded once.
+/// tick this is (`control_rate_hz`; default every tick), noting them in
+/// [`TickPublication`]. Each published or recorded sample is encoded once.
 #[allow(clippy::too_many_arguments)]
 pub fn publish_telemetry(
     publisher: Option<NonSendMut<TelemetryPublisher>>,
@@ -182,14 +236,16 @@ pub fn publish_telemetry(
     clock: Res<SimClock>,
     mut status: ResMut<SimStatus>,
     mut last: ResMut<LastPublished>,
+    mut publication: ResMut<TickPublication>,
     mut due: Local<Vec<(u32, bool)>>,
     q: TelemetryQuery,
 ) {
     let t = clock.time_s(&params);
     last.0.clear();
     due.clear();
+    publication.ids.clear();
     for (ac, st, kind, pilot, team, hp, gun, dead) in &q {
-        last.0.push(telemetry(clock.tick, t, ac, st, kind, pilot, team, hp, gun, dead));
+        last.0.push(telemetry(clock.tick, t, params.dt, ac, st, kind, pilot, team, hp, gun, dead));
         due.push((ac.id, pilot.due(clock.tick)));
     }
     last.0.sort_unstable_by_key(|s| s.aircraft_id);
@@ -216,6 +272,7 @@ pub fn publish_telemetry(
             None => Some(payload),
         };
         if let (Some(p), Some(payload)) = (publisher.as_mut(), to_publish) {
+            publication.ids.push(s.aircraft_id);
             if let Err(e) = p.publish_raw(s.aircraft_id, payload) {
                 eprintln!(
                     "[astrum-sim] telemetry publish failed for aircraft {}: {e}",
@@ -224,6 +281,7 @@ pub fn publish_telemetry(
             }
         }
     }
+    publication.end_pending = !publication.ids.is_empty();
 }
 
 /// Record a received command (as decoded) when recording.
@@ -317,9 +375,17 @@ fn lost_lockstep(id: u32) -> String {
     format!("lockstep: the controller for aircraft {id} disconnected")
 }
 
-/// How often a lockstep wait re-sends the last telemetry, so a controller that
-/// subscribed late (or lost a sample) still gets the tick it must answer.
+/// How often a lockstep wait re-sends the tick's telemetry, so a controller
+/// that subscribed late (or lost a sample) still gets the tick it must answer —
+/// and every other sample of that tick (a follower needs its leader's).
 const LOCKSTEP_REPUBLISH: Duration = Duration::from_millis(100);
+
+/// The components a command is applied to.
+type CommandQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Pilot, Option<&'static mut Trigger>, &'static VehicleKind, Has<Dead>),
+>;
 
 /// Apply one received command; returns the aircraft id and the telemetry tick
 /// it answered if it was applied.
@@ -328,7 +394,7 @@ fn apply_received(
     now: u64,
     lease: Option<u64>,
     index: &AircraftIndex,
-    q: &mut Query<(&mut Pilot, Option<&mut Trigger>, Has<Dead>)>,
+    q: &mut CommandQuery,
     log: &mut RefusalLog,
 ) -> Option<(u32, u64)> {
     let cmd = match received {
@@ -339,14 +405,14 @@ fn apply_received(
         }
     };
     let found = index.0.get(&cmd.target_id).and_then(|e| q.get_mut(*e).ok());
-    let Some((mut pilot, trigger, dead)) = found else {
+    let Some((mut pilot, trigger, kind, dead)) = found else {
         log.refuse(cmd.target_id, &Refusal::UnknownAircraft { id: cmd.target_id });
         return None;
     };
     if dead {
         return None; // a wreck takes no commands
     }
-    match apply_command(&mut pilot, trigger.map(|t| t.into_inner()), &cmd, now, lease) {
+    match apply_command(&mut pilot, trigger.map(|t| t.into_inner()), *kind, &cmd, now, lease) {
         Ok(()) => Some((cmd.target_id, cmd.telemetry_tick)),
         Err(why) => {
             log.refuse(cmd.target_id, &why);
@@ -356,14 +422,16 @@ fn apply_received(
 }
 
 /// Commands that arrived while paused, for the next tick: the latest per
-/// aircraft. A paused sim keeps re-sending telemetry and controllers answer
-/// every copy, so the bus queue would otherwise grow for as long as the pause
-/// lasts (and, once full, stall Zenoh's receive path).
+/// aircraft and epoch (so a non-owner's command cannot displace the owner's).
+/// A paused sim keeps re-sending telemetry and controllers answer every copy,
+/// so the bus queue would otherwise grow for as long as the pause lasts (and,
+/// once full, stall Zenoh's receive path).
 #[derive(Resource, Debug, Default)]
 pub struct HeldCommands(Vec<Command>);
 
 /// While paused, take commands off the bus as they arrive (recorded and
-/// checked as usual), keeping the latest per aircraft for the next tick.
+/// checked as usual), keeping the latest per aircraft and epoch for the next
+/// tick.
 pub fn hold_commands(
     receiver: Option<NonSend<CommandReceiver>>,
     recorder: Option<Res<TickRecorder>>,
@@ -376,7 +444,7 @@ pub fn hold_commands(
         record_received(recorder.as_deref(), &r, &mut status);
         match r {
             Ok(cmd) => {
-                held.0.retain(|c| c.target_id != cmd.target_id);
+                held.0.retain(|c| (c.target_id, c.epoch) != (cmd.target_id, cmd.epoch));
                 held.0.push(cmd);
             }
             Err(reject) => log.reject(&reject),
@@ -388,11 +456,12 @@ pub fn hold_commands(
 const LOCKSTEP_POLL: Duration = Duration::from_millis(20);
 
 /// Apply the commands held over a pause, then drain queued ones, in arrival
-/// order (the latest command per aircraft wins). In a lockstep scenario, then
-/// block until every living lockstep aircraft due a command this tick (see
-/// `control_rate_hz`) has one answering it, re-sending that telemetry while
-/// waiting. Too long a wait, or the controller of an awaited aircraft going
-/// away, is fatal; a stop request ends the wait.
+/// order (the owner's latest command wins). In a lockstep scenario, then block
+/// until every living lockstep aircraft due a command this tick (see
+/// `control_rate_hz`) has an applied one answering it, re-sending the tick's
+/// telemetry (every sample it published) and its `TickEnd` while waiting. Too
+/// long a wait, or the controller of an awaited aircraft going away, is fatal;
+/// a stop request ends the wait.
 #[allow(clippy::too_many_arguments)]
 pub fn ingest_commands(
     mut bus: Bus,
@@ -400,6 +469,7 @@ pub fn ingest_commands(
     stop: Option<Res<StopRequested>>,
     mode: Res<RunMode>,
     last: Res<LastPublished>,
+    publication: Res<TickPublication>,
     params: Res<SimParams>,
     clock: Res<SimClock>,
     index: Res<AircraftIndex>,
@@ -408,7 +478,7 @@ pub fn ingest_commands(
     mut status: ResMut<SimStatus>,
     mut log: ResMut<RefusalLog>,
     mut held: ResMut<HeldCommands>,
-    mut q: Query<(&mut Pilot, Option<&mut Trigger>, Has<Dead>)>,
+    mut q: CommandQuery,
 ) {
     let Some(rx) = bus.receiver.as_deref() else { return };
     let recorder = recorder.as_deref();
@@ -435,18 +505,17 @@ pub fn ingest_commands(
     }
 
     if params.lockstep {
-        let pending =
-            |answered: &BTreeSet<u32>, q: &Query<(&mut Pilot, Option<&mut Trigger>, Has<Dead>)>| {
-                index
-                    .0
-                    .iter()
-                    .filter(|(id, e)| {
-                        q.get(**e).is_ok_and(|(p, _, dead)| p.lockstep && !dead && p.due(now))
-                            && !answered.contains(id)
-                    })
-                    .map(|(id, _)| *id)
-                    .collect::<BTreeSet<u32>>()
-            };
+        let pending = |answered: &BTreeSet<u32>, q: &CommandQuery| {
+            index
+                .0
+                .iter()
+                .filter(|(id, e)| {
+                    q.get(**e).is_ok_and(|(p, _, _, dead)| p.lockstep && !dead && p.due(now))
+                        && !answered.contains(id)
+                })
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<u32>>()
+        };
         let deadline = Instant::now() + Duration::from_secs_f64(params.lockstep_timeout_s);
         let mut waiting = pending(&answered, &q);
         let mut republished = Instant::now();
@@ -491,9 +560,13 @@ pub fn ingest_commands(
                 if let Some(b) = &bus.board {
                     b.show_waiting(&waiting);
                 }
-                if let Some(p) = bus.publisher.as_mut() {
-                    for s in last.0.iter().filter(|s| waiting.contains(&s.aircraft_id)) {
-                        let _ = p.publish(s);
+                if let Some(publisher) = bus.publisher.as_mut() {
+                    for s in last.0.iter().filter(|s| publication.ids.contains(&s.aircraft_id)) {
+                        let pilot = index.0.get(&s.aircraft_id).and_then(|e| q.get(*e).ok());
+                        let _ = publisher.publish(&refreshed(s, pilot.map(|(p, ..)| p)));
+                    }
+                    if let Some(t) = &bus.tick {
+                        send_tick_end(t, &clock, &params);
                     }
                 }
             }

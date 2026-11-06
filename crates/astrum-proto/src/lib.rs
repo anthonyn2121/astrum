@@ -3,8 +3,9 @@
 //! encode/decode helpers so the rest of the workspace never touches capnp
 //! builders directly.
 //!
-//! Three payloads: [`Telemetry`] (sim → subscribers), [`Command`] (controllers →
-//! sim) and [`Event`] (sim → subscribers: hits, kills, mode changes, ...).
+//! Four payloads: [`Telemetry`] (sim → subscribers), [`Command`] (controllers →
+//! sim), [`Event`] (sim → subscribers: hits, kills, mode changes, ...) and
+//! [`TickEnd`] (sim → subscribers: the end of a tick's publications).
 //! Decoding reads straight from the payload slice (no segment copy) and rejects
 //! trailing bytes. Enum values from a newer schema decode to an `Unknown(n)`
 //! variant instead of being silently mapped to a known one.
@@ -115,6 +116,55 @@ pub struct Telemetry {
     pub vehicle_kind: VehicleKind,
     pub control_mode: ControlMode,
     pub combat: CombatStatus,
+    /// Sim time between this aircraft's telemetry samples (s).
+    pub control_period_s: f64,
+    /// Ownership and command refusals.
+    pub command: CommandStatus,
+}
+
+/// Why the sim refused a command. Mirrors the schema's `Refusal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Refusal {
+    /// No command refused yet.
+    #[default]
+    None,
+    /// `telemetry_tick` is ahead of the sim.
+    FromTheFuture,
+    /// `telemetry_tick` is older than the command lease.
+    Stale,
+    /// `seq` not above the owner's last applied seq.
+    OutOfOrder,
+    /// Another controller instance (epoch) owns the aircraft.
+    NotOwner,
+    /// Epoch 0.
+    MissingEpoch,
+    /// A NaN / infinite autopilot target.
+    NonFinite,
+    /// Raw on a multirotor, or multirotor on a fixed-wing.
+    WrongVehicleKind,
+    /// A value this build's schema does not know (sent by a newer peer).
+    Unknown(u16),
+}
+
+/// The sim's command bookkeeping for one aircraft. Mirrors `CommandStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommandStatus {
+    /// Epoch of the controller flying it; 0 = unowned.
+    pub owner_epoch: u64,
+    /// Seq of the owner's last applied command; 0 = none.
+    pub last_seq: u64,
+    /// Commands refused for this aircraft so far (wraps).
+    pub refusals: u32,
+    pub last_refusal: Refusal,
+    /// The epoch that sent the most recently refused command.
+    pub last_refused_epoch: u64,
+}
+
+/// The end of a tick's publications on `astrum/tick`. Mirrors `TickEnd`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TickEnd {
+    pub tick: u64,
+    pub sim_time_s: f64,
 }
 
 /// Raw actuator setpoints: surfaces in [-1, 1], throttle in [0, 1].
@@ -134,22 +184,36 @@ pub struct AutopilotTargets {
     pub tas_mps: f64,
 }
 
+/// Raw multirotor demands: body-rate demands in [-1, 1], collective in [0, 1].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MultirotorRaw {
+    pub roll_rate: f64,
+    pub pitch_rate: f64,
+    pub yaw_rate: f64,
+    pub collective: f64,
+}
+
 /// The control payload of a [`Command`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Control {
+    /// Fixed-wing aircraft only.
     Raw(RawActuators),
     Autopilot(AutopilotTargets),
+    /// Multirotor aircraft only.
+    Multirotor(MultirotorRaw),
 }
 
 /// A command for one aircraft. Mirrors `Command`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Command {
     pub target_id: u32,
-    /// Per-sender, strictly increasing.
+    /// Strictly increasing within one epoch.
     pub seq: u64,
     /// The `Telemetry::tick` this command was computed from.
     pub telemetry_tick: u64,
     pub trigger: bool,
+    /// Random non-zero id of the sending controller instance; 0 is refused.
+    pub epoch: u64,
     pub control: Control,
 }
 
@@ -251,6 +315,22 @@ impl ControlMode {
     }
 }
 
+impl Refusal {
+    pub fn name(self) -> &'static str {
+        match self {
+            Refusal::None => "none",
+            Refusal::FromTheFuture => "from-the-future",
+            Refusal::Stale => "stale",
+            Refusal::OutOfOrder => "out-of-order",
+            Refusal::NotOwner => "not-owner",
+            Refusal::MissingEpoch => "missing-epoch",
+            Refusal::NonFinite => "non-finite",
+            Refusal::WrongVehicleKind => "wrong-vehicle-kind",
+            Refusal::Unknown(_) => "unknown",
+        }
+    }
+}
+
 impl ModeReason {
     pub fn name(self) -> &'static str {
         match self {
@@ -289,7 +369,7 @@ impl EventKind {
     }
 }
 
-/// Room for one whole message in the first segment (Telemetry is ~40 words), so
+/// Room for one whole message in the first segment (Telemetry is ~50 words), so
 /// encoding allocates once instead of zero-filling capnp's default 8 KiB segment.
 const FIRST_SEGMENT_WORDS: u32 = 64;
 
@@ -322,7 +402,8 @@ fn get_enu(r: wire::enu::Reader) -> Enu {
 /// Serialise telemetry to one flat Cap'n Proto message.
 ///
 /// # Panics
-/// If `vehicle_kind` or `control_mode` is `Unknown(_)` (only produced by decoding).
+/// If `vehicle_kind`, `control_mode` or `command.last_refusal` is `Unknown(_)`
+/// (only produced by decoding).
 pub fn encode_telemetry(t: &Telemetry) -> Vec<u8> {
     let mut msg = builder();
     {
@@ -384,6 +465,15 @@ pub fn encode_telemetry(t: &Telemetry) -> Vec<u8> {
             c.set_alive(t.combat.alive);
             c.set_ammo(t.combat.ammo);
         }
+        b.set_control_period_s(t.control_period_s);
+        {
+            let mut s = b.reborrow().init_command();
+            s.set_owner_epoch(t.command.owner_epoch);
+            s.set_last_seq(t.command.last_seq);
+            s.set_refusals(t.command.refusals);
+            s.set_last_refusal(wire_refusal(t.command.last_refusal));
+            s.set_last_refused_epoch(t.command.last_refused_epoch);
+        }
     }
     serialize::write_message_to_words(&msg)
 }
@@ -398,6 +488,7 @@ pub fn decode_telemetry(bytes: &[u8]) -> capnp::Result<Telemetry> {
     let rates = r.get_body_rates()?;
     let aero = r.get_aero()?;
     let combat = r.get_combat()?;
+    let command = r.get_command()?;
     Ok(Telemetry {
         aircraft_id: r.get_aircraft_id(),
         tick: r.get_tick(),
@@ -439,6 +530,14 @@ pub fn decode_telemetry(bytes: &[u8]) -> capnp::Result<Telemetry> {
             alive: combat.get_alive(),
             ammo: combat.get_ammo(),
         },
+        control_period_s: r.get_control_period_s(),
+        command: CommandStatus {
+            owner_epoch: command.get_owner_epoch(),
+            last_seq: command.get_last_seq(),
+            refusals: command.get_refusals(),
+            last_refusal: refusal_of(command.get_last_refusal()),
+            last_refused_epoch: command.get_last_refused_epoch(),
+        },
     })
 }
 
@@ -451,6 +550,7 @@ pub fn encode_command(c: &Command) -> Vec<u8> {
         b.set_seq(c.seq);
         b.set_telemetry_tick(c.telemetry_tick);
         b.set_trigger(c.trigger);
+        b.set_epoch(c.epoch);
         let ctrl = b.init_control();
         match c.control {
             Control::Raw(r) => {
@@ -465,6 +565,13 @@ pub fn encode_command(c: &Command) -> Vec<u8> {
                 w.set_heading_rad(a.heading_rad);
                 w.set_alt_hae_m(a.alt_hae_m);
                 w.set_tas_mps(a.tas_mps);
+            }
+            Control::Multirotor(m) => {
+                let mut w = ctrl.init_multirotor();
+                w.set_roll_rate(m.roll_rate);
+                w.set_pitch_rate(m.pitch_rate);
+                w.set_yaw_rate(m.yaw_rate);
+                w.set_collective(m.collective);
             }
         }
     }
@@ -494,14 +601,70 @@ pub fn decode_command(bytes: &[u8]) -> capnp::Result<Command> {
                 tas_mps: a.get_tas_mps(),
             })
         }
+        Which::Multirotor(m) => {
+            let m = m?;
+            Control::Multirotor(MultirotorRaw {
+                roll_rate: m.get_roll_rate(),
+                pitch_rate: m.get_pitch_rate(),
+                yaw_rate: m.get_yaw_rate(),
+                collective: m.get_collective(),
+            })
+        }
     };
     Ok(Command {
         target_id: c.get_target_id(),
         seq: c.get_seq(),
         telemetry_tick: c.get_telemetry_tick(),
         trigger: c.get_trigger(),
+        epoch: c.get_epoch(),
         control,
     })
+}
+
+/// Serialise a tick end to one flat Cap'n Proto message.
+pub fn encode_tick_end(t: &TickEnd) -> Vec<u8> {
+    let mut msg = builder();
+    {
+        let mut b = msg.init_root::<wire::tick_end::Builder>();
+        b.set_tick(t.tick);
+        b.set_sim_time_s(t.sim_time_s);
+    }
+    serialize::write_message_to_words(&msg)
+}
+
+/// Deserialise a tick end.
+pub fn decode_tick_end(bytes: &[u8]) -> capnp::Result<TickEnd> {
+    let msg = reader(bytes)?;
+    let r = msg.get_root::<wire::tick_end::Reader>()?;
+    Ok(TickEnd { tick: r.get_tick(), sim_time_s: r.get_sim_time_s() })
+}
+
+fn wire_refusal(r: Refusal) -> wire::Refusal {
+    match r {
+        Refusal::None => wire::Refusal::None,
+        Refusal::FromTheFuture => wire::Refusal::FromTheFuture,
+        Refusal::Stale => wire::Refusal::Stale,
+        Refusal::OutOfOrder => wire::Refusal::OutOfOrder,
+        Refusal::NotOwner => wire::Refusal::NotOwner,
+        Refusal::MissingEpoch => wire::Refusal::MissingEpoch,
+        Refusal::NonFinite => wire::Refusal::NonFinite,
+        Refusal::WrongVehicleKind => wire::Refusal::WrongVehicleKind,
+        Refusal::Unknown(n) => panic!("cannot encode Refusal value {n} unknown to this schema"),
+    }
+}
+
+fn refusal_of(r: Result<wire::Refusal, capnp::NotInSchema>) -> Refusal {
+    match r {
+        Ok(wire::Refusal::None) => Refusal::None,
+        Ok(wire::Refusal::FromTheFuture) => Refusal::FromTheFuture,
+        Ok(wire::Refusal::Stale) => Refusal::Stale,
+        Ok(wire::Refusal::OutOfOrder) => Refusal::OutOfOrder,
+        Ok(wire::Refusal::NotOwner) => Refusal::NotOwner,
+        Ok(wire::Refusal::MissingEpoch) => Refusal::MissingEpoch,
+        Ok(wire::Refusal::NonFinite) => Refusal::NonFinite,
+        Ok(wire::Refusal::WrongVehicleKind) => Refusal::WrongVehicleKind,
+        Err(capnp::NotInSchema(n)) => Refusal::Unknown(n),
+    }
 }
 
 fn wire_control_mode(m: ControlMode) -> wire::ControlMode {

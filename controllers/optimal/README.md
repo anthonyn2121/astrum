@@ -1,43 +1,38 @@
-# ASTRUM optimal-control controllers (LQR / MPC)
+# ASTRUM optimal-control laws (LQR / MPC / figure-eight / formation)
 
-A clean-API scaffold for developing **your own** control laws — LQR, MPC, or
-whatever else — against `astrum-sim`. Unlike the minimal
-[`controllers/cpp`](../cpp) / [`controllers/python`](../python) examples (one file,
-one hard-coded hold law), this splits the code in two:
-
-- a **runtime** that owns everything you shouldn't have to think about — the one
-  `mode=client` Zenoh session to the sim (the router), the Cap'n Proto codec, decoding telemetry into a
-  clean state object, latest-value subscriptions, the vehicle-kind check, output
-  saturation, command `seq`/`telemetryTick`, and the startup/staleness timeouts;
-- **laws** — the only files you write. A law maps a `VehicleState` + `Reference`
-  to a control, and nothing else. No Zenoh, no Cap'n Proto, no wire.
+Control laws for developing **your own** controllers — LQR, MPC, or whatever else —
+against `astrum-sim`, on the SDK runtime ([`controllers/README.md`](../README.md)). The
+runtime owns everything you shouldn't have to think about: the one `mode=client` Zenoh
+session to the sim, the Cap'n Proto codec, latest-value telemetry and the fleet snapshot,
+events, command ownership, `epoch`/`seq`/`telemetryTick`, the vehicle-kind check, output
+saturation and the timeouts. A **law** maps a `StepInput` (the vehicle state, the fleet, the
+tick's events, the control period) to an `Action`, and nothing else — no Zenoh, no
+Cap'n Proto, no wire.
 
 Both languages share the same shape, so you can prototype a law in Python and port
 it to C++ (or vice versa) with the same mental model.
 
 ```
 controllers/optimal/
-├── python/                 # the `astrum_optimal` package (built on controllers/python's astrum_client)
-│   ├── run.py              # entry point: `--law <name>` selects a law
+├── python/                 # the `astrum_optimal` law pack (on controllers/python's astrum_client)
+│   ├── run.py              # entry point: the law table {lqr, mpc, figure8, formation} → run_main
 │   ├── pyproject.toml
-│   ├── tests/              # pytest: laws, MPC/LQR, formation, runtime
+│   ├── tests/              # pytest: laws, MPC/LQR, formation, the law table
 │   └── astrum_optimal/
-│       ├── runtime.py      # Law base class, Reference, flags, main()
 │       ├── linear.py       # ZOH discretization, dlqr, ChannelMPC
 │       └── laws/
 │           ├── _fixed_wing.py  # linear model + limited three-channel feedback (shared)
 │           ├── _guidance.py    # grid-track -> true-heading helpers (shared)
-│           ├── lqr.py          # LQR law   (edit me)
-│           ├── mpc.py          # MPC law   (edit me)
-│           ├── figure8.py      # leader guidance: fly a figure-eight
-│           └── formation.py    # follower: decentralized formation-keeping MPC
-└── cpp/                    # astrum-optimal-controller (built from controllers/, on controllers/common/cpp)
+│           ├── lqr.py          # LqrLaw   (edit me)
+│           ├── mpc.py          # MpcLaw   (edit me)
+│           ├── figure8.py      # Figure8Law: leader guidance, fly a figure-eight
+│           └── formation.py    # FormationLaw: follower, decentralized formation-keeping MPC
+└── cpp/                    # astrum-optimal-controller (built from controllers/, on astrum::runtime)
     ├── include/
-    │   ├── astrum_control.hpp  # the law API: Law, LawConfig
-    │   ├── laws.hpp            # law factories
+    │   ├── laws.hpp            # law factories + LawEntry for each law
     │   ├── attitude_axes.hpp   # per-axis models + LQR weights shared by lqr/mpc (edit me)
     │   └── optimal_math.hpp    # ZOH axis model, dlqr (reports non-convergence), box QP
-    ├── src/runtime.cpp     # CLI, law factory, kind/rate checks, main
+    ├── src/main.cpp        # the law table {lqr, mpc} → astrum::run_main
     ├── laws/
     │   ├── lqr.cpp         # LQR law   (edit me)
     │   └── mpc.cpp         # MPC law   (edit me)
@@ -46,58 +41,75 @@ controllers/optimal/
 
 ## The API
 
-You implement one method. In Python (`astrum_optimal/laws/<name>.py`):
+In Python, a law is a `astrum_client.runtime.Law` subclass:
 
 ```python
-from astrum_client.wire import RawActuators, VehicleKind
-from astrum_optimal.runtime import Law as BaseLaw
+from astrum_client.runtime import Law, StepInput
+from astrum_client.wire import Action, RawActuators, VehicleKind
 
 
-class Law(BaseLaw):
+class RollLeveller(Law):
     vehicle_kinds = frozenset({VehicleKind.FIXED_WING})  # anything else is refused
 
-    def control(self, s, ref, fleet):
-        aileron = -1.5 * s.roll  # your control law here
-        return RawActuators(aileron=aileron, elevator=0.0, rudder=0.0, throttle=0.6)
+    @classmethod
+    def from_args(cls, args):  # args.reference / args.limits / your add_args flags
+        return cls(gain=1.5)
+
+    def __init__(self, gain: float):
+        self.gain = gain
+
+    def configure(self, control_period_s: float) -> None:
+        self.dt = control_period_s  # design your gains here
+
+    def step(self, inp: StepInput) -> Action:
+        s = inp.state
+        return Action(RawActuators(aileron=-self.gain * s.roll, throttle=0.6))
 ```
 
-`configure(control_period_s)` is called once before the first `control()` (design
-your gains there); `fleet.latest(id)` returns any aircraft's newest state for a law
-that sets `needs_fleet = True`.
+`configure(dt)` is called once, before the first `step`, with the telemetry's control
+period. A law that sets `needs_fleet = True` reads any aircraft's state from `inp.fleet`
+(a snapshot taken after the tick's `TickEnd`, so it holds the same tick for every aircraft);
+`inp.events` carries the events of earlier ticks not yet delivered; `Action(..., trigger=True)`
+fires the gun. Raise `Stop(reason)` to refuse the aircraft. Register the class in `run.py`'s
+`LAWS` table.
 
-In C++ (a `class MyLaw : public astrum::Law` in `laws/<name>.cpp`, its factory in
-`laws.hpp`, and a line in `make_law()`):
+In C++, a `class MyLaw : public astrum::Law` with a `LawEntry` handed to `run_main` (see
+`src/main.cpp`):
 
 ```cpp
 class MyLaw : public Law {
  public:
-  explicit MyLaw(const LawConfig& config) : outer_(config.limits) {}  // config.dt = 1/--rate-hz
-  VehicleKind vehicle_kind() const override { return VehicleKind::FixedWing; }  // the default
-  Command control(const VehicleState& s, const Reference& ref) override {
-    const AttitudeTargets t = outer_.update(s, ref);  // saturated bank/pitch/throttle targets
-    return Command::raw(/*aileron=*/1.5 * (t.bank_rad - s.roll) - 0.3 * s.p, 0.0, 0.0, t.throttle);
+  explicit MyLaw(const LawContext& ctx) : outer_(ctx.limits), ref_(ctx.reference) {}
+  std::vector<VehicleKind> vehicle_kinds() const override { return {VehicleKind::FixedWing}; }
+  void configure(double dt) override { dt_ = dt; }  // design your gains here
+  LawResult step(const StepInput& in) override {
+    const VehicleState& s = in.state;
+    const AttitudeTargets t = outer_.update(s, ref_);  // saturated bank/pitch/throttle targets
+    return Action{RawActuators{1.5 * (t.bank_rad - s.roll) - 0.3 * s.p, 0.0, 0.0, t.throttle}};
   }
 
  private:
   OuterLoops outer_;
+  Reference ref_;
+  double dt_ = 0.0;
 };
 ```
 
-The C++ runtime is the shared client in [`controllers/common/cpp`](../common/cpp) (the
-same one the example uses): latest-value telemetry, exception-safe decoding, contract
-QoS, `seq`/`telemetryTick`, one command per sample, `--startup-timeout` (exit 1) /
-`--telemetry-timeout` (exit 0). It also exits 2 unless telemetry arrives every
-`1/--rate-hz` (the sim step must divide that period, and samples must come one period
-apart), because the laws are discretized for it.
+The runtime is the SDK in [`controllers/common/cpp`](../common/cpp) — the same one the
+example uses: latest-value telemetry, exception-safe decoding, ownership, one command per
+sample, `--startup-timeout` / `--telemetry-timeout`, and the exit codes of the
+[contract](../README.md#outcomes-and-exit-codes). The control period comes from the
+telemetry (`controlPeriodS`, the aircraft's `control_rate_hz`), so there is no rate flag to
+get wrong.
 
-`VehicleState` is SI units, decoded from telemetry v2 — including the body rates
-`p`/`q`/`r` the sim measures, `alpha`/`beta`, ENU and NED velocities, vehicle kind
-and control mode. `Reference` is the CLI setpoint (true heading, altitude HAE, true
-airspeed). A raw control (`RawActuators` / `Command::raw`) sends actuator
-deflections (you own the loop); an autopilot control (`AutopilotTargets` /
-`Command::autopilot`) hands a high-level target to the sim's built-in inner loop.
-The runtime sends one command per telemetry tick, saturates every channel, and
-refuses (exit 2) a vehicle kind the law does not list.
+`VehicleState` is SI units, decoded from telemetry v3 — including the body rates
+`p`/`q`/`r` the sim measures, `alpha`/`beta`, ENU and NED velocities, vehicle kind,
+control mode and command status. `Reference` is the CLI setpoint (true heading, altitude
+HAE, true airspeed). A raw control (`RawActuators`, or `MultirotorRaw` for a multirotor)
+sends actuator commands (you own the loop); an autopilot control (`AutopilotTargets`) hands a
+high-level target to the sim's built-in inner loop. The runtime sends one command per
+telemetry tick, saturates every channel, and refuses (exit 2) a vehicle kind the law does not
+list.
 
 ## What ships
 
@@ -105,7 +117,7 @@ Both `lqr` and `mpc` fly out of the box. In Python they share
 `laws/_fixed_wing.py`: a linear fixed-wing model (lateral `[psi_err, phi, p]`
 with heading rate `(g/V) phi`, longitudinal `[int h_err, h_err, theta, q]` with
 climb rate `V theta`, speed `[int v_err, v_err]`) discretized exactly (ZOH) at the
-control period `1/--rate-hz`. The gains are applied with **limits**: the outer
+control period (the telemetry's `controlPeriodS`). The gains are applied with **limits**: the outer
 states set a bank/pitch reference clamped to `--max-bank-deg` / `--max-pitch-deg`
 (defaults 25 / 10 for the c172x trainer; the f16 takes 60 / 24), every actuator is
 saturated, and the heading/altitude/airspeed integrators use conditional-integration
@@ -130,12 +142,12 @@ clamped to `±--max-pitch-deg`) and the airspeed error into throttle (PI, `[0, 1
 with conditional-integration anti-windup on all three integrators. The inner loop
 regulates `x = [angle − target, body rate]` per axis
 (roll → aileron, pitch → elevator) on the model in `include/attitude_axes.hpp`,
-`rate' = −damping·rate + gain·u`, discretized exactly (ZOH) at `dt = 1/--rate-hz`:
+`rate' = −damping·rate + gain·u`, discretized exactly (ZOH) at the control period `dt`:
 
-- **`lqr`** — `u = −K x` with `K = dlqr(A, B, Q, R)` computed at startup by the Riccati
-  recursion; non-convergence aborts startup (exit 1) instead of flying an unconverged
-  gain. Outputs are clamped to the actuator ranges.
-- **`mpc`** — a receding-horizon QP per axis over `N = round(--horizon-s · rate)` steps
+- **`lqr`** — `u = −K x` with `K = dlqr(A, B, Q, R)` computed in `configure()` by the Riccati
+  recursion; non-convergence ends the run (law fault, exit 3) instead of flying an
+  unconverged gain. Outputs are clamped to the actuator ranges.
+- **`mpc`** — a receding-horizon QP per axis over `N = round(--horizon-s / dt)` steps
   of `dt` (C++ default `--horizon-s 0.5`, i.e. 60 steps at 120 Hz) with the DARE
   solution as terminal cost, so with no active limit its first move equals the LQR
   law's exactly (tested). When the plan would exceed `|u| ≤ 1` it solves the
@@ -152,7 +164,7 @@ regulates `x = [angle − target, body rate]` per axis
   paces its reference point by *arc length flown*, so the reference stays abreast
   of the aircraft whatever speed it actually makes good.
 - **`formation`** flies each of the 3 *followers*, independently. A follower
-  watches only the leader's broadcast telemetry, places its slot (left / right /
+  reads only the leader's broadcast telemetry (from the fleet snapshot), places its slot (left / right /
   trail) in the leader's ground-track frame, and drives its slot error to zero with
   a per-axis receding-horizon MPC (`ChannelMPC`) on the motion *relative* to the
   slot. The slot velocity and acceleration come from the leader's own velocity and
@@ -185,7 +197,7 @@ Python needs no build:
 
 ```bash
 python controllers/optimal/python/run.py --law lqr --id 1 --heading 90
-python controllers/optimal/python/run.py --law mpc --horizon-s 6
+python controllers/optimal/python/run.py --law mpc --id 1 --horizon-s 6
 python -m pytest -q controllers/optimal/python
 ```
 
@@ -196,15 +208,15 @@ C++ is part of the one CMake project rooted at `controllers/` (see
 cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release
 cmake --build build/controllers -j
 ctest --test-dir build/controllers --output-on-failure
-./build/controllers/optimal/cpp/astrum-optimal-controller --law lqr --heading 90
-./build/controllers/optimal/cpp/astrum-optimal-controller --law mpc --rate-hz 120 --horizon-s 0.5
+./build/controllers/optimal/cpp/astrum-optimal-controller --law lqr --id 1 --heading 90
+./build/controllers/optimal/cpp/astrum-optimal-controller --law mpc --id 1 --horizon-s 0.5
 ```
 
-C++ flags: `--law lqr|mpc` (`ASTRUM_LAW`), the client and reference flags of the
-example (`--connect --id --heading --alt --speed --startup-timeout --telemetry-timeout`),
-`--max-bank-deg` / `--max-pitch-deg` (25 / 10; f16: 60 / 24), `--rate-hz` (`ASTRUM_RATE_HZ`,
-default 120 — the aircraft's control rate: its `control_rate_hz` in the scenario, which
-defaults to `sim.rate_hz`) and `--horizon-s` (mpc only).
+Flags: the [shared ones](../README.md#flags) (`--law`, `--id` (required), `--connect`,
+`--heading`, `--alt`, `--speed`, `--max-bank-deg` / `--max-pitch-deg` (25 / 10; f16: 60 / 24),
+`--startup-timeout`, `--telemetry-timeout`) plus each law's own: `--horizon-s` (mpc,
+`ASTRUM_MPC_HORIZON_S`), and in Python `figure8`'s `--fig-*` and `formation`'s `--leader`,
+`--slot*`, ….
 
 `--help` lists every flag with its `ASTRUM_*` env fallback (precedence: **CLI arg >
 `$ENV` > default**, as everywhere in ASTRUM). Start a sim in another shell first,
@@ -223,10 +235,11 @@ Both are wired into `docker/Dockerfile`.
 
 ## Adding a law
 
-1. **Python:** drop `astrum_optimal/laws/<name>.py` exposing a `Law(BaseLaw)` with
-   `vehicle_kinds` and `control()` (and `configure()` if it designs gains);
-   optionally an `add_args(parser)` hook for law-specific flags. Run it with
-   `run.py --law <name>`.
-2. **C++:** add `laws/<name>.cpp` with a `class : public Law`, declare its factory
-   in `include/laws.hpp`, wire it into `make_law()` in `src/runtime.cpp`, and add the
-   source to `astrum_laws` in `CMakeLists.txt`.
+1. **Python:** write a `Law` subclass (in `astrum_optimal/laws/<name>.py`, or anywhere on
+   your `PYTHONPATH`) with `vehicle_kinds`, `from_args`, `step` (and `configure()` if it
+   designs gains, `add_args(parser)` for its own flags), and add it to `LAWS` in `run.py` —
+   or hand your own table to `astrum_client.runtime.run_main` from your own script.
+2. **C++:** add `laws/<name>.cpp` with a `class : public Law` and a `LawEntry` (declared in
+   `include/laws.hpp`), add the entry to the table in `src/main.cpp`, and the source to
+   `CMakeLists.txt` — or build your own program against an installed SDK
+   ([`controllers/examples/out_of_tree`](../examples/out_of_tree)).

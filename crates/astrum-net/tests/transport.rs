@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use astrum_net::{
     fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, ScenarioServer,
-    Selection, Session, TelemetryPublisher,
+    Selection, Session, TelemetryPublisher, TickPublisher, TickReceiver,
 };
-use astrum_proto::{encode_command, Command, Control, RawActuators, Telemetry};
+use astrum_proto::{encode_command, Command, Control, RawActuators, Telemetry, TickEnd};
 use zenoh::Wait;
 
 fn sample(id: u32, tick: u64) -> Telemetry {
@@ -20,7 +20,7 @@ fn raw(a: f64) -> Control {
 }
 
 #[test]
-fn commands_arrive_in_order_with_increasing_seq() {
+fn commands_arrive_in_order_with_increasing_seq_and_the_senders_epoch() {
     let session = Session::in_process().unwrap();
     let rx = CommandReceiver::bind(&session).unwrap();
     let mut tx = CommandSender::new(&session, 42).unwrap();
@@ -39,6 +39,16 @@ fn commands_arrive_in_order_with_increasing_seq() {
     assert_eq!(got.iter().map(|c| c.telemetry_tick).collect::<Vec<_>>(), vec![100, 101, 102]);
     assert!(got[2].trigger && !got[0].trigger);
     assert!(got.iter().all(|c| c.target_id == 42));
+    assert_ne!(tx.epoch(), 0);
+    assert!(got.iter().all(|c| c.epoch == tx.epoch()));
+}
+
+#[test]
+fn every_sender_gets_its_own_epoch() {
+    let session = Session::in_process().unwrap();
+    let a = CommandSender::new(&session, 1).unwrap();
+    let b = CommandSender::new(&session, 1).unwrap();
+    assert_ne!(a.epoch(), b.epoch());
 }
 
 #[test]
@@ -46,8 +56,14 @@ fn command_whose_payload_disagrees_with_its_key_is_rejected() {
     let session = Session::in_process().unwrap();
     let rx = CommandReceiver::bind(&session).unwrap();
     // Payload says aircraft 2, key says aircraft 1.
-    let forged =
-        Command { target_id: 2, seq: 1, telemetry_tick: 0, trigger: false, control: raw(0.0) };
+    let forged = Command {
+        target_id: 2,
+        seq: 1,
+        telemetry_tick: 0,
+        trigger: false,
+        epoch: 1,
+        control: raw(0.0),
+    };
     let mut got = Vec::new();
     for _ in 0..1000 {
         session.raw().put(keys::command(1), encode_command(&forged)).wait().unwrap();
@@ -116,6 +132,35 @@ fn wait_times_out_without_new_samples() {
     let session = Session::in_process().unwrap();
     let mut sub = LatestTelemetry::subscribe(&session, Selection::Fleet).unwrap();
     assert_eq!(sub.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+#[test]
+fn tick_receiver_returns_the_newest_tick_end() {
+    let session = Session::in_process().unwrap();
+    let publisher = TickPublisher::new(&session).unwrap();
+    let mut rx = TickReceiver::subscribe(&session).unwrap();
+    for _ in 0..1000 {
+        publisher.publish(&TickEnd { tick: 0, sim_time_s: 0.0 }).unwrap();
+        if rx.latest().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rx.wait(Duration::from_secs(1)).unwrap();
+    for tick in 1..=5 {
+        publisher.publish(&TickEnd { tick, sim_time_s: tick as f64 / 120.0 }).unwrap();
+    }
+    for _ in 0..1000 {
+        if rx.latest().map(|t| t.tick) == Some(5) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        rx.wait(Duration::from_secs(1)).unwrap(),
+        TickEnd { tick: 5, sim_time_s: 5.0 / 120.0 }
+    );
+    assert_eq!(rx.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
 }
 
 #[test]

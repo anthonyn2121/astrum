@@ -5,15 +5,20 @@
 use std::path::PathBuf;
 
 use astrum_proto::{
-    Aero, AutopilotTargets, BodyRates, CombatStatus, Command, Control, ControlMode, EndReason, Enu,
-    Euler, Event, EventKind, ModeReason, Ned, RawActuators, Telemetry, VehicleKind,
+    decode_command, decode_event, decode_telemetry, decode_tick_end, encode_command, encode_event,
+    encode_telemetry, encode_tick_end, Aero, AutopilotTargets, BodyRates, CombatStatus, Command,
+    CommandStatus, Control, ControlMode, EndReason, Enu, Euler, Event, EventKind, ModeReason,
+    MultirotorRaw, Ned, RawActuators, Refusal, Telemetry, TickEnd, VehicleKind,
 };
 use serde_json::Value;
 
-pub const KINDS: [&str; 3] = ["telemetry", "command_raw", "command_autopilot"];
-pub const LANGS: [&str; 3] = ["rust", "cpp", "python"];
-/// Event fixtures (the shared event JSON shape); C++ has no Event codec.
-pub const EVENT_KINDS: [&str; 9] = [
+/// Every fixture kind; each is encoded by every language in [`LANGS`].
+pub const KINDS: [&str; 14] = [
+    "telemetry",
+    "command_raw",
+    "command_autopilot",
+    "command_multirotor",
+    "tick_end",
     "event_trigger_pressed",
     "event_trigger_released",
     "event_hit",
@@ -24,7 +29,41 @@ pub const EVENT_KINDS: [&str; 9] = [
     "event_controller_down",
     "event_run_ended",
 ];
-pub const EVENT_LANGS: [&str; 2] = ["rust", "python"];
+pub const LANGS: [&str; 3] = ["rust", "cpp", "python"];
+
+/// The Rust encoding of fixture `kind`.
+pub fn encode(values: &Value, kind: &str) -> Vec<u8> {
+    let v = &values[kind];
+    match kind {
+        "telemetry" => encode_telemetry(&telemetry(v)),
+        "tick_end" => encode_tick_end(&tick_end(v)),
+        k if k.starts_with("command_") => encode_command(&command(v)),
+        k if k.starts_with("event_") => encode_event(&event(v)),
+        other => panic!("unknown fixture kind {other:?}"),
+    }
+}
+
+/// Decode `bytes` as fixture `kind` and compare against its canonical value.
+pub fn check(values: &Value, kind: &str, bytes: &[u8]) -> Result<(), String> {
+    fn cmp<T: PartialEq + std::fmt::Debug>(
+        got: Result<T, astrum_proto::DecodeError>,
+        want: T,
+    ) -> Result<(), String> {
+        match got {
+            Ok(got) if got == want => Ok(()),
+            Ok(got) => Err(format!("decoded {got:?}, want {want:?}")),
+            Err(e) => Err(format!("decode error: {e}")),
+        }
+    }
+    let v = &values[kind];
+    match kind {
+        "telemetry" => cmp(decode_telemetry(bytes), telemetry(v)),
+        "tick_end" => cmp(decode_tick_end(bytes), tick_end(v)),
+        k if k.starts_with("command_") => cmp(decode_command(bytes), command(v)),
+        k if k.starts_with("event_") => cmp(decode_event(bytes), event(v)),
+        other => panic!("unknown fixture kind {other:?}"),
+    }
+}
 
 pub fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -102,7 +141,22 @@ pub fn telemetry(v: &Value) -> Telemetry {
                 ammo: u(c, "ammo") as u16,
             }
         },
+        control_period_s: f(v, "control_period_s"),
+        command: {
+            let c = &v["command"];
+            CommandStatus {
+                owner_epoch: u(c, "owner_epoch"),
+                last_seq: u(c, "last_seq"),
+                refusals: u32::try_from(u(c, "refusals")).expect("refusals must fit in u32"),
+                last_refusal: refusal(c, "last_refusal"),
+                last_refused_epoch: u(c, "last_refused_epoch"),
+            }
+        },
     }
+}
+
+pub fn tick_end(v: &Value) -> TickEnd {
+    TickEnd { tick: u(v, "tick"), sim_time_s: f(v, "sim_time_s") }
 }
 
 pub fn command(v: &Value) -> Command {
@@ -113,6 +167,13 @@ pub fn command(v: &Value) -> Command {
             elevator: f(r, "elevator"),
             rudder: f(r, "rudder"),
             throttle: f(r, "throttle"),
+        })
+    } else if let Some(m) = ctrl.get("multirotor") {
+        Control::Multirotor(MultirotorRaw {
+            roll_rate: f(m, "roll_rate"),
+            pitch_rate: f(m, "pitch_rate"),
+            yaw_rate: f(m, "yaw_rate"),
+            collective: f(m, "collective"),
         })
     } else {
         let a = &ctrl["autopilot"];
@@ -127,6 +188,7 @@ pub fn command(v: &Value) -> Command {
         seq: u(v, "seq"),
         telemetry_tick: u(v, "telemetry_tick"),
         trigger: v["trigger"].as_bool().expect("trigger"),
+        epoch: u(v, "epoch"),
         control,
     }
 }
@@ -169,6 +231,20 @@ fn control_mode(v: &Value, k: &str) -> ControlMode {
 fn mode_reason(v: &Value, k: &str) -> ModeReason {
     let all = [ModeReason::Command, ModeReason::LeaseExpired, ModeReason::ControllerLost];
     named(&all, ModeReason::name, v, k)
+}
+
+fn refusal(v: &Value, k: &str) -> Refusal {
+    let all = [
+        Refusal::None,
+        Refusal::FromTheFuture,
+        Refusal::Stale,
+        Refusal::OutOfOrder,
+        Refusal::NotOwner,
+        Refusal::MissingEpoch,
+        Refusal::NonFinite,
+        Refusal::WrongVehicleKind,
+    ];
+    named(&all, Refusal::name, v, k)
 }
 
 fn end_reason(v: &Value, k: &str) -> EndReason {
