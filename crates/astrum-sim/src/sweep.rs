@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::components::{SimClock, SimParams, SimStatus};
 use crate::record;
@@ -360,8 +360,10 @@ fn check_run(file: &SweepFile, purpose: Purpose, run: &Run) -> Result<(), String
     Ok(())
 }
 
-/// How a run ended.
-#[derive(Debug, Clone, PartialEq)]
+/// How a run ended. Serialised as `{"kind": "ok"}` or `{"kind": "failed" |
+/// "stopped", "reason": "..."}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "lowercase")]
 pub enum Status {
     Ok,
     Failed(String),
@@ -370,7 +372,7 @@ pub enum Status {
 }
 
 /// What one run produced.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Outcome {
     pub status: Status,
     /// Sim time reached, if known.

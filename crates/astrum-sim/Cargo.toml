@@ -41,3 +41,7 @@ ctrlc = { workspace = true }
 libc = "0.2"
 shlex = "2"
 tempfile = "3"
+
+[dev-dependencies]
+# Pin the JSON shape of run outcomes (the web API serves them).
+serde_json = { workspace = true }

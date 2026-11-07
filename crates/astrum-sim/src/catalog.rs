@@ -233,7 +233,7 @@ fn empty() -> Environment {
                 origin_alt_hae_m: 0.0,
             },
             Location {
-                name: "Rosemount, Minnesota",
+                name: "Quadrotor demo origin, Minnesota (44.726° N, 93.076° W)",
                 origin_lat_deg: 44.7258,
                 origin_lon_deg: -93.0759,
                 origin_alt_hae_m: 0.0,

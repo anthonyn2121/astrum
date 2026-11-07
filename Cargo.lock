@@ -240,6 +240,7 @@ dependencies = [
  "ctrlc",
  "libc",
  "serde",
+ "serde_json",
  "shlex",
  "tempfile",
  "toml",

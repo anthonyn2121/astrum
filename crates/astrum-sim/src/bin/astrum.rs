@@ -29,7 +29,7 @@ use std::time::Instant;
 use astrum_sim::catalog;
 use astrum_sim::launch::{
     connect_endpoint, run_processes, run_timeout, sibling, Children, Companion, LiveRun, LiveSpec,
-    Log, ProcessCtx,
+    Log, ProcessCtx, StartError,
 };
 use astrum_sim::sweep::{
     execute, run_in_process, write_summary, Purpose, Status, Sweep, SweepFile,
@@ -286,6 +286,7 @@ fn run(args: &RunArgs) -> ExitCode {
             source: "web".into(),
             program: sibling("astrum-web"),
             args: Vec::new(),
+            announce: Some(format!("viewer: {}", viewer_url())),
         }]
     } else {
         Vec::new()
@@ -306,14 +307,15 @@ fn run(args: &RunArgs) -> ExitCode {
     let file = args.file.display();
     let live = match LiveRun::start(spec, &children) {
         Ok(live) => live,
-        Err(why) => {
+        Err(StartError::Setup(why)) => {
+            eprintln!("[astrum] {why}");
+            return ExitCode::FAILURE;
+        }
+        Err(StartError::Launch(why)) => {
             eprintln!("[astrum] FAILED: {file}: {why}");
             return ExitCode::FAILURE;
         }
     };
-    if args.watch {
-        println!("[astrum] viewer: {}", viewer_url());
-    }
     match live.wait().status {
         Status::Ok => {
             println!("[astrum] ok: {file}");
