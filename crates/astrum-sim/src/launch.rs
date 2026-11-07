@@ -419,6 +419,9 @@ struct Ending {
     problem: Option<String>,
     /// Why the sim was asked to stop: a stop request or the run timeout.
     stopped: Option<String>,
+    /// The sim was asked to stop because of `problem` (fail-fast): however it
+    /// exits then, `problem` is the run's.
+    failed_fast: bool,
     sim: Option<ExitStatus>,
 }
 
@@ -444,6 +447,7 @@ fn supervise(
 ) -> Ending {
     let mut problem: Option<String> = None;
     let mut stopped: Option<String> = None;
+    let mut failed_fast = false;
     let mut companion_gone = vec![false; companions.len()];
     let sim_status = loop {
         match sim.exited() {
@@ -460,6 +464,7 @@ fn supervise(
                 if !status.success() && problem.is_none() {
                     problem = Some(format!("{} exited ({status})", c.name));
                     if how.fail_fast {
+                        failed_fast = true;
                         sim.signal(libc::SIGTERM);
                     }
                 }
@@ -485,15 +490,23 @@ fn supervise(
         }
         std::thread::sleep(POLL);
     };
-    Ending { problem, stopped, sim: sim_status }
+    Ending { problem, stopped, failed_fast, sim: sim_status }
 }
 
 /// A run's status from how it ended; `sim_log` hints where the sim's output is.
 /// A sim that failed by itself (it exits 0 when asked to stop) is the run's
 /// problem even if a controller exited first: a controller that quits on the
-/// sim's `RunEnded(fatal)` must not hide the sim's reason.
+/// sim's `RunEnded(fatal)` must not hide the sim's reason. A sim stopped
+/// because a controller failed (fail-fast) that then exits cleanly or dies of
+/// that SIGTERM (sent before it could handle it) did not fail by itself: the
+/// controller's failure is the run's.
 fn status_of(ending: Ending, sim_log: &str) -> Status {
+    let terminated = |s: &Option<ExitStatus>| {
+        s.is_some_and(|s| s.success() || s.signal() == Some(libc::SIGTERM))
+    };
+    let fail_fast_stop = ending.failed_fast && terminated(&ending.sim);
     match (ending.problem, ending.stopped, ending.sim) {
+        (Some(why), ..) if fail_fast_stop => Status::Failed(why),
         (_, None, Some(s)) if !s.success() => Status::Failed(format!("sim exited ({s}){sim_log}")),
         (Some(why), ..) => Status::Failed(why),
         (None, Some(why), _) => Status::Stopped(why),

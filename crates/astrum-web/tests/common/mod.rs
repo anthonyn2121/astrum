@@ -101,20 +101,28 @@ pub fn app_with_catalogs(tmp: &Path, bridge: Bridge, catalogs: Catalogs) -> Rout
     build(tmp, bridge, &[], catalogs)
 }
 
-/// [`app`] over `catalogs`, its live runs flown by `sim` into `<tmp>/runs`;
-/// also the run manager, for shutting it down.
+/// The `--connect` endpoint of [`app_with_runs`]' runs: where the bridge
+/// goes back to once a run has finished (no sim ever answers there).
+pub const RUNS_CONNECT: &str = "tcp/127.0.0.1:1";
+
+/// [`app`] over `catalogs`, its live runs flown by `sim` into `<tmp>/runs`
+/// (`--connect` = [`RUNS_CONNECT`]); also the run manager, for shutting it
+/// down.
 pub fn app_with_runs(tmp: &Path, bridge: Bridge, catalogs: Catalogs, sim: &Path) -> (Router, Runs) {
-    let runs = Runs::new(RunsConfig { dir: tmp.join("runs"), sim: sim.to_owned() }, bridge.clone());
+    let cfg =
+        RunsConfig { dir: tmp.join("runs"), sim: sim.to_owned(), connect: RUNS_CONNECT.into() };
+    let runs = Runs::new(cfg, bridge.clone());
     (build_with(tmp, bridge, &[], catalogs, runs.clone()), runs)
 }
 
 fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs) -> Router {
     // No test of these flies a run.
-    let runs = Runs::new(
-        RunsConfig { dir: tmp.join("runs"), sim: tmp.join("no-astrum-sim") },
-        bridge.clone(),
-    );
-    build_with(tmp, bridge, allowed_hosts, catalogs, runs)
+    let cfg = RunsConfig {
+        dir: tmp.join("runs"),
+        sim: tmp.join("no-astrum-sim"),
+        connect: RUNS_CONNECT.into(),
+    };
+    build_with(tmp, bridge.clone(), allowed_hosts, catalogs, Runs::new(cfg, bridge))
 }
 
 fn build_with(

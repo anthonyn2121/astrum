@@ -8,8 +8,10 @@
 //! starts the sim on a free loopback port (recording `run.mcap`) with the
 //! rendered controllers ([`LiveRun`]) and attaches the [`Bridge`] to it. A
 //! monitor thread waits for the run's end, computes its metrics once into
-//! `metrics.json` and marks it finished. The run's output lines go to a
-//! bounded ring buffer with a monotonic sequence number.
+//! `metrics.json`, marks it finished and — if the bridge still carries the
+//! run — sends the bridge back to the server's `--connect` endpoint. The
+//! run's output lines go to a bounded ring buffer with a monotonic sequence
+//! number, its controllers named by their aircraft.
 //!
 //! Every run directory under the runs dir (this server's or an earlier one's)
 //! serves its replay export and metrics; the active run's only once it has
@@ -29,7 +31,7 @@ use astrum_net::{speed_ok, MIN_SPEED};
 use astrum_sim::controllers::ControllerCatalog;
 use astrum_sim::launch::{Children, LiveRun, LiveSpec, Log, LogLine, LogStream};
 use astrum_sim::scenario::Scenario;
-use astrum_sim::sweep::Outcome;
+use astrum_sim::sweep::{Outcome, Status};
 use astrum_sim::systems::StopRequested;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -59,13 +61,16 @@ pub const METRICS_FILE: &str = "metrics.json";
 /// The run-id name part of an inline (unsaved) scenario.
 const INLINE_NAME: &str = "inline";
 
-/// Where runs go and what flies them.
+/// Where runs go, what flies them, and where the bridge goes back to.
 #[derive(Debug, Clone)]
 pub struct RunsConfig {
     /// Parent of every run's directory (`runs/web`).
     pub dir: PathBuf,
     /// The `astrum-sim` binary.
     pub sim: PathBuf,
+    /// The server's `--connect` endpoint: the bridge re-attaches there once a
+    /// run it was attached to has finished.
+    pub connect: String,
 }
 
 /// A run's lifecycle.
@@ -277,6 +282,9 @@ struct Plan {
     name: Option<String>,
     scenario: Scenario,
     controllers: Vec<String>,
+    /// Each controller's name in the run's log and messages, in
+    /// `controllers` order: `aircraft <id>`.
+    labels: Vec<String>,
     assignments: Vec<Assignment>,
 }
 
@@ -380,10 +388,41 @@ impl Runs {
             &utc_stamp(started_at_ms),
             plan.name.as_deref().unwrap_or(INLINE_NAME),
         )?;
-        let port = free_port().map_err(|e| RunError::Failed(format!("picking a port: {e}")))?;
+        let port = free_port().map_err(|e| RunError::Failed(format!("picking a port: {e}")));
+        let port = match port {
+            Ok(port) => port,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        };
         let listen = format!("tcp/127.0.0.1:{port}");
         let bag = dir.join(BAG_FILE);
+        let labels = Arc::new(plan.labels);
         let (tx, rx) = mpsc::channel();
+        // The log thread keeps the run's lines in the channel until the run's
+        // record (and its log ring) is installed, and discards them if it
+        // never is; it ends once the run's processes (the senders) are gone.
+        let (log_installed_tx, log_installed) = mpsc::channel::<()>();
+        let logs = self.clone();
+        let (log_id, log_labels) = (id.clone(), Arc::clone(&labels));
+        let log_thread =
+            std::thread::Builder::new().name(format!("run-log-{id}")).spawn(move || {
+                let keep = log_installed.recv().is_ok();
+                for mut line in rx {
+                    if keep {
+                        relabel_line(&mut line, &log_labels);
+                        logs.push_log(&log_id, line);
+                    }
+                }
+            });
+        let log_thread = match log_thread {
+            Ok(handle) => handle,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(RunError::Failed(format!("starting the log thread: {e}")));
+            }
+        };
         let spec = LiveSpec {
             sim: self.0.cfg.sim.clone(),
             scenario: plan.scenario.clone(),
@@ -400,12 +439,37 @@ impl Runs {
         let live = match LiveRun::start(spec, &self.0.children) {
             Ok(live) => live,
             Err(why) => {
-                // Nothing ran: leave no run behind.
+                // Nothing runs any more: leave no run behind.
+                drop(log_installed_tx);
+                let _ = log_thread.join();
                 let _ = std::fs::remove_dir_all(&dir);
+                let why = relabel(&why.to_string(), &labels);
                 return Err(RunError::Failed(format!("starting the run: {why}")));
             }
         };
         let endpoint = live.endpoint().to_owned();
+        let stop = live.stop_handle();
+        // The monitor finalizes the run only once its record is installed
+        // (`installed` sent, or dropped if installing never happens).
+        let (installed_tx, installed) = mpsc::channel::<()>();
+        let (done_tx, done) = watch::channel(false);
+        let monitor = self.clone();
+        let (monitor_id, monitor_dir) = (id.clone(), dir.clone());
+        let handle = std::thread::Builder::new().name(format!("run-{id}")).spawn(move || {
+            let outcome = live.wait();
+            let _ = log_thread.join();
+            let _ = installed.recv();
+            monitor.finish(&monitor_id, &monitor_dir, outcome, &labels, &done_tx);
+        });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The unstarted closure (and the run in it) was dropped:
+                // dropping a LiveRun stops it and reaps its processes.
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(RunError::Failed(format!("starting the run monitor: {e}")));
+            }
+        };
         let bridge_run = self.0.bridge.attach(&endpoint);
         let view = RunView {
             id: id.clone(),
@@ -422,8 +486,6 @@ impl Runs {
             dir: dir.display().to_string(),
             bag: bag.display().to_string(),
         };
-        let (done_tx, done) = watch::channel(false);
-        let stop = live.stop_handle();
         {
             let mut state = self.lock();
             if state.closed {
@@ -436,28 +498,11 @@ impl Runs {
                 answered: false,
                 stop,
                 done,
-                monitor: None,
+                monitor: Some(handle),
             });
         }
-        let logs = self.clone();
-        let log_id = id.clone();
-        std::thread::Builder::new()
-            .name(format!("run-log-{id}"))
-            .spawn(move || {
-                for line in rx {
-                    logs.push_log(&log_id, line);
-                }
-            })
-            .map_err(|e| RunError::Failed(format!("starting the log thread: {e}")))?;
-        let monitor = self.clone();
-        let monitor_id = id.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("run-{id}"))
-            .spawn(move || monitor.monitor(live, &monitor_id, &dir, done_tx))
-            .map_err(|e| RunError::Failed(format!("starting the run monitor: {e}")))?;
-        if let Some(record) = self.lock().current.as_mut().filter(|r| r.view.id == id) {
-            record.monitor = Some(handle);
-        }
+        let _ = log_installed_tx.send(());
+        let _ = installed_tx.send(());
         Ok(view)
     }
 
@@ -468,9 +513,17 @@ impl Runs {
         }
     }
 
-    /// Wait for the run's end, write its metrics, mark it finished.
-    fn monitor(&self, live: LiveRun, id: &str, dir: &Path, done: watch::Sender<bool>) {
-        let outcome = live.wait();
+    /// The run has ended (every process reaped, its log drained): write its
+    /// metrics, mark it finished, and send the bridge back to `--connect` if
+    /// it is still on this run.
+    fn finish(
+        &self,
+        id: &str,
+        dir: &Path,
+        mut outcome: Outcome,
+        labels: &[String],
+        done: &watch::Sender<bool>,
+    ) {
         if dir.join(BAG_FILE).is_file() {
             if let Err(why) = write_metrics(dir) {
                 self.push_log(
@@ -483,10 +536,23 @@ impl Runs {
                 );
             }
         }
-        if let Some(record) = self.lock().current.as_mut().filter(|r| r.view.id == id) {
-            record.view.state = RunState::Finished;
-            record.view.finished_at_ms = Some(now_ms());
-            record.view.outcome = Some(outcome);
+        outcome.status = match outcome.status {
+            Status::Failed(why) => Status::Failed(relabel(&why, labels)),
+            Status::Stopped(why) => Status::Stopped(relabel(&why, labels)),
+            Status::Ok => Status::Ok,
+        };
+        let bridge_run = {
+            let mut state = self.lock();
+            let record = state.current.as_mut().filter(|r| r.view.id == id);
+            record.map(|record| {
+                record.view.state = RunState::Finished;
+                record.view.finished_at_ms = Some(now_ms());
+                record.view.outcome = Some(outcome);
+                record.bridge_run
+            })
+        };
+        if bridge_run.is_some_and(|run| self.0.bridge.info().run == run) {
+            self.0.bridge.attach(&self.0.cfg.connect);
         }
         done.send_replace(true);
     }
@@ -496,7 +562,9 @@ impl Runs {
         let mut done = {
             let state = self.lock();
             let Some(record) = state.current.as_ref().filter(|r| r.active()) else {
-                return Err(RunError::Conflict("no run is active".into()));
+                let why =
+                    if state.starting { "a run is being started" } else { "no run is active" };
+                return Err(RunError::Conflict(why.into()));
             };
             record.stop.0.store(true, std::sync::atomic::Ordering::Relaxed);
             record.done.clone()
@@ -575,6 +643,11 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
             let scenario: Scenario =
                 serde_json::from_value(doc).map_err(|e| invalid(e.to_string()))?;
             scenario.validate().map_err(|e| invalid(e.to_string()))?;
+            // The model names a directory under the JSBSim root: no paths.
+            for a in &scenario.aircraft {
+                safe_name(&a.model)
+                    .map_err(|e| invalid(format!("aircraft {}: model: {e}", a.id)))?;
+            }
             (None, scenario)
         }
         _ => {
@@ -605,7 +678,73 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
     let (controllers, assignments) =
         assign(&mut scenario, &body.assignments, catalogs.controllers())
             .map_err(RunError::BadRequest)?;
-    Ok(Plan { name, scenario, controllers, assignments })
+    for a in &assignments {
+        // Rendered, so the catalog has it.
+        if let Some(spec) = catalogs.controllers().get(&a.controller) {
+            find_program(&spec.command[0]).map_err(|why| {
+                RunError::Failed(format!(
+                    "aircraft {}: controller `{}`: {why}",
+                    a.aircraft, a.controller
+                ))
+            })?;
+        }
+    }
+    let labels = assignments.iter().map(|a| format!("aircraft {}", a.aircraft)).collect();
+    Ok(Plan { name, scenario, controllers, labels, assignments })
+}
+
+/// Check that a controller's program can start: a path (relative to the
+/// server's working directory) to an executable file, or a name on `PATH`.
+fn find_program(program: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if program.contains('/') {
+        if executable(Path::new(program)) {
+            return Ok(());
+        }
+        let hint = if program.starts_with("build/controllers/") {
+            " (build the C++ controllers: cmake -S controllers -B build/controllers \
+             -DCMAKE_BUILD_TYPE=Release && cmake --build build/controllers -j)"
+        } else {
+            ""
+        };
+        return Err(format!("`{program}` not found or not executable{hint}"));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if std::env::split_paths(&path).any(|dir| executable(&dir.join(program))) {
+        Ok(())
+    } else {
+        Err(format!("`{program}` not found on PATH"))
+    }
+}
+
+/// `text` with a leading `controller <k>` (the supervisor's name for the k-th
+/// controller started) replaced by `labels[k-1]`'s controller.
+fn relabel(text: &str, labels: &[String]) -> String {
+    // Longest number first: `controller 12` is not `controller 1` + "2".
+    for (k, label) in labels.iter().enumerate().rev() {
+        let name = format!("controller {}", k + 1);
+        if let Some(rest) = text.strip_prefix(&name) {
+            if rest.is_empty() || rest.starts_with([' ', ':']) {
+                return format!("{label}'s controller{rest}");
+            }
+        }
+    }
+    text.to_owned()
+}
+
+/// A log line with the k-th controller's source (`ctl<k>`) named by its
+/// aircraft, and the supervisor's messages relabelled.
+fn relabel_line(line: &mut LogLine, labels: &[String]) {
+    if let Some(k) = line.source.strip_prefix("ctl").and_then(|k| k.parse::<usize>().ok()) {
+        if let Some(label) = k.checked_sub(1).and_then(|i| labels.get(i)) {
+            line.source.clone_from(label);
+        }
+    } else if line.source == "astrum" {
+        line.line = relabel(&line.line, labels);
+    }
 }
 
 /// Check every assignment against the scenario and the catalog, render the

@@ -173,6 +173,25 @@ fn a_failing_controller_fails_the_run_and_fail_fast_stops_it() {
 }
 
 #[test]
+fn a_controller_failing_fast_is_the_problem_even_if_the_stopped_sim_dies_of_the_sigterm() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    // No TERM trap: the fail-fast SIGTERM kills it.
+    let sim = script(dir.path(), "sim", "while true; do sleep 0.02; done");
+    let mut s = spec(sim, channel().0);
+    s.controllers = vec!["sh -c 'exit 3'".into()];
+    let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
+    assert_eq!(outcome.status, Status::Failed("controller 1 exited (exit status: 3)".into()));
+
+    // A sim that fails by its own exit code is still the problem.
+    let sim = script(dir.path(), "sim2", "trap 'exit 2' TERM\nwhile true; do sleep 0.02; done");
+    let mut s = spec(sim, channel().0);
+    s.controllers = vec!["sh -c 'exit 3'".into()];
+    let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
+    assert_eq!(outcome.status, Status::Failed("sim exited (exit status: 2)".into()));
+}
+
+#[test]
 fn without_fail_fast_the_run_flies_on_and_fails_at_its_end() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();

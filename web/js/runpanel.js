@@ -127,10 +127,13 @@ export class RunPanel {
     this.polling = true;
     try {
       const run = await getCurrentRun();
+      // A Stop may have finished the run meanwhile: its view is newer.
+      if (this.done) return;
       this.current = !!run && run.id === this.runId;
       if (this.current) {
         this.view = run;
         await this._pollLog();
+        if (this.done) return;
         if (run.state === "finished") this.done = true;
       } else {
         // An earlier run (or none since the server restarted): what it left.
@@ -139,9 +142,11 @@ export class RunPanel {
       }
       this._error("");
     } catch (e) {
+      if (this.done) return;
       this._error(`run status: ${e.message || e}`);
+    } finally {
+      this.polling = false;
     }
-    this.polling = false;
     this._render();
     if (this.done) this._showResult();
     else this._schedule(RUN_POLL_MS);
@@ -149,8 +154,10 @@ export class RunPanel {
 
   async _pollLog() {
     const { lines, next } = await getRunLog(this.logNext);
-    if (Array.isArray(lines) && lines.length) this._appendLog(lines);
-    if (Number.isInteger(next)) this.logNext = next;
+    // A concurrent poll (Stop's last one) may have appended these already.
+    const fresh = Array.isArray(lines) ? lines.filter((l) => Number.isInteger(l?.seq) && l.seq >= this.logNext) : [];
+    if (fresh.length) this._appendLog(fresh);
+    if (Number.isInteger(next)) this.logNext = Math.max(this.logNext, next);
   }
 
   _appendLog(lines) {
@@ -216,8 +223,8 @@ export class RunPanel {
         el.metrics.append(dt, dd);
       }
     } catch (e) {
-      // No recording: nothing to replay either.
-      if (e instanceof ApiError && e.status === 404) el.replay.hidden = true;
+      // No recording (404), or no such run (400): nothing to replay either.
+      if (e instanceof ApiError && (e.status === 404 || e.status === 400)) el.replay.hidden = true;
       this._error(`metrics: ${e.message || e}`);
     }
   }

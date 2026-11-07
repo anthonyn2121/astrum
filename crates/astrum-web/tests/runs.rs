@@ -74,6 +74,30 @@ description = "Multirotors only."
 command = ["sh", "-c", "trap 'exit 0' TERM; while true; do sleep 0.05; done", "ctl"]
 id_flag = "--id"
 kinds = ["multirotor"]
+
+[[controller]]
+id = "crash"
+name = "Test crash"
+description = "Fails at once."
+command = ["sh", "-c", "exit 3", "ctl"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+
+[[controller]]
+id = "unbuilt"
+name = "Test unbuilt"
+description = "Its program was never built."
+command = ["build/controllers/cpp/no-such-controller"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+
+[[controller]]
+id = "unstartable"
+name = "Test unstartable"
+description = "An executable whose interpreter does not exist."
+command = ["@BADINTERP@"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
 "#;
 
 /// A fixed-wing (1) and a multirotor (2); the scenario asks for lockstep on
@@ -111,8 +135,8 @@ lockstep = true
 "#;
 
 /// A temp tree: `config/` (the test catalog, `scenario.duo.toml` and an
-/// invalid `scenario.broken.toml`), a recorded bag to hand out, and the
-/// server's other files.
+/// invalid `scenario.broken.toml`), a recorded bag to hand out, an executable
+/// that cannot start (`badinterp`), and the server's other files.
 struct Tree {
     dir: tempfile::TempDir,
 }
@@ -122,11 +146,29 @@ impl Tree {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("controllers.toml"), CATALOG).unwrap();
+        let badinterp = dir.path().join("badinterp");
+        std::fs::write(&badinterp, "#!/no/such/interpreter\n").unwrap();
+        std::fs::set_permissions(&badinterp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let catalog = CATALOG.replace("@BADINTERP@", &badinterp.display().to_string());
+        std::fs::write(config.join("controllers.toml"), catalog).unwrap();
         std::fs::write(config.join("scenario.duo.toml"), DUO).unwrap();
         std::fs::write(config.join("scenario.broken.toml"), "[sim]\nrate_hz = -1\n").unwrap();
         write_bag(&dir.path().join("fixture.mcap"));
         Self { dir }
+    }
+
+    /// Processes still running from this tree's scripts.
+    fn leftovers(&self) -> Vec<String> {
+        let needle = self.path().display().to_string();
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else { continue };
+            let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            if cmdline.contains(&needle) {
+                found.push(cmdline);
+            }
+        }
+        found
     }
 
     fn path(&self) -> &Path {
@@ -235,15 +277,7 @@ async fn wait_for_log(app: &Router, what: &str, pred: impl Fn(&[Value]) -> bool)
 }
 
 async fn wait_finished(app: &Router) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let (_, body) = get(app, "/api/runs/current").await;
-        if body["run"]["state"] == "finished" {
-            return body["run"].clone();
-        }
-        assert!(Instant::now() < deadline, "the run did not finish: {body}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_state(app, "finished").await
 }
 
 async fn shutdown(runs: Runs) {
@@ -252,6 +286,29 @@ async fn shutdown(runs: Runs) {
 
 fn has_line(lines: &[Value], source: &str, prefix: &str) -> bool {
     lines.iter().any(|l| l["source"] == source && l["line"].as_str().unwrap().starts_with(prefix))
+}
+
+/// `scenario.duo.toml` as an inline scenario object, edited by `edit`.
+fn inline_duo(edit: impl FnOnce(&mut Value)) -> Value {
+    let mut duo = serde_json::to_value(toml::from_str::<toml::Value>(DUO).unwrap()).unwrap();
+    edit(&mut duo);
+    duo
+}
+
+async fn wait_state(app: &Router, want: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (_, body) = get(app, "/api/runs/current").await;
+        if body["run"]["state"] == want {
+            return body["run"].clone();
+        }
+        assert!(Instant::now() < deadline, "the run never was {want}: {body}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn bridge_endpoint(app: &Router) -> Value {
+    get(app, "/api/bridge").await.1["endpoint"].clone()
 }
 
 #[tokio::test]
@@ -328,6 +385,27 @@ async fn a_bad_start_names_the_culprit_and_starts_nothing() {
             StatusCode::UNPROCESSABLE_ENTITY,
             vec!["inline scenario"],
         ),
+        (
+            // A model is a directory name under the JSBSim root, never a path.
+            json!({"scenario": inline_duo(|duo| {
+                let a = &mut duo["aircraft"][0];
+                a["model"] = json!("../../../../../tmp/x");
+                a["kind"] = json!("fixed-wing");
+                a["autopilot_profile"] = json!("trainer");
+            })}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            vec!["inline scenario", "aircraft 1", "model"],
+        ),
+        (
+            with(json!([{"aircraft": 1, "controller": "unbuilt"}])),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            vec![
+                "aircraft 1",
+                "`unbuilt`",
+                "build/controllers/cpp/no-such-controller",
+                "build the C++ controllers",
+            ],
+        ),
         (json!({"scenario": "duo", "speed": -1}), StatusCode::BAD_REQUEST, vec!["speed"]),
         (json!({"scenario": "duo", "speed": 1e-9}), StatusCode::BAD_REQUEST, vec!["speed"]),
         (json!({"scenario": "duo", "max_time_s": -5}), StatusCode::BAD_REQUEST, vec!["max_time_s"]),
@@ -382,6 +460,8 @@ async fn a_run_flies_its_controlled_aircraft_in_lockstep_alone_until_stopped() {
     assert_eq!(lockstep, [(1, true), (2, false)]);
     assert_eq!((flown.sim.speed, flown.sim.max_time_s), (0.0, 12.5));
     assert_eq!(view["bag"], dir.join("run.mcap").display().to_string());
+    // The bridge carries the run.
+    assert_eq!(bridge_endpoint(&app).await, view["endpoint"]);
 
     // One run at a time.
     let again = start(&app, &json!({"scenario": "duo"})).await;
@@ -391,9 +471,10 @@ async fn a_run_flies_its_controlled_aircraft_in_lockstep_alone_until_stopped() {
         assert_error(&reply, StatusCode::CONFLICT, &[&id]);
     }
 
-    // The sim and the controller log, in order; `since` skips what was read.
+    // The sim and the controller (named by its aircraft) log, in order;
+    // `since` skips what was read.
     let lines = wait_for_log(&app, "the sim's ticks and the controller", |lines| {
-        has_line(lines, "ctl1", "ctl --id 1 --alt 1500")
+        has_line(lines, "aircraft 1", "ctl --id 1 --alt 1500")
             && lines.iter().filter(|l| l["source"] == "sim").count() >= 4
     })
     .await;
@@ -425,6 +506,8 @@ async fn a_run_flies_its_controlled_aircraft_in_lockstep_alone_until_stopped() {
     assert_eq!(get(&app, "/api/runs/current").await.1["run"], stopped);
     let none = send(&app, "DELETE", "/api/runs/current", &json!({})).await;
     assert_error(&none, StatusCode::CONFLICT, &["no run is active"]);
+    // Finished, the run no longer holds the bridge: back to `--connect`.
+    assert_eq!(bridge_endpoint(&app).await, common::RUNS_CONNECT);
 
     // Finished: its replay and metrics (written once, to metrics.json).
     let (status, replay) = get(&app, &format!("/api/runs/{id}/replay")).await;
@@ -447,12 +530,14 @@ async fn a_run_flies_its_controlled_aircraft_in_lockstep_alone_until_stopped() {
 }
 
 #[tokio::test]
-async fn an_uncontrolled_run_drops_the_scenarios_lockstep_and_ends_by_itself() {
+async fn an_uncontrolled_inline_run_drops_the_scenarios_lockstep_and_ends_by_itself() {
     let _serial = SERIAL.lock().await;
     let tree = Tree::new();
     let (app, runs) = tree.app(&tree.sim(Some("0.3")));
-    let (status, view) = start(&app, &json!({"scenario": "duo"})).await;
+    let (status, view) = start(&app, &json!({"scenario": inline_duo(|_| {})})).await;
     assert_eq!(status, StatusCode::CREATED, "{view}");
+    assert!(view["id"].as_str().unwrap().ends_with("-inline"), "{view}");
+    assert_eq!(view["scenario"], Value::Null);
     assert_eq!(view["lockstep"], false);
     assert_eq!(view["assignments"], json!([]));
     // The scenario's own pace and limit.
@@ -463,8 +548,47 @@ async fn an_uncontrolled_run_drops_the_scenarios_lockstep_and_ends_by_itself() {
 
     let finished = wait_finished(&app).await;
     assert_eq!(finished["outcome"]["status"], json!({"kind": "ok"}), "{finished}");
-    // Metrics were written when it finished, before anyone asked.
+    // Metrics were written when it finished, before anyone asked; the bridge
+    // is back on `--connect`.
     assert!(dir.join("metrics.json").is_file());
+    assert_eq!(bridge_endpoint(&app).await, common::RUNS_CONNECT);
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn a_failing_controller_is_named_by_its_aircraft() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, runs) = tree.app(&tree.sim(None));
+    let body = json!({"scenario": "duo", "assignments": [{"aircraft": 1, "controller": "crash"}]});
+    let (status, view) = start(&app, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let finished = wait_finished(&app).await;
+    assert_eq!(
+        finished["outcome"]["status"],
+        json!({"kind": "failed", "reason": "aircraft 1's controller exited (exit status: 3)"}),
+        "{finished}"
+    );
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn a_controller_that_cannot_start_fails_the_start_and_leaves_nothing() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, runs) = tree.app(&tree.sim(None));
+    let body =
+        json!({"scenario": "duo", "assignments": [{"aircraft": 1, "controller": "unstartable"}]});
+    let reply = start(&app, &body).await;
+    assert_error(
+        &reply,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &["aircraft 1's controller", "badinterp"],
+    );
+    assert_eq!(get(&app, "/api/runs/current").await.1, json!({"run": null}));
+    let left = std::fs::read_dir(tree.path().join("runs")).map_or(0, Iterator::count);
+    assert_eq!(left, 0, "the failed start left its run directory");
+    assert_eq!(tree.leftovers(), Vec::<String>::new(), "the failed start left processes");
     shutdown(runs).await;
 }
 
@@ -507,8 +631,10 @@ fn real_sim() -> Option<PathBuf> {
 #[tokio::test]
 async fn the_real_sim_flies_a_saved_scenario_to_its_end() {
     let Some(sim) = real_sim() else {
-        eprintln!(
-            "skipped: build astrum-sim first (cargo build -p astrum-sim) or set ASTRUM_SIM_BIN"
+        assert!(
+            std::env::var_os("ASTRUM_SKIP_REAL_SIM").is_some_and(|v| v == "1"),
+            "no astrum-sim next to the test binaries: build it first (cargo build -p astrum-sim), \
+             set ASTRUM_SIM_BIN, or skip this test with ASTRUM_SKIP_REAL_SIM=1"
         );
         return;
     };
@@ -516,16 +642,23 @@ async fn the_real_sim_flies_a_saved_scenario_to_its_end() {
     let tmp = tempfile::tempdir().unwrap();
     let (app, runs) =
         common::app_with_runs(tmp.path(), Bridge::new(config()), common::repo_catalogs(), &sim);
-    let body = json!({"scenario": "demo", "speed": 0, "max_time_s": 2});
+    // Real time, so the run is seen running.
+    let body = json!({"scenario": "demo", "speed": 1, "max_time_s": 4});
     let (status, view) = start(&app, &body).await;
     assert_eq!(status, StatusCode::CREATED, "{view}");
     let id = view["id"].as_str().unwrap().to_owned();
+    // Running = the bridge, attached to the run's endpoint, reached its sim.
+    let running = wait_state(&app, "running").await;
+    assert_eq!(running["id"], id.as_str());
+    let (_, bridge) = get(&app, "/api/bridge").await;
+    assert_eq!(bridge["endpoint"], view["endpoint"], "{bridge}");
     let finished = wait_finished(&app).await;
     assert_eq!(finished["outcome"]["status"], json!({"kind": "ok"}), "{finished}");
+    assert_eq!(bridge_endpoint(&app).await, common::RUNS_CONNECT);
     let (status, metrics) = get(&app, &format!("/api/runs/{id}/metrics")).await;
     assert_eq!(status, StatusCode::OK, "{metrics}");
     assert_eq!(metrics["end_reason"], "max-time");
-    assert!((metrics["sim_time_s"].as_f64().unwrap() - 2.0).abs() < 0.05, "{metrics}");
+    assert!((metrics["sim_time_s"].as_f64().unwrap() - 4.0).abs() < 0.05, "{metrics}");
     let (status, replay) = get(&app, &format!("/api/runs/{id}/replay")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(!replay["frames"].as_array().unwrap().is_empty());

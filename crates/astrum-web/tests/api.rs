@@ -106,7 +106,19 @@ async fn non_get_routes_refuse_other_origins_and_non_json_bodies() {
 async fn every_api_path_and_method_is_guarded() {
     let tmp = tempfile::tempdir().unwrap();
     let app = common::app(tmp.path(), Bridge::new(config()));
-    for path in ["/api/bridge", CONTROL, "/api/nope", "/api", "/api/"] {
+    let paths = [
+        "/api/bridge",
+        CONTROL,
+        "/api/runs",
+        "/api/runs/current",
+        "/api/runs/current/log",
+        "/api/runs/some-run/replay",
+        "/api/runs/some-run/metrics",
+        "/api/nope",
+        "/api",
+        "/api/",
+    ];
+    for path in paths {
         for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH, Method::OPTIONS] {
             let req = Request::builder()
                 .method(method.clone())

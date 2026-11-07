@@ -160,11 +160,50 @@ function renderFleet() {
   }
 }
 
-// The aircraft's initial value of a parameter's target (a scenario aircraft
-// field: heading_deg, alt_hae_m, tas_mps).
+// An aircraft's initial value of a parameter target (a scenario aircraft
+// field: heading_deg, alt_hae_m, tas_mps); headings wrapped to [0, 360).
 function initialOf(aircraftId, target) {
   const spec = state.doc?.scenario?.aircraft?.find((s) => s.id === aircraftId);
-  return spec && target in TARGET_UNITS && Number.isFinite(spec[target]) ? spec[target] : null;
+  if (!spec || !(target in TARGET_UNITS) || !Number.isFinite(spec[target])) return null;
+  const v = spec[target];
+  return target === "heading_deg" ? ((v % 360) + 360) % 360 : v;
+}
+
+const inBounds = (p, x) => !(Number.isFinite(p.min) && x < p.min) && !(Number.isFinite(p.max) && x > p.max);
+
+// The catalog default of an `aircraft` param, if it is a valid choice for this
+// row (another aircraft of the fleet) — what the server would use.
+function validAircraftDefault(row, p) {
+  const d = p.default;
+  return Number.isInteger(d) && d !== row.aircraft.id && state.scenario.aircraft.some((o) => o.id === d) ? d : null;
+}
+
+// Whose initial conditions a target param starts from: the aircraft the
+// controller follows when it has an `aircraft` param (a formation follower
+// holds its leader's altitude), else the controlled aircraft itself.
+function targetSource(row) {
+  for (const [, f] of row.fields) {
+    if (f.spec.type !== "aircraft") continue;
+    const id = Number(f.input.value);
+    return f.input.value !== "" && Number.isInteger(id) ? id : row.aircraft.id;
+  }
+  return row.aircraft.id;
+}
+
+// Fill each untouched target param from its source aircraft's initial value
+// (the catalog default when there is none or it is out of bounds).
+function prefillTargets(row) {
+  const source = targetSource(row);
+  for (const [, f] of row.fields) {
+    const p = f.spec;
+    if (!p.target || f.edited) continue;
+    const from = p.target === "alt_hae_m" ? source : row.aircraft.id;
+    const initial = initialOf(from, p.target);
+    const use = initial != null && inBounds(p, initial);
+    f.input.value = use ? String(Math.round(initial * 100) / 100) : p.default != null ? String(p.default) : "";
+    f.from.textContent = use ? `from #${from}'s start` : "";
+    check(row, p);
+  }
 }
 
 function renderParams(row) {
@@ -184,10 +223,10 @@ function renderParams(row) {
     } else if (p.type === "aircraft") {
       const others = state.scenario.aircraft.filter((o) => o.id !== row.aircraft.id);
       input = h("select", { id },
-        p.default == null ? h("option", { value: "", text: "— pick an aircraft —" }) : null,
+        h("option", { value: "", text: "— pick an aircraft —" }),
         ...others.map((o) => h("option", { value: String(o.id), text: `#${o.id} · ${o.model}` })));
-      if (p.default != null && others.some((o) => o.id === p.default)) input.value = String(p.default);
-      else if (p.default != null) input.value = "";
+      const d = validAircraftDefault(row, p);
+      input.value = d != null ? String(d) : "";
     } else {
       input = h("input", {
         id, type: "number", inputmode: "decimal",
@@ -198,21 +237,36 @@ function renderParams(row) {
       if (p.default != null) input.value = String(p.default);
     }
     const error = h("span", { class: "field-error", hidden: true });
+    const from = h("span", {});
     const field = h("div", { class: "field" }, label, input);
-    const initial = p.target ? initialOf(row.aircraft.id, p.target) : null;
-    if (initial != null) {
-      const use = h("button", { type: "button", class: "mini", title: "Set it to the aircraft's initial value" , text: "use" });
-      use.addEventListener("click", () => { input.value = String(initial); check(row, p); });
-      field.append(h("span", { class: "muted small hint" },
-        `starts at ${initial} ${TARGET_UNITS[p.target] || ""} `, use));
+    const f = { spec: p, input, error, from, edited: false };
+    if (p.target && p.type !== "aircraft" && p.type !== "choice") {
+      const hint = h("span", { class: "muted small hint" }, from);
+      if (p.default != null) {
+        const reset = h("button", { type: "button", class: "mini", title: "Set it to the catalog default", text: "reset" });
+        reset.addEventListener("click", () => {
+          input.value = String(p.default);
+          f.edited = true;
+          from.textContent = "";
+          check(row, p);
+        });
+        hint.append(` default ${p.default} `, reset);
+      }
+      field.append(hint);
     }
     field.append(error);
-    input.addEventListener("change", () => check(row, p));
-    row.fields.set(p.name, { spec: p, input, error });
+    input.addEventListener("change", () => {
+      f.edited = true;
+      if (p.target) from.textContent = "";
+      check(row, p);
+      if (p.type === "aircraft") prefillTargets(row); // the leader's altitude follows it
+    });
+    row.fields.set(p.name, f);
     grid.append(field);
   }
   if (!(c.params || []).length) grid.append(h("p", { class: "muted small", text: "No parameters." }));
   row.paramsBox.append(grid);
+  prefillTargets(row);
 }
 
 // ---- validation (mirrors ControllerSpec::render) ----
@@ -222,7 +276,11 @@ function renderParams(row) {
 function paramValue(row, p) {
   const raw = row.fields.get(p.name).input.value.trim();
   const fleetIds = state.scenario.aircraft.map((a) => a.id);
-  if (raw === "") return p.default != null ? { value: undefined } : { error: "required" };
+  if (raw === "") {
+    // Empty: the catalog default — for an aircraft, only a valid one.
+    if (p.type === "aircraft") return validAircraftDefault(row, p) != null ? { value: undefined } : { error: "pick an aircraft" };
+    return p.default != null ? { value: undefined } : { error: "required" };
+  }
   switch (p.type) {
     case "choice":
       return (p.choices || []).includes(raw) ? { value: raw } : { error: `must be one of ${(p.choices || []).join(", ")}` };

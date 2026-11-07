@@ -602,8 +602,10 @@ plot channels and event filters persist in `localStorage`. Three.js and uPlot ar
 **Replay viewer** (`/view.html`, everything above). `/interactive.html` sets up one live run: an
 environment (only `empty` for now), a scenario from `--config-dir` (invalid ones are listed,
 disabled, with their error), a catalog controller per aircraft (only those that fly its vehicle
-kind; its parameters as a form with the catalog's bounds and defaults; or none — uncommanded), a
-speed (1×, 2×, 10×, Max) and optionally a max sim time; **Run** starts it and opens
+kind; or none — uncommanded) with its parameters as a form with the catalog's bounds — heading,
+altitude and airspeed targets start from the aircraft's initial conditions (a follower's altitude
+from its leader's), the catalog default one click away — a speed (1×, 2×, 10×, Max) and
+optionally a max sim time; **Run** starts it and opens
 `/view.html?run=<id>`. While a run is active the page shows it (open / stop) instead. In the
 viewer, a **sim-control bar** at the bottom of the scene appears whenever the stream comes from a
 live sim: it pauses, resumes, steps N ticks and paces the *sim* (1×, 2×, 10×, Max) and shows its
@@ -663,16 +665,21 @@ Live interactive runs — one at a time, owned by the server: `POST /api/runs` w
 the run, `{id, scenario, state: "starting"|"running"|"finished", endpoint, speed, max_time_s,
 lockstep, assignments (every parameter, defaults filled in), started_at_ms, finished_at_ms,
 outcome, dir, bag}`; 400 for bad input (the message names the aircraft and parameter), 409 while a
-run is active, 422 for an invalid scenario. Exactly the controlled aircraft fly in lockstep; the
-others fly uncommanded. A run writes `<--runs-dir>/<id>/` (`scenario.toml`, `run.mcap`, and
-`metrics.json` once it ends; `<id>` = UTC `yyyymmdd-hhmmss-<scenario>`), its sim listens on a
-free loopback port and the bridge attaches to it. `GET /api/runs/current` → `{"run": …|null}`
-(the latest since the server started); `DELETE /api/runs/current` stops it (200 with its final
-state; 409 when none is active); `GET /api/runs/current/log?since=<seq>` → `{"lines": [{seq,
-source, stream, line}], "next"}` (its last 5000 output lines); `GET /api/runs/<id>/replay` (the
-`astrum-replay` export) and `GET /api/runs/<id>/metrics` (`astrum metrics` JSON) serve any run
-under the runs dir (409 while it runs, 404 when unknown or unrecorded). Stopping the server stops
-the active run first.
+run is active (or being started), 422 for an invalid scenario (an inline one's aircraft `model`
+must be a plain name), 500 when it cannot start — e.g. a controller program that is not built
+("aircraft 1: controller `cpp-hold`: `build/controllers/cpp/astrum-controller` not found …").
+Exactly the controlled aircraft fly in lockstep; the others fly uncommanded. A run writes
+`<--runs-dir>/<id>/` (`scenario.toml`, `run.mcap`, and `metrics.json` once it ends; `<id>` = UTC
+`yyyymmdd-hhmmss-<scenario>`), its sim listens on a free loopback port and the bridge attaches to
+it; when the run ends, the bridge goes back to `--connect` (unless something re-attached it
+meanwhile), which starts a fresh live timeline in every viewer — the run panel offers the full
+replay. `GET /api/runs/current` → `{"run": …|null}` (the latest since the server started);
+`DELETE /api/runs/current` stops it (200 with its final state; 409 when none is active);
+`GET /api/runs/current/log?since=<seq>` → `{"lines": [{seq, source, stream, line}], "next"}` (its
+last 5000 output lines; a controller's `source` is its aircraft, `aircraft 1`);
+`GET /api/runs/<id>/replay` (the `astrum-replay` export) and `GET /api/runs/<id>/metrics`
+(`astrum metrics` JSON) serve any run under the runs dir (400 for an id that is not a plain name,
+404 when unknown or unrecorded, 409 while it runs). Stopping the server stops the active run first.
 
 The same port serves the static `web/` app and the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags:
 `--connect` (default `tcp/127.0.0.1:7447`, attached at startup), `--bind` (default

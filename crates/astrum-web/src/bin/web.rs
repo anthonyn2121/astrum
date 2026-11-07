@@ -123,7 +123,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bridge = Bridge::new(BridgeConfig { min_period, models_poll: MODELS_POLL });
     bridge.attach(&cli.connect);
     let sim = cli.sim.unwrap_or_else(|| sibling("astrum-sim"));
-    let runs = Runs::new(RunsConfig { dir: cli.runs_dir, sim }, bridge.clone());
+    let runs = Runs::new(
+        RunsConfig { dir: cli.runs_dir, sim, connect: cli.connect.clone() },
+        bridge.clone(),
+    );
 
     let cfg = Config {
         root: cli.root,
