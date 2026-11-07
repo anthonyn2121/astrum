@@ -29,6 +29,8 @@ fn concurrent_construction_and_stepping_from_safe_threads() {
                     alt_hae_m: 1500.0,
                     psi_true_deg: 0.0,
                     tas_mps: if model == "F450" { 0.0 } else { 60.0 },
+                    gamma_deg: 0.0,
+                    phi_deg: 0.0,
                 })
                 .unwrap();
                 f.run_ic().unwrap();

@@ -85,6 +85,9 @@ fn default_health() -> f32 {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
 
 /// One aircraft entity's identity and initial conditions.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -108,7 +111,20 @@ pub struct AircraftSpec {
     pub heading_deg: f64,
     /// True airspeed (m/s).
     pub tas_mps: f64,
-    /// Trim for steady level flight at spawn. Default: fixed-wing yes,
+    /// Flight-path angle (deg, + = climbing), |climb_deg| < 90. A trimmed
+    /// aircraft is trimmed into this steady climb/descent; an untrimmed one just
+    /// starts with its velocity along it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub climb_deg: f64,
+    /// Bank angle (deg, + = right wing down), |bank_deg| < 90. A trimmed
+    /// fixed-wing is trimmed into a steady coordinated turn at this bank (exact
+    /// at spawn; the F-16's flight controls then roll an uncommanded aircraft
+    /// out of it, ≈ 30° → 13° in 20 s while climbing). Steep banks may not trim
+    /// (60° on the F-16 does not). An untrimmed aircraft just starts rolled by it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bank_deg: f64,
+    /// Trim at spawn for steady flight at `climb_deg`, wings level or — when
+    /// `bank_deg` ≠ 0 — in a coordinated turn. Default: fixed-wing yes,
     /// multirotor no. A trim that fails to converge is fatal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trim: Option<bool>,
@@ -295,11 +311,18 @@ impl Scenario {
                 ("alt_hae_m", a.alt_hae_m),
                 ("heading_deg", a.heading_deg),
                 ("tas_mps", a.tas_mps),
+                ("climb_deg", a.climb_deg),
+                ("bank_deg", a.bank_deg),
             ] {
                 finite(&format!("aircraft {} {name}", a.id), v)?;
             }
             if a.lat_deg.abs() > 90.0 {
                 return Err(a.err(format!("lat_deg out of range: {}", a.lat_deg)));
+            }
+            for (name, v) in [("climb_deg", a.climb_deg), ("bank_deg", a.bank_deg)] {
+                if v.abs() >= 90.0 {
+                    return Err(a.err(format!("{name} must be within (-90, 90), got {v}")));
+                }
             }
             if a.tas_mps < 0.0 {
                 return Err(a.err(format!("tas_mps must be >= 0, got {}", a.tas_mps)));

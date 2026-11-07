@@ -42,7 +42,14 @@ lockstep_timeout_s = 30.0
 # c172x (trainer gains), f16 (fighter gains), F450 (multirotor). Any other model
 # needs `kind = "fixed-wing" | "multirotor"` and, if fixed-wing,
 # `autopilot_profile = "trainer" | "fighter"`. Fixed-wing aircraft are trimmed
-# for level flight at spawn (`trim = false` to skip); a failed trim is fatal.
+# at spawn (`trim = false` to skip) for steady flight at `climb_deg`
+# (flight-path angle, + = climbing): wings level, or a coordinated turn at
+# `bank_deg` (+ = right wing down). Both default 0 and must be strictly within
+# ±90. The trim is exact at spawn, but the F-16's flight controls roll an
+# uncommanded aircraft out of the turn (≈ 30° → 13° in 20 s while climbing);
+# steep banks may not trim (60° on the F-16 does not), and a failed trim is
+# fatal. An untrimmed aircraft (multirotor, `trim = false`) simply starts with
+# that velocity and roll.
 # `control_rate_hz` (default: every tick) publishes that aircraft's telemetry —
 # and, in lockstep, waits for its commands — at a lower rate that divides
 # rate_hz; the last command holds in between.

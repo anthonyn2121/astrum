@@ -28,6 +28,8 @@ pub fn spec(
         alt_hae_m,
         heading_deg,
         tas_mps,
+        climb_deg: 0.0,
+        bank_deg: 0.0,
         trim: None,
         lockstep: false,
         control_rate_hz: None,
