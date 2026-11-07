@@ -1,0 +1,661 @@
+# Controller catalog: the SDK controller programs the web studio can launch, one
+# entry per (program, law). `ControllerSpec::render` (crates/astrum-sim/src/controllers.rs)
+# turns an entry plus parameter values into one `controllers` command line; paths are
+# relative to the repo root. Build the C++ programs first:
+#   cmake -S controllers -B build/controllers && cmake --build build/controllers -j
+# Parameter types: number | integer | choice | aircraft; `target` marks the aircraft
+# state a parameter commands (heading_deg | alt_hae_m | tas_mps).
+
+[[controller]]
+id = "cpp-hold"
+name = "C++ hold"
+description = "Raw-actuator heading / altitude / airspeed hold written against the C++ SDK."
+command = ["build/controllers/cpp/astrum-controller", "--law", "hold"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller.param]]
+name = "max-bank"
+flag = "--max-bank-deg"
+label = "Max bank"
+unit = "deg"
+type = "number"
+default = 25.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "max-pitch"
+flag = "--max-pitch-deg"
+label = "Max pitch"
+unit = "deg"
+type = "number"
+default = 10.0
+min = 1.0
+max = 89.0
+
+[[controller]]
+id = "cpp-autopilot"
+name = "C++ autopilot"
+description = "Sends the heading / altitude / airspeed reference to the sim's built-in autopilot (C++ SDK)."
+command = ["build/controllers/cpp/astrum-controller", "--law", "autopilot"]
+id_flag = "--id"
+kinds = ["fixed-wing", "multirotor"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller]]
+id = "py-hold"
+name = "Python hold"
+description = "Raw-actuator heading / altitude / airspeed hold written against the Python SDK."
+command = ["python3", "controllers/python/example.py", "--law", "hold"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller.param]]
+name = "max-bank"
+flag = "--max-bank-deg"
+label = "Max bank"
+unit = "deg"
+type = "number"
+default = 25.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "max-pitch"
+flag = "--max-pitch-deg"
+label = "Max pitch"
+unit = "deg"
+type = "number"
+default = 10.0
+min = 1.0
+max = 89.0
+
+[[controller]]
+id = "py-autopilot"
+name = "Python autopilot"
+description = "Sends the heading / altitude / airspeed reference to the sim's built-in autopilot (Python SDK)."
+command = ["python3", "controllers/python/example.py", "--law", "autopilot"]
+id_flag = "--id"
+kinds = ["fixed-wing", "multirotor"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller]]
+id = "cpp-lqr"
+name = "C++ LQR"
+description = "Discrete LQR attitude loops under saturated outer loops (C++)."
+command = ["build/controllers/optimal/cpp/astrum-optimal-controller", "--law", "lqr"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller.param]]
+name = "max-bank"
+flag = "--max-bank-deg"
+label = "Max bank"
+unit = "deg"
+type = "number"
+default = 25.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "max-pitch"
+flag = "--max-pitch-deg"
+label = "Max pitch"
+unit = "deg"
+type = "number"
+default = 10.0
+min = 1.0
+max = 89.0
+
+[[controller]]
+id = "cpp-mpc"
+name = "C++ MPC"
+description = "Box-constrained MPC attitude loops under saturated outer loops (C++)."
+command = ["build/controllers/optimal/cpp/astrum-optimal-controller", "--law", "mpc"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller.param]]
+name = "max-bank"
+flag = "--max-bank-deg"
+label = "Max bank"
+unit = "deg"
+type = "number"
+default = 25.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "max-pitch"
+flag = "--max-pitch-deg"
+label = "Max pitch"
+unit = "deg"
+type = "number"
+default = 10.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "horizon"
+flag = "--horizon-s"
+label = "MPC horizon"
+unit = "s"
+type = "number"
+default = 0.5
+min = 0.05
+max = 10.0
+
+[[controller]]
+id = "py-lqr"
+name = "Python LQR"
+description = "Discrete LQR attitude loops under saturated outer loops (Python)."
+command = ["python3", "controllers/optimal/python/run.py", "--law", "lqr"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller.param]]
+name = "max-bank"
+flag = "--max-bank-deg"
+label = "Max bank"
+unit = "deg"
+type = "number"
+default = 25.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "max-pitch"
+flag = "--max-pitch-deg"
+label = "Max pitch"
+unit = "deg"
+type = "number"
+default = 10.0
+min = 1.0
+max = 89.0
+
+[[controller]]
+id = "py-mpc"
+name = "Python MPC"
+description = "Limited unconstrained MPC attitude loops under saturated outer loops (Python)."
+command = ["python3", "controllers/optimal/python/run.py", "--law", "mpc"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = false
+
+[[controller.param]]
+name = "heading"
+flag = "--heading"
+label = "Heading"
+unit = "deg"
+type = "number"
+default = 0.0
+min = 0.0
+max = 360.0
+target = "heading_deg"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller.param]]
+name = "max-bank"
+flag = "--max-bank-deg"
+label = "Max bank"
+unit = "deg"
+type = "number"
+default = 25.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "max-pitch"
+flag = "--max-pitch-deg"
+label = "Max pitch"
+unit = "deg"
+type = "number"
+default = 10.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "horizon"
+flag = "--horizon-s"
+label = "MPC horizon"
+unit = "s"
+type = "number"
+default = 6.0
+min = 0.1
+max = 30.0
+
+[[controller]]
+id = "py-figure8"
+name = "Python figure-8"
+description = "Flies a speed-paced figure-eight (Gerono lemniscate) through the sim autopilot."
+command = ["python3", "controllers/optimal/python/run.py", "--law", "figure8"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = false
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "speed"
+flag = "--speed"
+label = "True airspeed"
+unit = "m/s"
+type = "number"
+default = 50.0
+min = 0.0
+target = "tas_mps"
+
+[[controller.param]]
+name = "rx"
+flag = "--fig-rx"
+label = "Half-width (East)"
+unit = "m"
+type = "number"
+default = 8000.0
+min = 100.0
+
+[[controller.param]]
+name = "ry"
+flag = "--fig-ry"
+label = "Lobe height (North)"
+unit = "m"
+type = "number"
+default = 4000.0
+min = 100.0
+
+[[controller.param]]
+name = "center-e"
+flag = "--fig-center-e"
+label = "Centre East"
+unit = "m"
+type = "number"
+default = 0.0
+
+[[controller.param]]
+name = "center-n"
+flag = "--fig-center-n"
+label = "Centre North"
+unit = "m"
+type = "number"
+default = 0.0
+
+[[controller.param]]
+name = "xtrack"
+flag = "--fig-xtrack"
+label = "Cross-track gain"
+unit = "1/s"
+type = "number"
+default = 0.05
+min = 0.0
+
+[[controller]]
+id = "py-formation"
+name = "Python formation"
+description = "MPC-tracks a slot off a leader aircraft's telemetry through the sim autopilot."
+command = ["python3", "controllers/optimal/python/run.py", "--law", "formation"]
+id_flag = "--id"
+kinds = ["fixed-wing"]
+needs_fleet = true
+
+[[controller.param]]
+name = "leader"
+flag = "--leader"
+label = "Leader"
+type = "aircraft"
+default = 1
+
+[[controller.param]]
+name = "slot"
+flag = "--slot"
+label = "Slot"
+type = "choice"
+choices = ["left", "right", "trail"]
+default = "trail"
+
+[[controller.param]]
+name = "alt"
+flag = "--alt"
+label = "Altitude (HAE)"
+unit = "m"
+type = "number"
+default = 1500.0
+target = "alt_hae_m"
+
+[[controller.param]]
+name = "max-bank"
+flag = "--max-bank-deg"
+label = "Max bank"
+unit = "deg"
+type = "number"
+default = 25.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "max-pitch"
+flag = "--max-pitch-deg"
+label = "Max pitch"
+unit = "deg"
+type = "number"
+default = 10.0
+min = 1.0
+max = 89.0
+
+[[controller.param]]
+name = "horizon"
+flag = "--horizon-s"
+label = "MPC horizon"
+unit = "s"
+type = "number"
+default = 4.0
+min = 0.1
+max = 30.0
+
+[[controller.param]]
+name = "q-pos"
+flag = "--q-pos"
+label = "Position weight"
+type = "number"
+default = 0.8
+min = 0.0
+
+[[controller.param]]
+name = "q-vel"
+flag = "--q-vel"
+label = "Velocity weight"
+type = "number"
+default = 3.0
+min = 0.0
+
+[[controller.param]]
+name = "r-acc"
+flag = "--r-acc"
+label = "Acceleration weight"
+type = "number"
+default = 2.0
+min = 0.001
+
+[[controller.param]]
+name = "cmd-lead"
+flag = "--cmd-lead-s"
+label = "Speed command lead"
+unit = "s"
+type = "number"
+default = 2.5
+min = 0.0
+
+[[controller.param]]
+name = "ap-heading-gain"
+flag = "--ap-heading-gain"
+label = "Autopilot heading gain"
+type = "number"
+default = 2.5
+min = 0.01
+
+[[controller.param]]
+name = "v-min"
+flag = "--v-min"
+label = "Min airspeed"
+unit = "m/s"
+type = "number"
+default = 80.0
+min = 0.0
+
+[[controller.param]]
+name = "v-max"
+flag = "--v-max"
+label = "Max airspeed"
+unit = "m/s"
+type = "number"
+default = 250.0
+min = 0.0
+
+[[controller.param]]
+name = "leader-max-age"
+flag = "--leader-max-age-s"
+label = "Max leader data age"
+unit = "s"
+type = "number"
+default = 0.5
+min = 0.01
