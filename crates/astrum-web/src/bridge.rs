@@ -136,6 +136,21 @@ struct Attachment {
     connected: bool,
 }
 
+impl Current {
+    fn info(&self) -> BridgeInfo {
+        let attachment = self.attachment.as_ref();
+        BridgeInfo {
+            endpoint: attachment.map(|a| a.endpoint.clone()),
+            run: self.run,
+            connected: attachment.is_some_and(|a| a.connected),
+        }
+    }
+
+    fn session(&self) -> Option<Session> {
+        self.attachment.as_ref().filter(|a| a.connected).and_then(|a| a.session.clone())
+    }
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Current> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
@@ -208,29 +223,21 @@ impl Bridge {
 
     /// The current attachment.
     pub fn info(&self) -> BridgeInfo {
-        self.link().0
+        self.shared.lock().info()
     }
 
     /// The attached session while a sim is reachable through it, for relaying
     /// requests to the sim. Its Zenoh calls block: make them (and drop the
     /// handle) off the async runtime's worker threads.
     pub fn session(&self) -> Option<Session> {
-        self.link().1
+        self.shared.lock().session()
     }
 
     /// [`info`](Self::info) and [`session`](Self::session) read together, so
     /// they describe the same attachment.
     pub fn link(&self) -> (BridgeInfo, Option<Session>) {
         let current = self.shared.lock();
-        let attachment = current.attachment.as_ref();
-        let connected = attachment.is_some_and(|a| a.connected);
-        let info = BridgeInfo {
-            endpoint: attachment.map(|a| a.endpoint.clone()),
-            run: current.run,
-            connected,
-        };
-        let session = attachment.filter(|_| connected).and_then(|a| a.session.clone());
-        (info, session)
+        (current.info(), current.session())
     }
 
     /// The newest fleet snapshot of the current run.

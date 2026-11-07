@@ -797,6 +797,12 @@ impl PresenceWatcher {
 /// Slowest supported `sim.speed` other than `0` (unpaced).
 pub const MIN_SPEED: f64 = 1e-3;
 
+/// The one rule for a sim speed: `0` (unpaced), or finite and at least
+/// `min_speed`.
+pub fn speed_ok(x: f64, min_speed: f64) -> bool {
+    x == 0.0 || (x.is_finite() && x >= min_speed)
+}
+
 /// A request on `astrum/control/*`. Control decides only when ticks run (pause,
 /// step, pace), never what a tick computes, so a lockstep run is unchanged by it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -827,7 +833,7 @@ impl ControlRequest {
     pub fn validate(self, min_speed: f64) -> Result<Self, String> {
         match self {
             ControlRequest::Step(0) => Err("step needs ticks >= 1, got 0".into()),
-            ControlRequest::Speed(x) if !(x == 0.0 || (x.is_finite() && x >= min_speed)) => {
+            ControlRequest::Speed(x) if !speed_ok(x, min_speed) => {
                 Err(format!("speed must be 0 (unpaced) or >= {min_speed}, got {x}"))
             }
             valid => Ok(valid),

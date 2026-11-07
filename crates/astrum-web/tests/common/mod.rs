@@ -18,11 +18,11 @@ use axum::Router;
 
 /// A Zenoh endpoint on this process's own port block (`n` < 10), so parallel
 /// tests and concurrently running test binaries do not collide. The band
-/// (11000–16999) is below the Linux ephemeral range and clear of the other
+/// (10000–19999) is below the Linux ephemeral range and clear of the other
 /// crates' test ports (astrum-net: 20000–39999).
 pub fn endpoint(n: u32) -> String {
     assert!(n < 10);
-    format!("tcp/127.0.0.1:{}", 11_000 + (std::process::id() % 600) * 10 + n)
+    format!("tcp/127.0.0.1:{}", 10_000 + (std::process::id() % 1_000) * 10 + n)
 }
 
 /// Fast pumps, so tests see changes quickly.

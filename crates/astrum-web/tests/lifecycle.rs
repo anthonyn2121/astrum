@@ -26,14 +26,17 @@ fn attach_and_detach_cycles_leave_no_bridge_threads() {
     let _sim = Sim::flying(&at, 1);
     let bridge = Bridge::new(config());
     for cycle in 0..10 {
-        bridge.attach(&at);
+        let run = bridge.attach(&at);
         if cycle % 2 == 0 {
             // Let this attachment connect and start every pump...
+            wait_until("the attachment to connect", || bridge.info().connected);
+            let own = format!("bridge-run-{run}");
             wait_until("the attachment's threads", || {
                 let threads = bridge_threads();
-                ["bridge-run-", "bridge-telemetr", "bridge-events", "bridge-models"]
-                    .iter()
-                    .all(|name| threads.iter().any(|t| t.starts_with(name)))
+                threads.contains(&own)
+                    && ["bridge-telemetr", "bridge-events", "bridge-models"]
+                        .iter()
+                        .all(|name| threads.iter().any(|t| t == name))
             });
         } // ...odd cycles are superseded while still connecting.
         if cycle % 3 == 0 {
