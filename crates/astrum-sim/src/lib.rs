@@ -22,6 +22,7 @@
 pub mod combat;
 pub mod components;
 pub mod control;
+pub mod controllers;
 pub mod env;
 pub mod events;
 pub mod net;
