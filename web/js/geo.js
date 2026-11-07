@@ -8,8 +8,8 @@
 // `out` object, so the per-frame paths allocate nothing.
 
 export const WGS84_A = 6378137;
-export const WGS84_F = 1 / 298.257223563;
-export const WGS84_E2 = WGS84_F * (2 - WGS84_F);
+const WGS84_F = 1 / 298.257223563;
+const WGS84_E2 = WGS84_F * (2 - WGS84_F);
 
 export const DEG2RAD = Math.PI / 180;
 export const RAD2DEG = 180 / Math.PI;
@@ -20,7 +20,7 @@ const _ecef2 = { x: 0, y: 0, z: 0 };
 const _enu = { e: 0, n: 0, u: 0 };
 const _geo = { lat: 0, lon: 0, h: 0 };
 
-export function geodeticToEcef(lat, lon, h, out = { x: 0, y: 0, z: 0 }) {
+function geodeticToEcef(lat, lon, h, out) {
   const sl = Math.sin(lat), cl = Math.cos(lat);
   const n = WGS84_A / Math.sqrt(1 - WGS84_E2 * sl * sl);
   out.x = (n + h) * cl * Math.cos(lon);
@@ -31,7 +31,7 @@ export function geodeticToEcef(lat, lon, h, out = { x: 0, y: 0, z: 0 }) {
 
 // Iterates the latitude with a height formula that stays well-conditioned at
 // the poles (the same scheme as astrum-geo).
-export function ecefToGeodetic(e, out = { lat: 0, lon: 0, h: 0 }) {
+function ecefToGeodetic(e, out) {
   const p = Math.hypot(e.x, e.y);
   let lat = Math.atan2(e.z, p * (1 - WGS84_E2));
   let h = 0;
@@ -135,9 +135,10 @@ export class Datum {
 
   // The grid bearing (radians, clockwise from grid north = +n) of true north
   // at the point (lat, lon): the local-level frame there is turned by this
-  // much against the grid (meridian convergence; ≈ sin(lat) · Δlon). A true
-  // heading ψ is grid bearing ψ + northBearing; astrum-geo's `ned_to_enu`
-  // rotates (1, 0, 0) NED into the same direction.
+  // much against the grid (meridian convergence; ≈ −sin(lat) · Δlon, so west
+  // of north east of the origin in the northern hemisphere). A true heading
+  // ψ is grid bearing ψ + northBearing; astrum-geo's `ned_to_enu` rotates
+  // (1, 0, 0) NED into the same direction.
   northBearing(lat, lon) {
     const sl = Math.sin(lat), cl = Math.cos(lat), so = Math.sin(lon), co = Math.cos(lon);
     // Local north as an ECEF vector (row N of that point's rotation), into the grid.

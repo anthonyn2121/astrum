@@ -5,10 +5,11 @@
 // scenario origin (geo.js, = crates/astrum-geo), attitude from the initial
 // heading / climb / bank, and the velocity of its TAS along the flight path.
 //
-// The heading in a scenario is a true heading, in the local-level frame at
-// the aircraft; the grid the scene draws in is the tangent plane at the
-// origin, turned against it by the meridian convergence (Datum.northBearing),
-// so samples carry the grid bearing — what the scene's handles report back.
+// Like telemetry, a sample's attitude is in the local-level frame at the
+// aircraft (psi_rad = the scenario's true heading) and its velocity is in the
+// grid (the tangent plane at the origin, turned against the local level by
+// the meridian convergence, Datum.northBearing); the scene turns attitudes
+// onto the grid itself, for telemetry and for these samples alike.
 
 import { Datum, DEG2RAD } from "./geo.js";
 
@@ -20,11 +21,6 @@ export class EditStore {
     this.tracks = new Map(); // id -> { id, kind }
     this._samples = new Map(); // id -> sample (store.js field names)
     this._datum = null;
-  }
-
-  // The Datum the samples are about (null before the first setFleet).
-  get datum() {
-    return this._datum;
   }
 
   // Rebuild from a scenario: `world` its `[world]`, `aircraft` its specs
@@ -54,7 +50,8 @@ export class EditStore {
     const angle = (v) => (Number.isFinite(v) ? v * DEG2RAD : 0);
     const lat = a.lat_deg * DEG2RAD, lon = a.lon_deg * DEG2RAD;
     const p = this._datum.toEnu(lat, lon, a.alt_hae_m);
-    const psi = angle(a.heading_deg) + this._datum.northBearing(lat, lon);
+    const psi = angle(a.heading_deg);
+    const track = psi + this._datum.northBearing(lat, lon); // the heading's grid bearing
     const gamma = angle(a.climb_deg), phi = angle(a.bank_deg);
     const tas = Number.isFinite(a.tas_mps) ? a.tas_mps : 0;
     const level = tas * Math.cos(gamma);
@@ -62,7 +59,7 @@ export class EditStore {
       t: 0, tick: 0, alive: true, control_mode: "uncommanded",
       lat_deg: a.lat_deg, lon_deg: a.lon_deg, alt_hae_m: a.alt_hae_m,
       enu_e: p.e, enu_n: p.n, enu_u: p.u,
-      vel_e_mps: level * Math.sin(psi), vel_n_mps: level * Math.cos(psi), vel_u_mps: tas * Math.sin(gamma),
+      vel_e_mps: level * Math.sin(track), vel_n_mps: level * Math.cos(track), vel_u_mps: tas * Math.sin(gamma),
       phi_rad: phi, theta_rad: gamma, psi_rad: psi,
       p_rad_s: 0, q_rad_s: 0, r_rad_s: 0,
       tas_mps: tas, mach: 0, alpha_rad: 0, nz_g: 1,

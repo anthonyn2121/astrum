@@ -37,6 +37,7 @@ import {
   buildAircraft, buildGhostGeometry, enuToThree, attitudeToQuaternion, aircraftColor, tintAircraft, setTwoTone,
 } from "./meshes.js";
 import { Environment } from "./environment.js";
+import { DEG2RAD, RAD2DEG } from "./geo.js";
 
 const TRAIL_MAX = 240;      // points per trail
 const TRAIL_MIN_STEP = 1.0; // metres between recorded trail points
@@ -48,8 +49,6 @@ const FLASH = {
   kill: { size: 260, life: 1.4, color: 0xff6a3a },
 };
 const FLASH_MAX = 96; // live flashes at once; older ones are dropped first
-
-const DEG2RAD = Math.PI / 180;
 
 // On-screen sizes (CSS px). Up close an aircraft is drawn at `modelScale` × its
 // true size (setModelScale); with distance it grows so the model's largest
@@ -136,7 +135,12 @@ const HEADING_KNOB_PX = 70;
 const ALT_KNOB_PX = 48;
 const KNOB_HIT_PX = 15;
 const HANDLE_COLOR = 0xffd166;
-const ROTATE_SNAP_DEG = 5;  // Shift while rotating snaps the heading to this
+const ROTATE_SNAP_DEG = 5;  // Shift while rotating snaps the (true) heading to this
+// Perspective drags on a horizontal plane: a pointer ray within 3° of the
+// plane is ignored, and a hit may land at most DRAG_REACH × the grabbed
+// aircraft's distance from the camera.
+const GRAZE_SIN = Math.sin(3 * Math.PI / 180);
+const DRAG_REACH = 4;
 // Preview ghosts (setGhosts): one instanced, flat, translucent silhouette per
 // item, at least PREVIEW_MIN_PX on screen.
 const PREVIEW_OPACITY = 0.6;
@@ -161,6 +165,7 @@ const _size = new THREE.Vector2();
 const _plane = new THREE.Plane();
 const _hit = new THREE.Vector3();
 const _s3 = new THREE.Vector3();
+const _geo = { lat: 0, lon: 0, h: 0 };
 
 // Frame-rate-independent exponential smoothing: the blend toward the goal
 // after `dt` seconds with time constant `tau`.
@@ -259,13 +264,17 @@ export class Scene {
     this._editSel = [];
     this._editSelSet = new Set();
     this._drag = null;
-    this._preview = null;
+    this._ghostLayers = new Map();          // layer key → [{ mesh, pos, quat, span }]
+    this._ghostCam = new THREE.Matrix4();   // the camera pose the ghosts were last sized for
+    this._ghostStamp = NaN;                 // …and the px scale × model scale
     // Keep handler refs so dispose() can detach them on a renderer swap.
     this._onDown = (e) => this._onPointerDown(e);
     this._onMove = (e) => this._onPointerMove(e);
     this._onUp = (e) => this._onPointerUp(e);
     this._onCancel = () => { this._down.active = false; };
     this._onWheel = (e) => this._onWheelZoom(e);
+    // The map pans with any button; a right-drag must not open the menu.
+    this._onMenu = (e) => { if (this._mode === "map") e.preventDefault(); };
     // Edit presses and map pans are watched in the capture phase, ahead of
     // OrbitControls, so a press they claim never reaches it.
     this._onCapDown = (e) => this._onCaptureDown(e);
@@ -282,6 +291,7 @@ export class Scene {
     el.addEventListener("pointerup", this._onUp);
     el.addEventListener("pointercancel", this._onCancel);
     el.addEventListener("wheel", this._onWheel, { passive: false });
+    el.addEventListener("contextmenu", this._onMenu);
 
     // Docks resize the container without any window resize. The observer also
     // fires once on observe(), which sizes the renderer initially.
@@ -762,7 +772,10 @@ export class Scene {
 
       enuToThree(s.enu_e, s.enu_n, s.enu_u, _p);
       a.group.position.copy(_p);
-      attitudeToQuaternion(s.phi_rad, s.theta_rad, s.psi_rad, _q);
+      // The attitude is about the local level at the aircraft; its heading
+      // turns onto the grid by the meridian convergence there.
+      a.psi = s.psi_rad + this._northBearing(s.lat_deg, s.lon_deg);
+      attitudeToQuaternion(s.phi_rad, s.theta_rad, a.psi, _q);
       a.group.quaternion.copy(_q);
       a.group.visible = true;
 
@@ -1111,7 +1124,7 @@ export class Scene {
     this._updateSelectMarker(px);
     this._updateTargetOverlay(px);
     this._updateHandles(px);
-    this._sizePreview(px);
+    this._sizeGhosts(px);
   }
 
   // The bracket size (CSS px) around a built aircraft: at least SELECT_PX and
@@ -1222,7 +1235,7 @@ export class Scene {
   dispose() {
     this.cancelEdit();
     this.clearFleet();
-    this._clearPreview();
+    for (const layer of [...this._ghostLayers.keys()]) this._dropGhostLayer(layer);
     this._resizeObserver.disconnect();
     const el = this.renderer.domElement;
     el.removeEventListener("pointerdown", this._onCapDown, { capture: true });
@@ -1234,6 +1247,7 @@ export class Scene {
     el.removeEventListener("pointerup", this._onUp);
     el.removeEventListener("pointercancel", this._onCancel);
     el.removeEventListener("wheel", this._onWheel);
+    el.removeEventListener("contextmenu", this._onMenu);
     this.controls.dispose();
     for (const { geom } of this._previewGeoms.values()) geom.dispose();
     this._headingLine.geometry.dispose();
@@ -1377,10 +1391,6 @@ export class Scene {
     this._previewGeoms = new Map(); // kind → { geom, span }
   }
 
-  get editing() {
-    return this._edit !== null;
-  }
-
   // Turn edit mode on with `handlers`, or off with null. The scene reports,
   // never changes, the scenario:
   //   onSelect(ids, mode) — a click or box asks for a new selection: "replace"
@@ -1389,10 +1399,12 @@ export class Scene {
   //   onEdit({ type, phase, changes }) — a drag of the selection: type "move"
   //     (horizontal, on the plane at the grabbed aircraft's altitude), "raise"
   //     (the altitude knob, or Alt+drag: up on screen = up) or "rotate" (the
-  //     heading knob; Shift snaps to 5°); phase "start" | "move" | "end" |
-  //     "cancel" (cancelEdit / pointercancel: the start values again);
-  //     changes [{ id, e, n, u }] (ENU metres) for move / raise, [{ id,
-  //     heading_deg }] (grid bearing, 0–360) for rotate;
+  //     heading knob); phase "start" | "move" | "end" | "cancel"
+  //     (cancelEdit / pointercancel: the start values again); changes
+  //     [{ id, e, n, u }] (ENU metres) for move / raise, [{ id, heading_deg }]
+  //     for rotate — the TRUE heading (0–360, the samples' psi_rad
+  //     convention), turned by the pointer's sweep on the grid; Shift snaps
+  //     that true heading to 5°;
   //   onPoint({ e, n }) — a click on empty ground (the u = 0 plane).
   // Pressing an aircraft or a knob keeps the press from OrbitControls, and
   // the tracked-view hand-off never runs while editing. Editing turns the
@@ -1534,7 +1546,7 @@ export class Scene {
     }
     if (d.type !== "ground" || e.timeStamp - d.t0 >= CLICK_MAX_MS) return;
     this._edit.onSelect([], "replace");
-    if (this._rayToPlane(e.clientX, e.clientY, 0, _hit)) this._edit.onPoint({ e: _hit.x, n: -_hit.z });
+    if (this._rayToPlane(e.clientX, e.clientY, 0, _hit, MAP_HEIGHT)) this._edit.onPoint({ e: _hit.x, n: -_hit.z });
   }
 
   // The drag passed the click slop: fix what it moves and where from, and
@@ -1557,8 +1569,10 @@ export class Scene {
     }
     const p = a.group.position;
     d.planeY = p.y;
+    // A perspective drag never lands beyond a few times the aircraft's distance.
+    d.maxDist = DRAG_REACH * this.camera.position.distanceTo(p);
     if (d.type === "move" || d.type === "rotate") {
-      if (!this._rayToPlane(d.x0, d.y0, d.planeY, _hit)) return false;
+      if (!this._rayToPlane(d.x0, d.y0, d.planeY, _hit, d.maxDist)) return false;
       d.hx = _hit.x;
       d.hz = _hit.z;
       d.cx = p.x;
@@ -1584,7 +1598,7 @@ export class Scene {
     } else if (d.type === "raise") {
       o.du = (d.y0 - e.clientY) * d.mpp;
       this._emit(d, "move");
-    } else if (this._rayToPlane(e.clientX, e.clientY, d.planeY, _hit)) {
+    } else if (this._rayToPlane(e.clientX, e.clientY, d.planeY, _hit, d.maxDist)) {
       if (d.type === "move") {
         o.de = _hit.x - d.hx;
         o.dn = -(_hit.z - d.hz);
@@ -1622,15 +1636,19 @@ export class Scene {
   }
 
   // Where the pointer's ray meets the horizontal plane at three-y `y`, into
-  // `out`; null when it misses or lands absurdly far (a grazing ray).
-  _rayToPlane(clientX, clientY, y, out) {
+  // `out`. In perspective, null for a ray within GRAZE_SIN of parallel to the
+  // plane or a hit farther than `maxDist` from the camera (a near-horizon
+  // pointer would fling the point kilometres away).
+  _rayToPlane(clientX, clientY, y, out, maxDist) {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this._pointer.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
     this._raycaster.setFromCamera(this._pointer, this.camera);
+    const ray = this._raycaster.ray;
+    if (this._mode !== "map" && Math.abs(ray.direction.y) < GRAZE_SIN) return null;
     _plane.set(UP, -y);
-    const hit = this._raycaster.ray.intersectPlane(_plane, out);
+    const hit = ray.intersectPlane(_plane, out);
     if (!hit) return null;
-    if (this._mode !== "map" && hit.distanceTo(this.camera.position) > MAP_HEIGHT) return null;
+    if (this._mode !== "map" && hit.distanceTo(this.camera.position) > maxDist) return null;
     return hit;
   }
 
@@ -1702,17 +1720,23 @@ export class Scene {
 
   // The primary selection's handles: the heading knob HEADING_KNOB_PX out
   // along the nose (with a line to it), the altitude knob ALT_KNOB_PX out the
-  // opposite way on screen, so the two never overlap.
+  // opposite way on screen, so the two never overlap. Hidden (and not
+  // pickable) while the aircraft or the heading knob is behind the camera.
   _updateHandles(px) {
     const a = this._edit ? this._visible(this.selectedId) : null;
-    const show = !!a?.sample;
+    let show = !!a?.sample;
+    let ps, hs;
+    if (show) {
+      const p = a.group.position;
+      _w.set(Math.sin(a.psi), 0, -Math.cos(a.psi)).multiplyScalar(HEADING_KNOB_PX * px * this._depth(p)).add(p);
+      ps = this._toScreen(p, _s3);
+      hs = this._toScreen(_w, _v);
+      show = Math.abs(ps.z) <= 1 && Math.abs(hs.z) <= 1;
+    }
     this._headingKnob.visible = this._altKnob.visible = this._headingLine.visible = show;
     this._knobs.id = show ? this.selectedId : null;
     if (!show) return;
     const p = a.group.position;
-    const depth = this._depth(p);
-    const psi = a.sample.psi_rad;
-    _w.set(Math.sin(psi), 0, -Math.cos(psi)).multiplyScalar(HEADING_KNOB_PX * px * depth).add(p);
     const pos = this._headingLine.geometry.attributes.position;
     pos.setXYZ(0, p.x, p.y, p.z);
     pos.setXYZ(1, _w.x, _w.y, _w.z);
@@ -1721,8 +1745,6 @@ export class Scene {
     this._headingKnob.position.copy(_w);
     this._headingKnob.scale.set(knobH, knobH, 1);
 
-    const ps = this._toScreen(p, _s3);
-    const hs = this._toScreen(_w, _v);
     this._knobs.rotate.x = hs.x;
     this._knobs.rotate.y = hs.y;
     let dx = hs.x - ps.x, dy = hs.y - ps.y;
@@ -1737,14 +1759,23 @@ export class Scene {
     this._altKnob.scale.set(knobH, knobH, 1);
   }
 
-  // Translucent preview aircraft ("ghosts", e.g. a spawn-cloud preview):
+  // Grid bearing of true north at (lat°, lon°) about the scene's datum; 0
+  // without one (a sim with no geodetic output draws headings as given).
+  _northBearing(latDeg, lonDeg) {
+    const d = this._env.datum;
+    return d ? d.northBearing(latDeg * DEG2RAD, lonDeg * DEG2RAD) : 0;
+  }
+
+  // Translucent preview aircraft ("ghosts") in named layers, so independent
+  // previews (a spawn preview, a sweep's spawn cloud) never wipe each other:
   // `items` [{ kind, e, n, u, heading_deg, climb_deg?, bank_deg?, color? }]
-  // (ENU metres, heading a grid bearing, colour a CSS string or hex number),
-  // drawn as one instanced flat silhouette layer per kind — cheap for
-  // thousands — never picked, kept at least PREVIEW_MIN_PX on screen. Items
-  // with a non-finite position are skipped; null or [] clears the layer.
-  setGhosts(items) {
-    this._clearPreview();
+  // (ENU metres, heading a TRUE heading like the samples', colour a CSS
+  // string or hex number) replace layer `layer`'s; null or [] clears it.
+  // Each layer is one instanced flat silhouette per kind — cheap for
+  // thousands — never picked, every ghost kept at least PREVIEW_MIN_PX on
+  // screen at its own distance. Items with a non-finite position are skipped.
+  setGhosts(layer, items) {
+    this._dropGhostLayer(layer);
     const byKind = new Map();
     for (const it of items || []) {
       if (![it.e, it.n, it.u].every(Number.isFinite)) continue;
@@ -1753,9 +1784,8 @@ export class Scene {
       byKind.get(kind).push(it);
     }
     if (!byKind.size) return;
-    const layers = [];
-    const center = new THREE.Vector3();
-    let total = 0;
+    const datum = this._env.datum;
+    const meshes = [];
     for (const [kind, list] of byKind) {
       let shape = this._previewGeoms.get(kind);
       if (!shape) { shape = buildGhostGeometry(kind); this._previewGeoms.set(kind, shape); }
@@ -1768,53 +1798,60 @@ export class Scene {
       const pos = new Float32Array(list.length * 3), quat = new Float32Array(list.length * 4);
       list.forEach((it, i) => {
         enuToThree(it.e, it.n, it.u, _p).toArray(pos, i * 3);
-        center.add(_p);
         const deg = (v) => (Number.isFinite(v) ? v * DEG2RAD : 0);
-        attitudeToQuaternion(deg(it.bank_deg), deg(it.climb_deg), deg(it.heading_deg), _q).toArray(quat, i * 4);
+        let psi = deg(it.heading_deg);
+        if (datum) {
+          const g = datum.toGeodetic(it.e, it.n, it.u, _geo);
+          psi += datum.northBearing(g.lat, g.lon);
+        }
+        attitudeToQuaternion(deg(it.bank_deg), deg(it.climb_deg), psi, _q).toArray(quat, i * 4);
         mesh.setColorAt(i, _col.set(it.color ?? PREVIEW_COLOR));
       });
       mesh.instanceColor.needsUpdate = true;
-      total += list.length;
       this.scene.add(mesh);
-      layers.push({ mesh, pos, quat, span: shape.span, scale: NaN });
+      meshes.push({ mesh, pos, quat, span: shape.span });
     }
-    this._preview = { layers, center: center.divideScalar(total) };
+    this._ghostLayers.set(layer, meshes);
+    this._ghostStamp = NaN; // size the new layer on the next frame
   }
 
-  // Size the ghosts for this frame (one scale for all, from the cloud's
-  // centre); the instance matrices are rebuilt only when it changed > 2 %.
-  _sizePreview(px) {
-    const pv = this._preview;
-    if (!pv) return;
-    const depth = this._depth(pv.center);
-    for (const l of pv.layers) {
-      const s = Math.max(this._modelScale, (PREVIEW_MIN_PX * px * depth) / l.span);
-      if (Math.abs(s - l.scale) <= l.scale * 0.02) continue;
-      l.scale = s;
-      _s3.setScalar(s);
-      for (let i = 0; i < l.mesh.count; i++) {
-        _p.fromArray(l.pos, i * 3);
-        _q.fromArray(l.quat, i * 4);
-        l.mesh.setMatrixAt(i, _m4.compose(_p, _q, _s3));
+  // Size every ghost for this frame: in perspective each by its own distance,
+  // on the map all alike. The instance matrices are rebuilt only when the
+  // camera, the scale or a layer changed.
+  _sizeGhosts(px) {
+    if (!this._ghostLayers.size) return;
+    const cam = this.camera;
+    const stamp = px * this._modelScale;
+    if (stamp === this._ghostStamp && this._ghostCam.equals(cam.matrixWorld)) return;
+    this._ghostStamp = stamp;
+    this._ghostCam.copy(cam.matrixWorld);
+    for (const meshes of this._ghostLayers.values()) {
+      for (const { mesh, pos, quat, span } of meshes) {
+        for (let i = 0; i < mesh.count; i++) {
+          _p.fromArray(pos, i * 3);
+          _q.fromArray(quat, i * 4);
+          _s3.setScalar(Math.max(this._modelScale, (PREVIEW_MIN_PX * px * this._depth(_p)) / span));
+          mesh.setMatrixAt(i, _m4.compose(_p, _q, _s3));
+        }
+        mesh.instanceMatrix.needsUpdate = true;
       }
-      l.mesh.instanceMatrix.needsUpdate = true;
     }
   }
 
-  // Drop the ghost layers (the per-kind geometry stays cached).
-  _clearPreview() {
-    if (!this._preview) return;
-    for (const { mesh } of this._preview.layers) {
+  // Drop one ghost layer (the per-kind geometry stays cached).
+  _dropGhostLayer(layer) {
+    const meshes = this._ghostLayers.get(layer);
+    if (!meshes) return;
+    for (const { mesh } of meshes) {
       this.scene.remove(mesh);
       mesh.material.dispose();
       mesh.dispose();
     }
-    this._preview = null;
+    this._ghostLayers.delete(layer);
   }
 }
 
 const NO_OFFSET = { de: 0, dn: 0, du: 0, dh: 0 };
-const RAD2DEG = 180 / Math.PI;
 
 function wrap360(deg) {
   return ((deg % 360) + 360) % 360;

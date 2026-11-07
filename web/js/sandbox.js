@@ -15,7 +15,7 @@
 
 import { Scene } from "./scene.js";
 import { EditStore } from "./editstore.js";
-import { Datum, DEG2RAD, RAD2DEG } from "./geo.js";
+import { Datum, DEG2RAD } from "./geo.js";
 import { getEnvironments, getModels, getScenario } from "./api.js";
 
 const DEFAULT_ENVIRONMENT = "empty";
@@ -126,27 +126,32 @@ function undo() {
   if (!state.undo.length) return;
   scene.cancelEdit();
   state.redo.push(snapshot());
-  restore(state.undo.pop());
-  state.entry.clear();
-  refresh();
+  travel(state.undo.pop());
 }
 
 function redo() {
   if (!state.redo.length) return;
   scene.cancelEdit();
   state.undo.push(snapshot());
-  restore(state.redo.pop());
+  travel(state.redo.pop());
+}
+
+// Restore a history snapshot; if that moves the origin, the view stays on
+// its ground as it does for the move itself.
+function travel(snap) {
+  const w0 = { ...state.scenario.world }, before = datum();
+  restore(snap);
   state.entry.clear();
+  const w = state.scenario.world;
+  if (["origin_lat_deg", "origin_lon_deg", "origin_alt_hae_m"].some((k) => w[k] !== w0[k])) keepViewOnGround(before, datum());
   refresh();
 }
 
-// Unused ids from the highest one up.
+// The `count` lowest unused ids from 1 up (fewer when the u32 range runs out).
 function freshIds(count) {
   const used = new Set(state.scenario.aircraft.map((a) => a.id));
   const ids = [];
-  let id = state.scenario.aircraft.reduce((m, a) => (Number.isInteger(a.id) ? Math.max(m, a.id) : m), 0);
-  while (ids.length < count && id < MAX_ID) {
-    id++;
+  for (let id = 1; ids.length < count && id <= MAX_ID; id++) {
     if (!used.has(id)) ids.push(id);
   }
   return ids;
@@ -173,6 +178,9 @@ function validate(scn) {
   }
   if (!(isNum(s.command_lease_s) && s.command_lease_s >= 0)) add(undefined, "sim.command_lease_s", `sim.command_lease_s must be >= 0, got ${s.command_lease_s}`);
   if (!(isNum(s.lockstep_timeout_s) && s.lockstep_timeout_s > 0)) add(undefined, "sim.lockstep_timeout_s", `sim.lockstep_timeout_s must be > 0, got ${s.lockstep_timeout_s}`);
+  // Integer fields serde would refuse to read otherwise (u64 / usize).
+  if (!(Number.isSafeInteger(s.seed) && s.seed >= 0)) add(undefined, "sim.seed", `sim.seed must be an integer >= 0, got ${s.seed}`);
+  if (!(Number.isSafeInteger(s.threads) && s.threads >= 0)) add(undefined, "sim.threads", `sim.threads must be an integer >= 0 (0 = every core), got ${s.threads}`);
   if (!scn.aircraft.length) add(undefined, "aircraft", "scenario has no aircraft");
 
   const seen = new Set();
@@ -191,17 +199,18 @@ function validate(scn) {
       if (isNum(v) && Math.abs(v) >= 90) add(id, k, `${k} must be within (-90, 90), got ${v}`);
     }
     if (isNum(a.tas_mps) && a.tas_mps < 0) add(id, "tas_mps", `tas_mps must be >= 0, got ${a.tas_mps}`);
+    // health is an f32 on the server: a value past its range is infinite there.
     const health = a.health ?? 100;
-    if (!(isNum(health) && health > 0)) add(id, "health", `health must be > 0, got ${health}`);
+    if (!(isNum(health) && Number.isFinite(Math.fround(health)) && health > 0)) add(id, "health", `health must be > 0, got ${health}`);
     const team = a.team ?? 0;
     if (!(Number.isInteger(team) && team >= 0 && team <= MAX_TEAM)) add(id, "team", `team must be an integer 0–${MAX_TEAM}`);
     if (a.lockstep && !s.lockstep) add(id, "lockstep", "lockstep = true requires sim.lockstep = true");
     const known = modelEntry(a.model);
     const kind = a.kind ?? known?.kind;
-    if (!kind) add(id, "model", `model '${a.model}' has no built-in profile; set kind = "fixed-wing" | "multirotor"`);
-    else if (kind === "multirotor" && a.autopilot_profile != null) add(id, "model", "autopilot_profile applies to fixed-wing aircraft only");
+    if (!kind) add(id, "kind", `model '${a.model}' has no built-in profile; set kind = "fixed-wing" | "multirotor"`);
+    else if (kind === "multirotor" && a.autopilot_profile != null) add(id, "autopilot_profile", "autopilot_profile applies to fixed-wing aircraft only");
     else if (kind === "fixed-wing" && a.autopilot_profile == null && !(known?.kind === "fixed-wing" && known.autopilot_profile)) {
-      add(id, "model", `fixed-wing model '${a.model}' has no built-in autopilot gains; set autopilot_profile = "trainer" | "fighter"`);
+      add(id, "autopilot_profile", `fixed-wing model '${a.model}' has no built-in autopilot gains; set autopilot_profile = "trainer" | "fighter"`);
     }
     if (a.ammo != null) {
       if (kind === "multirotor") add(id, "ammo", "ammo applies to armed fixed-wing aircraft only");
@@ -254,9 +263,7 @@ function onEdit({ type, phase, changes }) {
     const a = byId(c.id);
     if (!a) continue;
     if (type === "rotate") {
-      // The scene reports a grid bearing; the scenario wants a true heading.
-      const north = d.northBearing(a.lat_deg * DEG2RAD, a.lon_deg * DEG2RAD) * RAD2DEG;
-      a.heading_deg = round(wrap360(c.heading_deg - north), 1);
+      a.heading_deg = round(wrap360(c.heading_deg), 1); // a true heading (snapped by the scene on Shift)
     } else {
       const g = d.geodeticOf(c.e, c.n, c.u);
       if (type === "move") {
@@ -294,7 +301,6 @@ function moveOrigin(lat, lon, alt) {
   const before = datum();
   const after = Datum.fromDegrees(lat, lon, alt);
   const withFleet = $("moveFleet").checked;
-  const c = scene.viewCenter();
   commit(() => {
     if (withFleet) {
       for (const a of state.scenario.aircraft) {
@@ -308,12 +314,17 @@ function moveOrigin(lat, lon, alt) {
     }
     Object.assign(state.scenario.world, { origin_lat_deg: lat, origin_lon_deg: lon, origin_alt_hae_m: alt });
   });
-  if (!withFleet) {
-    const g = before.geodeticOf(c.e, c.n, 0);
-    const p = after.enuOf(g.lat_deg, g.lon_deg, g.alt_hae_m);
-    if (Math.hypot(p.e, p.n) <= VIEW_KEEP_M) scene.setViewCenter(p.e, p.n);
-    else scene.setViewCenter(0, 0);
-  }
+  if (!withFleet) keepViewOnGround(before, after);
+}
+
+// Re-centre the view on the ground it showed in datum `before`, now in
+// `after` — or on the origin when that ground is beyond the map's reach.
+function keepViewOnGround(before, after) {
+  const c = scene.viewCenter();
+  const g = before.geodeticOf(c.e, c.n, 0);
+  const p = after.enuOf(g.lat_deg, g.lon_deg, g.alt_hae_m);
+  if (Math.hypot(p.e, p.n) <= VIEW_KEEP_M) scene.setViewCenter(p.e, p.n);
+  else scene.setViewCenter(0, 0);
 }
 
 function setPicking(on) {
@@ -402,25 +413,33 @@ function showSpawnError(msg) {
 }
 
 // The spawn preview: ghosts where the form would put its aircraft, while the
-// pointer or focus is on the form.
+// pointer or focus is on the form. Its own ghost layer, so other previews stay.
 function updatePreview() {
-  if (!state.previewSpawn) { scene.setGhosts(null); return; }
+  if (!state.previewSpawn) { scene.setGhosts("spawn", null); return; }
   const plan = spawnPlan();
   showSpawnError(plan.error);
-  if (plan.error) { scene.setGhosts(null); return; }
+  if (plan.error) { scene.setGhosts("spawn", null); return; }
   const d = datum(), kind = modelEntry($("spawnModel").value)?.kind ?? "fixed-wing";
-  scene.setGhosts(plan.aircraft.map((a) => {
+  scene.setGhosts("spawn", plan.aircraft.map((a) => {
     const p = d.enuOf(a.lat_deg, a.lon_deg, a.alt_hae_m);
-    const north = d.northBearing(a.lat_deg * DEG2RAD, a.lon_deg * DEG2RAD) * RAD2DEG;
-    return { kind, e: p.e, n: p.n, u: p.u, heading_deg: a.heading_deg + north };
+    return { kind, e: p.e, n: p.n, u: p.u, heading_deg: a.heading_deg };
   }));
+}
+
+function showFleetStatus(msg) {
+  $("fleetStatus").hidden = !msg;
+  $("fleetStatus").textContent = msg ?? "";
 }
 
 function duplicate() {
   const src = state.selection.map(byId).filter(Boolean);
   if (!src.length) return;
   const ids = freshIds(src.length);
-  if (ids.length < src.length) return;
+  if (ids.length < src.length) {
+    showFleetStatus(`Cannot duplicate ${src.length} aircraft: only ${ids.length} aircraft ids are free.`);
+    return;
+  }
+  showFleetStatus(null);
   const d = datum();
   commit(() => {
     const copies = src.map((a, i) => {
@@ -442,16 +461,22 @@ function duplicate() {
 function removeSelected() {
   if (!state.selection.length) return;
   const gone = new Set(state.selection);
+  showFleetStatus(null);
   commit(() => {
     state.scenario.aircraft = state.scenario.aircraft.filter((a) => !gone.has(a.id));
     state.selection = [];
   });
 }
 
-// ---- Inspector -------------------------------------------------------------
+// ---- Inspector, world, sim -------------------------------------------------
 
 const insInputs = [...document.querySelectorAll("#insForm [data-field]")];
 const worldInputs = [...document.querySelectorAll("#worldForm [data-world]")];
+const simInputs = [...document.querySelectorAll("#simForm [data-sim]")];
+// Fields that are unset (left out of the JSON) when their control is blank.
+const OPTIONAL = new Set(["kind", "autopilot_profile", "trim", "control_rate_hz", "ammo"]);
+const INTEGERS = new Set(["id", "team", "ammo", "seed", "threads"]);
+const SELECTS = new Set(["model", "kind", "autopilot_profile", "trim"]);
 
 function fieldValue(a, field, d) {
   if (field.startsWith("enu_")) {
@@ -463,19 +488,29 @@ function fieldValue(a, field, d) {
   return v === null || v === undefined ? "" : String(v);
 }
 
-// A typed value for `field`, or { error } (the entry is refused). Optional
-// fields accept "" as unset (undefined).
-function parseField(field, raw) {
-  if (field === "model") return raw;
+// A control's typed value for `field`, or { error } (the entry is refused).
+// Optional fields read a blank control as unset (undefined); a checkbox is
+// true or unset (serde's default false).
+function parseField(field, input) {
+  if (input.type === "checkbox") return input.checked ? true : undefined;
+  const raw = input.value;
   if (field === "trim") return raw === "" ? undefined : raw === "true";
+  if (SELECTS.has(field)) return raw === "" ? undefined : raw;
   if (raw.trim() === "") {
-    if (field === "control_rate_hz" || field === "ammo") return undefined;
+    if (OPTIONAL.has(field)) return undefined;
     return { error: `${field} must be a number` };
   }
   const v = Number(raw);
   if (!Number.isFinite(v)) return { error: `${field} must be a finite number` };
-  if (["id", "team", "ammo"].includes(field) && !Number.isInteger(v)) return { error: `${field} must be an integer` };
+  if (INTEGERS.has(field) && !Number.isSafeInteger(v)) return { error: `${field} must be an integer` };
   return v;
+}
+
+// Fields that only apply to fixed-wing aircraft go when the class turns multirotor.
+function dropFixedWingFields(a) {
+  if (kindOf(a) !== "multirotor") return;
+  delete a.autopilot_profile;
+  delete a.ammo;
 }
 
 function onInspectorChange(input) {
@@ -483,7 +518,7 @@ function onInspectorChange(input) {
   if (!a) return;
   const field = input.dataset.field;
   const key = `${a.id}:${field}`;
-  const v = parseField(field, input.value);
+  const v = parseField(field, input);
   if (v && typeof v === "object") {
     state.entry.set(key, `aircraft ${a.id}: ${v.error}`);
     renderIssues();
@@ -500,11 +535,6 @@ function onInspectorChange(input) {
     if (field === "id") {
       state.selection = state.selection.map((id) => (id === a.id ? v : id));
       a.id = v;
-    } else if (field === "model") {
-      a.model = v;
-      const known = modelEntry(v);
-      if (known) { delete a.kind; delete a.autopilot_profile; }
-      if (kindOf(a) === "multirotor") delete a.ammo;
     } else if (field.startsWith("enu_")) {
       const p = d.enuOf(a.lat_deg, a.lon_deg, a.alt_hae_m);
       p[field.slice(4)] = v;
@@ -517,13 +547,14 @@ function onInspectorChange(input) {
     } else {
       a[field] = v;
     }
+    if (field === "model" || field === "kind") dropFixedWingFields(a);
   });
 }
 
 function onWorldChange(input) {
   const field = input.dataset.world;
   const key = `world:${field}`;
-  const v = parseField(field, input.value);
+  const v = parseField(field, input);
   if (v && typeof v === "object") {
     state.entry.set(key, `world.${field}: ${v.error.replace(`${field} `, "")}`);
     renderIssues();
@@ -539,6 +570,19 @@ function onWorldChange(input) {
   moveOrigin(w.origin_lat_deg, w.origin_lon_deg, w.origin_alt_hae_m);
 }
 
+function onSimChange(input) {
+  const field = input.dataset.sim;
+  const key = `sim:${field}`;
+  const v = field === "lockstep" ? input.checked : parseField(field, input);
+  if (v && typeof v === "object") {
+    state.entry.set(key, `sim.${field}: ${v.error.replace(`${field} `, "")}`);
+    renderIssues();
+    return;
+  }
+  state.entry.delete(key);
+  commit(() => { state.scenario.sim[field] = v; });
+}
+
 function fillModelSelect(select, current) {
   const names = state.env?.models?.length ? state.env.models : state.models.map((m) => m.model);
   const options = [...new Set([...names, ...(current && !names.includes(current) ? [current] : [])])];
@@ -551,6 +595,21 @@ function fillModelSelect(select, current) {
   }));
 }
 
+// Issue messages by field: validate()'s whose `match` holds, then the
+// refused entries under `prefix` ("<id>:", "world:", "sim:").
+function badFields(issues, match, prefix, strip) {
+  const bad = new Map();
+  for (const i of issues) if (match(i)) bad.set(strip(i.field), i.msg);
+  for (const [key, msg] of state.entry) if (key.startsWith(prefix)) bad.set(key.slice(prefix.length), msg);
+  return bad;
+}
+
+function showErrors(el, bad) {
+  const msgs = [...new Set(bad.values())];
+  el.hidden = !msgs.length;
+  el.textContent = msgs.join("\n");
+}
+
 function renderInspector(issues) {
   const sel = state.selection;
   const a = byId(sel.at(-1));
@@ -560,32 +619,31 @@ function renderInspector(issues) {
   $("insMulti").hidden = sel.length < 2;
   $("insMulti").textContent = sel.length < 2 ? "" : `${sel.length} aircraft selected — editing ${a.id}, the last picked`;
   const d = datum();
-  const modelSelect = $("insForm").querySelector('[data-field="model"]');
-  fillModelSelect(modelSelect, a.model);
-  const bad = new Map();
-  for (const i of issues) if (i.id === a.id) bad.set(i.field, i.msg);
-  for (const [key, msg] of state.entry) {
-    const [id, field] = key.split(":");
-    if (id === String(a.id)) bad.set(field, msg);
-  }
+  const form = $("insForm");
+  fillModelSelect(form.querySelector('[data-field="model"]'), a.model);
+  // "Default" says what the model gives when the field is unset.
+  const known = modelEntry(a.model);
+  form.querySelector('[data-field="kind"] option[value=""]').textContent = `Default (${known?.kind ?? "none"})`;
+  form.querySelector('[data-field="autopilot_profile"] option[value=""]').textContent =
+    `Default (${known?.autopilot_profile ?? "none"})`;
+  const bad = badFields(issues, (i) => i.id === a.id, `${a.id}:`, (f) => f);
   for (const input of insInputs) {
     const field = input.dataset.field;
-    if (document.activeElement !== input) {
+    if (input.type === "checkbox") input.checked = !!a[field];
+    else if (document.activeElement !== input) {
       input.value = field === "trim" ? (a.trim === undefined ? "" : String(a.trim)) : fieldValue(a, field, d);
     }
     input.setAttribute("aria-invalid", String(bad.has(field)));
   }
-  $("insForm").querySelector("[data-armed]").hidden = kindOf(a) !== "fixed-wing";
-  const msgs = [...new Set(bad.values())];
-  $("insErrors").hidden = !msgs.length;
-  $("insErrors").textContent = msgs.join("\n");
+  const fixedWing = kindOf(a) === "fixed-wing";
+  form.querySelector("[data-armed]").hidden = !fixedWing;
+  form.querySelector("[data-fixed-wing]").hidden = !fixedWing && a.autopilot_profile == null;
+  showErrors($("insErrors"), bad);
 }
 
 function renderWorld(issues) {
   const w = state.scenario.world;
-  const bad = new Map();
-  for (const i of issues) if (i.field.startsWith("world.")) bad.set(i.field.slice(6), i.msg);
-  for (const [key, msg] of state.entry) if (key.startsWith("world:")) bad.set(key.slice(6), msg);
+  const bad = badFields(issues, (i) => i.field.startsWith("world."), "world:", (f) => f.slice(6));
   for (const input of worldInputs) {
     const field = input.dataset.world;
     if (document.activeElement !== input) input.value = String(w[field]);
@@ -608,9 +666,19 @@ function renderWorld(issues) {
     }));
   }
   sel.value = match >= 0 ? String(match) : "";
-  const msgs = [...new Set(bad.values())];
-  $("worldErrors").hidden = !msgs.length;
-  $("worldErrors").textContent = msgs.join("\n");
+  showErrors($("worldErrors"), bad);
+}
+
+function renderSim(issues) {
+  const s = state.scenario.sim;
+  const bad = badFields(issues, (i) => i.field.startsWith("sim."), "sim:", (f) => f.slice(4));
+  for (const input of simInputs) {
+    const field = input.dataset.sim;
+    if (input.type === "checkbox") input.checked = !!s[field];
+    else if (document.activeElement !== input) input.value = String(s[field]);
+    input.setAttribute("aria-invalid", String(bad.has(field)));
+  }
+  showErrors($("simErrors"), bad);
 }
 
 // ---- Fleet list, JSON, issues ----------------------------------------------
@@ -668,6 +736,7 @@ function renderIssues(issues = validate(state.scenario)) {
   }
   renderInspector(issues);
   renderWorld(issues);
+  renderSim(issues);
   return issues;
 }
 
@@ -776,7 +845,8 @@ function wire() {
   });
   for (const input of insInputs) input.addEventListener("change", () => onInspectorChange(input));
   for (const input of worldInputs) input.addEventListener("change", () => onWorldChange(input));
-  for (const f of ["insForm", "worldForm"]) $(f).addEventListener("submit", (e) => e.preventDefault());
+  for (const input of simInputs) input.addEventListener("change", () => onSimChange(input));
+  for (const f of ["insForm", "worldForm", "simForm"]) $(f).addEventListener("submit", (e) => e.preventDefault());
 
   // A press on the map commits the field being typed in first (its change
   // event), so a drag never races a stale inspector value.

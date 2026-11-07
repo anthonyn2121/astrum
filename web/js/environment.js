@@ -564,6 +564,11 @@ export class Environment {
     return this._datum !== null;
   }
 
+  // The scenario's ENU frame (geo.js Datum), null until observed or set.
+  get datum() {
+    return this._datum;
+  }
+
   // Solve the scenario origin from a sample, if it is geolocated (0, 0 is a
   // sim without geodetic output). Call until hasDatum; a no-op once an origin
   // is known (observed or set).
