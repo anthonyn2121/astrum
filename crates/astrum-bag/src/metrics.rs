@@ -21,15 +21,24 @@
 //! missing from the bag is skipped for that pair. The minimum can therefore
 //! miss a closest approach between shared ticks by up to the distance the pair
 //! closes in one shared sample period.
+//!
+//! **One run per bag.** Metrics assume the bag holds a single run: a bag
+//! recorded across a sim restart is not split, so its metrics mix both runs
+//! (ticks restart, samples of the same tick number from either run are paired,
+//! and the final state is whichever sample has the highest tick).
+//!
+//! The model labels come from the recorded scenario via [`aircraft_models`]; a
+//! missing or unparseable scenario only leaves them `None`.
 
 use std::collections::BTreeMap;
 
 use astrum_proto::{decode_event, decode_telemetry, ControlMode, EventKind, Telemetry};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::{BagError, BagReader, Result, TopicKind};
+use crate::{aircraft_models, BagReader, Result, TopicKind};
 
-/// Fleet-level metrics of one recorded run.
+/// Fleet-level metrics of one recorded run (a bag spanning a sim restart mixes
+/// the runs; see the [module docs](self)).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunMetrics {
     /// The `run-ended` event's reason (`max-time`, `engagement-decided`,
@@ -55,8 +64,9 @@ pub struct RunMetrics {
     pub failsafe_entries: u32,
     /// `controller-down` events.
     pub controller_losses: u32,
-    /// Commands the sim refused, summed over aircraft (each aircraft's count
-    /// from its last telemetry sample).
+    /// Commands the sim refused, summed over aircraft: each aircraft's running
+    /// total since the sim started, from its last telemetry sample (so a live
+    /// `astrum record` joined mid-run includes refusals from before it joined).
     pub command_refusals: u64,
     /// `hit` events.
     pub hits: u32,
@@ -73,7 +83,8 @@ pub struct RunMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AircraftMetrics {
     pub id: u32,
-    /// JSBSim model from the bag's recorded scenario; `None` without one.
+    /// JSBSim model from the bag's recorded scenario ([`aircraft_models`]);
+    /// `None` without a parseable scenario entry for this id.
     pub model: Option<String>,
     /// From the last sample.
     pub alive: bool,
@@ -100,19 +111,6 @@ pub struct FinalState {
     pub tas_mps: f64,
     /// World-grid position `[e, n, u]` (m).
     pub enu_m: [f64; 3],
-}
-
-/// The fleet as the recorded scenario declares it: only what metrics need.
-#[derive(Deserialize)]
-struct ScenarioFleet {
-    #[serde(default)]
-    aircraft: Vec<ScenarioAircraft>,
-}
-
-#[derive(Deserialize)]
-struct ScenarioAircraft {
-    id: u32,
-    model: String,
 }
 
 #[derive(Default)]
@@ -163,18 +161,15 @@ struct TickSamples {
 
 /// Compute the run's metrics from `bag`.
 ///
-/// Errors if the bag's messages cannot be read or its recorded scenario is not
-/// a valid scenario TOML (`[[aircraft]]` entries need `id` and `model`).
+/// Errors only if the bag's messages cannot be read.
 pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
-    let models: BTreeMap<u32, String> = match bag.scenario() {
-        Some(toml) => toml::from_str::<ScenarioFleet>(toml)
-            .map_err(|e| BagError::Scenario(e.to_string()))?
-            .aircraft
-            .into_iter()
-            .map(|a| (a.id, a.model))
-            .collect(),
-        None => BTreeMap::new(),
-    };
+    let models: BTreeMap<u32, String> = bag
+        .scenario()
+        .map(aircraft_models)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.id, a.model))
+        .collect();
 
     let mut tracks: BTreeMap<u32, Track> = BTreeMap::new();
     let mut ticks: BTreeMap<u64, TickSamples> = BTreeMap::new();

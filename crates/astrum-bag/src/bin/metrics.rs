@@ -13,7 +13,7 @@ use clap::Parser;
 
 /// Print a bag's run metrics as JSON.
 #[derive(Parser)]
-#[command(name = "astrum-bag-metrics", version, about)]
+#[command(name = "astrum-bag-metrics", version, about = "Print a bag's run metrics as JSON.")]
 struct Cli {
     /// Input bag path.
     #[arg(env = "ASTRUM_BAG")]

@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use astrum_bag::metrics::{compute, RunMetrics};
-use astrum_bag::{BagError, BagReader, BagWriter};
+use astrum_bag::{BagReader, BagWriter};
 use astrum_proto::{
     encode_event, encode_telemetry, CombatStatus, CommandStatus, ControlMode, EndReason, Enu,
     Euler, Event, EventKind, ModeReason, Telemetry,
@@ -138,6 +138,21 @@ fn failsafe_counts_only_transitions_into_failsafe() {
     assert_eq!(m.controller_losses, 1);
     let per: Vec<(u32, u32)> = m.aircraft.iter().map(|a| (a.id, a.failsafe_entries)).collect();
     assert_eq!(per, vec![(1, 2), (2, 1)]);
+}
+
+#[test]
+fn an_event_only_aircraft_counts_in_the_fleet_but_has_no_entry() {
+    // Aircraft 9 never appears in telemetry: no state to report, but its
+    // failsafe entry is still a fleet event.
+    let items = vec![
+        tel(sample(1, 1, [0.0; 3])),
+        ev(event(2, mode_change(9, ControlMode::Autopilot, ControlMode::Failsafe))),
+    ];
+    let m = metrics_of(None, &items);
+    assert_eq!(m.failsafe_entries, 1);
+    let ids: Vec<u32> = m.aircraft.iter().map(|a| a.id).collect();
+    assert_eq!(ids, vec![1]);
+    assert_eq!(m.aircraft[0].failsafe_entries, 0);
 }
 
 #[test]
@@ -286,13 +301,32 @@ fn models_come_from_the_recorded_scenario() {
 }
 
 #[test]
-fn an_invalid_recorded_scenario_is_an_error() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let path = dir.path().join("bad.mcap");
-    write_bag(&path, Some("[[aircraft]]\nid = \"one\"\n"), &[]);
-    let err = compute(&BagReader::open(&path).expect("open")).expect_err("bad scenario");
-    assert!(matches!(err, BagError::Scenario(_)), "{err}");
-    assert!(err.to_string().contains("astrum.scenario"), "{err}");
+fn an_unparseable_recorded_scenario_only_drops_the_models() {
+    let items = vec![
+        tel(sample(1, 1, [0.0, 0.0, 500.0])),
+        tel(sample(2, 1, [30.0, 40.0, 500.0])),
+        ev(event(2, EventKind::RunEnded { reason: EndReason::MaxTime, message: String::new() })),
+    ];
+    let m = metrics_of(Some("[[aircraft]\nid = 1"), &items);
+    let models: Vec<Option<&str>> = m.aircraft.iter().map(|a| a.model.as_deref()).collect();
+    assert_eq!(models, vec![None, None]);
+    assert_eq!(m.min_separation_m, Some(50.0));
+    assert_eq!(m.min_alt_hae_m, Some(500.0));
+    assert_eq!(m.end_reason.as_deref(), Some("max-time"));
+    assert_eq!(m.sim_time_s, 1.0 / RATE_HZ);
+}
+
+#[test]
+fn final_heading_is_in_zero_to_360() {
+    let mut t = sample(1, 1, [0.0; 3]);
+    // -1e-17 rad in degrees wraps to 360 - 5.7e-16, which rounds to 360.0.
+    t.attitude.psi_rad = -1e-17;
+    let m = metrics_of(None, &[tel(t)]);
+    assert_eq!(m.aircraft[0].final_state.heading_deg, 0.0);
+
+    t.attitude.psi_rad = 3.0 * std::f64::consts::FRAC_PI_2;
+    let m = metrics_of(None, &[tel(t)]);
+    assert!((m.aircraft[0].final_state.heading_deg - 270.0).abs() < 1e-9);
 }
 
 #[test]
@@ -311,14 +345,23 @@ fn undecodable_or_mislabelled_payloads_are_rejected_not_counted() {
     assert!(m.aircraft.is_empty());
 }
 
+fn keys(v: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = v.as_object().expect("object").keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
+}
+
 #[test]
 fn json_uses_the_metric_ids() {
     let m = metrics_of(None, &[tel(sample(1, 1, [0.0; 3]))]);
     let json = serde_json::to_value(&m).expect("json");
-    for id in [
+    let mut fleet = vec![
         "end_reason",
+        "end_message",
         "sim_time_s",
         "min_separation_m",
+        "min_separation_pair",
+        "min_separation_t_s",
         "min_alt_hae_m",
         "max_bank_deg",
         "max_nz_g",
@@ -327,9 +370,30 @@ fn json_uses_the_metric_ids() {
         "command_refusals",
         "hits",
         "kills",
+        "rejected",
         "aircraft",
-    ] {
-        assert!(json.get(id).is_some(), "missing {id}: {json}");
-    }
-    assert_eq!(json["aircraft"][0]["final_state"]["enu_m"], serde_json::json!([0.0, 0.0, 0.0]));
+    ];
+    fleet.sort_unstable();
+    assert_eq!(keys(&json), fleet);
+
+    let aircraft = &json["aircraft"][0];
+    let mut per = vec![
+        "id",
+        "model",
+        "alive",
+        "hit_points",
+        "min_alt_hae_m",
+        "max_bank_deg",
+        "max_nz_g",
+        "failsafe_entries",
+        "final_state",
+    ];
+    per.sort_unstable();
+    assert_eq!(keys(aircraft), per);
+
+    let mut fin =
+        vec!["sim_time_s", "lat_deg", "lon_deg", "alt_hae_m", "heading_deg", "tas_mps", "enu_m"];
+    fin.sort_unstable();
+    assert_eq!(keys(&aircraft["final_state"]), fin);
+    assert_eq!(aircraft["final_state"]["enu_m"], serde_json::json!([0.0, 0.0, 0.0]));
 }
