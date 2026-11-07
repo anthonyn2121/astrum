@@ -21,7 +21,7 @@
        can be hidden one by one, and presentation mode hides them all. -->
   <div id="app">
     <header id="topbar">
-      <div class="brand"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Replay</em></div>
+      <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Replay</em></a>
       <div class="source">
         <span id="statusPill" class="pill idle">idle</span>
         <span id="sourceLabel" class="source-label muted">no source</span>
@@ -64,6 +64,9 @@
               <dt><kbd>Esc</kbd></dt><dd>close menus, leave presentation</dd>
             </dl>
             <p class="pop-note muted">In the scene: click selects, <kbd>Shift</kbd>+click pins a target.</p>
+            <div class="pop-title">Live sim</div>
+            <p class="pop-note muted">While the stream comes from a running sim, the bar at the bottom of the scene pauses, resumes, steps and paces the <em>sim</em> itself; the transport below only replays what this page has received.</p>
+            <p class="pop-note muted">A studio run (opened from Interactive) also shows its panel: state, Stop, its log and, once it ends, the outcome, key metrics and <em>Open full replay</em>.</p>
           </div>
         </div>
       </div>
@@ -141,6 +144,52 @@
         <span id="mapAttribution" hidden>Imagery © Esri, Maxar, Earthstar Geographics</span>
         <span id="fps">—</span>
       </div>
+
+      <!-- The live sim's control plane (js/simcontrol.js): shown while the
+           stream comes from a sim that answers its status. -->
+      <div id="simBar" class="overlay" role="group" aria-label="Sim control" hidden>
+        <span id="simState" class="sim-state">—</span>
+        <span class="sim-stat"><span class="hk">TICK</span> <span id="simTick">—</span></span>
+        <span class="sim-stat"><span class="hk">SIM</span> <span id="simTime">—</span></span>
+        <span class="sim-stat" title="Pace achieved / target (× real time)"><span class="hk">PACE</span> <span id="simPace">—</span></span>
+        <span id="simWaiting" class="sim-stat sim-waiting" title="Lockstep: the aircraft whose command the sim is waiting for" hidden></span>
+        <button id="simPauseBtn" title="Pause the sim">Pause</button>
+        <span class="sim-step">
+          <input id="simStepN" type="number" min="1" max="1000000" step="1" value="1" aria-label="Ticks to step" />
+          <button id="simStepBtn" title="Run this many ticks, then pause">Step</button>
+        </span>
+        <div id="simSpeed" class="seg" role="group" aria-label="Sim speed">
+          <button data-speed="1" aria-pressed="false" title="Real time">1×</button>
+          <button data-speed="2" aria-pressed="false" title="Twice real time">2×</button>
+          <button data-speed="10" aria-pressed="false" title="Ten times real time">10×</button>
+          <button data-speed="0" aria-pressed="false" title="As fast as the host allows">Max</button>
+        </div>
+        <span id="simError" class="sim-error" role="status" aria-live="polite"></span>
+      </div>
+
+      <!-- A studio run opened with ?run=<id> (js/runpanel.js). -->
+      <section id="runPanel" class="overlay" aria-label="Studio run" hidden>
+        <header class="run-head">
+          <span class="dock-title">Run</span>
+          <span id="runId" class="run-id"></span>
+          <span id="runState" class="pill idle">—</span>
+          <button id="runStopBtn" class="mini" title="Stop the run (the sim ends cleanly, then its controllers)" hidden>Stop</button>
+          <button id="runCollapseBtn" class="mini" aria-expanded="true" aria-controls="runBody" title="Collapse / expand">▾</button>
+        </header>
+        <div id="runBody" class="run-body">
+          <div id="runInfo" class="muted small"></div>
+          <div id="runError" class="run-error small" role="alert" hidden></div>
+          <div id="runResult" hidden>
+            <div id="runOutcome" class="run-outcome"></div>
+            <dl id="runMetrics" class="kv small"></dl>
+            <button id="runReplayBtn" class="primary">Open full replay</button>
+          </div>
+          <details id="runLog">
+            <summary>Log <span id="runLogCount" class="badge">0</span></summary>
+            <div id="runLogLines" class="run-log" role="log" tabindex="0" aria-label="Run output"></div>
+          </details>
+        </div>
+      </section>
 
       <div id="presentHint" class="overlay">Presentation mode · <kbd>P</kbd> or <kbd>Esc</kbd> to exit</div>
     </main>

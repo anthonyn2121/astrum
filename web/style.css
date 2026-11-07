@@ -103,6 +103,7 @@ code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .brand { font-weight: 700; letter-spacing: 0.5px; font-size: 15px; display: flex; align-items: center; gap: 8px; flex: none; }
 .brand em { color: var(--muted); font-style: normal; font-weight: 500; }
 .brand .mark { height: 26px; width: auto; display: block; }
+a.brand { color: inherit; text-decoration: none; }
 .source { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .source-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topbar-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex: none; }
@@ -282,6 +283,53 @@ code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
   pointer-events: none; opacity: 0; transition: opacity 0.5s;
 }
 #presentHint.show { opacity: 1; }
+
+/* Live sim control bar (js/simcontrol.js): bottom centre of the stage, above
+   the empty state (the sim can be paced before its first frame arrives). */
+#simBar {
+  z-index: 7;
+  left: 50%; bottom: 28px; transform: translateX(-50%); max-width: calc(100% - 24px);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center;
+  padding: 6px 10px; border-radius: var(--radius); background: var(--panel); backdrop-filter: blur(8px);
+  border: 1px solid var(--line); box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+}
+#simBar button { font-size: 12px; padding: 3px 10px; }
+.sim-state {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+  padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+}
+.sim-state.running { color: var(--bg); background: var(--ok); border-color: var(--ok); }
+.sim-state.paused { color: var(--warn); border-color: var(--warn); }
+.sim-state.waiting { color: #ffcf5a; border-color: #ffcf5a55; }
+.sim-stat { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sim-waiting { color: #ffcf5a; font-size: 12px; }
+.sim-step { display: inline-flex; gap: 4px; align-items: center; }
+#simStepN { width: 74px; padding: 3px 6px; background: rgba(0,0,0,0.35); cursor: text; }
+.sim-error { color: var(--live); font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sim-error:empty { display: none; }
+
+/* Studio run panel (js/runpanel.js): top right, under the compass. */
+#runPanel {
+  z-index: 7;
+  top: 78px; right: 10px; width: 340px; max-width: calc(100% - 20px); max-height: calc(100% - 150px);
+  display: flex; flex-direction: column; border-radius: var(--radius);
+  background: var(--panel-raised); border: 1px solid var(--line);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+}
+.run-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; }
+.run-id { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.run-body { display: flex; flex-direction: column; gap: 8px; padding: 0 10px 10px; min-height: 0; overflow: hidden auto; }
+.run-error { color: var(--live); overflow-wrap: anywhere; }
+.run-outcome { font-weight: 600; margin-bottom: 6px; overflow-wrap: anywhere; }
+#runMetrics { margin-bottom: 8px; }
+#runLog summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.run-log {
+  margin-top: 6px; max-height: 240px; overflow: auto; padding: 4px 6px; border-radius: 6px;
+  background: rgba(0,0,0,0.35); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.log-line { white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-line.stderr { color: #ffb3a8; }
+.log-src { color: var(--accent); margin-right: 6px; }
 
 /* ---- Inspector ---- */
 #inspector { overflow: hidden auto; }
@@ -475,7 +523,8 @@ button.live.active { background: var(--live); border-color: var(--live); color: 
 /* ---- Presentation mode ---- */
 body.present #app { --fleet-w: 0px; --ins-w: 0px; --plots-h: 0px; grid-template-rows: 0 minmax(0, 1fr) 0 44px; }
 body.present #topbar, body.present #fleet, body.present #inspector, body.present #plots,
-body.present #sceneToolbar, body.present #scaleBar, body.present #fps { display: none; }
+body.present #sceneToolbar, body.present #scaleBar, body.present #fps,
+body.present #simBar, body.present #runPanel { display: none; }
 body.present #killFeed { display: flex; top: 14px; right: 80px; }
 body.present #compass { opacity: 0.75; }
 body.present #presentHint { display: block; }

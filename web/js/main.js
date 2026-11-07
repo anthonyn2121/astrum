@@ -1,6 +1,7 @@
 // Entry point: wire the timeline store, the 3-D scene, the telemetry sources and
-// the HUD (shell, fleet list, inspector, event log, plots) together, then run
-// the animation / playback loop.
+// the HUD (shell, fleet list, inspector, event log, plots, the live sim's
+// control bar and — with ?run=<id> — the studio run's panel) together, then
+// run the animation / playback loop.
 //
 // main.js is the single source of truth for playback and selection state. The
 // store buffers telemetry keyed on sim time; the scene is a pure function of
@@ -17,6 +18,8 @@ import { EventLog, EVENT_GROUPS } from "./eventlog.js";
 import { Plots, CHANNELS } from "./plots.js";
 import { relativeGeometry } from "./geometry.js";
 import { loadPrefs, savePrefs } from "./prefs.js";
+import { SimControl } from "./simcontrol.js";
+import { RunPanel } from "./runpanel.js";
 
 // A playhead move longer than this (sim s) in one frame is a seek: the events
 // it skips over are not flashed.
@@ -95,7 +98,7 @@ const ui = new UI({
   onSpeed: (v) => { state.speed = v; },
   onConnect: (url) => connect(url || defaultWsUrl()),
   onRetry: () => connect(state.wsUrl || defaultWsUrl()),
-  onFile: (file) => openFile(file),
+  onFile: (file) => openFile(file, file.name),
   onCamera: (mode) => { scene.setCameraMode(mode); ui.setCameraMode(scene.cameraMode); },
   onFit: () => { scene.frameFleet(); ui.setCameraMode(scene.cameraMode); },
   onToggle: (key, val) => {
@@ -159,6 +162,11 @@ const plots = new Plots({
   onChannelsChange: (keys) => savePrefs({ channels: keys }),
 });
 plots.setVisible(ui.plotsVisible);
+
+// The studio run this page was opened for (view.html?run=<id>), if any.
+const runId = new URLSearchParams(location.search).get("run");
+const simControl = new SimControl({ enabled: () => state.mode === "live" });
+const runPanel = runId ? new RunPanel({ runId, onReplay: (doc, label) => openFile(doc, label) }) : null;
 
 ui.setToggles(state);
 ui.setModelScale(state.modelScale);
@@ -248,11 +256,13 @@ function connect(url) {
   net.connect(url);
 }
 
-async function openFile(file) {
+// Open an export document: a File/Blob, or one already parsed (a studio run's
+// replay); `name` labels it.
+async function openFile(source, name) {
   net.disconnect();
   state.connected = false;
   try {
-    const { meta, frames, events, models } = await loadExportFile(file);
+    const { meta, frames, events, models } = await loadExportFile(source);
     store.loadFile(frames, events);
     state.models = models;
     scene.clearFleet();
@@ -264,7 +274,7 @@ async function openFile(file) {
     state.playhead = b.min;
     resetSelection();
     state.status = "file";
-    ui.setStatus("file", `${file.name} · ${store.frameCount} frames`
+    ui.setStatus("file", `${name} · ${store.frameCount} frames`
       + ` · ${store.ids().length} aircraft`
       + (store.events.length ? ` · ${store.events.length} events` : "")
       + (meta?.rejected ? ` · ${Number(meta.rejected)} rejected` : ""));
@@ -416,7 +426,10 @@ function emptyText() {
   if (state.mode === "file" || state.fileError) return state.fileError || "The recording has no telemetry.";
   const url = state.wsUrl || defaultWsUrl();
   if (state.status === "connecting") return `Connecting to ${url}…`;
-  if (state.connected) return `Connected to ${url}. Waiting for the first frame.`;
+  if (state.connected) {
+    return runId ? `Connected to ${url}. Waiting for run ${runId}'s first frame.`
+      : `Connected to ${url}. Waiting for the first frame.`;
+  }
   return `No live stream at ${url}. Start one with astrum run <scenario> --watch, or open a recording.`;
 }
 
@@ -533,4 +546,6 @@ function tick(now) {
 const initialUrl = defaultWsUrl();
 ui.setWsUrl(initialUrl);
 connect(initialUrl); // auto-attach to the local bridge; the user can open a file instead
+simControl.start();
+runPanel?.start();
 requestAnimationFrame(tick);

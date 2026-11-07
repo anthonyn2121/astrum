@@ -14,13 +14,15 @@
 //!    origin, or naming a `Host` other than `localhost`, an IP address or one
 //!    of `--allowed-hosts`, are refused.
 //!  * **`/api/…`** — the JSON API (`astrum_web::api`): bridge status and run
-//!    control, behind the same `Host` check.
+//!    control, the studio's catalogs and its live interactive runs (one at a
+//!    time, under `--runs-dir`), behind the same `Host` check.
 //!  * **`GET /tiles/<z>/<x>/<y>.jpg`** — slippy-map tile proxy with a disk cache.
 //!  * **`GET /…`** — static files from `--root`.
 //!
 //! The bridge attaches to `--connect` at startup and keeps retrying in the
 //! background until a sim answers there; the server runs whether or not one
-//! ever does.
+//! ever does. Starting a run (`POST /api/runs`) re-attaches it to that run's
+//! sim. Shutting the server down stops the active run first.
 //!
 //! Config (CLI arg > env > default): see `--help`.
 
@@ -28,8 +30,10 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use astrum_sim::launch::sibling;
 use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::catalogs::Catalogs;
+use astrum_web::runs::{Runs, RunsConfig};
 use astrum_web::server::{self, Config};
 use clap::Parser;
 
@@ -86,6 +90,15 @@ struct Cli {
     /// startup) and the scenarios (`scenario.<name>.toml`) the studio offers.
     #[arg(long, env = "ASTRUM_CONFIG_DIR", default_value = "config")]
     config_dir: PathBuf,
+
+    /// Where live interactive runs go: one directory per run (its
+    /// `scenario.toml`, `run.mcap` and `metrics.json`).
+    #[arg(long, env = "ASTRUM_RUNS_DIR", default_value = "runs/web")]
+    runs_dir: PathBuf,
+
+    /// The `astrum-sim` binary live runs fly on (default: next to this one).
+    #[arg(long, env = "ASTRUM_SIM_BIN")]
+    sim: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -109,6 +122,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let catalogs = Catalogs::load(&cli.config_dir).map_err(|e| e.to_string())?;
     let bridge = Bridge::new(BridgeConfig { min_period, models_poll: MODELS_POLL });
     bridge.attach(&cli.connect);
+    let sim = cli.sim.unwrap_or_else(|| sibling("astrum-sim"));
+    let runs = Runs::new(RunsConfig { dir: cli.runs_dir, sim }, bridge.clone());
 
     let cfg = Config {
         root: cli.root,
@@ -116,6 +131,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tile_cache: cli.tile_cache,
         allowed_hosts,
         catalogs,
+        runs: runs.clone(),
     };
     let tiles = if cfg.tile_url.is_empty() {
         format!("cache-only ({})", cfg.tile_cache.display())
@@ -135,8 +151,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cli.connect, cli.max_hz
     );
     println!("[astrum-web] map tiles: {tiles}");
+    println!(
+        "[astrum-web] live runs: {} into {}",
+        runs.config().sim.display(),
+        runs.config().dir.display()
+    );
 
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    let closing = runs.clone();
+    let shutdown = async move {
+        shutdown_signal().await;
+        // Stop the active run now: open WebSockets hold the graceful shutdown.
+        closing.close();
+    };
+    let served = axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+    // Wait for the run's processes to be reaped (and its metrics written).
+    tokio::task::spawn_blocking(move || runs.shutdown()).await?;
+    served?;
     Ok(())
 }
 

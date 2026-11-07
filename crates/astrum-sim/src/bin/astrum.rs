@@ -245,11 +245,12 @@ fn plan_run(args: &RunArgs) -> Result<Sweep, String> {
     }
 }
 
-/// The viewer's URL: astrum-web binds `$ASTRUM_WEB_BIND` (default 127.0.0.1:8080).
+/// The viewer's URL: astrum-web binds `$ASTRUM_WEB_BIND` (default 127.0.0.1:8080)
+/// and serves the viewer as `/view.html` (`/` is the studio home).
 fn viewer_url() -> String {
     let bind = std::env::var("ASTRUM_WEB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let port = bind.rsplit_once(':').map_or("8080", |(_, port)| port);
-    format!("http://localhost:{port}")
+    format!("http://localhost:{port}/view.html")
 }
 
 fn run(args: &RunArgs) -> ExitCode {

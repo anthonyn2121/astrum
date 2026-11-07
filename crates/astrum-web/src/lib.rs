@@ -11,7 +11,8 @@
 //!   ([`snapshot_message`]), every event ([`events_message`]), the scenario's
 //!   aircraft models ([`models_message`]) and each change of attachment
 //!   ([`run_message`]) to every connected browser over WebSocket, while also
-//!   serving the static renderer and the JSON [`api`].
+//!   serving the static renderer and the JSON [`api`] (including the studio's
+//!   live interactive runs, [`runs`]).
 //! * **offline export** — the `astrum-web-export` binary ([`export`]) reads an
 //!   MCAP bag and bakes it into a single [`ExportDoc`] the renderer can open with
 //!   no running services.
@@ -22,6 +23,7 @@ pub mod api;
 pub mod bridge;
 pub mod catalogs;
 pub mod export;
+pub mod runs;
 pub mod server;
 
 use astrum_bag::{aircraft_models, AircraftModel};

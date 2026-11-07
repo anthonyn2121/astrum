@@ -360,7 +360,7 @@ make smoke                                 # every config/demos/*.toml in lockst
 changed (a no-op otherwise). Run it from `/workspace`: paths in files are relative to it.
 
 **Watch it in 3-D.** `--watch` (e.g. `astrum run config/scenario.example.toml --watch`)
-also starts the `astrum web` bridge; open http://localhost:8080 to see every aircraft on the ENU grid (orbit/follow cameras, trails,
+also starts the `astrum web` bridge; open http://localhost:8080/view.html to see every aircraft on the ENU grid (orbit/follow cameras, trails,
 playback transport). It works against a *live* sim or a bag being replayed by `astrum play`
 (both listen on the endpoint the bridge connects to). For an offline, service-free view,
 bake an MCAP bag to JSON and drag it onto the page (or use Source ▸ "Open export file…"):
@@ -375,7 +375,11 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 The renderer is static files under `web/` (Three.js and uPlot vendored in `web/vendor/`; the
 modules live in `web/js/`: `main.js` owns playback and selection state, `store.js` the timeline,
 `scene.js`/`meshes.js` the 3-D view, `ui.js` the shell and transport, `fleet.js`, `inspector.js`,
-`eventlog.js` and `plots.js` the docks, `geometry.js` the relative geometry); the bridge and
+`eventlog.js` and `plots.js` the docks, `geometry.js` the relative geometry, `simcontrol.js` the
+live sim's control bar and `runpanel.js` a studio run's panel); the viewer page is `view.html`.
+The studio's other pages are `index.html` (home, `home.js`) and `interactive.html`
+(`interactive.js`), styled by `css/studio.css` over `style.css`; every page reaches `/api` only
+through `js/api.js`. The bridge and
 exporter are the two binaries in `crates/astrum-web/`, both projecting telemetry through the one
 `astrum_web::FrameJson` shape. The bridge sends one batched snapshot of the fleet at most
 `--max-hz` (default 30) times per second. Telemetry carries only the vehicle class, so the bridge
@@ -389,6 +393,17 @@ follows the new run's message. `/api` lives in `src/api.rs`; its guard (`api::gu
 whole nested API service, so new routes inherit the Host, Origin and JSON-body checks. Control
 values are checked by `astrum_net::ControlRequest::validate` against `astrum_net::MIN_SPEED`, the
 one limit the sim and the API share.
+
+**Studio runs** (`crates/astrum-web/src/runs.rs`): `Runs` owns the one live interactive run. A
+start is checked and launched on the blocking pool (`LiveRun::start` with `Log::Channel`), so a
+client that goes away mid-request cannot leave a half-started run; a monitor thread per run
+`wait`s for it, writes `metrics.json` and only then marks it finished, so `finished` means the
+metrics are on disk. Stop requests flip the run's own stop handle and await the monitor's
+`watch` channel; nothing holds a lock across an await. The log ring's `seq` is monotonic over the
+server's lifetime (a reader's stale `since` never hides a new run's lines). `astrum-web` stops the
+active run when it is told to shut down (`Runs::close`) and waits for it after serving
+(`Runs::shutdown`). Its tests (`tests/runs.rs`) fly a shell-script stand-in sim plus, once
+`cargo build -p astrum-sim` has run, the real one.
 
 **Ground map and sky.** Only when the fleet includes an **F-16** (a scenario `model` starting with
 `f16`; the bridge polls the sim's scenario and sends `{"type":"models",…}`, exports carry

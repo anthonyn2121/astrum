@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ASTRUM · Studio</title>
+  <link rel="icon" type="image/png" href="./img/favicon.png" />
+  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/studio.css" />
+</head>
+<body class="studio">
+  <header class="studio-top">
+    <a class="brand" href="./"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Studio</em></a>
+  </header>
+
+  <main class="studio-main">
+    <section class="home-hero">
+      <img src="./img/astrum-logo.png" alt="ASTRUM — Aerospace Simulation" />
+      <p class="muted">Fly JSBSim scenarios with SDK controllers and watch them in 3-D.</p>
+    </section>
+
+    <!-- Filled by js/home.js while a studio run is live. -->
+    <p id="liveRun" class="home-live" role="status" hidden></p>
+
+    <nav class="cards" aria-label="Studio">
+      <a class="card" href="./interactive.html">
+        <h2>Interactive</h2>
+        <p>Pick an environment, a scenario and a controller per aircraft, then fly it live — faster than real time when the host allows — and pause, step or re-pace the sim as it flies.</p>
+        <span class="card-cta">Set up a run →</span>
+      </a>
+      <a class="card" href="./view.html">
+        <h2>Replay viewer</h2>
+        <p>Attach to a running sim (or a bag being replayed with <code>astrum play</code>), or open an <code>astrum-web-export</code> file — no services needed.</p>
+        <span class="card-cta">Open the viewer →</span>
+      </a>
+    </nav>
+  </main>
+
+  <script type="module" src="./js/home.js"></script>
+</body>
+</html>

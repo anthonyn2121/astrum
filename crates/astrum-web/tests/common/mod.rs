@@ -14,6 +14,7 @@ use astrum_net::{EventPublisher, Session, TelemetryPublisher};
 use astrum_proto::{encode_event, Event, EventKind, Telemetry};
 use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::catalogs::Catalogs;
+use astrum_web::runs::{Runs, RunsConfig};
 use astrum_web::server::{router, Config};
 use axum::Router;
 
@@ -100,7 +101,29 @@ pub fn app_with_catalogs(tmp: &Path, bridge: Bridge, catalogs: Catalogs) -> Rout
     build(tmp, bridge, &[], catalogs)
 }
 
+/// [`app`] over `catalogs`, its live runs flown by `sim` into `<tmp>/runs`;
+/// also the run manager, for shutting it down.
+pub fn app_with_runs(tmp: &Path, bridge: Bridge, catalogs: Catalogs, sim: &Path) -> (Router, Runs) {
+    let runs = Runs::new(RunsConfig { dir: tmp.join("runs"), sim: sim.to_owned() }, bridge.clone());
+    (build_with(tmp, bridge, &[], catalogs, runs.clone()), runs)
+}
+
 fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs) -> Router {
+    // No test of these flies a run.
+    let runs = Runs::new(
+        RunsConfig { dir: tmp.join("runs"), sim: tmp.join("no-astrum-sim") },
+        bridge.clone(),
+    );
+    build_with(tmp, bridge, allowed_hosts, catalogs, runs)
+}
+
+fn build_with(
+    tmp: &Path,
+    bridge: Bridge,
+    allowed_hosts: &[&str],
+    catalogs: Catalogs,
+    runs: Runs,
+) -> Router {
     let web = tmp.join("web");
     std::fs::create_dir_all(&web).unwrap();
     std::fs::write(web.join("index.html"), "<h1>astrum</h1>").unwrap();
@@ -114,6 +137,7 @@ fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs)
         tile_cache: cache,
         allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_owned()).collect(),
         catalogs,
+        runs,
     };
     router(cfg, bridge).unwrap()
 }
