@@ -16,7 +16,7 @@ name = "astrum-sim"
 path = "src/main.rs"
 
 # ASTRUM's command line: `astrum run` / `sweep` / `list`, and the other tools
-# (see src/bin/astrum.rs and the `sweep` module in the library).
+# (see src/bin/astrum.rs and the `launch`, `sweep` and `catalog` modules).
 [[bin]]
 name = "astrum"
 path = "src/bin/astrum.rs"
@@ -36,9 +36,8 @@ toml = { workspace = true }
 astrum-bag = { path = "../astrum-bag" }
 # SIGINT/SIGTERM end a run cleanly (a recording is finished, not truncated).
 ctrlc = { workspace = true }
-# astrum: signal child processes (SIGTERM) and split controller commands.
+# launch: signal child processes (SIGTERM), split controller commands, and
+# hand a live run's sim its scenario in a temporary file.
 libc = "0.2"
 shlex = "2"
-
-[dev-dependencies]
 tempfile = "3"

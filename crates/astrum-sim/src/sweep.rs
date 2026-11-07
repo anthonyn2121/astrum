@@ -5,9 +5,9 @@
 //! This module plans a file (parse it, expand its grid, build and validate
 //! every run's scenario up front, so a typo fails before anything flies), runs
 //! runs in-process ([`run_in_process`], for scenarios nothing external
-//! controls), drives a pool of runs ([`execute`]) and writes the summary. The
-//! `astrum` binary adds process mode: a sim plus external controllers per run,
-//! each on its own Zenoh endpoint, and `astrum run`'s single live run.
+//! controls), drives a pool of runs ([`execute`]) and writes the summary.
+//! Process mode — a sim plus external controllers per run, each on its own
+//! Zenoh endpoint — is [`crate::launch::run_processes`].
 //!
 //! A run file is a sweep file without a grid (no `vary`, one repeat); a bare
 //! scenario is a run file with nothing but `base` ([`SweepFile::for_scenario`]).

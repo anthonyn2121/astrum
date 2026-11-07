@@ -1,0 +1,698 @@
+//! Process supervision for runs that fly as processes: `astrum run`'s live
+//! run, `astrum sweep`'s process mode ([`run_processes`]) and the web
+//! studio's interactive runs share it.
+//!
+//! A [`LiveRun`] is one run: an `astrum-sim` process listening on an
+//! endpoint, its companions (e.g. the viewer) and its controllers, started
+//! together ([`LiveRun::start`]) and supervised on a thread of their own. The
+//! sim decides the run: it ends with the scenario's `max_time_s`, on a stop
+//! request ([`LiveRun::stop`]) or after the run timeout — the sim is asked to
+//! stop and ends cleanly — and then everything else is stopped. A controller
+//! that fails meanwhile fails the run (and, with `fail_fast`, stops it); a
+//! companion that exits is only reported.
+//!
+//! Nothing here is process-global: every child is registered in the
+//! caller's [`Children`], so a caller's signal handler can kill them all
+//! ([`Children::kill_all`]); a long-lived caller starts as many runs as it
+//! likes, one after another or at once.
+
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+
+use crate::scenario::Scenario;
+use crate::sweep::{parse_stopped_line, Outcome, Run, Status, Sweep};
+use crate::systems::StopRequested;
+
+/// How long processes get to exit after a stop before they are killed.
+const GRACE: Duration = Duration::from_secs(5);
+const POLL: Duration = Duration::from_millis(10);
+/// ANSI colours of the terminal tags: `[sim]`, companions, and `[ctlN]` in turn.
+const SIM_COLOR: &str = "36";
+const COMPANION_COLOR: &str = "35";
+const CONTROLLER_COLORS: [&str; 4] = ["32", "33", "34", "91"];
+
+/// The ASTRUM binary `name` next to the current executable (`name` itself,
+/// looked up on `PATH`, if that cannot be found).
+pub fn sibling(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .unwrap_or_else(|| name.into())
+}
+
+/// Where a client on this host reaches a sim listening on `listen`: a wildcard
+/// address (`0.0.0.0`, `[::]`) becomes loopback.
+pub fn connect_endpoint(listen: &str) -> String {
+    listen.replacen("/0.0.0.0:", "/127.0.0.1:", 1).replacen("/[::]:", "/[::1]:", 1)
+}
+
+/// A run file's `run_timeout_s` as a [`LiveSpec::run_timeout`] (0 = none).
+pub fn run_timeout(run_timeout_s: f64) -> Option<Duration> {
+    (run_timeout_s > 0.0).then(|| Duration::from_secs_f64(run_timeout_s))
+}
+
+// --- Child registry -------------------------------------------------------------
+
+/// The caller's registry of child processes not yet reaped — pid, and whether
+/// it leads its own process group — shared by every run started with it.
+/// Clones share the registry.
+#[derive(Debug, Clone, Default)]
+pub struct Children(Arc<Mutex<Vec<(u32, bool)>>>);
+
+impl Children {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<(u32, bool)>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The pids of the children still registered (spawned, not yet reaped).
+    pub fn pids(&self) -> Vec<u32> {
+        self.lock().iter().map(|&(pid, _)| pid).collect()
+    }
+
+    /// SIGKILL every registered child (and the process group it leads) — the
+    /// last resort of a second Ctrl-C. The runs then see their processes gone.
+    pub fn kill_all(&self) {
+        for &(pid, group) in self.lock().iter() {
+            send(pid, group, libc::SIGKILL);
+        }
+    }
+}
+
+fn send(pid: u32, group: bool, sig: libc::c_int) {
+    let pid = pid as libc::pid_t;
+    // SAFETY: kill(2) on a child (or the process group it leads) that we
+    // spawned and have not reaped.
+    unsafe {
+        libc::kill(if group { -pid } else { pid }, sig);
+    }
+}
+
+// --- Output -------------------------------------------------------------------
+
+/// Which of a child's output streams a line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+/// One whole line of a run's output (without its line ending).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogLine {
+    /// `"sim"`, a companion's source (`"web"`), `"ctl1"`, `"ctl2"`, …; or
+    /// `"astrum"` for the supervisor's own notices.
+    pub source: String,
+    pub stream: LogStream,
+    pub line: String,
+}
+
+/// Where a run's output goes.
+#[derive(Debug, Clone)]
+pub enum Log {
+    /// Onto this terminal, every line tagged `[source]` in an ANSI colour
+    /// (when the stream is a terminal); notices on stderr as `[astrum] …`.
+    /// Each child leads its own process group, so the terminal's Ctrl-C
+    /// reaches only this process, which stops the run in order.
+    Terminal,
+    /// As [`LogLine`]s, notices from source `"astrum"`; a dropped receiver
+    /// only discards them. Each child leads its own process group.
+    Channel(Sender<LogLine>),
+    /// Into `<dir>/<stem>.<source>.log`, one file per process; notices on
+    /// stderr. Children stay in this process group (a terminal's Ctrl-C
+    /// reaches them too).
+    Files { dir: PathBuf, stem: String },
+}
+
+impl Log {
+    fn output(&self, source: &str, color: &'static str) -> Output {
+        match self {
+            Log::Terminal => Output::Tagged { label: source.to_owned(), color },
+            Log::Channel(tx) => Output::Channel { source: source.to_owned(), tx: tx.clone() },
+            Log::Files { dir, stem } => Output::File(dir.join(format!("{stem}.{source}.log"))),
+        }
+    }
+
+    fn notice(&self, msg: String) {
+        match self {
+            Log::Channel(tx) => {
+                let _ = tx.send(LogLine {
+                    source: "astrum".into(),
+                    stream: LogStream::Stderr,
+                    line: msg,
+                });
+            }
+            Log::Terminal | Log::Files { .. } => eprintln!("[astrum] {msg}"),
+        }
+    }
+}
+
+/// Where one child's output goes.
+enum Output {
+    File(PathBuf),
+    Tagged { label: String, color: &'static str },
+    Channel { source: String, tx: Sender<LogLine> },
+}
+
+/// A spawned child and the threads copying its output.
+struct Proc {
+    /// For messages: "the sim", "controller 2", "the viewer".
+    name: String,
+    child: Child,
+    group: bool,
+    copiers: Vec<JoinHandle<()>>,
+    children: Children,
+}
+
+/// The sim time of the last [`crate::sweep::stopped_line`] seen on a stream.
+type SimTime = Arc<Mutex<Option<f64>>>;
+
+impl Proc {
+    /// Spawn `cmd`, registered in `children`; with `sim_time`, the sim time
+    /// of a stopped line on its (piped) stdout lands there.
+    fn spawn(
+        name: impl Into<String>,
+        mut cmd: Command,
+        output: Output,
+        children: &Children,
+        sim_time: Option<&SimTime>,
+    ) -> io::Result<Self> {
+        cmd.stdin(Stdio::null());
+        let group = !matches!(output, Output::File(_));
+        match &output {
+            Output::File(path) => {
+                let log = File::create(path)?;
+                cmd.stdout(log.try_clone()?).stderr(log);
+            }
+            Output::Tagged { .. } | Output::Channel { .. } => {
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+            }
+        }
+        let mut child = cmd.spawn()?;
+        children.lock().push((child.id(), group));
+        let mut copiers = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            let mut sink = sink(&output, LogStream::Stdout);
+            let watch = sim_time.cloned();
+            copiers.push(copy_lines(out, move |line| {
+                if let (Some(watch), Some(t)) = (&watch, parse_stopped_line(line)) {
+                    *watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+                }
+                sink(line);
+            }));
+        }
+        if let Some(err) = child.stderr.take() {
+            copiers.push(copy_lines(err, sink(&output, LogStream::Stderr)));
+        }
+        Ok(Self { name: name.into(), child, group, copiers, children: children.clone() })
+    }
+
+    fn signal(&self, sig: libc::c_int) {
+        send(self.child.id(), self.group, sig);
+    }
+
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Kill the child if it still runs, wait for it, and flush its output.
+    fn reap(&mut self) -> Option<ExitStatus> {
+        if self.running() {
+            self.signal(libc::SIGKILL);
+        }
+        let status = self.child.wait().ok();
+        let pid = self.child.id();
+        self.children.lock().retain(|&(p, _)| p != pid);
+        for copier in self.copiers.drain(..) {
+            let _ = copier.join();
+        }
+        status
+    }
+}
+
+/// Where the lines of one piped stream go.
+fn sink(output: &Output, stream: LogStream) -> Box<dyn FnMut(&str) + Send> {
+    let to_stderr = stream == LogStream::Stderr;
+    match output {
+        Output::Tagged { label, color } => {
+            let tag = format!("{:<6}", format!("[{label}]"));
+            let colored =
+                if to_stderr { io::stderr().is_terminal() } else { io::stdout().is_terminal() };
+            let tag = if colored { format!("\x1b[{color}m{tag}\x1b[0m") } else { tag };
+            Box::new(move |text| {
+                let _ = if to_stderr {
+                    writeln!(io::stderr().lock(), "{tag} {text}")
+                } else {
+                    writeln!(io::stdout().lock(), "{tag} {text}")
+                };
+            })
+        }
+        Output::Channel { source, tx } => {
+            let (source, tx) = (source.clone(), tx.clone());
+            Box::new(move |text| {
+                let line = LogLine { source: source.clone(), stream, line: text.to_owned() };
+                let _ = tx.send(line);
+            })
+        }
+        Output::File(_) => Box::new(|_| {}),
+    }
+}
+
+/// Copy `from` line by line (lossy UTF-8, line ending removed) into `sink`,
+/// until the stream ends.
+fn copy_lines(
+    from: impl Read + Send + 'static,
+    mut sink: impl FnMut(&str) + Send + 'static,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut from = BufReader::new(from);
+        let mut line = Vec::new();
+        while matches!(from.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+            let text = String::from_utf8_lossy(&line);
+            sink(text.trim_end_matches(['\n', '\r']));
+            line.clear();
+        }
+    })
+}
+
+/// SIGTERM every process still running, SIGKILL whatever outlives `GRACE`, and
+/// reap them all.
+fn terminate_all<'a>(procs: impl IntoIterator<Item = &'a mut Proc>) {
+    let mut procs: Vec<&mut Proc> = procs.into_iter().collect();
+    for p in procs.iter_mut() {
+        if p.running() {
+            p.signal(libc::SIGTERM);
+        }
+    }
+    let deadline = Instant::now() + GRACE;
+    while Instant::now() < deadline && procs.iter_mut().any(|p| p.running()) {
+        std::thread::sleep(POLL);
+    }
+    for p in procs {
+        p.reap();
+    }
+}
+
+/// Start the rendered controller command lines, pointed at `endpoint`, into
+/// `started`.
+fn start_controllers(
+    commands: &[String],
+    endpoint: &str,
+    log: &Log,
+    children: &Children,
+    started: &mut Vec<Proc>,
+) -> Result<(), String> {
+    for (k, line) in commands.iter().enumerate() {
+        let argv = shlex::split(line)
+            .filter(|argv| !argv.is_empty())
+            .ok_or_else(|| format!("controller {}: cannot split `{line}`", k + 1))?;
+        let mut command = Command::new(&argv[0]);
+        command.args(&argv[1..]).env("ASTRUM_ZENOH_CONNECT", endpoint);
+        let output =
+            log.output(&format!("ctl{}", k + 1), CONTROLLER_COLORS[k % CONTROLLER_COLORS.len()]);
+        if !matches!(output, Output::File(_)) {
+            // Live output: Python flushes every line, not only at exit.
+            command.env("PYTHONUNBUFFERED", "1");
+        }
+        let p = Proc::spawn(format!("controller {}", k + 1), command, output, children, None)
+            .map_err(|e| format!("controller {}: starting `{}`: {e}", k + 1, argv[0]))?;
+        started.push(p);
+    }
+    Ok(())
+}
+
+// --- Supervision --------------------------------------------------------------
+
+/// How a run's processes ended, as far as its status goes.
+struct Ending {
+    /// The first failure: a controller exiting non-zero while the sim ran.
+    problem: Option<String>,
+    /// Why the sim was asked to stop: a stop request or the run timeout.
+    stopped: Option<String>,
+    sim: Option<ExitStatus>,
+}
+
+/// What [`supervise`] watches.
+struct Supervision<'a> {
+    stop: &'a StopRequested,
+    started: Instant,
+    timeout: Option<Duration>,
+    fail_fast: bool,
+    log: &'a Log,
+}
+
+/// Wait for the sim to exit, asking it to stop on a stop request, after the
+/// timeout and — with `fail_fast` — once a controller fails. Notes the first
+/// controller failure, and reports a companion that exits.
+fn supervise(
+    sim: &mut Proc,
+    controllers: &mut [Proc],
+    companions: &mut [Proc],
+    how: &Supervision,
+) -> Ending {
+    let mut problem: Option<String> = None;
+    let mut stopped: Option<String> = None;
+    let mut companion_gone = vec![false; companions.len()];
+    let sim_status = loop {
+        match sim.child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => {
+                problem.get_or_insert(format!("waiting for the sim: {e}"));
+                terminate_all([&mut *sim]);
+                break sim.reap();
+            }
+        }
+        for c in controllers.iter_mut() {
+            if let Ok(Some(status)) = c.child.try_wait() {
+                if !status.success() && problem.is_none() {
+                    problem = Some(format!("{} exited ({status})", c.name));
+                    if how.fail_fast {
+                        sim.signal(libc::SIGTERM);
+                    }
+                }
+            }
+        }
+        for (c, gone) in companions.iter_mut().zip(&mut companion_gone) {
+            if !*gone {
+                if let Ok(Some(status)) = c.child.try_wait() {
+                    *gone = true;
+                    how.log.notice(format!("{} exited ({status}); the run goes on", c.name));
+                }
+            }
+        }
+        if stopped.is_none() {
+            if how.stop.requested() {
+                stopped = Some("stop requested".into());
+                sim.signal(libc::SIGTERM); // the sim ends its run and finishes the bag
+            } else if let Some(t) = how.timeout.filter(|t| how.started.elapsed() > *t) {
+                stopped = Some(format!("run_timeout_s {} exceeded", t.as_secs_f64()));
+                sim.signal(libc::SIGTERM);
+            }
+        }
+        std::thread::sleep(POLL);
+    };
+    Ending { problem, stopped, sim: sim_status }
+}
+
+/// A run's status from how it ended; `sim_log` hints where the sim's output is.
+/// A sim that failed by itself (it exits 0 when asked to stop) is the run's
+/// problem even if a controller exited first: a controller that quits on the
+/// sim's `RunEnded(fatal)` must not hide the sim's reason.
+fn status_of(ending: Ending, sim_log: &str) -> Status {
+    match (ending.problem, ending.stopped, ending.sim) {
+        (_, None, Some(s)) if !s.success() => Status::Failed(format!("sim exited ({s}){sim_log}")),
+        (Some(why), ..) => Status::Failed(why),
+        (None, Some(why), _) => Status::Stopped(why),
+        (None, None, Some(s)) if s.success() => Status::Ok,
+        (None, None, Some(s)) => Status::Failed(format!("sim exited ({s}){sim_log}")),
+        (None, None, None) => Status::Failed("the sim could not be reaped".into()),
+    }
+}
+
+// --- LiveRun ------------------------------------------------------------------
+
+/// A process started alongside the sim and stopped with it: its exit is
+/// reported but never fails the run (the `--watch` viewer).
+#[derive(Debug, Clone)]
+pub struct Companion {
+    /// For messages: "the viewer".
+    pub name: String,
+    /// Its output's source tag: "web".
+    pub source: String,
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+}
+
+/// Everything one [`LiveRun`] starts.
+#[derive(Clone)]
+pub struct LiveSpec {
+    /// The `astrum-sim` binary.
+    pub sim: PathBuf,
+    /// The complete scenario the sim flies.
+    pub scenario: Scenario,
+    /// Where to write the scenario for the sim (kept); `None`: a temporary
+    /// file, removed when the run ends.
+    pub scenario_file: Option<PathBuf>,
+    /// The Zenoh endpoint the sim listens on.
+    pub listen: String,
+    /// Have the sim record the run to this MCAP bag.
+    pub record: Option<PathBuf>,
+    /// Started after the sim, before the controllers.
+    pub companions: Vec<Companion>,
+    /// Controller command lines, placeholders already rendered; split like a
+    /// shell would (no shell runs them).
+    pub controllers: Vec<String>,
+    /// Stop the run once it has taken this long (wall clock).
+    pub run_timeout: Option<Duration>,
+    /// Stop the run as soon as a controller fails (else it flies on and
+    /// fails at the end).
+    pub fail_fast: bool,
+    pub log: Log,
+    /// The run's stop handle; share one to stop several runs at once.
+    pub stop: StopRequested,
+}
+
+/// One run's processes, supervised on a thread of their own.
+pub struct LiveRun {
+    endpoint: String,
+    stop: StopRequested,
+    supervisor: Option<JoinHandle<Outcome>>,
+    outcome: Option<Outcome>,
+}
+
+impl LiveRun {
+    /// Write the scenario, start the sim, the companions and the controllers
+    /// (each with `$ASTRUM_ZENOH_CONNECT` = [`LiveRun::endpoint`]), register
+    /// them in `children` and return at once. If any of them cannot start,
+    /// those already started are stopped and the error says which.
+    pub fn start(spec: LiveSpec, children: &Children) -> Result<Self, String> {
+        let started = Instant::now();
+        let (scenario_path, temp) = match &spec.scenario_file {
+            Some(path) => {
+                std::fs::write(path, spec.scenario.to_toml())
+                    .map_err(|e| format!("writing {}: {e}", path.display()))?;
+                (path.clone(), None)
+            }
+            None => {
+                let mut temp = tempfile::Builder::new()
+                    .prefix("astrum-run-")
+                    .suffix(".toml")
+                    .tempfile()
+                    .map_err(|e| format!("creating the scenario file: {e}"))?;
+                temp.write_all(spec.scenario.to_toml().as_bytes())
+                    .map_err(|e| format!("writing {}: {e}", temp.path().display()))?;
+                (temp.path().to_owned(), Some(temp))
+            }
+        };
+        let endpoint = connect_endpoint(&spec.listen);
+
+        let mut sim_cmd = Command::new(&spec.sim);
+        sim_cmd.arg(&scenario_path).args(["--listen", &spec.listen]);
+        if let Some(bag) = &spec.record {
+            sim_cmd.arg("--record").arg(bag);
+        }
+        let sim_time = SimTime::default();
+        let output = spec.log.output("sim", SIM_COLOR);
+        let mut sim = Proc::spawn("the sim", sim_cmd, output, children, Some(&sim_time))
+            .map_err(|e| format!("starting {}: {e}", spec.sim.display()))?;
+        let mut companions = Vec::new();
+        let mut controllers = Vec::new();
+        let launched = (|| {
+            for c in &spec.companions {
+                let mut cmd = Command::new(&c.program);
+                cmd.args(&c.args).env("ASTRUM_ZENOH_CONNECT", &endpoint);
+                let output = spec.log.output(&c.source, COMPANION_COLOR);
+                let p = Proc::spawn(c.name.clone(), cmd, output, children, None)
+                    .map_err(|e| format!("starting {}: {e}", c.name))?;
+                companions.push(p);
+            }
+            start_controllers(&spec.controllers, &endpoint, &spec.log, children, &mut controllers)
+        })();
+        if let Err(why) = launched {
+            terminate_all(std::iter::once(&mut sim).chain(&mut companions).chain(&mut controllers));
+            return Err(why);
+        }
+
+        let stop = spec.stop.clone();
+        let supervisor = std::thread::spawn(move || {
+            let how = Supervision {
+                stop: &spec.stop,
+                started,
+                timeout: spec.run_timeout,
+                fail_fast: spec.fail_fast,
+                log: &spec.log,
+            };
+            let ending = supervise(&mut sim, &mut controllers, &mut companions, &how);
+            terminate_all(controllers.iter_mut().chain(&mut companions));
+            sim.reap();
+            drop(temp);
+            let (sim_time_s, hint) = match &spec.log {
+                Log::Files { dir, stem } => (
+                    std::fs::read_to_string(dir.join(format!("{stem}.sim.log")))
+                        .ok()
+                        .and_then(|log| parse_stopped_line(&log)),
+                    format!("; see {stem}.sim.log"),
+                ),
+                _ => (*sim_time.lock().unwrap_or_else(|e| e.into_inner()), String::new()),
+            };
+            let status = status_of(ending, &hint);
+            Outcome { status, sim_time_s, wall_s: started.elapsed().as_secs_f64() }
+        });
+        Ok(Self { endpoint, stop, supervisor: Some(supervisor), outcome: None })
+    }
+
+    /// Where a client on this host reaches the run's sim.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The run's stop handle (the spec's `stop`).
+    pub fn stop_handle(&self) -> StopRequested {
+        self.stop.clone()
+    }
+
+    /// Ask the run to stop: the sim ends cleanly, then everything else.
+    pub fn stop(&self) {
+        self.stop.0.store(true, Ordering::Relaxed);
+    }
+
+    /// The run's outcome once every process has been reaped; `None` while it
+    /// runs. Never blocks.
+    pub fn poll(&mut self) -> Option<&Outcome> {
+        if self.supervisor.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.outcome = self.join();
+        }
+        self.outcome.as_ref()
+    }
+
+    /// Wait for the run to end and every process to be reaped.
+    pub fn wait(mut self) -> Outcome {
+        match self.outcome.take() {
+            Some(outcome) => outcome,
+            None => self.join().expect("a LiveRun has its supervisor or its outcome"),
+        }
+    }
+
+    fn join(&mut self) -> Option<Outcome> {
+        let supervisor = self.supervisor.take()?;
+        Some(supervisor.join().unwrap_or_else(|_| Outcome {
+            status: Status::Failed("the run's supervisor panicked".into()),
+            sim_time_s: None,
+            wall_s: 0.0,
+        }))
+    }
+}
+
+/// A run dropped before it ends is stopped, and its processes reaped.
+impl Drop for LiveRun {
+    fn drop(&mut self) {
+        if self.supervisor.is_some() {
+            self.stop();
+            self.join();
+        }
+    }
+}
+
+// --- Sweep process mode -------------------------------------------------------
+
+/// What every process-mode run of a sweep shares.
+pub struct ProcessCtx<'a> {
+    pub sweep: &'a Sweep,
+    /// The sweep's output directory: every run's scenario, bag and logs.
+    pub out: &'a Path,
+    /// The `astrum-sim` binary.
+    pub sim: &'a Path,
+    /// Run N listens on `tcp/127.0.0.1:<base_port + N - 1>`.
+    pub base_port: u16,
+    pub stop: &'a StopRequested,
+    pub children: &'a Children,
+}
+
+/// One sweep run as processes: the sim on its own endpoint, recording to
+/// `<out>/<stem>.mcap`, plus the sweep's controllers pointed at it, each
+/// logging to `<out>/<stem>.<source>.log`. A failing controller fails the run
+/// at its end; the run stops on the sweep's stop request.
+pub fn run_processes(ctx: &ProcessCtx, run: &Run) -> Outcome {
+    let started = Instant::now();
+    let stem = run.stem();
+    let endpoint = format!("tcp/127.0.0.1:{}", u32::from(ctx.base_port) + run.index as u32);
+    let spec = LiveSpec {
+        sim: ctx.sim.to_owned(),
+        scenario: run.scenario.clone(),
+        scenario_file: Some(ctx.out.join(format!("{stem}.toml"))),
+        record: Some(ctx.out.join(format!("{stem}.mcap"))),
+        companions: Vec::new(),
+        controllers: ctx.sweep.file.controllers.iter().map(|c| run.render(c, &endpoint)).collect(),
+        listen: endpoint,
+        run_timeout: run_timeout(ctx.sweep.file.run_timeout_s),
+        fail_fast: false,
+        log: Log::Files { dir: ctx.out.to_owned(), stem },
+        stop: ctx.stop.clone(),
+    };
+    match LiveRun::start(spec, ctx.children) {
+        Ok(live) => live.wait(),
+        Err(why) => Outcome {
+            status: Status::Failed(why),
+            sim_time_s: None,
+            wall_s: started.elapsed().as_secs_f64(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt;
+
+    use super::*;
+
+    fn exited(code: i32) -> Option<ExitStatus> {
+        Some(ExitStatus::from_raw(code << 8))
+    }
+
+    #[test]
+    fn a_failed_sim_is_the_problem_even_if_a_controller_exited_first() {
+        let ending =
+            Ending { problem: Some("controller 1 exited".into()), stopped: None, sim: exited(1) };
+        match status_of(ending, "; see run.sim.log") {
+            Status::Failed(why) => assert!(why.starts_with("sim exited"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_controller_failure_is_the_problem_when_the_sim_stopped_cleanly() {
+        let ending =
+            Ending { problem: Some("controller 1 exited".into()), stopped: None, sim: exited(0) };
+        assert_eq!(status_of(ending, ""), Status::Failed("controller 1 exited".into()));
+    }
+
+    #[test]
+    fn a_stopped_sim_that_exits_non_zero_is_still_stopped() {
+        let ending =
+            Ending { problem: None, stopped: Some("stop requested".into()), sim: exited(1) };
+        assert_eq!(status_of(ending, ""), Status::Stopped("stop requested".into()));
+    }
+
+    #[test]
+    fn wildcard_listen_addresses_connect_over_loopback() {
+        assert_eq!(connect_endpoint("tcp/0.0.0.0:7447"), "tcp/127.0.0.1:7447");
+        assert_eq!(connect_endpoint("tcp/[::]:7447"), "tcp/[::1]:7447");
+        assert_eq!(connect_endpoint("tcp/10.0.0.2:7447"), "tcp/10.0.0.2:7447");
+    }
+}
