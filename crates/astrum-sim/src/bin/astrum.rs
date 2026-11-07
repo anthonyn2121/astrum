@@ -420,7 +420,9 @@ fn sweep(args: SweepArgs) -> ExitCode {
     let running = AtomicBool::new(true);
     let outcomes = std::thread::scope(|s| {
         s.spawn(|| progress.tick(&running));
-        let outcomes = if sweep.in_process() {
+        // Stops the ticker however `execute` ends (a worker's panic too).
+        let _stop_ticker = StopTicker(&running);
+        if sweep.in_process() {
             execute(&sweep, jobs, &stop, on_event, |run| {
                 run_in_process(run, &sweep.out.join(format!("{}.mcap", run.stem())), &stop)
             })
@@ -434,9 +436,7 @@ fn sweep(args: SweepArgs) -> ExitCode {
                 children: &children,
             };
             execute(&sweep, jobs, &stop, on_event, |run| run_processes(&ctx, run))
-        };
-        running.store(false, Ordering::Relaxed);
-        outcomes
+        }
     });
     progress.print();
     let outcomes = match outcomes {
@@ -459,6 +459,15 @@ fn sweep(args: SweepArgs) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Clears the ticker's flag when dropped.
+struct StopTicker<'a>(&'a AtomicBool);
+
+impl Drop for StopTicker<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 

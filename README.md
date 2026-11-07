@@ -369,7 +369,8 @@ the run is applied, in the frame of those initial conditions: `forward_m` (horiz
 heading), `right_m` (90° clockwise of it), `up_m` (local vertical), and `heading_deg` (wraps to
 [0, 360)), `climb_deg`, `bank_deg` (the results must stay strictly within ±90). Offsets stack, and
 a heading offset never turns the frame of another, so a draw shifts an aircraft alike at every grid
-point. **Random offsets**: `samples = N` draws every `[[perturb]]` table N times; sample `k` is the
+point — except that a rigid group's drawn turn swings its members about wherever the grid put the
+lead. **Random offsets**: `samples = N` draws every `[[perturb]]` table N times; sample `k` is the
 same at every grid point (common random numbers) and reproducible from the file. A draw that puts
 two aircraft closer than `min_separation_m` (3-D) or one below `min_alt_hae_m` at any grid point is
 redrawn (1000 attempts, then the sweep is invalid). Without those limits sample `k` depends only on
