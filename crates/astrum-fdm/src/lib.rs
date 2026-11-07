@@ -366,12 +366,18 @@ impl Fdm {
             };
             self.check(st)?;
         }
+        // The level-start sequence (psi, phi, gamma = 0, vt) is kept exactly as it
+        // always was so level starts stay bit-identical. JSBSim's gamma setter
+        // tilts the existing velocity vector, so a climb angle is applied only
+        // once vt has made that vector non-zero.
         self.set("ic/psi-true-deg", ic.psi_true_deg)?;
-        // Speed first: JSBSim scales the existing velocity vector, so the angles
-        // set afterwards orient a non-zero velocity rather than being lost.
-        self.set("ic/vt-fps", ic.tas_mps / FT_TO_M)?;
         self.set("ic/phi-deg", ic.phi_deg)?;
-        self.set("ic/gamma-deg", ic.gamma_deg)
+        self.set("ic/gamma-deg", 0.0)?;
+        self.set("ic/vt-fps", ic.tas_mps / FT_TO_M)?;
+        if ic.gamma_deg != 0.0 {
+            self.set("ic/gamma-deg", ic.gamma_deg)?;
+        }
+        Ok(())
     }
 
     /// Apply the staged initial conditions.

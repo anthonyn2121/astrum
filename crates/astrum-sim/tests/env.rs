@@ -101,6 +101,22 @@ fn reset_with_new_initial_conditions_matches_a_fresh_env_of_that_scenario() {
 }
 
 #[test]
+fn reused_fdms_switch_between_level_and_banked_climbing_starts_exactly() {
+    let level = two_f16_opposing();
+    let mut turning = level.clone();
+    (turning.aircraft[0].climb_deg, turning.aircraft[0].bank_deg) = (-2.0, -20.0);
+    (turning.aircraft[1].climb_deg, turning.aircraft[1].bank_deg) = (3.0, 30.0);
+    let mut env = SimEnv::new(level.clone()).unwrap();
+    rollout(&mut env, 60);
+    for next in [turning, level] {
+        let via_reset = env.reset(None, Some(next.clone())).unwrap();
+        let mut fresh = SimEnv::new(next).unwrap();
+        assert_eq!(via_reset, fresh.observe());
+        assert_eq!(rollout(&mut env, 120), rollout(&mut fresh, 120));
+    }
+}
+
+#[test]
 fn episode_truncates_at_the_time_cap() {
     let mut s = single_ship();
     s.sim.max_time_s = 0.5;

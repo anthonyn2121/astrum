@@ -117,11 +117,14 @@ pub struct AircraftSpec {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub climb_deg: f64,
     /// Bank angle (deg, + = right wing down), |bank_deg| < 90. A trimmed
-    /// fixed-wing is trimmed into a steady coordinated turn at this bank; an
-    /// untrimmed aircraft just starts rolled by it.
+    /// fixed-wing is trimmed into a steady coordinated turn at this bank (exact
+    /// at spawn; the F-16's flight controls then roll an uncommanded aircraft
+    /// out of it, ≈ 30° → 13° in 20 s while climbing). Steep banks may not trim
+    /// (60° on the F-16 does not). An untrimmed aircraft just starts rolled by it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bank_deg: f64,
-    /// Trim for steady level flight at spawn. Default: fixed-wing yes,
+    /// Trim at spawn for steady flight at `climb_deg`, wings level or — when
+    /// `bank_deg` ≠ 0 — in a coordinated turn. Default: fixed-wing yes,
     /// multirotor no. A trim that fails to converge is fatal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trim: Option<bool>,

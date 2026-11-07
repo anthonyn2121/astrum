@@ -212,11 +212,12 @@ fn turn_trim_holds_a_coordinated_bank() {
 
 #[test]
 fn f16_turn_trim_starts_in_the_turn() {
-    // The trim itself is exact (φ = 30°, body rates of the steady turn), but the
-    // F-16's fly-by-wire yaw damper and filters start from zero state and pull
-    // the turn rate to ≈ 0.6–0.8 of g·tanφ/V within the first second while φ
-    // relaxes ≈ 1.3°/s (measured). So pin the trimmed start, and only that the
-    // turn continues the right way for a few seconds.
+    // Measured: the trim is exact at spawn (φ = 30°, q and r of the steady
+    // turn), but flown with no commands the F-16's FLCS rolls it out of the
+    // turn — yaw rate drops from 0.0245 to 0.015 rad/s in the first second,
+    // the heading rate then sits at ≈ 0.6–0.8 of g·tanφ/V and φ falls ≈ 1.3°/s
+    // (30° → 13° in 20 s in a 3° climb). So pin the trimmed start, and only
+    // that the turn continues the right way for a few seconds.
     let (tas, phi) = (200.0, 30.0);
     let mut f = trimmed("f16", 5000.0, tas, 0.0, phi);
     let omega = G * f64::tan(phi.to_radians()) / tas;
@@ -229,5 +230,52 @@ fn f16_turn_trim_starts_in_the_turn() {
         let (rate, s) = heading_rate_over_1s(&mut f);
         assert!(rate > 0.5 * omega && rate < 1.05 * omega, "second {sec}: heading rate {rate}");
         assert!((s.phi_rad.to_degrees() - phi).abs() < 6.0, "second {sec}: φ {s:?}");
+    }
+}
+
+#[test]
+fn level_start_replays_the_original_staging_sequence() {
+    // Level starts must stay bit-identical to builds that predate climb/bank.
+    // Those staged psi, phi = 0, gamma = 0, vt on a freshly positioned IC; B
+    // replays exactly that by hand. Its first set_initial_conditions only
+    // positions the IC and writes JSBSim's defaults (all zero) back, so B ends
+    // on the old sequence. Any reordering changes θ/TAS/β in the last bits at
+    // these headings (the vt-first order did), so `==` catches it.
+    let fly = |f: &mut Fdm, trim: bool| {
+        f.run_ic().unwrap();
+        f.start_engines().unwrap();
+        if trim {
+            f.trim(TrimMode::Full).unwrap();
+        }
+        f.set_dt(DT).unwrap();
+        let mut out = vec![f.state().unwrap()];
+        for _ in 0..120 {
+            f.step().unwrap();
+        }
+        out.push(f.state().unwrap());
+        out
+    };
+    for (model, psi, tas, trim) in
+        [("f16", 37.0, 200.0, true), ("c172x", 123.0, 45.0, false), ("c172x", 123.0, 45.0, true)]
+    {
+        let ic = InitialConditions {
+            lat_geod_deg: 37.6188,
+            lon_deg: -122.3756,
+            alt_hae_m: 1500.0,
+            psi_true_deg: psi,
+            tas_mps: tas,
+            gamma_deg: 0.0,
+            phi_deg: 0.0,
+        };
+        let mut a = Fdm::load(&root(), model).unwrap();
+        a.set_initial_conditions(&ic).unwrap();
+        let mut b = Fdm::load(&root(), model).unwrap();
+        b.set_initial_conditions(&InitialConditions { psi_true_deg: 0.0, tas_mps: 0.0, ..ic })
+            .unwrap();
+        b.set("ic/psi-true-deg", psi).unwrap();
+        b.set("ic/phi-deg", 0.0).unwrap();
+        b.set("ic/gamma-deg", 0.0).unwrap();
+        b.set("ic/vt-fps", tas / 0.3048).unwrap();
+        assert_eq!(fly(&mut a, trim), fly(&mut b, trim), "{model} hdg {psi} trim {trim}");
     }
 }
