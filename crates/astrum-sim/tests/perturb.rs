@@ -90,6 +90,7 @@ fn forward_and_right_follow_the_heading_and_up_raises_the_aircraft() {
     for (heading, forward, right) in [
         (0.0, (0.0, 100.0), (50.0, 0.0)),
         (90.0, (100.0, 0.0), (0.0, -50.0)),
+        (180.0, (0.0, -100.0), (-50.0, 0.0)),
         (270.0, (-100.0, 0.0), (0.0, 50.0)),
     ] {
         let mut base = scenario();
@@ -97,14 +98,14 @@ fn forward_and_right_follow_the_heading_and_up_raises_the_aircraft() {
         for (axis, want) in [(Axis::ForwardM, forward), (Axis::RightM, right)] {
             let v = if axis == Axis::ForwardM { 100.0 } else { 50.0 };
             let mut s = base.clone();
-            single(1, &[(axis, v)]).apply(&mut s).unwrap();
+            single(1, &[(axis, v)]).apply(&base, &mut s).unwrap();
             close(moved(&base, &s, 1), (want.0, want.1, 0.0));
             assert_eq!(s.aircraft[0].heading_deg, heading, "a shift does not turn");
         }
     }
     let base = scenario();
     let mut s = base.clone();
-    single(1, &[(Axis::UpM, 30.0)]).apply(&mut s).unwrap();
+    single(1, &[(Axis::UpM, 30.0)]).apply(&base, &mut s).unwrap();
     close(moved(&base, &s, 1), (0.0, 0.0, 30.0));
     assert!((s.aircraft[0].alt_hae_m - (base.aircraft[0].alt_hae_m + 30.0)).abs() < 1e-3);
     assert_eq!(s.aircraft[1], base.aircraft[1], "other aircraft stay put");
@@ -116,7 +117,9 @@ fn a_shift_moves_the_aircraft_by_its_level_frame_length() {
         let mut base = scenario();
         base.aircraft[0].heading_deg = heading;
         let mut s = base.clone();
-        single(1, &[(Axis::ForwardM, 3000.0), (Axis::RightM, -4000.0)]).apply(&mut s).unwrap();
+        single(1, &[(Axis::ForwardM, 3000.0), (Axis::RightM, -4000.0)])
+            .apply(&base, &mut s)
+            .unwrap();
         let d = moved(&base, &s, 1);
         let len = (d.e * d.e + d.n * d.n + d.u * d.u).sqrt();
         assert!((len - 5000.0).abs() < 1e-3, "heading {heading}: {len}");
@@ -125,21 +128,75 @@ fn a_shift_moves_the_aircraft_by_its_level_frame_length() {
 }
 
 #[test]
+fn a_shift_is_taken_in_a_frame_at_the_aircraft_not_at_the_world_origin() {
+    // About 150 km from the world origin, where the two frames' axes differ
+    // by over a degree (tens of metres over this shift).
+    let mut base = scenario();
+    base.aircraft[0].lat_deg = 38.5;
+    base.aircraft[0].lon_deg = -121.0;
+    base.aircraft[0].heading_deg = 30.0;
+    let mut s = base.clone();
+    single(1, &[(Axis::ForwardM, 2000.0), (Axis::RightM, 1500.0)]).apply(&base, &mut s).unwrap();
+    let (sin, cos) = 30f64.to_radians().sin_cos();
+    close(moved(&base, &s, 1), (2000.0 * sin + 1500.0 * cos, 2000.0 * cos - 1500.0 * sin, 0.0));
+}
+
+#[test]
+fn stacked_offsets_are_all_taken_in_the_base_frame() {
+    // A grid turns aircraft 2 (heading 180) by 90°, then a draw moves it
+    // forward: forward is still south, as with no turn.
+    let base = scenario();
+    let mut turned = base.clone();
+    single(2, &[(Axis::HeadingDeg, 90.0)]).apply(&base, &mut turned).unwrap();
+    single(2, &[(Axis::ForwardM, 100.0)]).apply(&base, &mut turned).unwrap();
+    close(moved(&base, &turned, 2), (0.0, -100.0, 0.0));
+    assert_eq!(turned.aircraft[1].heading_deg, 270.0);
+
+    // A rigid group whose lead was already moved and turned shifts its lead
+    // by the same displacement as an untouched one.
+    let group = Group {
+        lead: 1,
+        members: vec![1, 2],
+        offset: offset(&[(Axis::ForwardM, 300.0), (Axis::HeadingDeg, 20.0)]),
+    };
+    let mut plain = base.clone();
+    group.apply(&base, &mut plain).unwrap();
+    let mut moved_first = base.clone();
+    single(1, &[(Axis::RightM, 500.0), (Axis::HeadingDeg, 45.0)])
+        .apply(&base, &mut moved_first)
+        .unwrap();
+    let before = moved_first.clone();
+    group.apply(&base, &mut moved_first).unwrap();
+    let shift = |from: &Scenario, to: &Scenario| {
+        let frame = LocalFrame::new(geodetic(&base, 1));
+        let (p, q) =
+            (frame.geodetic_to_enu(&geodetic(from, 1)), frame.geodetic_to_enu(&geodetic(to, 1)));
+        (q.e - p.e, q.n - p.n, q.u - p.u)
+    };
+    let want = shift(&base, &plain);
+    let got = shift(&before, &moved_first);
+    close(Enu { e: got.0, n: got.1, u: got.2 }, want);
+    let d = distance(&moved_first, 1, 2);
+    assert!((d - distance(&before, 1, 2)).abs() < 1e-3, "the group keeps its spacing");
+}
+
+#[test]
 fn heading_offsets_wrap_and_climb_or_bank_stay_within_90() {
-    let mut s = scenario();
-    single(1, &[(Axis::HeadingDeg, 300.0)]).apply(&mut s).unwrap();
+    let base = scenario();
+    let mut s = base.clone();
+    single(1, &[(Axis::HeadingDeg, 300.0)]).apply(&base, &mut s).unwrap();
     assert_eq!(s.aircraft[0].heading_deg, 30.0);
-    single(1, &[(Axis::HeadingDeg, -45.0)]).apply(&mut s).unwrap();
+    single(1, &[(Axis::HeadingDeg, -45.0)]).apply(&base, &mut s).unwrap();
     assert_eq!(s.aircraft[0].heading_deg, 345.0);
     assert_eq!(wrap_heading(-1e-17), 0.0);
     assert_eq!(wrap_heading(720.0), 0.0);
 
-    single(1, &[(Axis::ClimbDeg, 89.9), (Axis::BankDeg, -89.9)]).apply(&mut s).unwrap();
+    single(1, &[(Axis::ClimbDeg, 89.9), (Axis::BankDeg, -89.9)]).apply(&base, &mut s).unwrap();
     for (axis, v, field) in
         [(Axis::ClimbDeg, 90.0, "climb_deg"), (Axis::BankDeg, -120.0, "bank_deg")]
     {
         let mut s = scenario();
-        let e = single(2, &[(axis, v)]).apply(&mut s).unwrap_err();
+        let e = single(2, &[(axis, v)]).apply(&base, &mut s).unwrap_err();
         let key = format!("aircraft.2.offset.{field}");
         assert!(e.contains("aircraft 2") && e.contains(&key) && e.contains("(-90, 90)"), "{e}");
     }
@@ -160,14 +217,14 @@ fn a_rigid_group_keeps_its_geometry_and_turns_about_its_lead() {
         ]),
     };
     let mut s = base.clone();
-    group.apply(&mut s).unwrap();
+    group.apply(&base, &mut s).unwrap();
     for (a, b) in [(1, 2), (1, 3), (2, 3)] {
         let (before, after) = (distance(&base, a, b), distance(&s, a, b));
         assert!((before - after).abs() < 1e-3, "{a}-{b}: {before} → {after}");
     }
     // The lead moves exactly as alone; everyone turns and banks alike.
     let mut alone = base.clone();
-    Group { members: vec![1], ..group.clone() }.apply(&mut alone).unwrap();
+    Group { members: vec![1], ..group.clone() }.apply(&base, &mut alone).unwrap();
     close(moved(&base, &s, 1), {
         let d = moved(&base, &alone, 1);
         (d.e, d.n, d.u)

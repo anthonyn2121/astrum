@@ -3,18 +3,22 @@
 //!
 //! **Offsets** (`aircraft.<id>.offset.<axis>` in a sweep's `set`/`vary`, and
 //! every `[[perturb]]` draw) are taken in the aircraft's *level frame* at its
-//! own position, with its heading before any heading offset: `forward_m` is
+//! base position with its base heading — its initial conditions once the
+//! run's absolute keys are applied, before any offset: `forward_m` is
 //! horizontal along the true heading, `right_m` 90° clockwise of it, `up_m` the
 //! local vertical (neither is tilted by climb or bank). With heading ψ, the
 //! shift in a local ENU frame at the aircraft is `e = f·sinψ + r·cosψ`,
 //! `n = f·cosψ − r·sinψ`, `u = up`. `heading_deg` adds and wraps to [0, 360);
-//! `climb_deg` and `bank_deg` add and must stay strictly within ±90.
+//! `climb_deg` and `bank_deg` add and must stay strictly within ±90. Offsets
+//! stack — a sweep applies its `set`/`vary` offsets, then each draw — and as
+//! every one is taken in the base frame, a draw shifts an aircraft by the same
+//! ENU displacement whatever heading offset the grid gives it.
 //!
 //! **Groups.** A [`Group`] applies one offset to several aircraft as a rigid
-//! body in its lead's frame: the shift moves every member alike, a heading
-//! offset turns every member's position about the lead (and adds to every
-//! member's heading), so every pairwise distance is kept. A single aircraft is
-//! a group of one.
+//! body in its lead's base frame: the shift moves every member alike, a
+//! heading offset turns every member's position about the lead's current
+//! position (and adds to every member's heading), so every pairwise distance
+//! is kept. A single aircraft is a group of one.
 //!
 //! **Draws.** A [`Perturb`] table draws offsets per axis — `{ uniform = a }`
 //! (±a) or `{ normal = s }` (σ = s, truncated at 3σ) — either per aircraft
@@ -26,7 +30,7 @@ use astrum_geo::{Enu, Geodetic, LocalFrame};
 use serde::{Deserialize, Serialize};
 
 use crate::rng::SplitMix64;
-use crate::scenario::Scenario;
+use crate::scenario::{AircraftSpec, Scenario};
 
 /// One offset axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -114,17 +118,19 @@ pub struct Group {
 }
 
 impl Group {
-    /// Apply the offset to `scenario`. Errors name the aircraft and key when a
-    /// climb or bank leaves (-90, 90), or when an aircraft is missing.
-    pub fn apply(&self, scenario: &mut Scenario) -> Result<(), String> {
+    /// Apply the offset to `scenario`, in the lead's frame in `base` (the
+    /// same aircraft before any offset; see the [module docs](self)). Errors
+    /// name the aircraft and key when a climb or bank leaves (-90, 90), or
+    /// when an aircraft is missing.
+    pub fn apply(&self, base: &Scenario, scenario: &mut Scenario) -> Result<(), String> {
         let find = |s: &Scenario, id: u32| {
             s.aircraft
                 .iter()
                 .position(|a| a.id == id)
                 .ok_or_else(|| format!("the scenario has no aircraft {id}"))
         };
-        let lead = &scenario.aircraft[find(scenario, self.lead)?];
-        let at = Geodetic::from_degrees(lead.lat_deg, lead.lon_deg, lead.alt_hae_m);
+        let geodetic = |a: &AircraftSpec| Geodetic::from_degrees(a.lat_deg, a.lon_deg, a.alt_hae_m);
+        let lead = &base.aircraft[find(base, self.lead)?];
         let off = &self.offset;
         let (de, dn) =
             level_to_en(lead.heading_deg, off.or_zero(Axis::ForwardM), off.or_zero(Axis::RightM));
@@ -134,27 +140,31 @@ impl Group {
             || shift.n != 0.0
             || shift.u != 0.0
             || (turn != 0.0 && self.members.len() > 1);
-        let frame = moves.then(|| LocalFrame::new(at));
+        let frame = moves.then(|| LocalFrame::new(geodetic(lead)));
+        // The turn centre: where the lead is now.
+        let centre = match &frame {
+            Some(frame) => {
+                frame.geodetic_to_enu(&geodetic(&scenario.aircraft[find(scenario, self.lead)?]))
+            }
+            None => Enu { e: 0.0, n: 0.0, u: 0.0 },
+        };
         let (sin, cos) = turn.sin_cos();
         for &id in &self.members {
             let i = find(scenario, id)?;
             let a = &mut scenario.aircraft[i];
             if let Some(frame) = &frame {
-                // The lead sits at the frame origin exactly.
-                let p = if id == self.lead {
+                // Relative to the centre (the lead itself exactly at it),
+                // turned clockwise (from north toward east) by the offset.
+                let r = if id == self.lead {
                     Enu { e: 0.0, n: 0.0, u: 0.0 }
                 } else {
-                    frame.geodetic_to_enu(&Geodetic::from_degrees(
-                        a.lat_deg,
-                        a.lon_deg,
-                        a.alt_hae_m,
-                    ))
+                    let p = frame.geodetic_to_enu(&geodetic(&*a));
+                    Enu { e: p.e - centre.e, n: p.n - centre.n, u: p.u - centre.u }
                 };
-                // Clockwise (from north toward east) by the heading offset.
                 let moved = Enu {
-                    e: p.e * cos + p.n * sin + shift.e,
-                    n: p.n * cos - p.e * sin + shift.n,
-                    u: p.u + shift.u,
+                    e: centre.e + r.e * cos + r.n * sin + shift.e,
+                    n: centre.n + r.n * cos - r.e * sin + shift.n,
+                    u: centre.u + r.u + shift.u,
                 };
                 let g = frame.enu_to_geodetic(&moved);
                 (a.lat_deg, a.lon_deg, a.alt_hae_m) = (g.lat_deg(), g.lon_deg(), g.alt_hae_m);

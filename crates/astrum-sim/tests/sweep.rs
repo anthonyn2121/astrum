@@ -357,12 +357,14 @@ fn samples_multiply_the_grid_and_share_their_draws_across_it() {
         let mut offset = Offset::default();
         offset.set(Axis::ForwardM, v[0]);
         offset.set(Axis::HeadingDeg, v[1]);
-        Group { lead: 7, members: vec![7], offset }.apply(&mut want).unwrap();
+        let absolute = want.clone();
+        Group { lead: 7, members: vec![7], offset }.apply(&absolute, &mut want).unwrap();
         assert_eq!(run.scenario.aircraft, want.aircraft, "{}", run.stem());
     }
 
-    // Sample k depends on (sample_seed, k) only: replanning — even with a
-    // smaller grid — draws the same, another seed draws otherwise.
+    // Without separation / altitude limits, sample k depends only on
+    // (sample_seed, k): replanning — even with a smaller grid — draws the
+    // same, another seed draws otherwise.
     let again = plan(dir.path(), SAMPLED).unwrap();
     let fewer = plan(dir.path(), &SAMPLED.replace("[50.0, 60.0]", "[70.0]")).unwrap();
     let reseeded =
@@ -371,6 +373,51 @@ fn samples_multiply_the_grid_and_share_their_draws_across_it() {
         assert_eq!(draws(&again, k), draws(&sweep, k));
         assert_eq!(draws(&fewer, k)[0], draws(&sweep, k)[0]);
         assert_ne!(draws(&reseeded, k)[0], draws(&sweep, k)[0]);
+    }
+}
+
+#[test]
+fn a_draw_shifts_an_aircraft_alike_whatever_heading_offset_the_grid_gives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = Scenario::from_toml_str(&two_ship()).unwrap();
+    let sweep = plan_on(
+        dir.path(),
+        &two_ship(),
+        r#"
+samples = 3
+[vary]
+"aircraft.8.offset.heading_deg" = [0.0, 90.0]
+"aircraft.7.offset.heading_deg" = [0.0, 135.0]
+[[perturb]]
+aircraft = [8]
+forward_m = { uniform = 500.0 }
+right_m = { uniform = 500.0 }
+[[perturb]]
+aircraft = [7, 8]
+rigid = true
+forward_m = { uniform = 500.0 }
+"#,
+    )
+    .unwrap();
+    assert_eq!(sweep.runs.len(), 12);
+    for k in 0..3 {
+        let runs: Vec<_> = sweep.runs.iter().filter(|r| r.sample == Some(k)).collect();
+        // Aircraft 7 only moves with the rigid draw, along its base heading
+        // (east) at every grid point; 8 by both draws, along its own (north).
+        let v = floats(&runs[0].values[2..]);
+        let (f8, r8, f7) = (v[0], v[1], v[2]);
+        for run in &runs {
+            let [e, n, u] = moved(&base, &run.scenario, 7);
+            assert!((e - f7).abs() < 1e-3 && n.abs() < 1e-3 && u.abs() < 1e-3, "{}", run.stem());
+        }
+        // 8 is the rigid group's member, turned about 7 by nothing: shifted
+        // by 7's frame (east) plus its own draw (north / east).
+        let shifts: Vec<[f64; 3]> = runs.iter().map(|r| moved(&base, &r.scenario, 8)).collect();
+        for s in &shifts {
+            for (got, want) in s.iter().zip([r8 + f7, f8, 0.0]) {
+                assert!((got - want).abs() < 1e-3, "sample {k}: {shifts:?}");
+            }
+        }
     }
 }
 
@@ -675,4 +722,34 @@ fn a_stopped_sweep_marks_the_runs_it_never_started() {
     let status: Vec<String> =
         csv(&sweep.out.join("summary.csv"))[1..].iter().map(|r| r[1].clone()).collect();
     assert_eq!(status, ["ok", "not run", "not run"]);
+}
+
+#[test]
+fn an_earlier_sweeps_bag_never_passes_for_a_run_that_recorded_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sweep = plan(dir.path(), "").unwrap();
+    sweep.out = dir.path().join("out");
+    std::fs::create_dir_all(&sweep.out).unwrap();
+    let bag = sweep.out.join("run-0001.mcap");
+    let json = sweep.out.join("run-0001.metrics.json");
+    let stop = StopRequested::default();
+    assert_eq!(run_in_process(&sweep.runs[0], &bag, &stop).status, Status::Ok);
+    std::fs::write(&json, "{}").unwrap();
+
+    // This run fails before it records anything.
+    let failed =
+        |_: &_| Outcome { status: Status::Failed("no sim".into()), sim_time_s: None, wall_s: 0.0 };
+    let metrics = Mutex::new(Vec::new());
+    let on_event = |e: RunEvent| {
+        if let RunEvent::Finished { metrics: m, .. } = e {
+            metrics.lock().unwrap().push(m);
+        }
+    };
+    execute(&sweep, 1, &stop, on_event, failed).unwrap();
+    assert_eq!(*metrics.lock().unwrap(), [None]);
+    assert!(!bag.exists() && !json.exists());
+    let rows = csv(&sweep.out.join("summary.csv"));
+    let end_reason = rows[0].iter().position(|h| h == "end_reason").unwrap();
+    assert!(rows[1][1].starts_with("failed"), "{:?}", rows[1]);
+    assert!(rows[1][end_reason..].iter().all(String::is_empty), "{:?}", rows[1]);
 }

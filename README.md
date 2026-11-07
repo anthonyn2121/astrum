@@ -364,14 +364,16 @@ initial conditions exactly as the sim will (`--dry-run` too), before anything fl
 cannot trim is invalid, named with its values. The check builds each distinct aircraft once,
 about 8 ms per F-16 (200 runs × 4 F-16s: 6.7 s); JSBSim loads models one at a time.
 
-**Offsets** move or turn an aircraft relative to its initial conditions, after every absolute key
-of the run: `forward_m` (horizontal, along its heading), `right_m` (90° clockwise of it), `up_m`
-(local vertical), and `heading_deg` (wraps to [0, 360)), `climb_deg`, `bank_deg` (the results must
-stay strictly within ±90). **Random offsets**: `samples = N` draws every `[[perturb]]` table N
-times; sample `k` is the same at every grid point (common random numbers) and depends only on
-`sample_seed` (default 0) and `k`. A draw that puts two aircraft closer than `min_separation_m`
-(3-D) or one below `min_alt_hae_m` at any grid point is redrawn (1000 attempts, then the sweep is
-invalid).
+**Offsets** move or turn an aircraft relative to its initial conditions once every absolute key of
+the run is applied, in the frame of those initial conditions: `forward_m` (horizontal, along its
+heading), `right_m` (90° clockwise of it), `up_m` (local vertical), and `heading_deg` (wraps to
+[0, 360)), `climb_deg`, `bank_deg` (the results must stay strictly within ±90). Offsets stack, and
+a heading offset never turns the frame of another, so a draw shifts an aircraft alike at every grid
+point. **Random offsets**: `samples = N` draws every `[[perturb]]` table N times; sample `k` is the
+same at every grid point (common random numbers) and reproducible from the file. A draw that puts
+two aircraft closer than `min_separation_m` (3-D) or one below `min_alt_hae_m` at any grid point is
+redrawn (1000 attempts, then the sweep is invalid). Without those limits sample `k` depends only on
+`sample_seed` (default 0) and `k`; a redrawn sample also depends on every grid point.
 
 ```toml
 samples = 20

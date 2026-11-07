@@ -20,7 +20,10 @@
 //! initial conditions once every absolute key of the run is applied; see
 //! [`crate::perturb`]). `[[perturb]]` tables draw such offsets at random:
 //! `samples` draws, sample `k` the same at every grid point (common random
-//! numbers), deterministic from `(sample_seed, k)`.
+//! numbers) and reproducible from the file. Without `min_separation_m` /
+//! `min_alt_hae_m`, sample `k` depends only on `(sample_seed, k)`; a draw
+//! those limits reject is redrawn, so a redrawn sample also depends on every
+//! grid point.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -69,7 +72,8 @@ pub struct SweepFile {
     /// Random draws of the `[[perturb]]` tables per grid point; 0 = none.
     #[serde(default)]
     pub samples: u64,
-    /// Seed of the draws: sample `k` depends on `(sample_seed, k)` only.
+    /// Seed of the draws (see the module docs for what else a sample
+    /// depends on).
     #[serde(default)]
     pub sample_seed: u64,
     /// Redraw a sample that puts two aircraft closer than this (3-D, m).
@@ -303,10 +307,12 @@ fn plain(v: &toml::Value) -> String {
     }
 }
 
-/// One combination of the grid, its offsets applied.
+/// One combination of the grid: its scenario with only the absolute keys
+/// applied (the frame every offset is taken in), and with its offsets too.
 struct Point {
     values: Vec<toml::Value>,
     params: BTreeMap<String, toml::Value>,
+    absolute: Scenario,
     scenario: Scenario,
 }
 
@@ -399,15 +405,16 @@ impl Sweep {
             let at = || {
                 format!("run {} ({})", first_run(combination, 0) + 1, describe(&vary_keys, &values))
             };
-            let mut scenario: Scenario = value
+            let absolute: Scenario = value
                 .try_into()
                 .map_err(|e: toml::de::Error| err(format!("{}: {}", at(), e.message())))?;
+            let mut scenario = absolute.clone();
             for (&id, &offset) in &overrides.offsets {
                 Group { lead: id, members: vec![id], offset }
-                    .apply(&mut scenario)
+                    .apply(&absolute, &mut scenario)
                     .map_err(|e| err(format!("{}: {e}", at())))?;
             }
-            points.push(Point { values, params: overrides.params, scenario });
+            points.push(Point { values, params: overrides.params, absolute, scenario });
         }
 
         let samples: Vec<Sample> = (0..file.samples)
@@ -570,7 +577,7 @@ fn draw_sample(
         for (p, point) in points.iter().enumerate() {
             let mut scenario = point.scenario.clone();
             for group in &groups {
-                group.apply(&mut scenario).map_err(|e| {
+                group.apply(&point.absolute, &mut scenario).map_err(|e| {
                     let keys: Vec<String> = vary_keys.iter().chain(draw_keys).cloned().collect();
                     let values: Vec<toml::Value> =
                         point.values.iter().chain(&drawn).cloned().collect();
@@ -742,8 +749,10 @@ fn record_metrics(bag: &Path, json: &Path) -> std::io::Result<Option<Box<RunMetr
 
 /// Fly every run of `sweep` on `jobs` threads with `run_one` (which records
 /// run `r`'s bag, if any, to `<sweep.out>/<stem>.mcap`), returning each run's
-/// outcome (`None`: never started, because a stop was requested). After each
-/// run its bag's metrics go to `<sweep.out>/<stem>.metrics.json`; and
+/// outcome (`None`: never started, because a stop was requested). Before each
+/// run its earlier `<stem>.mcap` and `<stem>.metrics.json` are removed (an
+/// earlier sweep's results never pass for this run's); after it its bag's
+/// metrics go to `<sweep.out>/<stem>.metrics.json`; and
 /// `<sweep.out>/summary.csv` is rewritten whenever a run starts or finishes,
 /// so a reader sees progress. `on_event` hears every start and finish, on the
 /// worker thread. Failing to write a result stops starting runs; the error is
@@ -779,19 +788,25 @@ pub fn execute(
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(run) = sweep.runs.get(i) else { return };
+                let stem = run.stem();
+                let bag = sweep.out.join(format!("{stem}.mcap"));
+                let json = sweep.out.join(format!("{stem}.metrics.json"));
+                for stale in [&bag, &json] {
+                    match std::fs::remove_file(stale) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return fail(e),
+                        _ => {}
+                    }
+                }
                 update(i, RunState::Running);
                 on_event(RunEvent::Started { index: i });
                 let outcome = run_one(run);
-                let stem = run.stem();
-                let bag = sweep.out.join(format!("{stem}.mcap"));
-                let metrics =
-                    match record_metrics(&bag, &sweep.out.join(format!("{stem}.metrics.json"))) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            fail(e);
-                            None
-                        }
-                    };
+                let metrics = match record_metrics(&bag, &json) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        fail(e);
+                        None
+                    }
+                };
                 update(i, RunState::Finished(outcome.clone(), metrics.clone()));
                 on_event(RunEvent::Finished { index: i, outcome, metrics });
             });

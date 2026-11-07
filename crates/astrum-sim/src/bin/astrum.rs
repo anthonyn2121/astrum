@@ -25,7 +25,7 @@ use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -417,21 +417,28 @@ fn sweep(args: SweepArgs) -> ExitCode {
     let started = Instant::now();
     let progress = Progress::new(sweep.runs.len(), started);
     let on_event = |e: RunEvent| progress.on(&e);
-    let outcomes = if sweep.in_process() {
-        execute(&sweep, jobs, &stop, on_event, |run| {
-            run_in_process(run, &sweep.out.join(format!("{}.mcap", run.stem())), &stop)
-        })
-    } else {
-        let ctx = ProcessCtx {
-            sweep: &sweep,
-            out: &sweep.out,
-            sim: &sim,
-            base_port: args.base_port,
-            stop: &stop,
-            children: &children,
+    let running = AtomicBool::new(true);
+    let outcomes = std::thread::scope(|s| {
+        s.spawn(|| progress.tick(&running));
+        let outcomes = if sweep.in_process() {
+            execute(&sweep, jobs, &stop, on_event, |run| {
+                run_in_process(run, &sweep.out.join(format!("{}.mcap", run.stem())), &stop)
+            })
+        } else {
+            let ctx = ProcessCtx {
+                sweep: &sweep,
+                out: &sweep.out,
+                sim: &sim,
+                base_port: args.base_port,
+                stop: &stop,
+                children: &children,
+            };
+            execute(&sweep, jobs, &stop, on_event, |run| run_processes(&ctx, run))
         };
-        execute(&sweep, jobs, &stop, on_event, |run| run_processes(&ctx, run))
-    };
+        running.store(false, Ordering::Relaxed);
+        outcomes
+    });
+    progress.print();
     let outcomes = match outcomes {
         Ok(o) => o,
         Err(e) => {
@@ -455,25 +462,24 @@ fn sweep(args: SweepArgs) -> ExitCode {
     }
 }
 
-/// The sweep's progress line, printed as runs finish (at most about once a
-/// second, and always for the last).
+/// The sweep's progress line: once a second while it runs ([`Progress::tick`])
+/// and once at its end.
 struct Progress {
     total: usize,
     started: Instant,
     state: Mutex<ProgressState>,
 }
 
+#[derive(Default)]
 struct ProgressState {
     done: usize,
     not_ok: usize,
     sim_s: f64,
-    printed: Option<Instant>,
 }
 
 impl Progress {
     fn new(total: usize, started: Instant) -> Self {
-        let state = ProgressState { done: 0, not_ok: 0, sim_s: 0.0, printed: None };
-        Self { total, started, state: Mutex::new(state) }
+        Self { total, started, state: Mutex::default() }
     }
 
     fn on(&self, event: &RunEvent) {
@@ -484,15 +490,27 @@ impl Progress {
             s.not_ok += 1;
         }
         s.sim_s += outcome.sim_time_s.unwrap_or(0.0);
-        let due = s.printed.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
-        if due || s.done == self.total {
-            s.printed = Some(Instant::now());
-            let rate = s.sim_s / self.started.elapsed().as_secs_f64();
-            println!(
-                "[sweep] {}/{} done, {} not ok | {rate:.0} sim-s per wall-s",
-                s.done, self.total, s.not_ok
-            );
+    }
+
+    /// Print the line every second while `running`.
+    fn tick(&self, running: &AtomicBool) {
+        let mut next = Duration::from_secs(1);
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+            if self.started.elapsed() >= next && running.load(Ordering::Relaxed) {
+                self.print();
+                next += Duration::from_secs(1);
+            }
         }
+    }
+
+    fn print(&self) {
+        let s = self.state.lock().unwrap();
+        let rate = s.sim_s / self.started.elapsed().as_secs_f64();
+        println!(
+            "[sweep] {}/{} done, {} not ok | {rate:.0} sim-s per wall-s",
+            s.done, self.total, s.not_ok
+        );
     }
 }
 
