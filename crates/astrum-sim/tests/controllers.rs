@@ -269,6 +269,9 @@ fn load_err(toml: &str) -> String {
 fn load_rejects_invalid_catalogs() {
     let dup = format!("{MINI}{}", &MINI[..MINI.find("[[controller.param]]").unwrap()]);
     assert!(load_err(&dup).contains("duplicate controller id `mini`"));
+    let head = &MINI[..MINI.find("[[controller.param]]").unwrap()];
+    let same_name = format!("{MINI}{}", head.replace("id = \"mini\"", "id = \"mini-2\""));
+    assert!(load_err(&same_name).contains("duplicate controller name `Mini`"));
 
     let oob = MINI.replace("default = 100.0", "default = 1000.5");
     let msg = load_err(&oob);
@@ -288,6 +291,11 @@ fn load_rejects_invalid_catalogs() {
     assert!(load_err(&MINI.replace("name = \"steps\"", "name = \"alt\"")).contains("`alt`"));
     assert!(load_err(&MINI.replace("flag = \"--steps\"", "flag = \"--alt\"")).contains("--alt"));
     assert!(load_err(&MINI.replace("flag = \"--steps\"", "flag = \"--id\"")).contains("--id"));
+    // A param may not re-declare a fixed `-`-prefixed argument of the command.
+    assert!(load_err(&MINI.replace("flag = \"--steps\"", "flag = \"--law\"")).contains("--law"));
+    let fixed_eq = MINI.replace("\"--law\", \"x\"", "\"--law=x\"");
+    assert!(load_err(&fixed_eq.replace("flag = \"--steps\"", "flag = \"--law\"")).contains("--law"));
+    assert!(ControllerCatalog::from_toml_str(&MINI.replace("\"x\"]", "\"--steps\"]")).is_err());
     assert!(load_err(&MINI.replace("label = \"Slot\"", "label = \"Slot\"\nextra = 1"))
         .contains("extra"));
 }
@@ -297,4 +305,35 @@ fn flies_filters_by_kind() {
     let e = mini().entries()[0].clone();
     assert!(e.flies(VehicleKind::Multirotor));
     assert!(!e.flies(VehicleKind::FixedWing));
+}
+
+#[test]
+fn render_unbounded_numbers_exactly_and_rejects_unprintable_ones() {
+    let cat = shipped();
+    let e = cat.get("cpp-autopilot").unwrap();
+    let alt = |x: f64| e.render(1, &with(&[("alt", toml::Value::Float(x))]), &[1]);
+    let argv = |x: f64| split(&alt(x).unwrap());
+    let rest = |v: &str| {
+        [
+            "build/controllers/cpp/astrum-controller",
+            "--law",
+            "autopilot",
+            "--id",
+            "1",
+            "--heading",
+            "0",
+            "--alt",
+            v,
+            "--speed",
+            "50",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    assert_eq!(argv(-50.5), rest("-50.5"));
+    assert_eq!(argv(1e300), rest(&format!("1{}", "0".repeat(300))));
+    for x in [f64::INFINITY, f64::NEG_INFINITY, 1e-310, -1e-310] {
+        assert_eq!(bad_value(alt(x).unwrap_err()), "alt", "{x}");
+    }
+    assert_eq!(argv(-0.0), rest("-0"));
 }

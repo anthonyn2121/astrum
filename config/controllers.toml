@@ -366,7 +366,10 @@ label = "True airspeed"
 unit = "m/s"
 type = "number"
 default = 50.0
-min = 0.0
+# The law linearizes about this speed (it divides by it); 600 m/s is the f16's
+# ~Mach 2 ceiling, the fastest shipped model.
+min = 1.0
+max = 600.0
 target = "tas_mps"
 
 [[controller.param]]
@@ -425,7 +428,10 @@ label = "True airspeed"
 unit = "m/s"
 type = "number"
 default = 50.0
-min = 0.0
+# The law linearizes about this speed (it divides by it); 600 m/s is the f16's
+# ~Mach 2 ceiling, the fastest shipped model.
+min = 1.0
+max = 600.0
 target = "tas_mps"
 
 [[controller.param]]
@@ -456,7 +462,7 @@ unit = "s"
 type = "number"
 default = 6.0
 min = 0.1
-max = 30.0
+max = 10.0
 
 [[controller]]
 id = "py-figure8"
@@ -573,16 +579,6 @@ min = 1.0
 max = 89.0
 
 [[controller.param]]
-name = "max-pitch"
-flag = "--max-pitch-deg"
-label = "Max pitch"
-unit = "deg"
-type = "number"
-default = 10.0
-min = 1.0
-max = 89.0
-
-[[controller.param]]
 name = "horizon"
 flag = "--horizon-s"
 label = "MPC horizon"
@@ -590,7 +586,7 @@ unit = "s"
 type = "number"
 default = 4.0
 min = 0.1
-max = 30.0
+max = 10.0
 
 [[controller.param]]
 name = "q-pos"

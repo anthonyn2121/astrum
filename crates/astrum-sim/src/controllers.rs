@@ -134,11 +134,18 @@ impl ControllerCatalog {
         let file: CatalogFile =
             toml::from_str(text).map_err(|e| ControllerError::Catalog(e.to_string()))?;
         let mut ids = BTreeSet::new();
+        let mut names = BTreeSet::new();
         for spec in &file.controller {
             if !ids.insert(spec.id.as_str()) {
                 return Err(ControllerError::Catalog(format!(
                     "duplicate controller id `{}`",
                     spec.id
+                )));
+            }
+            if !names.insert(spec.name.as_str()) {
+                return Err(ControllerError::Catalog(format!(
+                    "controller `{}`: duplicate controller name `{}`",
+                    spec.id, spec.name
                 )));
             }
             spec.validate()
@@ -194,7 +201,12 @@ impl ControllerSpec {
             check_arg(arg).map_err(|e| format!("command: {e}"))?;
         }
         let mut names = BTreeSet::new();
-        let mut flags = BTreeSet::from([self.id_flag.as_str()]);
+        // Fixed flags (e.g. `--law`) and the id flag cannot be params too.
+        let fixed_flags = self.command[1..]
+            .iter()
+            .filter(|a| a.starts_with('-'))
+            .map(|a| a.split_once('=').map_or(a.as_str(), |(flag, _)| flag));
+        let mut flags: BTreeSet<&str> = fixed_flags.chain([self.id_flag.as_str()]).collect();
         for p in &self.params {
             if !names.insert(p.name.as_str()) {
                 return Err(format!("duplicate param name `{}`", p.name));
@@ -286,6 +298,10 @@ impl ParamSpec {
         };
         match (self.ty, value) {
             (ParamType::Number, toml::Value::Float(x)) if x.is_finite() => {
+                // Subnormals print as long decimals C++ `strtod` refuses (ERANGE).
+                if *x != 0.0 && x.abs() < f64::MIN_POSITIVE {
+                    return Err(format!("{x:e} is subnormal"));
+                }
                 in_bounds(*x)?;
                 Ok(x.to_string())
             }
