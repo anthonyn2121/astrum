@@ -14,6 +14,7 @@ use astrum_net::{EventPublisher, Session, TelemetryPublisher};
 use astrum_proto::{encode_event, Event, EventKind, Telemetry};
 use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::catalogs::Catalogs;
+use astrum_web::runs::{Runs, RunsConfig};
 use astrum_web::server::{router, Config};
 use axum::Router;
 
@@ -100,7 +101,37 @@ pub fn app_with_catalogs(tmp: &Path, bridge: Bridge, catalogs: Catalogs) -> Rout
     build(tmp, bridge, &[], catalogs)
 }
 
+/// The `--connect` endpoint of [`app_with_runs`]' runs: where the bridge
+/// goes back to once a run has finished (no sim ever answers there).
+pub const RUNS_CONNECT: &str = "tcp/127.0.0.1:1";
+
+/// [`app`] over `catalogs`, its live runs flown by `sim` into `<tmp>/runs`
+/// (`--connect` = [`RUNS_CONNECT`]); also the run manager, for shutting it
+/// down.
+pub fn app_with_runs(tmp: &Path, bridge: Bridge, catalogs: Catalogs, sim: &Path) -> (Router, Runs) {
+    let cfg =
+        RunsConfig { dir: tmp.join("runs"), sim: sim.to_owned(), connect: RUNS_CONNECT.into() };
+    let runs = Runs::new(cfg, bridge.clone());
+    (build_with(tmp, bridge, &[], catalogs, runs.clone()), runs)
+}
+
 fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs) -> Router {
+    // No test of these flies a run.
+    let cfg = RunsConfig {
+        dir: tmp.join("runs"),
+        sim: tmp.join("no-astrum-sim"),
+        connect: RUNS_CONNECT.into(),
+    };
+    build_with(tmp, bridge.clone(), allowed_hosts, catalogs, Runs::new(cfg, bridge))
+}
+
+fn build_with(
+    tmp: &Path,
+    bridge: Bridge,
+    allowed_hosts: &[&str],
+    catalogs: Catalogs,
+    runs: Runs,
+) -> Router {
     let web = tmp.join("web");
     std::fs::create_dir_all(&web).unwrap();
     std::fs::write(web.join("index.html"), "<h1>astrum</h1>").unwrap();
@@ -114,6 +145,7 @@ fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs)
         tile_cache: cache,
         allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_owned()).collect(),
         catalogs,
+        runs,
     };
     router(cfg, bridge).unwrap()
 }

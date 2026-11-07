@@ -46,3 +46,11 @@ export const getScenario = (name) => apiGet(`/scenarios/${encodeURIComponent(nam
 // The bridge: which sim the telemetry stream carries, and that sim's run control.
 export const getBridge = () => apiGet("/bridge");
 export const controlSim = (action) => apiPost("/bridge/control", action);
+
+// Live interactive runs (one at a time; crates/astrum-web/src/runs.rs).
+export const startRun = (body) => apiPost("/runs", body);
+export const getCurrentRun = () => apiGet("/runs/current").then((r) => r.run);
+export const stopRun = () => apiDelete("/runs/current");
+export const getRunLog = (since) => apiGet(`/runs/current/log?since=${encodeURIComponent(since)}`);
+export const getRunReplay = (id) => apiGet(`/runs/${encodeURIComponent(id)}/replay`);
+export const getRunMetrics = (id) => apiGet(`/runs/${encodeURIComponent(id)}/metrics`);

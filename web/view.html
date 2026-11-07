@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ASTRUM · 3-D Replay</title>
+  <link rel="icon" type="image/png" href="./img/favicon.png" />
+  <link rel="stylesheet" href="./vendor/uPlot.min.css" />
+  <link rel="stylesheet" href="./style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js",
+        "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <!-- One grid: top bar, fleet | stage | inspector, plots, transport. The docks
+       can be hidden one by one, and presentation mode hides them all. -->
+  <div id="app">
+    <header id="topbar">
+      <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Replay</em></a>
+      <div class="source">
+        <span id="statusPill" class="pill idle">idle</span>
+        <span id="sourceLabel" class="source-label muted">no source</span>
+      </div>
+      <div class="topbar-actions">
+        <div class="seg" role="group" aria-label="Panels">
+          <button id="dockFleetBtn" class="seg-btn" aria-pressed="true" title="Show / hide the fleet panel">Fleet</button>
+          <button id="dockInspectorBtn" class="seg-btn" aria-pressed="true" title="Show / hide the aircraft panel">Aircraft</button>
+          <button id="dockPlotsBtn" class="seg-btn" aria-pressed="true" title="Show / hide the plots">Plots</button>
+        </div>
+        <button id="presentBtn" title="Presentation mode (P)">Present</button>
+        <div class="menu-wrap">
+          <button id="sourceBtn" aria-haspopup="dialog" aria-expanded="false" aria-controls="sourceMenu">Source ▾</button>
+          <div id="sourceMenu" class="popover" role="dialog" aria-label="Telemetry source" hidden>
+            <div class="pop-title">Live stream</div>
+            <div class="pop-row">
+              <input id="wsUrl" type="text" spellcheck="false" placeholder="ws://host:8080/telemetry" aria-label="WebSocket URL" />
+              <button id="connectBtn" class="primary" title="Connect to an astrum-web bridge">Connect</button>
+            </div>
+            <div class="pop-title">Recording</div>
+            <button id="openFileBtn" title="Open an astrum-web-export JSON file">Open export file…</button>
+            <p class="pop-note muted">…or drop an <code>astrum-web-export</code> JSON anywhere on the page.</p>
+          </div>
+        </div>
+        <div class="menu-wrap">
+          <button id="helpBtn" class="icon" aria-haspopup="dialog" aria-expanded="false" aria-controls="helpMenu" title="Keyboard shortcuts (?)">?</button>
+          <div id="helpMenu" class="popover" role="dialog" aria-label="Keyboard shortcuts" hidden>
+            <div class="pop-title">Keyboard</div>
+            <dl class="keys">
+              <dt><kbd>Space</kbd></dt><dd>play / pause</dd>
+              <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>step 1 s (<kbd>Shift</kbd> 10 s)</dd>
+              <dt><kbd>Home</kbd> <kbd>End</kbd></dt><dd>start / end</dd>
+              <dt><kbd>L</kbd></dt><dd>jump to the live head</dd>
+              <dt><kbd>-</kbd> <kbd>=</kbd></dt><dd>slower / faster</dd>
+              <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>previous / next aircraft</dd>
+              <dt><kbd>T</kbd></dt><dd>cycle the pinned target</dd>
+              <dt><kbd>1</kbd>–<kbd>5</kbd></dt><dd>camera: orbit, follow, chase, top, side</dd>
+              <dt><kbd>F</kbd></dt><dd>fit the fleet in view</dd>
+              <dt><kbd>P</kbd></dt><dd>presentation mode</dd>
+              <dt><kbd>Esc</kbd></dt><dd>close menus, leave presentation</dd>
+            </dl>
+            <p class="pop-note muted">In the scene: click selects, <kbd>Shift</kbd>+click pins a target.</p>
+            <div class="pop-title">Live sim</div>
+            <p class="pop-note muted">While the stream comes from a running sim, the bar at the bottom of the scene pauses, resumes, steps and paces the <em>sim</em> itself; the transport below only replays what this page has received.</p>
+            <p class="pop-note muted">A studio run (opened from Interactive) also shows its panel: state, Stop, its log and, once it ends, the outcome, key metrics and <em>Open full replay</em>.</p>
+          </div>
+        </div>
+      </div>
+      <input id="fileInput" type="file" accept=".json,application/json" hidden />
+    </header>
+
+    <aside id="fleet" class="dock">
+      <header class="dock-head">
+        <span class="dock-title">Fleet</span>
+        <span id="fleetCount" class="badge">0</span>
+      </header>
+      <div id="fleetSearchWrap" class="dock-tools" hidden>
+        <input id="fleetSearch" type="search" spellcheck="false" placeholder="Filter: id, team, kind, mode" aria-label="Filter the fleet" />
+      </div>
+      <div id="fleetList" class="dock-body" role="listbox" aria-label="Aircraft"></div>
+      <div id="fleetEmpty" class="dock-empty muted">No aircraft yet.</div>
+      <footer class="dock-foot muted">Click to select · <span class="pin-glyph">◎</span> pins a target</footer>
+    </aside>
+
+    <main id="stage">
+      <div id="view"></div>
+
+      <!-- Empty state: the logo plus what the viewer is waiting for. Hidden once
+           telemetry is buffered. -->
+      <div id="splash">
+        <img src="./img/astrum-logo.png" alt="ASTRUM — Aerospace Simulation" />
+        <div class="empty-card">
+          <div id="emptyStatus">Connecting…</div>
+          <div class="empty-actions">
+            <button id="retryBtn" title="Connect to the live stream again">Retry connection</button>
+            <button id="emptyOpenBtn" class="primary">Open export file…</button>
+          </div>
+          <div class="muted small">…or drop an <code>astrum-web-export</code> JSON anywhere.</div>
+        </div>
+      </div>
+
+      <div id="sceneToolbar" class="overlay">
+        <div class="seg" role="group" aria-label="Camera">
+          <button class="seg-btn" data-cam="orbit" title="Free orbit (1)">Orbit</button>
+          <button class="seg-btn" data-cam="follow" title="Orbit the selection (2)">Follow</button>
+          <button class="seg-btn" data-cam="chase" title="Chase the selection (3)">Chase</button>
+          <button class="seg-btn" data-cam="top" title="Top-down (4)">Top</button>
+          <button class="seg-btn" data-cam="side" title="Side-on (5)">Side</button>
+        </div>
+        <button id="fitBtn" title="Fit the fleet in view (F)">Fit</button>
+        <div class="seg" role="group" aria-label="Overlays">
+          <button id="tglTrails" class="seg-btn" aria-pressed="true" title="Motion trails">Trails</button>
+          <button id="tglLabels" class="seg-btn" aria-pressed="true" title="Id labels">Labels</button>
+          <button id="tglDrop" class="seg-btn" aria-pressed="true" title="Altitude drop lines">Alt lines</button>
+        </div>
+        <label class="size-ctl" title="Model size near the camera (1× = true size); far aircraft never shrink below a readable minimum">
+          Size <input id="sizeRange" type="range" min="1" max="20" step="1" value="4" aria-label="Model size" />
+          <span id="sizeValue">4×</span>
+        </label>
+      </div>
+
+      <div id="compass" class="overlay" title="Compass">
+        <svg viewBox="-30 -30 60 60" aria-hidden="true">
+          <circle r="27" class="compass-ring" />
+          <g id="compassRose">
+            <path d="M0,-22 L5,-4 L0,-7 L-5,-4 Z" class="compass-north" />
+            <path d="M0,22 L5,4 L0,7 L-5,4 Z" class="compass-south" />
+            <text y="-11.5" class="compass-n">N</text>
+          </g>
+        </svg>
+      </div>
+
+      <div id="scaleBar" class="overlay" hidden><div class="scale-line"></div><span id="scaleLabel"></span></div>
+
+      <ol id="killFeed" class="overlay" aria-live="polite"></ol>
+
+      <div id="sceneMeta" class="overlay">
+        <!-- Ground-map credit (default tile source is Esri World Imagery); shown
+             while the streamed map is in use (F-16 fleets). -->
+        <span id="mapAttribution" hidden>Imagery © Esri, Maxar, Earthstar Geographics</span>
+        <span id="fps">—</span>
+      </div>
+
+      <!-- The live sim's control plane (js/simcontrol.js): shown while the
+           stream comes from a sim that answers its status. -->
+      <div id="simBar" class="overlay" role="group" aria-label="Sim control" hidden>
+        <span id="simState" class="sim-state">—</span>
+        <span class="sim-stat"><span class="hk">TICK</span> <span id="simTick">—</span></span>
+        <span class="sim-stat"><span class="hk">SIM</span> <span id="simTime">—</span></span>
+        <span class="sim-stat" title="Pace achieved / target (× real time)"><span class="hk">PACE</span> <span id="simPace">—</span></span>
+        <span id="simWaiting" class="sim-stat sim-waiting" title="Lockstep: the aircraft whose command the sim is waiting for" hidden></span>
+        <button id="simPauseBtn" title="Pause the sim">Pause</button>
+        <span class="sim-step">
+          <input id="simStepN" type="number" min="1" max="1000000" step="1" value="1" aria-label="Ticks to step" />
+          <button id="simStepBtn" title="Run this many ticks, then pause">Step</button>
+        </span>
+        <div id="simSpeed" class="seg" role="group" aria-label="Sim speed">
+          <button data-speed="1" aria-pressed="false" title="Real time">1×</button>
+          <button data-speed="2" aria-pressed="false" title="Twice real time">2×</button>
+          <button data-speed="10" aria-pressed="false" title="Ten times real time">10×</button>
+          <button data-speed="0" aria-pressed="false" title="As fast as the host allows">Max</button>
+        </div>
+        <span id="simError" class="sim-error" role="status" aria-live="polite"></span>
+      </div>
+
+      <!-- A studio run opened with ?run=<id> (js/runpanel.js). -->
+      <section id="runPanel" class="overlay" aria-label="Studio run" hidden>
+        <header class="run-head">
+          <span class="dock-title">Run</span>
+          <span id="runId" class="run-id"></span>
+          <span id="runState" class="pill idle">—</span>
+          <button id="runStopBtn" class="mini" title="Stop the run (the sim ends cleanly, then its controllers)" hidden>Stop</button>
+          <button id="runCollapseBtn" class="mini" aria-expanded="true" aria-controls="runBody" title="Collapse / expand">▾</button>
+        </header>
+        <div id="runBody" class="run-body">
+          <div id="runInfo" class="muted small"></div>
+          <div id="runError" class="run-error small" role="alert" hidden></div>
+          <div id="runResult" hidden>
+            <div id="runOutcome" class="run-outcome"></div>
+            <dl id="runMetrics" class="kv small"></dl>
+            <p id="runMovedNote" class="muted small" hidden>The live stream went back to the server's own source when the run ended; the full replay has the whole run.</p>
+            <button id="runReplayBtn" class="primary">Open full replay</button>
+          </div>
+          <details id="runLog">
+            <summary>Log <span id="runLogCount" class="badge">0</span></summary>
+            <div id="runLogLines" class="run-log" role="log" tabindex="0" aria-label="Run output"></div>
+          </details>
+        </div>
+      </section>
+
+      <div id="presentHint" class="overlay">Presentation mode · <kbd>P</kbd> or <kbd>Esc</kbd> to exit</div>
+    </main>
+
+    <aside id="inspector" class="dock">
+      <header class="dock-head">
+        <span id="insSwatch" class="swatch"></span>
+        <span class="dock-title">Aircraft <span id="insId">—</span></span>
+        <span class="ins-tags"><span id="insKind" class="tag">—</span><span id="insMode" class="tag">—</span><span id="insState" class="tag" hidden></span></span>
+      </header>
+      <div id="insEmpty" class="dock-empty muted">Select an aircraft in the fleet list or the scene.</div>
+      <div id="insBody" class="ins-body" hidden>
+        <section class="ins-section">
+          <div class="hero-grid">
+            <div class="hero"><span class="hk">ALT</span><span class="hv" id="ro-alt">—</span><span class="hu">m</span></div>
+            <div class="hero"><span class="hk">V/S</span><span class="hv" id="ro-vs">—</span><span class="hu">m/s</span></div>
+            <div class="hero"><span class="hk">TAS</span><span class="hv" id="ro-tas">—</span><span class="hu">m/s</span></div>
+            <div class="hero"><span class="hk">MACH</span><span class="hv" id="ro-mach">—</span><span class="hu"></span></div>
+            <div class="hero"><span class="hk">LOAD</span><span class="hv" id="ro-nz">—</span><span class="hu">g</span></div>
+            <div class="hero"><span class="hk">AOA</span><span class="hv" id="ro-aoa">—</span><span class="hu">°</span></div>
+          </div>
+          <div class="att-row">
+            <span><span class="hk">HDG</span> <span id="ro-hdg">—</span>°</span>
+            <span><span class="hk">PITCH</span> <span id="ro-pitch">—</span>°</span>
+            <span><span class="hk">ROLL</span> <span id="ro-roll">—</span>°</span>
+          </div>
+          <div id="combatRow" class="combat-row">
+            <span id="ro-team" class="team-chip">—</span>
+            <span class="hp-wrap"><span class="hp"><span id="ro-hpFill" class="hp-fill"></span></span><span id="ro-hp" class="hp-text">—</span></span>
+            <span><span class="hk">AMMO</span> <span id="ro-ammo">—</span></span>
+          </div>
+        </section>
+
+        <section class="ins-section">
+          <div class="sec-head">
+            <span class="sec-title"><span class="pin-glyph">◎</span> Target <span id="tgtId"></span></span>
+            <span class="sec-actions">
+              <button id="tgtSwapBtn" class="mini" title="Swap selection and target" hidden>⇄</button>
+              <button id="tgtClearBtn" class="mini" title="Unpin the target" hidden>×</button>
+            </span>
+          </div>
+          <div id="tgtEmpty" class="muted small">Pin one with ◎ in the fleet list, <kbd>T</kbd>, or <kbd>Shift</kbd>+click in the scene.</div>
+          <dl id="tgtBody" class="kv" hidden>
+            <dt>range</dt><dd id="tg-range">—</dd>
+            <dt>closure</dt><dd id="tg-closure">—</dd>
+            <dt title="Antenna train angle: your nose to the line of sight (0° = nose-on)">ATA</dt><dd id="tg-ata">—</dd>
+            <dt title="The target's nose to the line of sight (0° = you sit on its six)">aspect</dt><dd id="tg-aspect">—</dd>
+            <dt>Δ altitude</dt><dd id="tg-relalt">—</dd>
+          </dl>
+        </section>
+
+        <details class="ins-section" id="posSection">
+          <summary>Position &amp; time</summary>
+          <dl class="kv">
+            <dt>sim time</dt><dd><span id="ro-time">—</span> s</dd>
+            <dt>latitude</dt><dd><span id="ro-lat">—</span>°</dd>
+            <dt>longitude</dt><dd><span id="ro-lon">—</span>°</dd>
+            <dt>altitude (HAE)</dt><dd><span id="ro-altHae">—</span> m</dd>
+            <dt>ENU east</dt><dd><span id="ro-e">—</span> m</dd>
+            <dt>ENU north</dt><dd><span id="ro-n">—</span> m</dd>
+            <dt>ENU up</dt><dd><span id="ro-u">—</span> m</dd>
+            <dt>ground speed</dt><dd><span id="ro-gs">—</span> m/s</dd>
+          </dl>
+        </details>
+      </div>
+
+      <section id="events" class="ins-section events">
+        <div class="sec-head">
+          <span class="sec-title">Events <span id="evCount" class="badge">0</span></span>
+          <button id="evMineBtn" class="mini" aria-pressed="false" title="Only events involving the selected aircraft">Selected only</button>
+        </div>
+        <div id="evFilters" class="chips" role="group" aria-label="Event kinds"></div>
+        <div id="evList" class="ev-list" role="list" tabindex="0" aria-label="Run events"></div>
+        <div id="evEmpty" class="muted small">No events.</div>
+      </section>
+    </aside>
+
+    <section id="plots" class="dock">
+      <div id="plotsResize" class="dock-resize" title="Drag to resize"></div>
+      <header class="dock-head">
+        <span class="dock-title">Plots</span>
+        <div id="plotsToolbar"></div>
+      </header>
+      <div id="plotsBody"></div>
+    </section>
+
+    <footer id="transport">
+      <button id="playBtn" class="icon" title="Play / pause (Space)" aria-label="Play">
+        <svg class="ico-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" /></svg>
+        <svg class="ico-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z" /></svg>
+      </button>
+      <button id="liveBtn" class="live" title="Jump to the live head (L)">LIVE</button>
+      <span id="timeCur" class="time">0:00.0</span>
+      <div id="scrubWrap">
+        <input id="scrub" type="range" min="0" max="1000" value="0" aria-label="Playhead" />
+        <div id="markers"></div>
+      </div>
+      <span id="timeTot" class="time">0:00.0</span>
+      <select id="speedSel" title="Playback speed (- / =)" aria-label="Playback speed">
+        <option value="0.25">0.25×</option>
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+        <option value="8">8×</option>
+      </select>
+    </footer>
+  </div>
+
+  <div id="dropHint">Drop an <code>astrum-web-export</code> JSON here</div>
+
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>

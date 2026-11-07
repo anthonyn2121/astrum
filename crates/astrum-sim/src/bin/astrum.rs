@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use astrum_sim::catalog;
 use astrum_sim::launch::{
-    connect_endpoint, run_processes, run_timeout, sibling, Children, Companion, LiveRun, LiveSpec,
-    Log, ProcessCtx, StartError,
+    connect_endpoint, numbered, run_processes, run_timeout, sibling, Children, Companion, LiveRun,
+    LiveSpec, Log, ProcessCtx, StartError,
 };
 use astrum_sim::sweep::{execute, run_in_process, Purpose, RunEvent, Status, Sweep, SweepFile};
 use astrum_sim::systems::StopRequested;
@@ -246,11 +246,12 @@ fn plan_run(args: &RunArgs) -> Result<Sweep, String> {
     }
 }
 
-/// The viewer's URL: astrum-web binds `$ASTRUM_WEB_BIND` (default 127.0.0.1:8080).
+/// The viewer's URL: astrum-web binds `$ASTRUM_WEB_BIND` (default 127.0.0.1:8080)
+/// and serves the viewer as `/view.html` (`/` is the studio home).
 fn viewer_url() -> String {
     let bind = std::env::var("ASTRUM_WEB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let port = bind.rsplit_once(':').map_or("8080", |(_, port)| port);
-    format!("http://localhost:{port}")
+    format!("http://localhost:{port}/view.html")
 }
 
 fn run(args: &RunArgs) -> ExitCode {
@@ -303,7 +304,7 @@ fn run(args: &RunArgs) -> ExitCode {
         listen: args.listen.clone(),
         record: args.record.clone(),
         companions,
-        controllers,
+        controllers: numbered(controllers),
         run_timeout: run_timeout(sweep.file.run_timeout_s),
         fail_fast: true,
         log: Log::Terminal,

@@ -383,29 +383,54 @@ fn terminate_all<'a>(procs: impl IntoIterator<Item = &'a mut Proc>) {
     }
 }
 
-/// Start the rendered controller command lines, pointed at `endpoint`, into
-/// `started`.
+/// One controller of a run: its command line and what the run calls it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerCmd {
+    /// The rendered command line (placeholders filled in); split like a
+    /// shell would (no shell runs it).
+    pub command: String,
+    /// Its name in the run's messages and status: "controller 2".
+    pub name: String,
+    /// Its output's source tag (and log-file infix): "ctl2".
+    pub source: String,
+}
+
+/// `commands` as the k-th controllers of a run (from 1): "controller k",
+/// source "ctlk" — how `astrum run` and sweeps name them.
+pub fn numbered<S: Into<String>>(commands: impl IntoIterator<Item = S>) -> Vec<ControllerCmd> {
+    commands
+        .into_iter()
+        .enumerate()
+        .map(|(k, command)| ControllerCmd {
+            command: command.into(),
+            name: format!("controller {}", k + 1),
+            source: format!("ctl{}", k + 1),
+        })
+        .collect()
+}
+
+/// Start the controllers, pointed at `endpoint`, into `started`.
 fn start_controllers(
-    commands: &[String],
+    controllers: &[ControllerCmd],
     endpoint: &str,
     log: &Log,
     registries: &Registries,
     started: &mut Vec<Proc>,
 ) -> Result<(), String> {
-    for (k, line) in commands.iter().enumerate() {
+    for (k, c) in controllers.iter().enumerate() {
+        let (line, name) = (&c.command, &c.name);
         let argv = shlex::split(line)
             .filter(|argv| !argv.is_empty())
-            .ok_or_else(|| format!("controller {}: cannot split `{line}`", k + 1))?;
+            .ok_or_else(|| format!("{name}: cannot split `{line}`"))?;
         let mut command = Command::new(&argv[0]);
         command.args(&argv[1..]).env("ASTRUM_ZENOH_CONNECT", endpoint);
-        let output =
-            log.output(&format!("ctl{}", k + 1), CONTROLLER_COLORS[k % CONTROLLER_COLORS.len()]);
+        let output = log.output(&c.source, CONTROLLER_COLORS[k % CONTROLLER_COLORS.len()]);
         if !matches!(output, Output::File(_)) {
             // Live output: Python flushes every line, not only at exit.
             command.env("PYTHONUNBUFFERED", "1");
         }
-        let p = Proc::spawn(format!("controller {}", k + 1), command, output, registries, None)
-            .map_err(|e| format!("controller {}: starting `{}`: {e}", k + 1, argv[0]))?;
+        let p = Proc::spawn(name.clone(), command, output, registries, None)
+            .map_err(|e| format!("{name}: starting `{}`: {e}", argv[0]))?;
         started.push(p);
     }
     Ok(())
@@ -419,6 +444,9 @@ struct Ending {
     problem: Option<String>,
     /// Why the sim was asked to stop: a stop request or the run timeout.
     stopped: Option<String>,
+    /// The sim was asked to stop because of `problem` (fail-fast): however it
+    /// exits then, `problem` is the run's.
+    failed_fast: bool,
     sim: Option<ExitStatus>,
 }
 
@@ -444,6 +472,7 @@ fn supervise(
 ) -> Ending {
     let mut problem: Option<String> = None;
     let mut stopped: Option<String> = None;
+    let mut failed_fast = false;
     let mut companion_gone = vec![false; companions.len()];
     let sim_status = loop {
         match sim.exited() {
@@ -460,6 +489,7 @@ fn supervise(
                 if !status.success() && problem.is_none() {
                     problem = Some(format!("{} exited ({status})", c.name));
                     if how.fail_fast {
+                        failed_fast = true;
                         sim.signal(libc::SIGTERM);
                     }
                 }
@@ -485,15 +515,23 @@ fn supervise(
         }
         std::thread::sleep(POLL);
     };
-    Ending { problem, stopped, sim: sim_status }
+    Ending { problem, stopped, failed_fast, sim: sim_status }
 }
 
 /// A run's status from how it ended; `sim_log` hints where the sim's output is.
 /// A sim that failed by itself (it exits 0 when asked to stop) is the run's
 /// problem even if a controller exited first: a controller that quits on the
-/// sim's `RunEnded(fatal)` must not hide the sim's reason.
+/// sim's `RunEnded(fatal)` must not hide the sim's reason. A sim stopped
+/// because a controller failed (fail-fast) that then exits cleanly or dies of
+/// that SIGTERM (sent before it could handle it) did not fail by itself: the
+/// controller's failure is the run's.
 fn status_of(ending: Ending, sim_log: &str) -> Status {
+    let terminated = |s: &Option<ExitStatus>| {
+        s.is_some_and(|s| s.success() || s.signal() == Some(libc::SIGTERM))
+    };
+    let fail_fast_stop = ending.failed_fast && terminated(&ending.sim);
     match (ending.problem, ending.stopped, ending.sim) {
+        (Some(why), ..) if fail_fast_stop => Status::Failed(why),
         (_, None, Some(s)) if !s.success() => Status::Failed(format!("sim exited ({s}){sim_log}")),
         (Some(why), ..) => Status::Failed(why),
         (None, Some(why), _) => Status::Stopped(why),
@@ -536,9 +574,8 @@ pub struct LiveSpec {
     pub record: Option<PathBuf>,
     /// Started after the sim, before the controllers.
     pub companions: Vec<Companion>,
-    /// Controller command lines, placeholders already rendered; split like a
-    /// shell would (no shell runs them).
-    pub controllers: Vec<String>,
+    /// The controllers ([`numbered`] for "controller k" / "ctlk").
+    pub controllers: Vec<ControllerCmd>,
     /// Stop the run once it has taken this long (wall clock).
     pub run_timeout: Option<Duration>,
     /// Stop the run as soon as a controller fails (else it flies on and
@@ -797,7 +834,7 @@ pub fn run_processes(ctx: &ProcessCtx, run: &Run) -> Outcome {
         scenario_file: Some(ctx.out.join(format!("{stem}.toml"))),
         record: Some(ctx.out.join(format!("{stem}.mcap"))),
         companions: Vec::new(),
-        controllers: ctx.sweep.file.controllers.iter().map(|c| run.render(c, &endpoint)).collect(),
+        controllers: numbered(ctx.sweep.file.controllers.iter().map(|c| run.render(c, &endpoint))),
         listen: endpoint,
         run_timeout: run_timeout(ctx.sweep.file.run_timeout_s),
         fail_fast: false,

@@ -21,7 +21,8 @@ fixed-wing aircraft and sUAS quadrotors, each with its own high-fidelity flight 
 Telemetry and commands can be recorded to an **MCAP** bag and the telemetry replayed to any
 subscriber with the recorded payload bytes, and a browser-based **3-D replay renderer**
 (Three.js, procedural meshes) visualises the fleet live or from an exported bag — `astrum run
-config/scenario.example.toml --watch`, then open http://localhost:8080.
+config/scenario.example.toml --watch`, then open http://localhost:8080/view.html. The same server
+hosts a small web **studio** (http://localhost:8080) that sets up and flies interactive runs.
 
 ## Status
 
@@ -120,7 +121,7 @@ Inside the dev container (`/workspace`):
 ```bash
 astrum list                                    # every scenario / run / sweep file under config/
 astrum run config/demos/cpp.toml               # C++ controller flies aircraft 1, then tears down
-astrum run config/demos/formation.toml --watch # figure-eight leader + 3 MPC followers, live at http://localhost:8080
+astrum run config/demos/formation.toml --watch # figure-eight leader + 3 MPC followers, live at http://localhost:8080/view.html
 make verify                                    # confirm the toolchain (pinned versions agree, JSBSim/zenoh link + run)
 make test                                      # all tests
 make ci                                        # the full gate: fmt-check + lint + all tests + cargo deny
@@ -416,7 +417,7 @@ A **run file** is a sweep file without a grid: `base`, `controllers`, `[set]` an
 bare scenario TOML) in the foreground and refuses files that plan more than one run:
 
 ```bash
-astrum run config/demos/formation.toml --watch               # + the viewer at http://localhost:8080
+astrum run config/demos/formation.toml --watch               # + the viewer at http://localhost:8080/view.html
 astrum run config/scenario.demo.toml --speed 0 --set aircraft.1.tas_mps=60
 astrum run config/demos/cpp.toml --record recordings/session.mcap
 astrum run config/demos/quad.toml --dry-run                  # print the resolved scenario TOML
@@ -634,12 +635,28 @@ curved WGS84 surface; every other platform keeps the dark ENU grid. Presentation
 plot channels and event filters persist in `localStorage`. Three.js and uPlot are vendored under
 `web/vendor/`.
 
+**The studio.** `astrum web` also serves a small studio: `/` (home) links **Interactive** and the
+**Replay viewer** (`/view.html`, everything above). `/interactive.html` sets up one live run: an
+environment (only `empty` for now), a scenario from `--config-dir` (invalid ones are listed,
+disabled, with their error), a catalog controller per aircraft (only those that fly its vehicle
+kind; or none — uncommanded) with its parameters as a form with the catalog's bounds — heading,
+altitude and airspeed targets start from the aircraft's initial conditions (a follower's altitude
+from its leader's), the catalog default one click away — a speed (1×, 2×, 10×, Max) and
+optionally a max sim time; **Run** starts it and opens
+`/view.html?run=<id>`. While a run is active the page shows it (open / stop) instead. In the
+viewer, a **sim-control bar** at the bottom of the scene appears whenever the stream comes from a
+live sim: it pauses, resumes, steps N ticks and paces the *sim* (1×, 2×, 10×, Max) and shows its
+state, tick, sim time, achieved vs target pace and the lockstep aircraft it is waiting for — the
+transport only replays what the page has received. With `?run=<id>` a run panel shows the run's
+state, **Stop**, its log and, once it ends, its outcome, key metrics and **Open full replay** (the
+run's bag as an export, loaded like a file).
+
 Both data paths feed one JSON frame shape (`astrum_web::FrameJson`) and one event shape
 (`astrum_web::EventJson`, see [Events](#events)), so the live stream and an offline export can't
 drift:
 
 ```bash
-# LIVE — start the fleet + the bridge, then open http://localhost:8080
+# LIVE — start the fleet + the bridge, then open http://localhost:8080/view.html
 astrum run config/scenario.example.toml --watch
 # (the bridge equally serves a bag being replayed: `astrum play b.mcap` in one shell, `astrum web` in another)
 
@@ -678,14 +695,42 @@ summary, environment, fleet, or the error that makes it unflyable) and `GET
 requests are subject to the `Host` check (403); non-GET ones must also be `Content-Type:
 application/json` (415) and, from a browser, same-origin (403).
 
+Live interactive runs — one at a time, owned by the server: `POST /api/runs` with
+`{"scenario": "<name>" | {…scenario…}, "assignments": [{"aircraft": 1, "controller": "cpp-hold",
+"params": {"alt": 1500}}], "speed": 0, "max_time_s": 60}` (`speed` 0 = as fast as possible;
+`speed` and `max_time_s` default to the scenario's, `max_time_s` 0 = until stopped) → 201 with
+the run, `{id, scenario, state: "starting"|"running"|"finished", endpoint, speed, max_time_s,
+lockstep, assignments (every parameter, defaults filled in), started_at_ms, finished_at_ms,
+outcome, dir, bag}`; 400 for bad input (the message names the aircraft and parameter), 409 while a
+run is active (or being started), 422 for an invalid scenario (an inline one's aircraft `model`
+must be a plain name), 500 when it cannot start — e.g. a controller program that is not built
+("aircraft 1: controller `cpp-hold`: `build/controllers/cpp/astrum-controller` not found …").
+Exactly the controlled aircraft fly in lockstep; the others fly uncommanded. A run writes
+`<--runs-dir>/<id>/` (`scenario.toml`, `run.mcap`, and `metrics.json` once it ends; `<id>` = UTC
+`yyyymmdd-hhmmss-<scenario>`), its sim listens on a free loopback port and the bridge attaches to
+it; when the run ends, the bridge goes back to `--connect` (unless something re-attached it
+meanwhile), which starts a fresh live timeline in every viewer — the run panel offers the full
+replay. `GET /api/runs/current` → `{"run": …|null}` (the latest since the server started);
+`DELETE /api/runs/current` stops it (200 with its final state; 409 when none is active);
+`GET /api/runs/current/log?since=<seq>` → `{"lines": [{seq, source, stream, line}], "next"}` (its
+last 5000 output lines; a controller's `source` is its aircraft, `aircraft 1`);
+`GET /api/runs/<id>/replay` (the `astrum-replay` export) and `GET /api/runs/<id>/metrics`
+(`astrum metrics` JSON) serve any run under the runs dir (400 for an id that is not a plain name,
+404 when unknown or unrecorded, 409 while it runs). Stopping the server stops the active run first.
+
 The same port serves the static `web/` app and the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags:
 `--connect` (default `tcp/127.0.0.1:7447`, attached at startup), `--bind` (default
 `127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`, published on host
 loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache`, `--allowed-hosts`,
-`--config-dir` (its `controllers.toml` is read at startup; a broken one stops the server) — each
-with an `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback
-(`ASTRUM_WEB_ALLOWED_HOSTS` and `ASTRUM_CONFIG_DIR` for the last two). `astrum export` takes
-the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,
+`--config-dir` (its `controllers.toml` is read at startup; a broken one stops the server),
+`--runs-dir` (default `runs/web`) and `--sim` (default: the `astrum-sim` next to `astrum-web`) —
+each with an `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback
+(`ASTRUM_WEB_ALLOWED_HOSTS`, `ASTRUM_CONFIG_DIR`, `ASTRUM_RUNS_DIR` and `ASTRUM_SIM_BIN` for the
+last four). Paths are relative to the server's working directory: run it from the repo root, so
+the catalog's controller commands (`build/controllers/…`, `controllers/…`) resolve.
+
+`astrum export` takes the bag as a positional argument and writes an `astrum-replay` document
+(version 3: `frames`,
 `events`, and `meta` with their counts, the embedded `scenario` TOML and its aircraft `models`
 as `[{"id","model"},…]`, `[]` without a scenario) to `--out` (env fallbacks `ASTRUM_BAG` /
 `ASTRUM_WEB_EXPORT`). Version 2 exports still open (without events); v1 JSON exports are not

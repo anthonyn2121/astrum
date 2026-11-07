@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ASTRUM · Interactive</title>
+  <link rel="icon" type="image/png" href="./img/favicon.png" />
+  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/studio.css" />
+</head>
+<body class="studio">
+  <header class="studio-top">
+    <a class="brand" href="./"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Studio</em></a>
+    <span class="crumb">Interactive</span>
+    <a class="top-link" href="./view.html">Replay viewer</a>
+  </header>
+
+  <main class="studio-main">
+    <h1>Interactive run</h1>
+    <p class="muted lede">Fly one scenario live: every aircraft you give a controller flies it in lockstep with the sim; the others fly uncommanded (trimmed controls).</p>
+
+    <!-- One live run at a time: while one is active, it is shown here instead
+         of a new start. -->
+    <section id="activeRun" class="banner" aria-live="polite" hidden>
+      <div class="banner-text">
+        <strong>A run is active:</strong> <span id="activeId" class="mono"></span>
+        <div id="activeMeta" class="muted small"></div>
+      </div>
+      <div class="banner-actions">
+        <a id="activeOpen" class="button primary" href="./view.html">Open in the viewer</a>
+        <button id="activeStop" type="button">Stop it</button>
+      </div>
+      <div id="activeError" class="form-error" role="alert" hidden></div>
+    </section>
+
+    <p id="loadError" class="form-error" role="alert" hidden></p>
+
+    <form id="setup" novalidate>
+      <fieldset id="setupFields">
+        <section class="step" aria-labelledby="envHead">
+          <h2 id="envHead"><span class="step-n">1</span> Environment</h2>
+          <div id="envList" class="choices" role="radiogroup" aria-labelledby="envHead"></div>
+        </section>
+
+        <section class="step" aria-labelledby="scenarioHead">
+          <h2 id="scenarioHead"><span class="step-n">2</span> Scenario</h2>
+          <div id="scenarioList" class="choices" role="radiogroup" aria-labelledby="scenarioHead"></div>
+          <p id="scenarioEmpty" class="muted" hidden>No scenarios for this environment in the config directory.</p>
+        </section>
+
+        <section class="step" aria-labelledby="fleetHead">
+          <h2 id="fleetHead"><span class="step-n">3</span> Controllers</h2>
+          <p id="fleetEmpty" class="muted">Pick a scenario first.</p>
+          <div id="fleet" class="fleet"></div>
+        </section>
+
+        <section class="step" aria-labelledby="runHead">
+          <h2 id="runHead"><span class="step-n">4</span> Run</h2>
+          <div class="run-options">
+            <div class="field">
+              <span id="speedLabel" class="field-label">Speed</span>
+              <div id="speedSeg" class="seg" role="group" aria-labelledby="speedLabel">
+                <button type="button" data-speed="1" aria-pressed="true" title="Real time">1×</button>
+                <button type="button" data-speed="2" aria-pressed="false" title="Twice real time">2×</button>
+                <button type="button" data-speed="10" aria-pressed="false" title="Ten times real time">10×</button>
+                <button type="button" data-speed="0" aria-pressed="false" title="As fast as the host allows">Max</button>
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="maxTime">Max sim time (s)</label>
+              <input id="maxTime" type="number" min="0" step="any" inputmode="decimal" aria-describedby="maxTimeHint" />
+              <span id="maxTimeHint" class="muted small"></span>
+              <span id="maxTimeError" class="field-error" hidden></span>
+            </div>
+          </div>
+          <div id="formError" class="form-error" role="alert" hidden></div>
+          <div class="run-actions">
+            <button id="runBtn" type="submit" class="primary big" disabled>Run</button>
+            <span id="runNote" class="muted small"></span>
+          </div>
+        </section>
+      </fieldset>
+    </form>
+  </main>
+
+  <script type="module" src="./js/interactive.js"></script>
+</body>
+</html>

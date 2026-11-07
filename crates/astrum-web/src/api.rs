@@ -32,8 +32,25 @@
 //!   ([`ScenarioDoc`](crate::catalogs::ScenarioDoc)): 400 for a name that
 //!   cannot be a file name, 404 when there is none, 422 when the file is not a
 //!   valid scenario.
+//! * **`POST /api/runs`** — start the live interactive run
+//!   ([`crate::runs`]): `{"scenario": "<name>" | {…}, "assignments":
+//!   [{"aircraft", "controller", "params"}], "speed", "max_time_s"}` → 201
+//!   [`RunView`](crate::runs::RunView); 400 for bad input (the message names
+//!   the aircraft / parameter), 409 while a run is active, 422 for an invalid
+//!   scenario, 500 when it cannot start.
+//! * **`GET /api/runs/current`** — `{"run": RunView | null}`: the latest run
+//!   since the server started. **`DELETE`** stops the active one (200, its
+//!   final view; 409 when none is active).
+//! * **`GET /api/runs/current/log?since=<seq>`** — `{"lines": [{"seq",
+//!   "source", "stream", "line"}], "next"}`: the current run's output lines
+//!   from `since` on (a bounded ring buffer).
+//! * **`GET /api/runs/<id>/replay`**, **`GET /api/runs/<id>/metrics`** — a
+//!   run's export document / [`astrum_bag::metrics::RunMetrics`]: 400 for an
+//!   unsafe id, 404 for an unknown run (or one without a recording), 409
+//!   while it runs.
 //!
-//! Zenoh's calls and file reads block, so they run on tokio's blocking pool.
+//! Zenoh's calls, file reads and process starts block, so they run on
+//! tokio's blocking pool.
 //!
 //! [`host_allowed`]: crate::server::host_allowed
 
@@ -54,6 +71,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::BridgeInfo;
 use crate::catalogs::{models, ScenarioError};
+use crate::runs;
 use crate::server::{host_allowed, origin_allowed, AppState};
 
 /// Longest a file-like name ([`safe_name`]) may be.
@@ -74,6 +92,11 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/controllers", get(controllers))
         .route("/scenarios", get(scenarios))
         .route("/scenarios/{name}", get(scenario))
+        .route("/runs", post(runs::start))
+        .route("/runs/current", get(runs::current).delete(runs::stop))
+        .route("/runs/current/log", get(runs::log))
+        .route("/runs/{id}/replay", get(runs::replay))
+        .route("/runs/{id}/metrics", get(runs::metrics))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no such API route") })
         .method_not_allowed_fallback(|| async {
             error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed on this API route")

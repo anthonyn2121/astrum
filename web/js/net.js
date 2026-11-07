@@ -9,7 +9,8 @@
 //    and whenever the bridge is attached elsewhere: a new run starts there).
 //    The store buffers frames and events so you can scrub back through what's
 //    been received (events only from when this page connected).
-//  * File — an `astrum-web-export` document (a whole bag baked to JSON). Loaded
+//  * File — an `astrum-web-export` document (a whole bag baked to JSON), from a
+//    file or a finished studio run (`GET /api/runs/<id>/replay`). Loaded
 //    whole, giving a fully seekable timeline with no running services; its
 //    `meta.models` names the models.
 
@@ -95,14 +96,18 @@ export function defaultWsUrl() {
   return `${proto}//${host}/telemetry`;
 }
 
-// Parse an astrum-web-export document. Returns { frames, events, meta, models }
-// (models: Map id -> JSBSim model, empty for exports without them) or throws.
-export async function loadExportFile(file) {
-  let doc;
-  try {
-    doc = JSON.parse(await file.text());
-  } catch {
-    throw new Error("not JSON (expected an astrum-web-export document)");
+// Parse an astrum-web-export document — a File/Blob of JSON, or the document
+// already parsed (untrusted either way). Returns { frames, events, meta,
+// models } (models: Map id -> JSBSim model, empty for exports without them)
+// or throws.
+export async function loadExportFile(source) {
+  let doc = source;
+  if (source instanceof Blob) {
+    try {
+      doc = JSON.parse(await source.text());
+    } catch {
+      throw new Error("not JSON (expected an astrum-web-export document)");
+    }
   }
   if (!doc || doc.kind !== EXPORT_KIND || !Array.isArray(doc.frames)) {
     throw new Error("not an ASTRUM replay export (expected an astrum-web-export document)");
