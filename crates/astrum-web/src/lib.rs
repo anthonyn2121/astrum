@@ -5,18 +5,21 @@
 //! [`EventJson`] for `astrum/events`, [`AircraftModel`] for the fleet's JSBSim
 //! models — used by both delivery paths:
 //!
-//! * **live / replay stream** — the `astrum-web` binary ([`server`]) tracks the
-//!   newest telemetry of every aircraft (the live sim *or* `astrum-bag-play`) and
-//!   pushes rate-limited fleet snapshots ([`snapshot_message`]), every event
-//!   ([`events_message`]) and the scenario's aircraft models
-//!   ([`models_message`]) to every connected browser over WebSocket, while also
-//!   serving the static renderer.
+//! * **live / replay stream** — the `astrum-web` binary ([`server`]) attaches a
+//!   [`bridge::Bridge`] to the live sim *or* `astrum-bag-play`, tracks the newest
+//!   telemetry of every aircraft and pushes rate-limited fleet snapshots
+//!   ([`snapshot_message`]), every event ([`events_message`]), the scenario's
+//!   aircraft models ([`models_message`]) and each change of attachment
+//!   ([`run_message`]) to every connected browser over WebSocket, while also
+//!   serving the static renderer and the JSON [`api`].
 //! * **offline export** — the `astrum-web-export` binary ([`export`]) reads an
 //!   MCAP bag and bakes it into a single [`ExportDoc`] the renderer can open with
 //!   no running services.
 //!
 //! Keeping the shapes here means the live stream and the exporter cannot drift.
 
+pub mod api;
+pub mod bridge;
 pub mod export;
 pub mod server;
 
@@ -303,6 +306,24 @@ struct ModelsMessage<'a> {
 pub fn models_message(models: &[AircraftModel]) -> String {
     serde_json::to_string(&ModelsMessage { kind: "models", models })
         .unwrap_or_else(|e| unreachable!("AircraftModel serialisation failed: {e}"))
+}
+
+/// One live WebSocket message: which attachment the stream now carries.
+#[derive(Serialize)]
+struct RunMessage<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    run: u64,
+    endpoint: Option<&'a str>,
+}
+
+/// Encode a run change as the live stream's message,
+/// `{"type":"run","run":N,"endpoint":"tcp/…"}` (`endpoint` is `null` while
+/// nothing is attached). A new `run` means everything sent before it belongs
+/// to another sim or run: the browser starts a fresh timeline.
+pub fn run_message(run: u64, endpoint: Option<&str>) -> String {
+    serde_json::to_string(&RunMessage { kind: "run", run, endpoint })
+        .unwrap_or_else(|e| unreachable!("run message serialisation failed: {e}"))
 }
 
 /// One exported telemetry sample plus the recorder's receive time.
