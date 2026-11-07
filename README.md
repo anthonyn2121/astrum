@@ -351,13 +351,46 @@ and collects every run.
 ```bash
 astrum sweep config/sweep.demo.toml             # 12 runs: C++ controller, 4 headings × 3 speeds
 astrum sweep config/sweep.trim.toml --jobs 8
+astrum sweep config/sweep.offsets.toml          # 60 runs: random wingman start offsets
 astrum sweep config/sweep.demo.toml --dry-run   # list the planned runs, fly nothing
 ```
 
 A sweep file names a `base` scenario, fixed overrides (`[set]`) and a grid (`[vary]`: every
-combination is a run, × `repeats`, repeat `r` with seed `sim.seed + r`). Keys are
-`sim.<field>`, `world.<field>`, `aircraft.<id>.<field>`, or `param.<name>` (a free value for
-controller commands). Every run's scenario is built and validated before anything flies.
+combination is a grid point; each flies × `samples` (if any) × `repeats`, repeat `r` with seed
+`sim.seed + r`). Keys are `sim.<field>`, `world.<field>`, `aircraft.<id>.<field>`,
+`aircraft.<id>.offset.<axis>` or `param.<name>` (a free value for controller commands). Every
+run's scenario is built and validated, and every aircraft that trims is trimmed at its run's
+initial conditions exactly as the sim will (`--dry-run` too), before anything flies: a run that
+cannot trim is invalid, named with its values. The check builds each distinct aircraft once,
+about 8 ms per F-16 (200 runs × 4 F-16s: 6.7 s); JSBSim loads models one at a time.
+
+**Offsets** move or turn an aircraft relative to its initial conditions once every absolute key of
+the run is applied, in the frame of those initial conditions: `forward_m` (horizontal, along its
+heading), `right_m` (90° clockwise of it), `up_m` (local vertical), and `heading_deg` (wraps to
+[0, 360)), `climb_deg`, `bank_deg` (the results must stay strictly within ±90). Offsets stack, and
+a heading offset never turns the frame of another, so a draw shifts an aircraft alike at every grid
+point — except that a rigid group's drawn turn swings its members about wherever the grid put the
+lead. **Random offsets**: `samples = N` draws every `[[perturb]]` table N times; sample `k` is the
+same at every grid point (common random numbers) and reproducible from the file. A draw that puts
+two aircraft closer than `min_separation_m` (3-D) or one below `min_alt_hae_m` at any grid point is
+redrawn (1000 attempts, then the sweep is invalid). Without those limits sample `k` depends only on
+`sample_seed` (default 0) and `k`; a redrawn sample also depends on every grid point.
+
+```toml
+samples = 20
+sample_seed = 7
+min_separation_m = 300.0
+
+[[perturb]]
+aircraft = [2, 3]                  # each its own draw per axis…
+forward_m = { uniform = 300.0 }    # ±300 m
+up_m = { normal = 50.0 }           # σ = 50 m, truncated at 3σ
+
+[[perturb]]
+aircraft = [4, 5]
+rigid = true                       # …or one draw for the group, in aircraft 4's frame:
+heading_deg = { uniform = 20.0 }   # turns the pair about 4, keeping their spacing
+```
 
 - **Without `controllers`** the runs fly in-process, one thread each (for scenarios that need no
   external control — trim, initial-condition and physics studies).
@@ -367,12 +400,16 @@ controller commands). Every run's scenario is built and validated before anythin
   `{endpoint}`, `{run}`, `{seed}` and `{param.<name>}` are filled in. Unpaced runs with controllers
   must be lockstep, so they are reproducible.
 
-Results land in `runs/<file stem>/`: per run its scenario, bag and logs, and `summary.csv` (run,
-status, seed, the varied values, sim time, wall time, speed, bag). Ctrl-C stops starting runs and
-ends the running ones cleanly; the summary marks them. Exit status 0 means every run was ok.
-Bundled sweeps: `sweep.trim.toml` (in-process), `sweep.demo.toml` (C++ controller),
-`sweep.formation.toml` (four Python controllers at a 30 Hz control rate). Other flags:
-`--out DIR`, `--overwrite`, `--base-port P`, `--sim PATH`.
+Results land in `runs/<file stem>/`: per run its scenario, bag, logs and `<run>.metrics.json`
+(`astrum metrics` of its bag), and `summary.csv` — run, status, seed, the sample (when sampling),
+the varied values and drawn offsets (one column per `aircraft.<id>.offset.<axis>`; a rigid group's
+under its first aircraft), sim time, wall time, speed, bag, then the fleet metrics (`end_reason`,
+`min_separation_m`, … `kills`; empty without a bag). The summary is rewritten whenever a run starts
+or finishes (`running`, `not run` for the rest), so it shows progress. Ctrl-C stops starting runs
+and ends the running ones cleanly; the summary marks the rest. Exit status 0 means every run was
+ok. Bundled sweeps: `sweep.trim.toml` (in-process), `sweep.offsets.toml` (in-process, random
+offsets), `sweep.demo.toml` (C++ controller), `sweep.formation.toml` (four Python controllers at a
+30 Hz control rate). Other flags: `--out DIR`, `--overwrite`, `--base-port P`, `--sim PATH`.
 
 A **run file** is a sweep file without a grid: `base`, `controllers`, `[set]` and an optional
 `speed` — one run. The demos under `config/demos/` are run files. `astrum run` flies one (or a

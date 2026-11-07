@@ -4,6 +4,7 @@
 use bevy::prelude::*;
 
 use super::ballistics::Ballistics;
+use crate::rng::SplitMix64;
 
 /// Tunable combat constants, shared by every shooter and round.
 #[derive(Resource, Clone, Copy, Debug)]
@@ -41,40 +42,15 @@ pub struct CombatState {
     pub initial_living_teams: u8,
 }
 
-/// Deterministic PRNG (SplitMix64) for gun dispersion. A resource so the whole
-/// sim is reproducible from the scenario seed; MUST be used in place of any
-/// thread-local RNG (§7). Cheap and good enough for a dispersion cone — not for
-/// cryptography.
-#[derive(Resource, Clone, Debug)]
-pub struct CombatRng {
-    state: u64,
-}
+/// The seeded PRNG for gun dispersion: the crate's [`SplitMix64`] as a
+/// resource, so the whole sim is reproducible from the scenario seed; MUST be
+/// used in place of any thread-local RNG (§7).
+#[derive(Resource, Clone, Debug, Deref, DerefMut)]
+pub struct CombatRng(SplitMix64);
 
 impl CombatRng {
     /// Seed the generator (any 64-bit value; the scenario exposes the seed).
     pub fn seeded(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    /// Next raw 64-bit value (SplitMix64).
-    pub fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform `f64` in `[0, 1)` (top 53 bits → full double mantissa).
-    pub fn next_f64(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// A standard-normal sample (mean 0, variance 1) via Box–Muller — used to
-    /// scatter rounds within the muzzle-dispersion cone.
-    pub fn next_gaussian(&mut self) -> f64 {
-        let u1 = self.next_f64().max(f64::MIN_POSITIVE);
-        let u2 = self.next_f64();
-        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        Self(SplitMix64::seeded(seed))
     }
 }

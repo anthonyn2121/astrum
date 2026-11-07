@@ -29,6 +29,7 @@ fn files_are_classified_by_their_keys_and_sorted_by_kind_then_path() {
     let single = write(root, "single.toml", "base = \"b.toml\"\nrepeats = 1\n[vary]\n");
     let grid = write(root, "grid.toml", "base = \"b.toml\"\n[vary]\n\"sim.seed\" = [1, 2]\n");
     let repeats = write(root, "repeats.toml", "base = \"b.toml\"\nrepeats = 3\n");
+    let sampled = write(root, "sampled.toml", "base = \"b.toml\"\nsamples = 20\n");
     let broken = write(root, "broken.toml", "# Broken. Really.\nbase = \n");
     write(root, "other.toml", "[package]\nname = \"x\"\n");
     write(root, "notes.txt", "[[aircraft]]\n");
@@ -44,6 +45,7 @@ fn files_are_classified_by_their_keys_and_sorted_by_kind_then_path() {
             (FileKind::Scenario, a.as_path()),
             (FileKind::Sweep, grid.as_path()),
             (FileKind::Sweep, repeats.as_path()),
+            (FileKind::Sweep, sampled.as_path()),
             (FileKind::Invalid, broken.as_path()),
         ]
     );

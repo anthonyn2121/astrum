@@ -1,44 +1,58 @@
 //! Run and sweep files (`astrum run`, `astrum sweep`): fly one base scenario
-//! once, or many times — a grid of overrides × repeats — many runs at once,
-//! collecting every run's bag plus a `summary.csv`.
+//! once, or many times — a grid of overrides × random samples × repeats — many
+//! runs at once, collecting every run's bag, metrics and a `summary.csv`.
 //!
-//! This module plans a file (parse it, expand its grid, build and validate
-//! every run's scenario up front, so a typo fails before anything flies), runs
-//! runs in-process ([`run_in_process`], for scenarios nothing external
-//! controls), drives a pool of runs ([`execute`]) and writes the summary.
-//! Process mode — a sim plus external controllers per run, each on its own
-//! Zenoh endpoint — is [`crate::launch::run_processes`].
+//! This module plans a file (parse it, expand its grid, draw its samples, build
+//! and validate every run's scenario up front, so a typo fails before anything
+//! flies), checks every run's aircraft trim ([`Sweep::check_trim`]), runs runs
+//! in-process ([`run_in_process`], for scenarios nothing external controls)
+//! and drives a pool of runs ([`execute`]), keeping each run's metrics and the
+//! summary up to date. Process mode — a sim plus external controllers per run,
+//! each on its own Zenoh endpoint — is [`crate::launch::run_processes`].
 //!
 //! A run file is a sweep file without a grid (no `vary`, one repeat); a bare
 //! scenario is a run file with nothing but `base` ([`SweepFile::for_scenario`]).
 //!
 //! Override keys: `sim.<field>`, `world.<field>`, `aircraft.<id>.<field>`
-//! (scenario values, checked like the scenario itself) and `param.<name>`
-//! (free values substituted into controller commands as `{param.<name>}`).
+//! (scenario values, checked like the scenario itself), `param.<name>` (free
+//! values substituted into controller commands as `{param.<name>}`) and
+//! `aircraft.<id>.offset.<axis>` (moves or turns the aircraft relative to its
+//! initial conditions once every absolute key of the run is applied; see
+//! [`crate::perturb`]). `[[perturb]]` tables draw such offsets at random:
+//! `samples` draws, sample `k` the same at every grid point (common random
+//! numbers) and reproducible from the file. Without `min_separation_m` /
+//! `min_alt_hae_m`, sample `k` depends only on `(sample_seed, k)`; a draw
+//! those limits reject is redrawn, so a redrawn sample also depends on every
+//! grid point.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use astrum_bag::metrics::RunMetrics;
+use astrum_bag::BagReader;
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::METRICS;
 use crate::components::{SimClock, SimParams, SimStatus};
+use crate::perturb::{self, Axis, Group, Offset, Perturb};
 use crate::record;
+use crate::rng::SplitMix64;
 use crate::scenario::Scenario;
-use crate::systems::StopRequested;
+use crate::systems::{build_fdm, StopRequested};
 use crate::{build_app, run_to_exit, RunMode};
 
 /// A run or sweep file (TOML). Paths are relative to the working directory.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SweepFile {
     /// The scenario every run starts from.
     pub base: PathBuf,
-    /// Runs per combination of `vary`, run `r` with seed `sim.seed + r`.
+    /// Runs per grid point and sample, run `r` with seed `sim.seed + r`.
     #[serde(default = "one")]
     pub repeats: u64,
     /// Runs at once (`--jobs` overrides); 0 = one per core, divided by the
@@ -47,25 +61,41 @@ pub struct SweepFile {
     pub jobs: usize,
     /// Every run's `sim.speed`. Unset: 0 (as fast as possible) in a sweep, the
     /// scenario's own in `astrum run`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<f64>,
     /// Stop a run that takes longer than this many wall seconds; 0 = never.
     #[serde(default)]
     pub run_timeout_s: f64,
     /// Output directory (`--out` overrides); default `runs/<sweep file stem>`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out: Option<PathBuf>,
+    /// Random draws of the `[[perturb]]` tables per grid point; 0 = none.
+    #[serde(default)]
+    pub samples: u64,
+    /// Seed of the draws (see the module docs for what else a sample
+    /// depends on).
+    #[serde(default)]
+    pub sample_seed: u64,
+    /// Redraw a sample that puts two aircraft closer than this (3-D, m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_separation_m: Option<f64>,
+    /// Redraw a sample that puts an aircraft below this height (HAE, m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_alt_hae_m: Option<f64>,
     /// Commands started for every run (process mode), not through a shell.
     /// Placeholders: `{endpoint}` (the run's Zenoh endpoint, also in
     /// `$ASTRUM_ZENOH_CONNECT`), `{run}` (1-based), `{seed}`, `{param.<name>}`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controllers: Vec<String>,
     /// Overrides applied to every run.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub set: BTreeMap<String, toml::Value>,
-    /// The grid: every combination of these values is a run (× `repeats`).
-    #[serde(default)]
+    /// The grid: every combination of these values is a grid point.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vary: BTreeMap<String, Vec<toml::Value>>,
+    /// Random initial-condition offsets, drawn `samples` times.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perturb: Vec<Perturb>,
 }
 
 fn one() -> u64 {
@@ -82,10 +112,20 @@ impl SweepFile {
             speed: None,
             run_timeout_s: 0.0,
             out: None,
+            samples: 0,
+            sample_seed: 0,
+            min_separation_m: None,
+            min_alt_hae_m: None,
             controllers: Vec::new(),
             set: BTreeMap::new(),
             vary: BTreeMap::new(),
+            perturb: Vec::new(),
         }
+    }
+
+    /// The file as TOML (parses back to an equal file).
+    pub fn to_toml(&self) -> Result<String, SweepError> {
+        toml::to_string(self).map_err(|e| err(format!("writing the sweep: {e}")))
     }
 }
 
@@ -109,8 +149,12 @@ pub struct Run {
     pub index: usize,
     /// The complete, validated scenario this run flies.
     pub scenario: Scenario,
-    /// This run's `vary` values, in [`Sweep::vary_keys`] order.
+    /// This run's `vary` values, then its drawn offsets, in
+    /// [`Sweep::value_keys`] order.
     pub values: Vec<toml::Value>,
+    /// The sample this run flies (0-based; summaries show it 1-based), when
+    /// the sweep samples.
+    pub sample: Option<u64>,
     /// `param.<name>` values (from `set` and `vary`), for controller commands.
     pub params: BTreeMap<String, toml::Value>,
 }
@@ -138,7 +182,9 @@ impl Run {
 #[derive(Debug, Clone)]
 pub struct Sweep {
     pub file: SweepFile,
-    pub vary_keys: Vec<String>,
+    /// The keys of [`Run::values`]: the `vary` keys (sorted), then the drawn
+    /// offset keys ([`perturb::keys`]).
+    pub value_keys: Vec<String>,
     pub runs: Vec<Run>,
     pub out: PathBuf,
 }
@@ -163,7 +209,12 @@ fn err(msg: impl Into<String>) -> SweepError {
 enum Target<'k> {
     Section(&'k str, &'k str),
     Aircraft(u32, &'k str),
+    Offset(u32, Axis),
     Param(&'k str),
+}
+
+fn aircraft_id(key: &str, id: &str) -> Result<u32, SweepError> {
+    id.parse().map_err(|_| err(format!("{key}: `{id}` is not an aircraft id")))
 }
 
 fn target(key: &str) -> Result<Target<'_>, SweepError> {
@@ -171,22 +222,41 @@ fn target(key: &str) -> Result<Target<'_>, SweepError> {
     match parts.as_slice() {
         ["sim", "speed"] => Err(err("sim.speed is set by `speed` (the file's, or --speed)")),
         [section @ ("sim" | "world"), field] => Ok(Target::Section(section, field)),
-        ["aircraft", id, field] => id
-            .parse()
-            .map(|id| Target::Aircraft(id, field))
-            .map_err(|_| err(format!("{key}: `{id}` is not an aircraft id"))),
+        ["aircraft", id, field] => Ok(Target::Aircraft(aircraft_id(key, id)?, field)),
+        ["aircraft", id, "offset", axis] => {
+            let id = aircraft_id(key, id)?;
+            let axis = Axis::parse(axis).ok_or_else(|| {
+                let names: Vec<&str> = Axis::ALL.iter().map(|a| a.name()).collect();
+                err(format!("{key}: unknown offset axis `{axis}` (use {})", names.join(", ")))
+            })?;
+            Ok(Target::Offset(id, axis))
+        }
         ["param", name] if !name.is_empty() => Ok(Target::Param(name)),
         _ => Err(err(format!(
-            "unknown key `{key}`: use sim.<field>, world.<field>, aircraft.<id>.<field> or \
-             param.<name>"
+            "unknown key `{key}`: use sim.<field>, world.<field>, aircraft.<id>.<field>, \
+             aircraft.<id>.offset.<axis> or param.<name>"
         ))),
     }
 }
 
-/// Apply one override to a scenario (as a TOML value) or the run's params.
+/// What the overrides of one grid point set besides scenario values.
+#[derive(Clone, Default)]
+struct Overrides {
+    params: BTreeMap<String, toml::Value>,
+    offsets: BTreeMap<u32, Offset>,
+}
+
+fn has_aircraft(scenario: &toml::Value, id: u32) -> bool {
+    scenario.get("aircraft").and_then(toml::Value::as_array).is_some_and(|a| {
+        a.iter().any(|a| a.get("id").and_then(toml::Value::as_integer) == Some(i64::from(id)))
+    })
+}
+
+/// Apply one override to a scenario (as a TOML value), the run's params or
+/// its offsets.
 fn apply(
     scenario: &mut toml::Value,
-    params: &mut BTreeMap<String, toml::Value>,
+    o: &mut Overrides,
     key: &str,
     value: &toml::Value,
 ) -> Result<(), SweepError> {
@@ -211,8 +281,19 @@ fn apply(
                 .ok_or_else(|| err(format!("{key}: the base scenario has no aircraft {id}")))?;
             aircraft.insert(field.to_owned(), value.clone());
         }
+        Target::Offset(id, axis) => {
+            if !has_aircraft(scenario, id) {
+                return Err(err(format!("{key}: the base scenario has no aircraft {id}")));
+            }
+            let v = value
+                .as_float()
+                .or_else(|| value.as_integer().map(|i| i as f64))
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| err(format!("{key} must be a finite number, got {value}")))?;
+            o.offsets.entry(id).or_default().set(axis, v);
+        }
         Target::Param(name) => {
-            params.insert(name.to_owned(), value.clone());
+            o.params.insert(name.to_owned(), value.clone());
         }
     }
     Ok(())
@@ -225,6 +306,24 @@ fn plain(v: &toml::Value) -> String {
         other => other.to_string(),
     }
 }
+
+/// One combination of the grid: its scenario with only the absolute keys
+/// applied (the frame every offset is taken in), and with its offsets too.
+struct Point {
+    values: Vec<toml::Value>,
+    params: BTreeMap<String, toml::Value>,
+    absolute: Scenario,
+    scenario: Scenario,
+}
+
+/// One accepted draw: its values and the scenario it makes at every point.
+struct Sample {
+    values: Vec<toml::Value>,
+    scenarios: Vec<Scenario>,
+}
+
+/// Draws tried per sample before the separation / altitude limits fail it.
+const MAX_DRAWS: usize = 1000;
 
 impl Sweep {
     /// Read and plan the sweep file at `path`.
@@ -243,9 +342,22 @@ impl Sweep {
         Self::plan(file, name, Purpose::Sweep)
     }
 
-    /// Plan `file` for `purpose`; `name` sets the default output directory
-    /// (`runs/<name>`).
+    /// Plan `file` for `purpose`, loading its `base`; `name` sets the default
+    /// output directory (`runs/<name>`).
     pub fn plan(file: SweepFile, name: &str, purpose: Purpose) -> Result<Self, SweepError> {
+        let base = Scenario::load(&file.base)
+            .map_err(|e| err(format!("base scenario {}: {e}", file.base.display())))?;
+        Self::plan_scenario(file, base, name, purpose)
+    }
+
+    /// Plan `file` for `purpose` from an in-memory `base` (`file.base` is not
+    /// read); otherwise exactly [`Self::plan`].
+    pub fn plan_scenario(
+        file: SweepFile,
+        base: Scenario,
+        name: &str,
+        purpose: Purpose,
+    ) -> Result<Self, SweepError> {
         if file.repeats == 0 {
             return Err(err("repeats must be >= 1"));
         }
@@ -255,12 +367,11 @@ impl Sweep {
         if let Some((key, _)) = file.vary.iter().find(|(_, values)| values.is_empty()) {
             return Err(err(format!("vary.{key:?} has no values")));
         }
-        let base = Scenario::load(&file.base)
-            .map_err(|e| err(format!("base scenario {}: {e}", file.base.display())))?;
+        check_sampling(&file, &base)?;
         let mut base_value = toml::Value::try_from(&base).map_err(|e| err(e.to_string()))?;
-        let mut base_params = BTreeMap::new();
+        let mut base_overrides = Overrides::default();
         for (key, value) in &file.set {
-            apply(&mut base_value, &mut base_params, key, value)?;
+            apply(&mut base_value, &mut base_overrides, key, value)?;
         }
         let speed = file.speed.or(match purpose {
             Purpose::Sweep => Some(0.0),
@@ -268,9 +379,16 @@ impl Sweep {
         });
 
         let vary_keys: Vec<String> = file.vary.keys().cloned().collect();
+        let draw_keys = perturb::keys(&file.perturb);
+        if let Some(key) = draw_keys.iter().find(|k| file.vary.contains_key(*k)) {
+            return Err(err(format!("{key} is both varied and drawn by [[perturb]]")));
+        }
         let axes: Vec<&Vec<toml::Value>> = file.vary.values().collect();
         let combinations: usize = axes.iter().map(|a| a.len()).product();
-        let mut runs = Vec::with_capacity(combinations * file.repeats as usize);
+        let per_point = file.samples.max(1) * file.repeats;
+        let first_run =
+            |point: usize, sample: u64| point as u64 * per_point + sample * file.repeats;
+        let mut points = Vec::with_capacity(combinations);
         for combination in 0..combinations {
             // Mixed-radix digits, the last `vary` key fastest.
             let mut rest = combination;
@@ -280,29 +398,68 @@ impl Sweep {
                 rest /= axis.len();
             }
             let mut value = base_value.clone();
-            let mut params = base_params.clone();
+            let mut overrides = base_overrides.clone();
             for (key, v) in vary_keys.iter().zip(&values) {
-                apply(&mut value, &mut params, key, v)?;
+                apply(&mut value, &mut overrides, key, v)?;
             }
-            let scenario: Scenario = value.try_into().map_err(|e: toml::de::Error| {
-                err(format!("{}: {}", describe(&vary_keys, &values), e.message()))
-            })?;
-            for r in 0..file.repeats {
-                let mut scenario = scenario.clone();
-                if let Some(speed) = speed {
-                    scenario.sim.speed = speed;
+            let at = || {
+                format!("run {} ({})", first_run(combination, 0) + 1, describe(&vary_keys, &values))
+            };
+            let absolute: Scenario = value
+                .try_into()
+                .map_err(|e: toml::de::Error| err(format!("{}: {}", at(), e.message())))?;
+            let mut scenario = absolute.clone();
+            for (&id, &offset) in &overrides.offsets {
+                Group { lead: id, members: vec![id], offset }
+                    .apply(&absolute, &mut scenario)
+                    .map_err(|e| err(format!("{}: {e}", at())))?;
+            }
+            points.push(Point { values, params: overrides.params, absolute, scenario });
+        }
+
+        let samples: Vec<Sample> = (0..file.samples)
+            .map(|k| draw_sample(&file, k, &points, &vary_keys, &draw_keys, first_run))
+            .collect::<Result<_, _>>()?;
+
+        let value_keys: Vec<String> = vary_keys.iter().chain(&draw_keys).cloned().collect();
+        let mut runs = Vec::with_capacity(points.len() * per_point as usize);
+        for (p, point) in points.iter().enumerate() {
+            let variants: Vec<(Option<u64>, &Scenario, Vec<toml::Value>)> = if samples.is_empty() {
+                vec![(None, &point.scenario, point.values.clone())]
+            } else {
+                samples
+                    .iter()
+                    .enumerate()
+                    .map(|(k, s)| {
+                        let values = point.values.iter().chain(&s.values).cloned().collect();
+                        (Some(k as u64), &s.scenarios[p], values)
+                    })
+                    .collect()
+            };
+            for (sample, scenario, values) in variants {
+                for r in 0..file.repeats {
+                    let mut scenario = scenario.clone();
+                    if let Some(speed) = speed {
+                        scenario.sim.speed = speed;
+                    }
+                    scenario.sim.seed = scenario.sim.seed.wrapping_add(r);
+                    let index = runs.len();
+                    let run = Run {
+                        index,
+                        scenario,
+                        values: values.clone(),
+                        sample,
+                        params: point.params.clone(),
+                    };
+                    check_run(&file, purpose, &run).map_err(|e| {
+                        err(format!("run {} ({}): {e}", index + 1, describe(&value_keys, &values)))
+                    })?;
+                    runs.push(run);
                 }
-                scenario.sim.seed = scenario.sim.seed.wrapping_add(r);
-                let index = runs.len();
-                let run = Run { index, scenario, values: values.clone(), params: params.clone() };
-                check_run(&file, purpose, &run).map_err(|e| {
-                    err(format!("run {} ({}): {e}", index + 1, describe(&vary_keys, &values)))
-                })?;
-                runs.push(run);
             }
         }
         let out = file.out.clone().unwrap_or_else(|| Path::new("runs").join(name));
-        Ok(Self { file, vary_keys, runs, out })
+        Ok(Self { file, value_keys, runs, out })
     }
 
     /// Whether runs fly in-process (no external controllers).
@@ -322,6 +479,139 @@ impl Sweep {
             n => n,
         }
     }
+
+    /// Build and trim every aircraft whose class trims at every run's initial
+    /// conditions, in run order — the sim's own FDM build ([`build_fdm`]), so
+    /// a run that would fail its spawn trim fails here, before anything flies.
+    /// Identical builds (same aircraft, ICs, rate and seed) are trimmed once.
+    /// JSBSim serialises model loads and trims process-wide, so this runs on
+    /// the calling thread (about 8 ms per F-16). The error names the first
+    /// failing run, its values and the aircraft.
+    pub fn check_trim(&self) -> Result<TrimCheck, SweepError> {
+        let started = Instant::now();
+        let mut seen = HashSet::new();
+        for run in &self.runs {
+            let s = &run.scenario;
+            for a in &s.aircraft {
+                let class = a.class().map_err(|e| err(e.to_string()))?;
+                if !class.trim {
+                    continue;
+                }
+                let bits = [
+                    a.lat_deg,
+                    a.lon_deg,
+                    a.alt_hae_m,
+                    a.heading_deg,
+                    a.tas_mps,
+                    a.climb_deg,
+                    a.bank_deg,
+                    s.sim.rate_hz,
+                ]
+                .map(f64::to_bits);
+                if !seen.insert(format!("{}|{}|{class:?}|{bits:?}|{}", a.id, a.model, s.sim.seed)) {
+                    continue;
+                }
+                build_fdm(a, &class, 1.0 / s.sim.rate_hz, s.sim.seed).map_err(|e| {
+                    let values = describe(&self.value_keys, &run.values);
+                    err(format!("run {} ({values}): {e}", run.index + 1))
+                })?;
+            }
+        }
+        Ok(TrimCheck { trims: seen.len(), wall_s: started.elapsed().as_secs_f64() })
+    }
+}
+
+/// What [`Sweep::check_trim`] did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrimCheck {
+    /// Distinct aircraft builds trimmed.
+    pub trims: usize,
+    pub wall_s: f64,
+}
+
+/// The sampling keys' own rules and the `[[perturb]]` tables against `base`.
+fn check_sampling(file: &SweepFile, base: &Scenario) -> Result<(), SweepError> {
+    match (file.samples > 0, file.perturb.is_empty()) {
+        (true, true) => return Err(err("samples needs [[perturb]] tables to draw")),
+        (false, false) => return Err(err("[[perturb]] needs samples > 0")),
+        _ => {}
+    }
+    if file.perturb.is_empty() {
+        for (key, set) in
+            [("min_separation_m", file.min_separation_m), ("min_alt_hae_m", file.min_alt_hae_m)]
+        {
+            if set.is_some() {
+                return Err(err(format!("{key} limits [[perturb]] draws (there are none)")));
+            }
+        }
+    }
+    if let Some(m) = file.min_separation_m {
+        if !(m.is_finite() && m > 0.0) {
+            return Err(err(format!("min_separation_m must be > 0, got {m}")));
+        }
+    }
+    if let Some(m) = file.min_alt_hae_m {
+        if !m.is_finite() {
+            return Err(err(format!("min_alt_hae_m must be finite, got {m}")));
+        }
+    }
+    perturb::validate(&file.perturb, base).map_err(err)
+}
+
+/// Draw sample `k` (0-based): the first draw of its stream that keeps every
+/// grid point within the separation and altitude limits. `first_run(p, k)` is
+/// the 0-based index of the first run of point `p`, sample `k`.
+fn draw_sample(
+    file: &SweepFile,
+    k: u64,
+    points: &[Point],
+    vary_keys: &[String],
+    draw_keys: &[String],
+    first_run: impl Fn(usize, u64) -> u64,
+) -> Result<Sample, SweepError> {
+    let mut rng = SplitMix64::stream(file.sample_seed, k);
+    'draw: for _ in 0..MAX_DRAWS {
+        let (groups, drawn) = perturb::draw(&file.perturb, &mut rng);
+        let drawn: Vec<toml::Value> = drawn.into_iter().map(toml::Value::Float).collect();
+        let mut scenarios = Vec::with_capacity(points.len());
+        for (p, point) in points.iter().enumerate() {
+            let mut scenario = point.scenario.clone();
+            for group in &groups {
+                group.apply(&point.absolute, &mut scenario).map_err(|e| {
+                    let keys: Vec<String> = vary_keys.iter().chain(draw_keys).cloned().collect();
+                    let values: Vec<toml::Value> =
+                        point.values.iter().chain(&drawn).cloned().collect();
+                    err(format!(
+                        "run {} (sample {}, {}): {e}",
+                        first_run(p, k) + 1,
+                        k + 1,
+                        describe(&keys, &values)
+                    ))
+                })?;
+            }
+            let too_low = file
+                .min_alt_hae_m
+                .is_some_and(|min| scenario.aircraft.iter().any(|a| a.alt_hae_m < min));
+            let too_close = file
+                .min_separation_m
+                .is_some_and(|min| perturb::min_separation_m(&scenario).is_some_and(|d| d < min));
+            if too_low || too_close {
+                continue 'draw;
+            }
+            scenarios.push(scenario);
+        }
+        return Ok(Sample { values: drawn, scenarios });
+    }
+    let limits: Vec<String> =
+        [("min_separation_m", file.min_separation_m), ("min_alt_hae_m", file.min_alt_hae_m)]
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| format!("{k} = {v:?}")))
+            .collect();
+    Err(err(format!(
+        "sample {}: no draw in {MAX_DRAWS} attempts meets {} at every grid point",
+        k + 1,
+        limits.join(" and ")
+    )))
 }
 
 fn describe(keys: &[String], values: &[toml::Value]) -> String {
@@ -425,58 +715,114 @@ pub fn run_in_process(run: &Run, bag: &Path, stop: &StopRequested) -> Outcome {
     Outcome { status, sim_time_s: Some(sim_time_s), wall_s: started.elapsed().as_secs_f64() }
 }
 
-/// Run every run of `sweep` on `jobs` threads with `run_one`, returning each
-/// run's outcome (`None`: never started, because a stop was requested). With
-/// `progress`, prints a status line about once a second.
+/// What [`execute`] reports about a run, from the worker thread running it.
+#[derive(Debug, Clone)]
+pub enum RunEvent {
+    Started {
+        index: usize,
+    },
+    /// `metrics`: of the run's bag (`None` without a readable one).
+    Finished {
+        index: usize,
+        outcome: Outcome,
+        metrics: Option<Box<RunMetrics>>,
+    },
+}
+
+/// A run's row in the summary.
+#[derive(Debug, Clone)]
+enum RunState {
+    NotRun,
+    Running,
+    Finished(Outcome, Option<Box<RunMetrics>>),
+}
+
+/// The metrics of the bag at `bag`, also written to `json`; `Ok(None)`
+/// without a readable bag.
+fn record_metrics(bag: &Path, json: &Path) -> std::io::Result<Option<Box<RunMetrics>>> {
+    let Ok(reader) = BagReader::open(bag) else { return Ok(None) };
+    let Ok(metrics) = astrum_bag::metrics::compute(&reader) else { return Ok(None) };
+    let text = serde_json::to_string_pretty(&metrics).map_err(std::io::Error::other)?;
+    std::fs::write(json, text + "\n")?;
+    Ok(Some(Box::new(metrics)))
+}
+
+/// Fly every run of `sweep` on `jobs` threads with `run_one` (which records
+/// run `r`'s bag, if any, to `<sweep.out>/<stem>.mcap`), returning each run's
+/// outcome (`None`: never started, because a stop was requested). Before each
+/// run its earlier `<stem>.mcap` and `<stem>.metrics.json` are removed (an
+/// earlier sweep's results never pass for this run's); after it its bag's
+/// metrics go to `<sweep.out>/<stem>.metrics.json`; and
+/// `<sweep.out>/summary.csv` is rewritten whenever a run starts or finishes,
+/// so a reader sees progress. `on_event` hears every start and finish, on the
+/// worker thread. Failing to write a result stops starting runs; the error is
+/// returned once the running ones end.
 pub fn execute(
     sweep: &Sweep,
     jobs: usize,
     stop: &StopRequested,
-    progress: bool,
+    on_event: impl Fn(RunEvent) + Sync,
     run_one: impl Fn(&Run) -> Outcome + Sync,
-) -> Vec<Option<Outcome>> {
+) -> std::io::Result<Vec<Option<Outcome>>> {
+    std::fs::create_dir_all(&sweep.out)?;
+    let summary = sweep.out.join("summary.csv");
+    let board = Mutex::new(vec![RunState::NotRun; sweep.runs.len()]);
+    write_summary(&summary, sweep, &board.lock().unwrap())?;
     let next = AtomicUsize::new(0);
-    let finished = AtomicUsize::new(0);
-    let outcomes: Mutex<Vec<Option<Outcome>>> = Mutex::new(vec![None; sweep.runs.len()]);
-    let failed = AtomicUsize::new(0);
-    let sim_done = Mutex::new(0.0f64);
-    let started = Instant::now();
+    let error: Mutex<Option<std::io::Error>> = Mutex::new(None);
+    let fail = |e: std::io::Error| {
+        error.lock().unwrap().get_or_insert(e);
+    };
+    let update = |index: usize, state: RunState| {
+        let mut board = board.lock().unwrap();
+        board[index] = state;
+        if let Err(e) = write_summary(&summary, sweep, &board) {
+            fail(e);
+        }
+    };
     std::thread::scope(|s| {
         for _ in 0..jobs.min(sweep.runs.len()).max(1) {
             s.spawn(|| loop {
-                if stop.requested() {
+                if stop.requested() || error.lock().unwrap().is_some() {
                     return;
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(run) = sweep.runs.get(i) else { return };
-                let outcome = run_one(run);
-                if outcome.status != Status::Ok {
-                    failed.fetch_add(1, Ordering::Relaxed);
+                let stem = run.stem();
+                let bag = sweep.out.join(format!("{stem}.mcap"));
+                let json = sweep.out.join(format!("{stem}.metrics.json"));
+                for stale in [&bag, &json] {
+                    match std::fs::remove_file(stale) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return fail(e),
+                        _ => {}
+                    }
                 }
-                *sim_done.lock().unwrap() += outcome.sim_time_s.unwrap_or(0.0);
-                outcomes.lock().unwrap()[i] = Some(outcome);
-                finished.fetch_add(1, Ordering::Relaxed);
+                update(i, RunState::Running);
+                on_event(RunEvent::Started { index: i });
+                let outcome = run_one(run);
+                let metrics = match record_metrics(&bag, &json) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        fail(e);
+                        None
+                    }
+                };
+                update(i, RunState::Finished(outcome.clone(), metrics.clone()));
+                on_event(RunEvent::Finished { index: i, outcome, metrics });
             });
         }
-        if progress {
-            let total = sweep.runs.len();
-            let mut last = 0;
-            while finished.load(Ordering::Relaxed) < total && !stop.requested() {
-                std::thread::sleep(Duration::from_millis(100));
-                let done = finished.load(Ordering::Relaxed);
-                let secs = started.elapsed().as_secs();
-                if secs > last || done == total {
-                    last = secs;
-                    let rate = *sim_done.lock().unwrap() / started.elapsed().as_secs_f64();
-                    println!(
-                        "[sweep] {done}/{total} done, {} not ok | {rate:.0} sim-s per wall-s",
-                        failed.load(Ordering::Relaxed)
-                    );
-                }
-            }
-        }
     });
-    outcomes.into_inner().unwrap()
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
+    let board = board.into_inner().unwrap();
+    Ok(board
+        .into_iter()
+        .map(|s| match s {
+            RunState::Finished(outcome, _) => Some(outcome),
+            RunState::NotRun | RunState::Running => None,
+        })
+        .collect())
 }
 
 fn csv_cell(s: &str) -> String {
@@ -487,32 +833,56 @@ fn csv_cell(s: &str) -> String {
     }
 }
 
-/// Write `summary.csv`: one row per run — status, seed, the `vary` values, sim
-/// time, wall time, speed and the bag.
-pub fn write_summary(
-    path: &Path,
-    sweep: &Sweep,
-    outcomes: &[Option<Outcome>],
-) -> std::io::Result<()> {
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+/// A metric value as a summary cell: empty when unknown, reals to 3 decimals.
+fn metric_cell(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) if n.is_f64() => {
+            n.as_f64().map_or(String::new(), |f| format!("{f:.3}"))
+        }
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Write `summary.csv` (via a temporary file, so a reader never sees half of
+/// it): one row per run in run order — status, seed, the sample (when the
+/// sweep samples), the `vary` values and drawn offsets, sim time, wall time,
+/// speed, the bag, then the fleet metrics ([`METRICS`], but for `sim_time_s`,
+/// a column already).
+fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Result<()> {
+    let tmp = path.with_extension("csv.tmp");
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    let sampled = sweep.file.samples > 0;
     let mut header = vec!["run".to_owned(), "status".into(), "seed".into()];
-    header.extend(sweep.vary_keys.iter().cloned());
+    if sampled {
+        header.push("sample".into());
+    }
+    header.extend(sweep.value_keys.iter().cloned());
     header.extend(["sim_time_s", "wall_s", "speed_x", "bag"].map(String::from));
+    let metric_ids: Vec<&str> =
+        METRICS.iter().copied().filter(|id| !header.iter().any(|h| h == id)).collect();
+    header.extend(metric_ids.iter().map(|id| id.to_string()));
     writeln!(f, "{}", header.iter().map(|h| csv_cell(h)).collect::<Vec<_>>().join(","))?;
-    for (run, outcome) in sweep.runs.iter().zip(outcomes) {
-        let (status, sim, wall) = match outcome {
-            None => ("not run".to_owned(), None, None),
-            Some(o) => (
+    for (run, state) in sweep.runs.iter().zip(rows) {
+        let (status, outcome, metrics) = match state {
+            RunState::NotRun => ("not run".to_owned(), None, None),
+            RunState::Running => ("running".to_owned(), None, None),
+            RunState::Finished(o, m) => (
                 match &o.status {
                     Status::Ok => "ok".to_owned(),
                     Status::Failed(why) => format!("failed: {why}"),
                     Status::Stopped(why) => format!("stopped: {why}"),
                 },
-                o.sim_time_s,
-                Some(o.wall_s),
+                Some(o),
+                m.as_ref(),
             ),
         };
+        let (sim, wall) = (outcome.and_then(|o| o.sim_time_s), outcome.map(|o| o.wall_s));
         let mut row = vec![(run.index + 1).to_string(), status, run.scenario.sim.seed.to_string()];
+        if sampled {
+            row.push(run.sample.map_or(String::new(), |k| (k + 1).to_string()));
+        }
         row.extend(run.values.iter().map(plain));
         row.push(sim.map_or(String::new(), |s| format!("{s:.3}")));
         row.push(wall.map_or(String::new(), |w| format!("{w:.3}")));
@@ -522,7 +892,13 @@ pub fn write_summary(
         });
         let bag = PathBuf::from(format!("{}.mcap", run.stem()));
         row.push(if outcome.is_some() { bag.display().to_string() } else { String::new() });
+        let metrics = metrics.map(|m| serde_json::to_value(m).unwrap_or_default());
+        row.extend(
+            metric_ids.iter().map(|id| metric_cell(metrics.as_ref().and_then(|m| m.get(id)))),
+        );
         writeln!(f, "{}", row.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(","))?;
     }
-    f.flush()
+    f.flush()?;
+    drop(f);
+    std::fs::rename(tmp, path)
 }

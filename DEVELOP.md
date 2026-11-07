@@ -157,7 +157,7 @@ crates/            # Rust workspace (one crate per responsibility)
   astrum-net/       #   Zenoh transport (keys, QoS, LatestTelemetry, CommandSender, events, tick ends, presence, control, scenario)
   astrum-bag/       #   MCAP record (telemetry + commands + events) / replay (telemetry + events) / run metrics (astrum-bag-metrics)
   astrum-web/       #   axum bridge + tile proxy (astrum-web) + MCAP→JSON exporter (astrum-web-export)
-  astrum-sim/       #   the Bevy ECS app — the sim binary + the embedded env seam (env.rs) + run supervision (launch.rs), file/environment catalog (catalog.rs), controller catalog (controllers.rs), the astrum CLI
+  astrum-sim/       #   the Bevy ECS app — the sim binary + the embedded env seam (env.rs) + run supervision (launch.rs), sweeps (sweep.rs, IC offsets perturb.rs), file/environment catalog (catalog.rs), controller catalog (controllers.rs), the astrum CLI
   astrum-env/       #   PyO3 module `astrum_env` + the dogfight Gym adapter (python/)
 controllers/       # flight controllers (clients); README.md is the SDK contract, CMakeLists.txt the one C++ project
   common/cpp/       #   the C++ SDK: astrum::wire / control / cli / client / runtime + wire-fixture tool
@@ -218,6 +218,16 @@ flag. `LiveRun::stop`/`kill`/drop act on that run only; the spec's shared `stop`
 sharing it. `start` (on failure), `wait` and drop block until the run's processes are reaped —
 call them from a blocking thread in async code. `astrum_sim::catalog` classifies files for
 `astrum list`, finds JSBSim models (`jsbsim_models`) and defines the environments (`empty`).
+
+Sweeps are the `astrum_sim::sweep` library, the CLI only prints: `Sweep::plan` (or
+`plan_scenario` from an in-memory base `Scenario`) expands the grid, draws the `[[perturb]]`
+samples (`astrum_sim::perturb`: level-frame offsets via astrum-geo, rigid groups, spreads, from
+the crate's one PRNG `rng::SplitMix64`, which `CombatRng` also wraps) and validates every run;
+`check_trim` builds each run's trimmed aircraft with the sim's own `build_fdm`; `execute(sweep,
+jobs, stop, on_event, run_one)` flies the pool, calling `on_event` with `RunEvent::Started` /
+`Finished { outcome, metrics }` from the worker threads, writing `<stem>.metrics.json` and
+rewriting `summary.csv` (atomically) at every start and finish. `SweepFile` serialises back to
+TOML (`to_toml`).
 
 ## 5. Scenarios
 

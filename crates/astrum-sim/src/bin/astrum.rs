@@ -10,11 +10,13 @@
 //! `max_time_s` or on Ctrl-C (the sim stops cleanly, then everything else); a
 //! controller that fails meanwhile stops the run and fails it.
 //!
-//! `sweep` flies many runs at once. Without `controllers` in the sweep file,
-//! runs fly in-process (one thread each). With them, each run is an
-//! `astrum-sim` process on its own Zenoh endpoint plus the listed controller
-//! processes, each logging to a file. Ctrl-C stops starting runs and ends the
-//! running ones cleanly; the summary is written either way.
+//! `sweep` flies many runs at once. It first trims every run's aircraft as the
+//! sim would (a run that cannot trim is invalid input). Without `controllers`
+//! in the sweep file, runs fly in-process (one thread each). With them, each
+//! run is an `astrum-sim` process on its own Zenoh endpoint plus the listed
+//! controller processes, each logging to a file. `summary.csv` is kept up to
+//! date as runs start and finish. Ctrl-C stops starting runs and ends the
+//! running ones cleanly; the summary marks the runs that never ran.
 //!
 //! Exit status: 0 ok, 1 a run not ok, 2 invalid input; a `run` stopped by
 //! Ctrl-C exits 130.
@@ -23,17 +25,16 @@ use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use astrum_sim::catalog;
 use astrum_sim::launch::{
     connect_endpoint, run_processes, run_timeout, sibling, Children, Companion, LiveRun, LiveSpec,
     Log, ProcessCtx, StartError,
 };
-use astrum_sim::sweep::{
-    execute, run_in_process, write_summary, Purpose, Status, Sweep, SweepFile,
-};
+use astrum_sim::sweep::{execute, run_in_process, Purpose, RunEvent, Status, Sweep, SweepFile};
 use astrum_sim::systems::StopRequested;
 use clap::{Args, Parser, Subcommand};
 
@@ -142,7 +143,7 @@ struct SweepArgs {
     #[arg(long)]
     overwrite: bool,
 
-    /// Plan the sweep and print its runs without flying them.
+    /// Plan the sweep, check its trims and print its runs without flying them.
     #[arg(long)]
     dry_run: bool,
 
@@ -366,15 +367,31 @@ fn sweep(args: SweepArgs) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    match sweep.check_trim() {
+        Ok(check) => println!(
+            "[sweep] trim check: {} aircraft builds trimmed in {:.1} s",
+            check.trims, check.wall_s
+        ),
+        Err(e) => {
+            eprintln!("[sweep] trim check: {e}");
+            return ExitCode::from(2);
+        }
+    }
     if args.dry_run {
         for run in &sweep.runs {
             let values: Vec<String> = sweep
-                .vary_keys
+                .value_keys
                 .iter()
                 .zip(&run.values)
                 .map(|(k, v)| format!("{k} = {v}"))
                 .collect();
-            println!("  {} seed {}: {}", run.stem(), run.scenario.sim.seed, values.join(", "));
+            let sample = run.sample.map_or(String::new(), |k| format!(" sample {}", k + 1));
+            println!(
+                "  {} seed {}{sample}: {}",
+                run.stem(),
+                run.scenario.sim.seed,
+                values.join(", ")
+            );
         }
         return ExitCode::SUCCESS;
     }
@@ -382,10 +399,6 @@ fn sweep(args: SweepArgs) -> ExitCode {
     if summary.exists() && !args.overwrite {
         eprintln!("[sweep] {} exists; pass --overwrite to replace it", summary.display());
         return ExitCode::from(2);
-    }
-    if let Err(e) = std::fs::create_dir_all(&sweep.out) {
-        eprintln!("[sweep] creating {}: {e}", sweep.out.display());
-        return ExitCode::FAILURE;
     }
     let sim = args.sim.unwrap_or_else(|| sibling("astrum-sim"));
     if !sweep.in_process() && !sim.exists() {
@@ -402,26 +415,38 @@ fn sweep(args: SweepArgs) -> ExitCode {
     }
 
     let started = Instant::now();
-    let outcomes = if sweep.in_process() {
-        execute(&sweep, jobs, &stop, true, |run| {
-            run_in_process(run, &sweep.out.join(format!("{}.mcap", run.stem())), &stop)
-        })
-    } else {
-        let ctx = ProcessCtx {
-            sweep: &sweep,
-            out: &sweep.out,
-            sim: &sim,
-            base_port: args.base_port,
-            stop: &stop,
-            children: &children,
-        };
-        execute(&sweep, jobs, &stop, true, |run| run_processes(&ctx, run))
+    let progress = Progress::new(sweep.runs.len(), started);
+    let on_event = |e: RunEvent| progress.on(&e);
+    let running = AtomicBool::new(true);
+    let outcomes = std::thread::scope(|s| {
+        s.spawn(|| progress.tick(&running));
+        // Stops the ticker however `execute` ends (a worker's panic too).
+        let _stop_ticker = StopTicker(&running);
+        if sweep.in_process() {
+            execute(&sweep, jobs, &stop, on_event, |run| {
+                run_in_process(run, &sweep.out.join(format!("{}.mcap", run.stem())), &stop)
+            })
+        } else {
+            let ctx = ProcessCtx {
+                sweep: &sweep,
+                out: &sweep.out,
+                sim: &sim,
+                base_port: args.base_port,
+                stop: &stop,
+                children: &children,
+            };
+            execute(&sweep, jobs, &stop, on_event, |run| run_processes(&ctx, run))
+        }
+    });
+    progress.print();
+    let outcomes = match outcomes {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[sweep] writing the results to {}: {e}", sweep.out.display());
+            return ExitCode::FAILURE;
+        }
     };
     let wall = started.elapsed().as_secs_f64();
-    if let Err(e) = write_summary(&summary, &sweep, &outcomes) {
-        eprintln!("[sweep] writing {}: {e}", summary.display());
-        return ExitCode::FAILURE;
-    }
     let ok = outcomes.iter().filter(|o| o.as_ref().is_some_and(|o| o.status == Status::Ok)).count();
     let sim_total: f64 = outcomes.iter().flatten().filter_map(|o| o.sim_time_s).sum();
     println!(
@@ -434,6 +459,67 @@ fn sweep(args: SweepArgs) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Clears the ticker's flag when dropped.
+struct StopTicker<'a>(&'a AtomicBool);
+
+impl Drop for StopTicker<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The sweep's progress line: once a second while it runs ([`Progress::tick`])
+/// and once at its end.
+struct Progress {
+    total: usize,
+    started: Instant,
+    state: Mutex<ProgressState>,
+}
+
+#[derive(Default)]
+struct ProgressState {
+    done: usize,
+    not_ok: usize,
+    sim_s: f64,
+}
+
+impl Progress {
+    fn new(total: usize, started: Instant) -> Self {
+        Self { total, started, state: Mutex::default() }
+    }
+
+    fn on(&self, event: &RunEvent) {
+        let RunEvent::Finished { outcome, .. } = event else { return };
+        let mut s = self.state.lock().unwrap();
+        s.done += 1;
+        if outcome.status != Status::Ok {
+            s.not_ok += 1;
+        }
+        s.sim_s += outcome.sim_time_s.unwrap_or(0.0);
+    }
+
+    /// Print the line every second while `running`.
+    fn tick(&self, running: &AtomicBool) {
+        let mut next = Duration::from_secs(1);
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+            if self.started.elapsed() >= next && running.load(Ordering::Relaxed) {
+                self.print();
+                next += Duration::from_secs(1);
+            }
+        }
+    }
+
+    fn print(&self) {
+        let s = self.state.lock().unwrap();
+        let rate = s.sim_s / self.started.elapsed().as_secs_f64();
+        println!(
+            "[sweep] {}/{} done, {} not ok | {rate:.0} sim-s per wall-s",
+            s.done, self.total, s.not_ok
+        );
     }
 }
 
