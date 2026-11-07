@@ -13,11 +13,13 @@ use crate::scenario::{Sim, KNOWN_MODELS};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileKind {
-    /// A run file: `base` without a grid (no `vary`, at most one repeat).
+    /// A run file: `base` without a grid (no `vary`, at most one repeat and
+    /// one sample).
     Run,
     /// A scenario: `aircraft` and no `base`.
     Scenario,
-    /// A sweep file: `base` with a non-empty `vary` or `repeats` > 1.
+    /// A sweep file: `base` with a non-empty `vary`, `repeats` > 1 or
+    /// `samples` > 1.
     Sweep,
     /// Unreadable, or not TOML.
     Invalid,
@@ -28,11 +30,11 @@ impl FileKind {
     /// ASTRUM's).
     pub fn of(table: &toml::Table) -> Option<Self> {
         if table.contains_key("base") {
-            let grid = table
-                .get("vary")
-                .and_then(toml::Value::as_table)
-                .is_some_and(|v| !v.is_empty())
-                || table.get("repeats").and_then(toml::Value::as_integer).is_some_and(|r| r > 1);
+            let grid =
+                table.get("vary").and_then(toml::Value::as_table).is_some_and(|v| !v.is_empty())
+                    || ["repeats", "samples"].iter().any(|key| {
+                        table.get(*key).and_then(toml::Value::as_integer).is_some_and(|n| n > 1)
+                    });
             Some(if grid { FileKind::Sweep } else { FileKind::Run })
         } else if table.contains_key("aircraft") {
             Some(FileKind::Scenario)

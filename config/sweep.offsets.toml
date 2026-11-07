@@ -1,0 +1,35 @@
+# In-process sweep (no controllers) of initial-condition offsets: how much do
+# small differences in where the uncommanded wingman starts change the pair's
+# closest approach? Aircraft 2 of the two-ship example starts at a random
+# offset from its own spawn point — ±300 m along / across its heading, about
+# ±50 m (1σ) up, ±15° of heading — drawn 20 times (the same 20 draws for every
+# grid point), and the lead turns -10° / 0 / +10° from its heading: 3 × 20 = 60
+# runs of 30 s, every aircraft trimmed at its run's ICs before anything flies.
+#
+#   astrum sweep config/sweep.offsets.toml
+#   astrum sweep config/sweep.offsets.toml --dry-run   # the runs and their draws
+#
+# Results: runs/sweep.offsets/summary.csv — one column per varied or drawn
+# offset (aircraft.<id>.offset.<axis>) and the run metrics (min_separation_m,
+# max_bank_deg, …) — plus each run's bag and <run>.metrics.json.
+
+base = "config/scenario.example.toml"
+
+samples = 20
+sample_seed = 7
+# Redraw a sample that starts the pair closer than 300 m.
+min_separation_m = 300.0
+
+[set]
+"sim.max_time_s" = 30.0
+
+[vary]
+# Offsets are relative to the aircraft's own initial conditions.
+"aircraft.1.offset.heading_deg" = [-10.0, 0.0, 10.0]
+
+[[perturb]]
+aircraft = [2]
+forward_m = { uniform = 300.0 }
+right_m = { uniform = 300.0 }
+up_m = { normal = 50.0 }
+heading_deg = { uniform = 15.0 }

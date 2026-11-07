@@ -22,7 +22,7 @@ use astrum_sim::launch::{
     LogStream, ProcessCtx, StartError,
 };
 use astrum_sim::scenario::Scenario;
-use astrum_sim::sweep::{Outcome, Purpose, Status, Sweep, SweepFile};
+use astrum_sim::sweep::{execute, Outcome, Purpose, RunEvent, Status, Sweep, SweepFile};
 use astrum_sim::systems::StopRequested;
 
 /// Tests spawn processes from scripts they just wrote; one at a time, so no
@@ -475,6 +475,56 @@ fn a_process_mode_sweep_run_listens_on_its_port_records_and_keeps_its_scenario()
     );
     assert_eq!(read("run-0002.ctl1.log"), "ctl tcp/127.0.0.1:27611\n");
     assert_eq!(Scenario::load(out.join("run-0002.toml")).unwrap(), sweep.runs[1].scenario);
+}
+
+#[test]
+fn a_process_mode_sweep_reports_every_run_once_and_summarises_it() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut scenario = common::single_ship();
+    scenario.sim.max_time_s = 1.0;
+    let base = dir.path().join("base.toml");
+    std::fs::write(&base, scenario.to_toml()).unwrap();
+    let mut file = SweepFile::for_scenario(base);
+    file.repeats = 3;
+    file.speed = Some(1.0);
+    file.controllers = vec!["echo ctl {endpoint}".into()];
+    let mut sweep = Sweep::plan(file, "t", Purpose::Sweep).unwrap();
+    sweep.out = dir.path().join("out");
+    let sim = script(dir.path(), "sim", &format!("sleep 0.2\n{STOPPED}"));
+    let stop = StopRequested::default();
+    let children = Children::new();
+    let ctx = ProcessCtx {
+        sweep: &sweep,
+        out: &sweep.out,
+        sim: &sim,
+        base_port: 27710,
+        stop: &stop,
+        children: &children,
+    };
+    let events = Mutex::new(Vec::new());
+    let on_event = |e: RunEvent| {
+        events.lock().unwrap().push(match e {
+            RunEvent::Started { index } => (false, index),
+            RunEvent::Finished { index, outcome, metrics } => {
+                assert_eq!(outcome.status, Status::Ok);
+                assert_eq!(metrics, None, "the stand-in records no bag");
+                (true, index)
+            }
+        });
+    };
+    let outcomes = execute(&sweep, 2, &stop, on_event, |run| run_processes(&ctx, run)).unwrap();
+    assert!(outcomes.iter().all(|o| o.as_ref().is_some_and(|o| o.status == Status::Ok)));
+    let mut events = events.into_inner().unwrap();
+    for i in 0..3 {
+        let at = |finished| events.iter().position(|&e| e == (finished, i)).unwrap();
+        assert!(at(false) < at(true), "{events:?}");
+    }
+    events.sort();
+    assert_eq!(events, [(false, 0), (false, 1), (false, 2), (true, 0), (true, 1), (true, 2)]);
+    let summary = std::fs::read_to_string(sweep.out.join("summary.csv")).unwrap();
+    let status: Vec<&str> = summary.lines().skip(1).map(|l| l.split(',').nth(1).unwrap()).collect();
+    assert_eq!(status, ["ok", "ok", "ok"]);
 }
 
 // --- `astrum run` on the terminal ---------------------------------------------
