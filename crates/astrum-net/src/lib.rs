@@ -7,7 +7,9 @@
 //!   `astrum/telemetry/<id>` through a per-aircraft declared publisher.
 //!   [`LatestTelemetry`] keeps the newest sample per aircraft for controllers and
 //!   viewers: a control law must act on the freshest state, never on a queue of
-//!   stale frames.
+//!   stale frames. [`SampledTelemetry`] keeps a bounded, thinned trail of every
+//!   aircraft's samples instead, for viewers that draw history (the web bridge
+//!   at faster than real time).
 //! * **Commands** — a controller's [`CommandSender`] publishes on
 //!   `astrum/command/<id>`, stamping a random non-zero `epoch` (its instance
 //!   id: the sim lets one epoch own an aircraft) and a strictly increasing
@@ -42,20 +44,20 @@
 //! are not batched (`express`) and are marked `InteractiveHigh`. Events and
 //! tick ends must not be lost, so they block rather than drop and are marked
 //! `Data`. What the priority buys depends on the link's transport. The sim's
-//! router offers Zenoh's low-latency transport, which the C++ and Python
-//! controller clients ask for (every lockstep round trip counts): it has ONE
-//! lane per link, no batching and no fragmentation, so priorities reorder
-//! nothing — messages arrive in the order the sim sent them — and every message
-//! must fit in one transport frame. Clients that don't ask (the recorder, the
-//! web bridge) get the default transport: one lane per priority (a higher one
-//! is sent first) and fragmentation for large replies. Either way a link
-//! delivers the messages of one priority in send order, which is what the
-//! per-tick order above relies on.
+//! router offers Zenoh's low-latency transport and every client asks for it —
+//! the C++ and Python controllers (every lockstep round trip counts) and
+//! [`Session::connect`] (recorder, web bridge, ctl), which on the default
+//! transport could lose all telemetry to a Zenoh 1.10 congestion bug (see
+//! `LOW_LATENCY`). It has ONE lane per link, no batching and no fragmentation,
+//! so priorities reorder nothing — messages arrive in the order the sim sent
+//! them — nothing is dropped (a client that falls behind slows the sender, so
+//! `CongestionControl::Drop` drops nothing here), and every message must fit in
+//! one transport frame ([`MAX_SCENARIO_BYTES`]).
 //!
 //! Every call uses Zenoh's synchronous `.wait()` resolver; Zenoh runs its own
 //! runtime internally, so these wrappers drop into synchronous code as-is.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -161,6 +163,8 @@ pub enum NetError {
     BadScenario(String),
     /// The sim refused a control request (the reason it gave).
     Refused(String),
+    /// A message would not fit one frame of the low-latency transport.
+    TooLarge(String),
 }
 
 impl fmt::Display for NetError {
@@ -171,6 +175,7 @@ impl fmt::Display for NetError {
             NetError::Zenoh(e) => write!(f, "zenoh error: {e}"),
             NetError::BadScenario(e) => write!(f, "scenario reply is not UTF-8: {e}"),
             NetError::Refused(why) => write!(f, "refused: {why}"),
+            NetError::TooLarge(what) => write!(f, "too large: {what}"),
         }
     }
 }
@@ -190,51 +195,78 @@ pub struct Session {
     z: zenoh::Session,
 }
 
+/// Zenoh's low-latency transport — no batching, no QoS lanes, no fragmentation:
+/// the sim's router offers it and every client asks for it (the C++ and Python
+/// SDKs set the same two keys). Besides the shorter lockstep round trip it
+/// avoids a Zenoh 1.10 bug in the default transport: on a link without QoS
+/// lanes (the router turns them off for this transport) the transmission
+/// pipeline marks congestion on the `Priority::DEFAULT` bit but clears the bit
+/// of queue 0 (`zenoh-transport` `src/common/pipeline.rs`,
+/// `push_network_message` / `refill`), so once a client fell behind and one
+/// droppable sample was dropped, every later droppable message to it —
+/// telemetry, commands — was dropped for the rest of the session. On this
+/// transport a write to a client that falls behind blocks the sender instead
+/// (nothing is dropped; a client that stops reading stalls the sim until its
+/// lease expires), and a message must fit in one frame — a larger one is
+/// silently lost. The frame is the TCP link's Zenoh MTU, a multiple of half the
+/// socket's MSS below 64 KiB (`zenoh-link-tcp` `src/unicast.rs`): ~48 KiB on
+/// loopback, ~64 KiB on a 1500-byte Ethernet link, never below 32 KiB. Of the
+/// replies, only the scenario's can grow that large ([`MAX_SCENARIO_BYTES`]).
+const LOW_LATENCY: [(&str, &str); 2] =
+    [("transport/unicast/lowlatency", "true"), ("transport/unicast/qos/enabled", "false")];
+
 impl Session {
     /// Open a session that LISTENS on `endpoint` (the sim / bag-replay role) as a
     /// Zenoh **router**: every other process connects only to this hub, and peers
     /// do not forward for each other, so the hub must route — otherwise one
     /// client's publications (a controller's commands) would never reach another
     /// client (the recorder). Multicast scouting is off: Docker bridge networks
-    /// don't pass multicast, so clients connect by explicit endpoint.
+    /// don't pass multicast, so clients connect by explicit endpoint. It offers
+    /// the low-latency transport (`LOW_LATENCY`) to every client that asks.
     pub fn listen(endpoint: &str) -> Result<Self> {
-        Self::open(&[
-            ("scouting/multicast/enabled", "false".into()),
-            ("mode", r#""router""#.into()),
-            ("listen/endpoints", format!(r#"["{endpoint}"]"#)),
-            // Low-latency transport (no batching or QoS lanes) to every client
-            // that asks for it — the controllers do; measured ~14 % more lockstep
-            // throughput. Clients that don't (recorder, web) get the default.
-            ("transport/unicast/lowlatency", "true".into()),
-            ("transport/unicast/qos/enabled", "false".into()),
-        ])
+        Self::open(
+            &[
+                ("scouting/multicast/enabled", "false".into()),
+                ("mode", r#""router""#.into()),
+                ("listen/endpoints", format!(r#"["{endpoint}"]"#)),
+            ],
+            &LOW_LATENCY,
+        )
     }
 
-    /// Open a session that CONNECTS to the hub at `endpoint` (controller /
-    /// recorder / web) as a Zenoh **client**: the hub routes everything for it,
-    /// including other clients' publications. Waits up to `timeout` for the hub
-    /// (a sim still loading its aircraft), then fails; once connected, Zenoh
-    /// reconnects by itself if the hub restarts.
+    /// Open a session that CONNECTS to the hub at `endpoint` (recorder / web /
+    /// ctl) as a Zenoh **client** on the low-latency transport (`LOW_LATENCY`):
+    /// the hub routes everything for it, including other clients' publications.
+    /// Waits up to `timeout` for the hub (a sim still loading its aircraft),
+    /// then fails; once connected, Zenoh reconnects by itself if the hub
+    /// restarts.
     pub fn connect(endpoint: &str, timeout: Duration) -> Result<Self> {
         let timeout_ms = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
-        Self::open(&[
-            ("scouting/multicast/enabled", "false".into()),
-            ("mode", r#""client""#.into()),
-            ("connect/endpoints", format!(r#"["{endpoint}"]"#)),
-            ("connect/timeout_ms", timeout_ms.to_string()),
-        ])
+        Self::open(
+            &[
+                ("scouting/multicast/enabled", "false".into()),
+                ("mode", r#""client""#.into()),
+                ("connect/endpoints", format!(r#"["{endpoint}"]"#)),
+                ("connect/timeout_ms", timeout_ms.to_string()),
+            ],
+            &LOW_LATENCY,
+        )
     }
 
     /// An isolated in-process session (no endpoints) whose publishers deliver to
     /// its own subscribers — for tests.
     pub fn in_process() -> Result<Self> {
-        Self::open(&[("scouting/multicast/enabled", "false".into()), ("mode", r#""peer""#.into())])
+        Self::open(
+            &[("scouting/multicast/enabled", "false".into()), ("mode", r#""peer""#.into())],
+            &[],
+        )
     }
 
-    fn open(patches: &[(&str, String)]) -> Result<Self> {
+    fn open(patches: &[(&str, String)], transport: &[(&str, &str)]) -> Result<Self> {
         let mut config = zenoh::Config::default();
-        for (key, value) in patches {
-            config.insert_json5(key, value).map_err(zerr)?;
+        let transport = transport.iter().map(|&(key, value)| (key, value.to_owned()));
+        for (key, value) in patches.iter().cloned().chain(transport) {
+            config.insert_json5(key, &value).map_err(zerr)?;
         }
         let z = zenoh::open(config).wait().map_err(zerr)?;
         Ok(Self { z })
@@ -376,6 +408,186 @@ impl LatestTelemetry {
         }
         self.seen_generation = st.generation;
         Ok(())
+    }
+}
+
+/// Share of a [`SampledTelemetry`] period two samples may fall short of it and
+/// still count as spaced: sim times are `tick / rate_hz`, so a sample exactly
+/// one period later can round a hair below it.
+const SPACING_SLACK: f64 = 1e-6;
+
+/// One aircraft's trail in a [`SampledTelemetry`].
+#[derive(Default)]
+struct Trail {
+    /// Samples not yet taken, oldest first. Each is at least one period of sim
+    /// time after the one before it (the first: after the last one taken),
+    /// except the last, which is always the newest sample received.
+    pending: VecDeque<Telemetry>,
+    /// The newest sample received.
+    newest: Option<Telemetry>,
+    /// Sim time of the last sample taken (`None` until one is, and after the
+    /// aircraft's clock went backwards).
+    taken: Option<f64>,
+}
+
+impl Trail {
+    /// Add `t`, thinning to one sample per `period` of sim time and keeping at
+    /// most `cap` pending (the newest). Returns the samples dropped by the cap.
+    fn add(&mut self, t: Telemetry, period: f64, cap: usize) -> u64 {
+        if self.newest.is_some_and(|n| t.sim_time_s < n.sim_time_s) {
+            // The clock went backwards: a restarted sim or replay. The old
+            // run's samples go, so a trail is always time-ordered.
+            self.pending.clear();
+            self.taken = None;
+        }
+        self.newest = Some(t);
+        let len = self.pending.len();
+        if len == 0 {
+            self.pending.push_back(t);
+            return 0;
+        }
+        let before = if len >= 2 { Some(self.pending[len - 2].sim_time_s) } else { self.taken };
+        let tail = &mut self.pending[len - 1];
+        let spaced = before.is_none_or(|b| tail.sim_time_s - b >= period * (1.0 - SPACING_SLACK));
+        if !spaced || tail.sim_time_s == t.sim_time_s {
+            *tail = t; // the tail only stood in for the newest sample
+            return 0;
+        }
+        self.pending.push_back(t);
+        if self.pending.len() > cap {
+            self.pending.pop_front();
+            return 1;
+        }
+        0
+    }
+}
+
+#[derive(Default)]
+struct SampledState {
+    trails: BTreeMap<u32, Trail>,
+    generation: u64,
+    decode_errors: u64,
+    capped: u64,
+}
+
+/// A thinned trail of every aircraft's samples, taken in batches: a viewer that
+/// draws history at faster than real time gets every aircraft's flight at an
+/// even sim-time resolution, not just whatever sample was newest when it
+/// looked. Samples are decoded and thinned on Zenoh's receive thread, so a slow
+/// consumer never blocks the transport, and memory stays bounded:
+///
+/// * **thinned by sim time** — an aircraft's pending samples are at least
+///   `period` of sim time apart, except that the newest sample received is
+///   always pending too (it replaces a previous newest that was closer than
+///   `period` to the sample before it). So between two takes an aircraft gains
+///   at most one sample per `period` plus its newest, and consecutive kept
+///   samples are never more than `period` plus one publication interval apart.
+/// * **capped** — at most `cap` samples per aircraft wait to be taken; past
+///   that the oldest go ([`capped`](Self::capped) counts them).
+/// * **time-ordered** — a sample older than the aircraft's newest (a restarted
+///   sim or replay) discards that aircraft's pending samples first.
+///
+/// It subscribes like [`LatestTelemetry`]; the callback is O(1) per sample, so
+/// on the low-latency transport — where a reader that falls behind slows the
+/// sim rather than losing samples — it keeps up with a sim far faster than
+/// real time.
+pub struct SampledTelemetry {
+    shared: Arc<(Mutex<SampledState>, Condvar)>,
+    seen_generation: u64,
+    _sub: Subscriber<()>,
+}
+
+impl SampledTelemetry {
+    /// Subscribe to `selection`, keeping samples at least `period_s` of sim
+    /// time apart and at most `cap` (≥ 1) pending per aircraft.
+    pub fn subscribe(
+        session: &Session,
+        selection: Selection,
+        period_s: f64,
+        cap: usize,
+    ) -> Result<Self> {
+        let key = match selection {
+            Selection::Aircraft(id) => keys::telemetry(id),
+            Selection::Fleet => keys::TELEMETRY_ALL.to_owned(),
+        };
+        let cap = cap.max(1);
+        let shared: Arc<(Mutex<SampledState>, Condvar)> = Arc::default();
+        let sink = Arc::clone(&shared);
+        let sub = session
+            .z
+            .declare_subscriber(key)
+            .callback(move |sample: Sample| {
+                let decoded = decode_telemetry(&sample.payload().to_bytes());
+                let (lock, cv) = &*sink;
+                let mut st = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                match decoded {
+                    Ok(t) => {
+                        let capped =
+                            st.trails.entry(t.aircraft_id).or_default().add(t, period_s, cap);
+                        st.capped += capped;
+                        st.generation += 1;
+                    }
+                    Err(_) => st.decode_errors += 1,
+                }
+                drop(st);
+                cv.notify_all();
+            })
+            .wait()
+            .map_err(zerr)?;
+        Ok(Self { shared, seen_generation: 0, _sub: sub })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SampledState> {
+        self.shared.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Payloads that failed to decode so far.
+    pub fn decode_errors(&self) -> u64 {
+        self.state().decode_errors
+    }
+
+    /// Samples the cap dropped so far.
+    pub fn capped(&self) -> u64 {
+        self.state().capped
+    }
+
+    /// Block until at least one sample arrives after the last `wait` or
+    /// [`take`](Self::take).
+    pub fn wait(&mut self, timeout: Duration) -> Result<()> {
+        let (lock, cv) = &*self.shared;
+        let deadline = Instant::now() + timeout;
+        let mut st = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while st.generation == self.seen_generation {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(NetError::Timeout);
+            }
+            st = cv.wait_timeout(st, left).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        self.seen_generation = st.generation;
+        Ok(())
+    }
+
+    /// The batch since the last take, ordered by aircraft id and, per aircraft,
+    /// by sim time: every aircraft's pending samples, or — for one with none —
+    /// its newest sample again, so a batch always covers every aircraft seen.
+    /// Empty until a sample arrived.
+    pub fn take(&mut self) -> Vec<Telemetry> {
+        let mut st = self.state();
+        let generation = st.generation;
+        let mut batch = Vec::new();
+        for trail in st.trails.values_mut() {
+            match trail.pending.back() {
+                Some(last) => {
+                    trail.taken = Some(last.sim_time_s);
+                    batch.extend(trail.pending.drain(..));
+                }
+                None => batch.extend(trail.newest),
+            }
+        }
+        drop(st);
+        self.seen_generation = generation;
+        batch
     }
 }
 
@@ -683,6 +895,12 @@ impl TickReceiver {
 
 // --- Scenario -----------------------------------------------------------------
 
+/// Largest scenario TOML a [`ScenarioServer`] serves: its reply must fit one
+/// frame of the low-latency transport on any link (at least 32 KiB, see
+/// `LOW_LATENCY`), with room for the key and headers: about 200 aircraft (one
+/// takes ~140 bytes of the TOML `astrum-sim` serves).
+pub const MAX_SCENARIO_BYTES: usize = 31 * 1024;
+
 /// Answers `get astrum/scenario` with the sim's scenario TOML for as long as it
 /// is alive.
 pub struct ScenarioServer {
@@ -690,7 +908,15 @@ pub struct ScenarioServer {
 }
 
 impl ScenarioServer {
+    /// Serve `scenario_toml`; [`NetError::TooLarge`] past
+    /// [`MAX_SCENARIO_BYTES`], which no low-latency client could receive.
     pub fn serve(session: &Session, scenario_toml: String) -> Result<Self> {
+        if scenario_toml.len() > MAX_SCENARIO_BYTES {
+            return Err(NetError::TooLarge(format!(
+                "the scenario TOML is {} bytes; at most {MAX_SCENARIO_BYTES} fit one reply",
+                scenario_toml.len()
+            )));
+        }
         let queryable = session
             .z
             .declare_queryable(keys::SCENARIO)

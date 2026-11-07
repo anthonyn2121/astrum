@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use astrum_net::{
-    fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, ScenarioServer,
-    Selection, Session, TelemetryPublisher, TickPublisher, TickReceiver,
+    fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, SampledTelemetry,
+    ScenarioServer, Selection, Session, TelemetryPublisher, TickPublisher, TickReceiver,
 };
 use astrum_proto::{encode_command, Command, Control, RawActuators, Telemetry, TickEnd};
 use zenoh::Wait;
@@ -132,6 +132,91 @@ fn wait_times_out_without_new_samples() {
     let session = Session::in_process().unwrap();
     let mut sub = LatestTelemetry::subscribe(&session, Selection::Fleet).unwrap();
     assert_eq!(sub.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+/// A fleet trail on `session` thinned to `period_s`, already receiving: it has
+/// seen tick 0 of every aircraft in `ids` (not yet taken).
+fn sampled(
+    session: &Session,
+    publisher: &mut TelemetryPublisher,
+    ids: &[u32],
+    period_s: f64,
+    cap: usize,
+) -> SampledTelemetry {
+    let mut sub = SampledTelemetry::subscribe(session, Selection::Fleet, period_s, cap).unwrap();
+    for _ in 0..1000 {
+        for &id in ids {
+            publisher.publish(&sample(id, 0)).unwrap();
+        }
+        if sub.wait(Duration::from_millis(1)).is_ok() {
+            break;
+        }
+    }
+    settle(&mut sub);
+    sub
+}
+
+/// Wait until `sub` has had no new sample for 50 ms: everything published has
+/// been delivered.
+fn settle(sub: &mut SampledTelemetry) {
+    while sub.wait(Duration::from_millis(50)).is_ok() {}
+}
+
+fn ticks(batch: &[Telemetry]) -> Vec<(u32, u64)> {
+    batch.iter().map(|t| (t.aircraft_id, t.tick)).collect()
+}
+
+#[test]
+fn sampled_telemetry_keeps_one_sample_per_period_of_sim_time_plus_the_newest() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    // 120 Hz ticks thinned to 30 Hz: every 4th tick.
+    let mut sub = sampled(&session, &mut publisher, &[1, 2], 1.0 / 30.0, 1000);
+    for tick in 1..=118 {
+        publisher.publish(&sample(2, tick)).unwrap();
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    // Ids ascending, each in time order; tick 118 is the newest, closer than a
+    // period to tick 116.
+    let every_4th = (0..=116).step_by(4).chain([118]);
+    let want: Vec<_> = every_4th.clone().map(|t| (1, t)).chain(every_4th.map(|t| (2, t))).collect();
+    assert_eq!(ticks(&sub.take()), want);
+
+    // Nothing new: each aircraft's newest again.
+    assert_eq!(ticks(&sub.take()), [(1, 118), (2, 118)]);
+    // The spacing carries on from the last sample taken, not from the grid.
+    for tick in 119..=128 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [(1, 122), (1, 126), (1, 128), (2, 118)]);
+    assert_eq!(sub.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+#[test]
+fn sampled_telemetry_caps_each_aircraft_at_its_newest_samples() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    let mut sub = sampled(&session, &mut publisher, &[1], 1e-9, 10);
+    for tick in 1..=100 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), (91..=100).map(|t| (1, t)).collect::<Vec<_>>());
+    assert_eq!(sub.capped(), 91);
+}
+
+#[test]
+fn sampled_telemetry_drops_an_aircrafts_old_run_when_its_clock_goes_back() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 1000);
+    for tick in (1..=40).chain(0..=8) {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [(1, 0), (1, 4), (1, 8)]);
 }
 
 #[test]
