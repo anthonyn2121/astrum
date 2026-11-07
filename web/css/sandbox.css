@@ -1,0 +1,85 @@
+/* Sandbox (scenario editor) page; builds on style.css's theme and controls. */
+
+#sandbox {
+  position: fixed; inset: 0;
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr) 330px;
+  grid-template-rows: 44px minmax(0, 1fr);
+  grid-template-areas:
+    "top top top"
+    "left stage right";
+}
+@media (max-width: 1280px) { #sandbox { grid-template-columns: 236px minmax(0, 1fr) 300px; } }
+
+.sb-top {
+  grid-area: top;
+  display: flex; align-items: center; gap: 14px; padding: 0 12px; min-width: 0;
+  background: var(--panel-solid); border-bottom: 1px solid var(--line);
+}
+.sb-source { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sb-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex: none; }
+
+.sb-left { grid-area: left; border-right: 1px solid var(--line); }
+.sb-right { grid-area: right; border-left: 1px solid var(--line); }
+
+.sb-stage { grid-area: stage; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.sb-view { position: absolute; inset: 0; }
+
+.sb-banner {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 5;
+  padding: 6px 12px; border-radius: var(--radius);
+  background: var(--panel); border: 1px solid var(--accent); pointer-events: none;
+}
+.sb-banner-error { border-color: var(--live); color: var(--live); top: 48px; pointer-events: auto; }
+
+.sb-scale {
+  position: absolute; left: 12px; bottom: 34px; z-index: 4; pointer-events: none;
+  display: flex; align-items: center; gap: 8px; font-size: 11px;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+}
+.sb-scale-bar { width: 100px; height: 6px; border: 2px solid var(--text); border-top: 0; }
+.sb-hint {
+  position: absolute; left: 12px; right: 12px; bottom: 6px; margin: 0; z-index: 4; pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.9); color: var(--text); opacity: 0.85;
+}
+.sb-k { color: #ffd166; font-weight: 700; }
+
+.sb-section { padding: 10px 12px 14px; border-bottom: 1px solid var(--line); }
+.sb-h {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+}
+.sb-pad { padding: 8px 12px; }
+.sb-row { display: flex; gap: 6px; }
+
+.sb-form { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; margin: 0; }
+.sb-form label { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--muted); min-width: 0; }
+.sb-form input, .sb-form select { width: 100%; min-width: 0; padding: 3px 6px; font-size: 12px; color: var(--text); }
+.sb-form input[type="number"] { background: rgba(0,0,0,0.35); cursor: text; font-variant-numeric: tabular-nums; }
+.sb-form input[aria-invalid="true"], .sb-form select[aria-invalid="true"] { border-color: var(--live); }
+.sb-form .sb-check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); }
+.sb-form .sb-check input { width: auto; }
+.sb-span { grid-column: 1 / -1; margin: 0; }
+.sb-error { color: var(--live); font-size: 12px; margin: 0; white-space: pre-line; }
+#pickOriginBtn[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+
+.sb-fleet { list-style: none; margin: 0; padding: 4px 0; }
+.sb-fleet li {
+  display: flex; align-items: center; gap: 8px; padding: 4px 12px; cursor: pointer;
+  border-left: 2px solid transparent;
+}
+.sb-fleet li:hover { background: rgba(74,163,255,0.08); }
+.sb-fleet li[aria-selected="true"] { background: rgba(74,163,255,0.16); border-left-color: var(--accent); }
+.sb-fleet li:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sb-fleet .sb-id { font-weight: 700; font-variant-numeric: tabular-nums; min-width: 2.5em; }
+.sb-fleet .sb-meta { color: var(--muted); font-size: 12px; margin-left: auto; }
+.sb-fleet .sb-bad { color: var(--live); }
+
+.sb-issues { list-style: none; margin: 0 0 6px; padding: 0; font-size: 12px; }
+.sb-issues li { color: var(--live); padding: 1px 0; }
+.sb-issues li.sb-ok { color: var(--ok); }
+.sb-json {
+  margin: 0; max-height: 46vh; overflow: auto; padding: 8px;
+  background: rgba(0,0,0,0.35); border: 1px solid var(--line); border-radius: 6px;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+}

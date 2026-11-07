@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ASTRUM · Sandbox</title>
+  <link rel="icon" type="image/png" href="./img/favicon.png" />
+  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/sandbox.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js",
+        "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <!-- Scenario editor: fleet + spawn | map | aircraft + world + scenario JSON. -->
+  <div id="sandbox">
+    <header class="sb-top">
+      <div class="brand"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Sandbox</em></div>
+      <span id="sourceLabel" class="sb-source muted">new scenario</span>
+      <div class="sb-actions">
+        <button id="undoBtn" title="Undo (Ctrl+Z)" disabled>Undo</button>
+        <button id="redoBtn" title="Redo (Ctrl+Shift+Z / Ctrl+Y)" disabled>Redo</button>
+        <div class="seg" role="group" aria-label="View">
+          <button id="viewMapBtn" aria-pressed="true" title="Top-down map, north up (M)">Map</button>
+          <button id="viewOrbitBtn" aria-pressed="false" title="3-D orbit view (O)">Orbit</button>
+        </div>
+        <button id="fitBtn" title="Frame every aircraft (F)">Fit</button>
+      </div>
+    </header>
+
+    <aside class="dock sb-left" aria-label="Fleet and spawning">
+      <div class="dock-head"><span class="dock-title">Fleet</span><span id="fleetCount" class="badge">0</span></div>
+      <div class="dock-body">
+        <ul id="fleetList" class="sb-fleet" aria-label="Aircraft (click to select, Shift+click to add)"></ul>
+        <p id="fleetEmpty" class="dock-empty muted small">No aircraft yet — spawn some below.</p>
+        <div class="sb-row sb-pad">
+          <button id="dupBtn" disabled title="Duplicate the selection (Ctrl+D)">Duplicate</button>
+          <button id="delBtn" disabled title="Delete the selection (Delete)">Delete</button>
+        </div>
+        <p id="fleetStatus" class="sb-error sb-pad" role="alert" hidden></p>
+
+        <section class="sb-section" aria-labelledby="spawnTitle">
+          <h2 id="spawnTitle" class="sb-h">Spawn</h2>
+          <form id="spawnForm" class="sb-form" novalidate>
+            <label>Model <select id="spawnModel"></select></label>
+            <label>Count <input id="spawnCount" type="number" min="1" max="200" step="1" value="3" /></label>
+            <label>Pattern
+              <select id="spawnPattern">
+                <option value="abreast">Line abreast</option>
+                <option value="trail">Trail</option>
+                <option value="grid">Grid</option>
+                <option value="random">Random in a box</option>
+              </select>
+            </label>
+            <label><span id="spawnSpacingLabel">Spacing (m)</span> <input id="spawnSpacing" type="number" min="0" step="any" value="100" /></label>
+            <label>Altitude HAE (m) <input id="spawnAlt" type="number" step="any" value="1500" /></label>
+            <label>Heading (°) <input id="spawnHeading" type="number" step="any" value="0" /></label>
+            <label>TAS (m/s) <input id="spawnTas" type="number" min="0" step="any" value="0" /></label>
+            <label>Team <input id="spawnTeam" type="number" min="0" max="255" step="1" value="0" /></label>
+            <p class="muted small sb-span">Centred on the view; the ghosts preview where they go.</p>
+            <p id="spawnError" class="sb-error sb-span" role="alert" hidden></p>
+            <button id="spawnBtn" class="primary sb-span" type="submit">Spawn</button>
+          </form>
+        </section>
+      </div>
+    </aside>
+
+    <main class="sb-stage" aria-label="Map">
+      <div id="view" class="sb-view"></div>
+      <div id="pickBanner" class="sb-banner" role="status" hidden>Click the map to place the world origin — <kbd>Esc</kbd> cancels</div>
+      <div id="loadError" class="sb-banner sb-banner-error" role="alert" hidden></div>
+      <div class="sb-scale" aria-hidden="true"><div id="scaleBar" class="sb-scale-bar"></div><span id="scaleLabel">—</span></div>
+      <p class="sb-hint muted small">Drag aircraft to move · knobs: <span class="sb-k">↻</span> heading, <span class="sb-k">⇕</span> altitude (or Alt+drag) · Shift+click / Shift+drag to multi-select · wheel zooms</p>
+    </main>
+
+    <aside class="dock sb-right" aria-label="Aircraft, world and scenario">
+      <div class="dock-body">
+        <section class="sb-section" aria-labelledby="insTitle">
+          <h2 id="insTitle" class="sb-h">Aircraft</h2>
+          <p id="insEmpty" class="muted small">Select an aircraft on the map or in the fleet list.</p>
+          <form id="insForm" class="sb-form" novalidate hidden>
+            <p id="insMulti" class="muted small sb-span" hidden></p>
+            <label>Id <input data-field="id" type="number" min="0" step="1" /></label>
+            <label>Model <select data-field="model"></select></label>
+            <label>Kind
+              <select data-field="kind">
+                <option value="">Default</option>
+                <option value="fixed-wing">Fixed-wing</option>
+                <option value="multirotor">Multirotor</option>
+              </select>
+            </label>
+            <label data-fixed-wing>Autopilot
+              <select data-field="autopilot_profile">
+                <option value="">Default</option>
+                <option value="trainer">Trainer</option>
+                <option value="fighter">Fighter</option>
+              </select>
+            </label>
+            <label>Team <input data-field="team" type="number" min="0" max="255" step="1" /></label>
+            <label>Latitude (°) <input data-field="lat_deg" type="number" step="any" /></label>
+            <label>Longitude (°) <input data-field="lon_deg" type="number" step="any" /></label>
+            <label>East (m) <input data-field="enu_e" type="number" step="any" /></label>
+            <label>North (m) <input data-field="enu_n" type="number" step="any" /></label>
+            <label>Up (m) <input data-field="enu_u" type="number" step="any" /></label>
+            <label>Altitude HAE (m) <input data-field="alt_hae_m" type="number" step="any" /></label>
+            <label>Heading (°) <input data-field="heading_deg" type="number" step="any" /></label>
+            <label>Climb (°) <input data-field="climb_deg" type="number" step="any" min="-89.9" max="89.9" /></label>
+            <label>Bank (°) <input data-field="bank_deg" type="number" step="any" min="-89.9" max="89.9" /></label>
+            <label>TAS (m/s) <input data-field="tas_mps" type="number" min="0" step="any" /></label>
+            <label>Trim
+              <select data-field="trim">
+                <option value="">Default</option>
+                <option value="true">Yes</option>
+                <option value="false">No</option>
+              </select>
+            </label>
+            <label>Control rate (Hz) <input data-field="control_rate_hz" type="number" min="0" step="any" placeholder="every tick" /></label>
+            <label>Health <input data-field="health" type="number" min="0" step="any" /></label>
+            <label data-armed>Ammo <input data-field="ammo" type="number" min="0" max="65535" step="1" placeholder="default" /></label>
+            <label class="sb-check sb-span" title="In a lockstep [sim], the sim waits for this aircraft's commands each tick. Web runs set this themselves for the aircraft they attach controllers to."><input data-field="lockstep" type="checkbox" /> Lockstep (wait for its commands each tick)</label>
+            <p id="insErrors" class="sb-error sb-span" role="alert" hidden></p>
+          </form>
+        </section>
+
+        <section class="sb-section" aria-labelledby="worldTitle">
+          <h2 id="worldTitle" class="sb-h">World origin</h2>
+          <form id="worldForm" class="sb-form" novalidate>
+            <label class="sb-span" id="locationRow" hidden>Location <select id="worldLocation"></select></label>
+            <label>Latitude (°) <input data-world="origin_lat_deg" type="number" step="any" /></label>
+            <label>Longitude (°) <input data-world="origin_lon_deg" type="number" step="any" /></label>
+            <label>Altitude HAE (m) <input data-world="origin_alt_hae_m" type="number" step="any" /></label>
+            <label class="sb-check sb-span"><input id="moveFleet" type="checkbox" /> Move the fleet with the origin</label>
+            <button id="pickOriginBtn" type="button" class="sb-span" aria-pressed="false">Pick on map</button>
+            <p id="worldErrors" class="sb-error sb-span" role="alert" hidden></p>
+          </form>
+        </section>
+
+        <section class="sb-section" aria-labelledby="simTitle">
+          <h2 id="simTitle" class="sb-h">Sim</h2>
+          <form id="simForm" class="sb-form" novalidate>
+            <label>Rate (Hz) <input data-sim="rate_hz" type="number" min="0" step="any" /></label>
+            <label>Max time (s) <input data-sim="max_time_s" type="number" min="0" step="any" title="0 runs until stopped" /></label>
+            <label>Speed (× real time) <input data-sim="speed" type="number" min="0" step="any" title="0 = as fast as possible" /></label>
+            <label>Seed <input data-sim="seed" type="number" min="0" step="1" /></label>
+            <label>Threads <input data-sim="threads" type="number" min="0" step="1" title="0 = every core" /></label>
+            <label>Command lease (s) <input data-sim="command_lease_s" type="number" min="0" step="any" title="0 disables the failsafe lease" /></label>
+            <label>Lockstep timeout (s) <input data-sim="lockstep_timeout_s" type="number" min="0" step="any" /></label>
+            <label class="sb-check"><input data-sim="lockstep" type="checkbox" /> Lockstep</label>
+            <p id="simErrors" class="sb-error sb-span" role="alert" hidden></p>
+          </form>
+        </section>
+
+        <section class="sb-section" aria-labelledby="jsonTitle">
+          <h2 id="jsonTitle" class="sb-h">Scenario JSON <button id="copyBtn" type="button" class="mini">Copy</button> <span id="copyStatus" class="muted small" role="status"></span></h2>
+          <ul id="issues" class="sb-issues" aria-label="Problems"></ul>
+          <pre id="scenarioJson" class="sb-json" tabindex="0" aria-label="Scenario JSON"></pre>
+        </section>
+      </div>
+    </aside>
+  </div>
+
+  <script type="module" src="./js/sandbox.js"></script>
+</body>
+</html>

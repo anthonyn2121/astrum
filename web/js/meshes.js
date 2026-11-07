@@ -4,7 +4,9 @@
 // No external model assets: an F-16-style jet (slender fuselage, chin intake,
 // bubble canopy, cropped-delta wing, swept tail) and an F450-like quad (X-frame
 // + 4 rotors) are built from primitives. The mesh is chosen by VehicleKind
-// (fixed-wing vs multirotor), not the specific JSBSim model.
+// (fixed-wing vs multirotor), not the specific JSBSim model. Each kind also
+// has a flat few-triangle silhouette (buildGhostGeometry) for the scene's
+// instanced preview ghosts.
 //
 // Colours (aircraftColor): in the plain environment, a per-class hue band with
 // a per-id hue; in the sky environment, saturated team hues that stand out
@@ -339,4 +341,47 @@ export function buildAircraft(kind, id, color, maskLayer) {
   group.userData.baseColor = base;
   group.userData.label = labelSprite(String(id), base);
   return group;
+}
+
+// A flat, few-triangle silhouette of the `kind`'s mesh for the scene's
+// instanced preview ghosts, in the same model units and axes (nose +Z, up
+// +Y) as buildAircraft: the jet's planform plus its fin, or the quad's hub,
+// nose marker and rotor discs. Returns { geom, span } (span as in userData).
+export function buildGhostGeometry(kind) {
+  if (kind === "multirotor") {
+    const shapes = [];
+    const hub = new THREE.Shape();
+    hub.moveTo(-0.7, -0.7); hub.lineTo(0.7, -0.7); hub.lineTo(0.7, 0.7); hub.lineTo(-0.7, 0.7); hub.closePath();
+    const nose = new THREE.Shape();
+    nose.moveTo(0, 1.6); nose.lineTo(-0.45, 0.85); nose.lineTo(0.45, 0.85); nose.closePath();
+    shapes.push(hub, nose);
+    const d = 2.3 * Math.SQRT1_2;
+    for (const [sx, sy] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const r = new THREE.Shape();
+      r.absarc(sx * d, sy * d, 1.15, 0, Math.PI * 2, false);
+      shapes.push(r);
+    }
+    return { geom: new THREE.ShapeGeometry(shapes, 8).rotateX(Math.PI / 2), span: 5.6 };
+  }
+  // Planform (shape +y → +Z, the nose), one outline from the nose round the
+  // starboard side and back up the port side.
+  const half = [
+    [0.45, 3.2], [0.5, 1.6], [3.1, -0.6], [3.1, -1.5], [0.5, -2.4],
+    [1.7, -2.6], [1.7, -3.5], [0.4, -3.6], [0.35, -4.05],
+  ];
+  const plan = new THREE.Shape();
+  plan.moveTo(0, 5.4);
+  for (const [x, y] of half) plan.lineTo(x, y);
+  for (let i = half.length - 1; i >= 0; i--) plan.lineTo(-half[i][0], half[i][1]);
+  plan.closePath();
+  const flat = new THREE.ShapeGeometry(plan).rotateX(Math.PI / 2).toNonIndexed();
+  const p = flat.attributes.position.array;
+  const fin = [0, 0.4, -1.4, 0, 2.2, -3.3, 0, 0.4, -3.4]; // the swept fin, one triangle
+  const pos = new Float32Array(p.length + fin.length);
+  pos.set(p);
+  pos.set(fin, p.length);
+  flat.dispose();
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  return { geom, span: 9.5 };
 }

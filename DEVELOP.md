@@ -384,12 +384,14 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 
 The renderer is static files under `web/` (Three.js and uPlot vendored in `web/vendor/`; the
 modules live in `web/js/`: `main.js` owns playback and selection state, `store.js` the timeline,
-`scene.js`/`meshes.js` the 3-D view, `ui.js` the shell and transport, `fleet.js`, `inspector.js`,
-`eventlog.js` and `plots.js` the docks, `geometry.js` the relative geometry, `simcontrol.js` the
-live sim's control bar and `runpanel.js` a studio run's panel); the viewer page is `view.html`.
-The studio's other pages are `index.html` (home, `home.js`) and `interactive.html`
-(`interactive.js`), styled by `css/studio.css` over `style.css`; every page reaches `/api` only
-through `js/api.js`. The bridge and
+`scene.js`/`meshes.js` the 3-D view, `environment.js` the sky / map, `geo.js` WGS84 geodetic ⇄
+ECEF ⇄ ENU (the same math as `crates/astrum-geo`, to ~1e-8 m), `ui.js` the shell and transport,
+`fleet.js`, `inspector.js`, `eventlog.js` and `plots.js` the docks, `geometry.js` the relative
+geometry, `simcontrol.js` the live sim's control bar and `runpanel.js` a studio run's panel); the
+viewer page is `view.html`. The studio's other pages are `index.html` (home, `home.js`),
+`interactive.html` (`interactive.js`) and the scenario editor `sandbox.html` (`sandbox.js` +
+`editstore.js`), styled by `css/studio.css` / `css/sandbox.css` over `style.css`; every page
+reaches `/api` only through `js/api.js`. The bridge and
 exporter are the two binaries in `crates/astrum-web/`, both projecting telemetry through the one
 `astrum_web::FrameJson` shape. The bridge sends one batched snapshot of the fleet at most
 `--max-hz` (default 30) times per second. Telemetry carries only the vehicle class, so the bridge
@@ -422,6 +424,29 @@ waits for it after serving (`Runs::shutdown`). Its tests (`tests/runs.rs`) fly a
 stand-in sim and the real one, which must be built first (`cargo build -p astrum-sim`; or set
 `ASTRUM_SKIP_REAL_SIM=1`).
 
+**Scene edit API** (the sandbox; sweep previews build on it). `Scene.setEditing({onSelect, onEdit,
+onPoint})` turns on edit mode (and the `"map"` environment: imagery for any fleet); the scene only
+*reports* what the pointer did and draws what its store says. `onSelect(ids, "replace" | "toggle" |
+"add")` for clicks / Shift+clicks / Shift+boxes; `onEdit({type: "move" | "raise" | "rotate", phase:
+"start" | "move" | "end" | "cancel", changes})` with `[{id, e, n, u}]` (ENU m) or `[{id,
+heading_deg}]` (the TRUE heading, Shift-snapped to 5° in true terms); and `onPoint({e, n})` for a
+click on empty ground. Presses on an aircraft or knob are taken in the capture phase, so
+OrbitControls and the tracked-view hand-off never steal them; a perspective drag ignores pointer
+rays within 3° of the drag plane and hits beyond 4× the aircraft's distance. `setSelection(ids)`
+(last = primary, which gets the handles), `cancelEdit()`, `setOrigin(lat°, lon°, alt)` (the map
+datum from a `[world]`, no telemetry), `setCameraMode("map")` (orthographic, north up; pans and
+zooms by itself), `viewCenter()` / `setViewCenter(e, n)`, and `setGhosts(layer, [{kind, e, n, u,
+heading_deg, climb_deg?, bank_deg?, color?}])` (named instanced translucent preview layers —
+`"spawn"` is the sandbox's, a sweep cloud takes its own; `null` clears one; each ghost sized by its
+own distance). Static initial conditions render through `editstore.js`'s
+`EditStore.setScenario(world, aircraft, kindOf)`, which offers what `Scene.update` reads from a
+store (`ids()`, `track(id).kind`, `sampleAt(id, t)`). Headings everywhere — telemetry `psi_rad`,
+editor samples, edit events, ghosts — are true headings in the aircraft's local level; the scene
+turns each onto the grid by `geo.js` `Datum.northBearing` at the aircraft's lat/lon (meridian
+convergence, ≈ −sin(lat)·Δlon: 0.2° at 30 km east at 37° N), in the viewer and the sandbox alike.
+A horizontal drag keeps each aircraft's `alt_hae_m`; its grid height is recomputed, so far out it
+sits below the flat drag plane by the Earth's curvature (d²/2R: ~18 m at 15 km).
+
 **Ground map and sky.** Only when the fleet includes an **F-16** (a scenario `model` starting with
 `f16`; the bridge polls the sim's scenario and sends `{"type":"models",…}`, exports carry
 `meta.models`) does the renderer switch to daytime: a sky dome with the sun, a drifting cumulus deck
@@ -429,7 +454,9 @@ stand-in sim and the real one, which must be built first (`cargo build -p astrum
 in level-of-detail rings around the ground point below the camera — fine tiles near it, coarser
 ones out to ~150 km — each tile placed at its exact WGS84 position in the scenario's ENU frame, so
 the map follows the Earth's curvature and stays under the aircraft however far they fly. Every other
-platform (c172x, F450, unknown) keeps the dark ENU grid with no map. Tiles are served by
+platform (c172x, F450, unknown) keeps the dark ENU grid with no map in the viewer; the sandbox
+editor always shows the map (the `"map"` look: daylight, no clouds), its origin set from the
+scenario's `[world]`. Tiles are served by
 `astrum web` at `/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every
 tile under `tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling,
 and an area viewed once while online works **offline** afterward; a tile that 404s (offline +

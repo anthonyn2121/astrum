@@ -651,6 +651,27 @@ transport only replays what the page has received. With `?run=<id>` a run panel 
 state, **Stop**, its log and, once it ends, its outcome, key metrics and **Open full replay** (the
 run's bag as an export, loaded like a file).
 
+**Sandbox** (`/sandbox.html?scenario=<name>`, or `/sandbox.html` for a new scenario from the empty
+environment's sim defaults and a chosen location) is the scenario editor: the fleet at its initial
+conditions on a top-down, north-up map over aerial imagery (any platform; an orbit view too).
+Click / Shift+click / Shift+drag selects; drag moves the selection on the horizontal plane at its
+altitude (each aircraft keeps its `alt_hae_m` and its grid height is recomputed, so far from the
+origin it settles below the drag plane by the Earth's curvature — ~18 m at 15 km); the yellow
+knobs rotate the true heading (Shift snaps it to 5°) and raise or lower it (or Alt+drag); wheel
+zooms, drag on empty map pans (any button). The inspector edits every `[[aircraft]]` field (id,
+model, kind and autopilot profile overrides, team, lat/lon or ENU about the origin, altitude HAE,
+heading, climb, bank, TAS, trim, lockstep, control rate, health, ammo for fixed-wing), and the
+`[world]` and `[sim]` sections are editable too; web-launched runs set `lockstep` themselves for
+the aircraft they attach controllers to, so a scenario authored for the studio leaves it off.
+**Spawn** places N aircraft of a model in line abreast, trail, a grid or at random in a box around
+the view centre (the lowest free ids, TAS 0 for multirotors, previewed as translucent ghosts);
+duplicate, delete, undo / redo (Ctrl+Z / Ctrl+Shift+Z) and the world origin (fields, a location,
+or pick on the map; optionally moving the fleet with it; the view stays on the same ground, undo
+and redo included) round it off.
+A live panel shows the scenario as JSON in `Scenario`'s own serde shape (copyable), with the
+problems `Scenario::validate` would report (unique ids, |climb|, |bank| < 90, control rates that
+divide `rate_hz`, lockstep consistency, finite numbers, …) inline.
+
 Both data paths feed one JSON frame shape (`astrum_web::FrameJson`) and one event shape
 (`astrum_web::EventJson`, see [Events](#events)), so the live stream and an offline export can't
 drift:
