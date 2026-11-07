@@ -6,9 +6,10 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use astrum_bag::aircraft_models;
 use astrum_net::{ScenarioServer, Session};
 use astrum_web::bridge::{Bridge, BridgeInfo};
-use astrum_web::{aircraft_models, models_message, run_message};
+use astrum_web::{models_message, run_message};
 use axum::extract::ws::Utf8Bytes;
 use common::{config, endpoint, wait_until, Sim};
 use tokio::sync::watch;

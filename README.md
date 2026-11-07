@@ -179,6 +179,8 @@ lon_deg = -122.3756
 alt_hae_m = 4572.0
 heading_deg = 90.0
 tas_mps = 250.0
+# climb_deg = 0.0         # flight-path angle at spawn, + = climbing; strictly within ±90
+# bank_deg = 0.0          # roll at spawn, + = right wing down; strictly within ±90
 # trim = true             # default: true for fixed-wing, false for multirotor; failure is fatal
 # lockstep = false        # in a lockstep scenario, wait for this aircraft's commands
 # control_rate_hz = 30.0  # telemetry + lockstep commands at this rate (divides rate_hz)
@@ -186,6 +188,12 @@ team = 0
 health = 100.0
 # ammo = 511              # armed (fixed-wing) aircraft only
 ```
+
+A trimmed fixed-wing starts in steady flight at `climb_deg`: wings level, or a coordinated turn
+at `bank_deg` (JSBSim's turn trim). The trim is exact at spawn, but the F-16's own flight
+controls roll an uncommanded aircraft out of the turn (≈ 30° → 13° in 20 s while climbing), and
+steep banks may not trim at all (60° on the F-16 does not) — fatal, like any failed trim. An
+untrimmed aircraft (multirotor, `trim = false`) just starts with that velocity direction and roll.
 
 Bundled scenarios: `scenario.example.toml` (2-ship fleet), `scenario.demo.toml` (bounded single
 fixed-wing), `scenario.quad.toml` (single F450), `scenario.formation.toml` (4-ship formation),
@@ -441,6 +449,16 @@ For developing real control laws there's [`controllers/optimal/`](controllers/op
 (C++ and Python laws on the same runtime): **LQR** and **MPC** (`--law lqr|mpc`), and in Python
 also `figure8` and `formation` (a follower that reads its leader from the fleet snapshot).
 
+**Controller catalog.** `config/controllers.toml` lists every launchable (program, law) pair —
+the ten above — with its vehicle kinds, whether it reads the fleet, and typed, bounded
+parameters (`number`, `integer`, `choice`, or another `aircraft` of the scenario; heading,
+altitude and speed parameters say which state they command). It is what the web studio launches
+from: `astrum_sim::controllers::ControllerSpec::render` turns an entry, an aircraft id and
+parameter values into one `controllers` command line, refusing unknown, out-of-range or
+wrongly-typed values, so a browser never supplies a command. The C++ entries need the programs
+built (`cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release && cmake --build
+build/controllers -j`, which `astrum` does for you); the Python ones run with `python3`.
+
 ## Wire protocol, telemetry & commands
 
 One Cap'n Proto schema (`crates/astrum-proto/schema/astrum.capnp`, **v3**) is shared by Rust, C++
@@ -496,8 +514,9 @@ opens one `mode=client` session (multicast scouting off) connecting to it: `tcp/
 default (host-side tools reach the dev container's published port on the same address). The router routes between its clients, so e.g. the
 recorder sees the commands a controller sends (Zenoh 1.10 routers do not forward between two
 *peers*). A client's open waits for a sim that is still starting, up to its connect timeout, then
-fails with a clear message: controllers exit 1 after `--startup-timeout`; `astrum record` and
-`astrum web` take `--connect-timeout` (`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s). Endpoints are
+fails with a clear message: controllers exit 1 after `--startup-timeout`; `astrum record` takes
+`--connect-timeout` (`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s); `astrum web` never gives up: it
+keeps retrying in the background and serves pages meanwhile. Endpoints are
 overridable via `$ASTRUM_ZENOH_LISTEN` (sim / replay) and `$ASTRUM_ZENOH_CONNECT` (everyone else);
 the endpoint syntax is `proto/host:port`.
 
@@ -537,6 +556,21 @@ replayed. Flags: positional bag
 path (`ASTRUM_BAG`), `--rate` (sim-time speed multiplier, default `1.0`; ≤ 0 = unpaced; a single
 gap is capped at 5 s; `ASTRUM_REPLAY_RATE`), `--listen` (`ASTRUM_ZENOH_LISTEN`), `--warmup-ms`
 (default 300; `ASTRUM_REPLAY_WARMUP_MS`). Legacy pre-MCAP `.bag` files are not readable — re-record.
+
+```bash
+# run metrics as JSON: end reason, closest approach, extremes, failsafe/refusal/hit/kill counts, final states
+astrum metrics recordings/session.mcap [--out metrics.json]
+```
+
+`astrum metrics` (`astrum_bag::metrics::compute`) reduces a bag to `end_reason`, `end_message`,
+`sim_time_s`, `min_separation_m` (with `min_separation_pair` and `min_separation_t_s`),
+`min_alt_hae_m`, `max_bank_deg`, `max_nz_g`, `failsafe_entries`, `controller_losses`,
+`command_refusals` (running totals since the sim started), `hits`, `kills`, and per aircraft its
+model, extremes and final state. Only living aircraft count. Separation compares samples of the
+same tick, never interpolated: exact on `--record` bags (every tick), limited to the ticks both
+aircraft share on control-rate or `astrum record` bags. One bag is one run: a bag recorded across
+a sim restart is not split. Flags: positional bag path (`ASTRUM_BAG`), `--out`
+(`ASTRUM_METRICS_OUT`; default stdout).
 
 ## 3-D replay renderer (`astrum web` + `web/`)
 
@@ -583,12 +617,30 @@ are never dropped or throttled: each batch goes to every browser as `{"type":"ev
 on the same socket, from the moment it connected. The fleet's JSBSim models, which telemetry does
 not carry, come from the sim's (or `astrum play`'s) `astrum/scenario` reply, polled every 5 s:
 each browser gets `{"type":"models","models":[{"id":1,"model":"f16"},…]}` (sorted by id) on
-connect once known, and again whenever the fleet changes. WebSocket
-upgrades whose `Origin` does not match the request's `Host` are rejected. The same port serves the static `web/` app and
-the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags: `--connect` (default `tcp/127.0.0.1:7447`),
-`--bind` (default `127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`,
-published on host loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache` — each with an
-`ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback. `astrum export` takes
+connect once known, and again whenever the fleet changes. Each browser also gets
+`{"type":"run","run":N,"endpoint":"tcp/…"}` on connect and whenever the bridge is attached
+elsewhere (or detached: `"endpoint":null`); everything after it belongs to the new run, and the
+viewer starts a fresh timeline. The bridge attaches to `--connect` at startup and retries in the
+background until a sim answers there; the server stays up with or without one, and each
+attachment starts with an empty fleet (no aircraft carried over from an earlier sim).
+
+WebSocket upgrades whose `Origin` does not match the request's `Host` are rejected. The WebSocket
+and every `/api` route also answer only a `Host` of `localhost`, an IP address, or a name listed in
+`--allowed-hosts` (comma-separated host names, no port), so a domain re-pointed at the server (DNS
+rebinding) is refused; static files and tiles are not restricted. Add the machine's DNS name there
+to use the viewer by name from another machine. JSON API: `GET /api/bridge` →
+`{endpoint, run, connected, status}` (`status` is the sim's `astrum ctl status` JSON, or null);
+`POST /api/bridge/control` with `{"action":"pause"|"resume"}`, `{"action":"step","ticks":N}` or
+`{"action":"speed","value":X}` → `{"ok":true}`, or `{"error":…}` with 400 (bad body), 409 (sim
+refused), 503 (no sim). All `/api` requests are subject to the `Host` check (403); non-GET ones
+must also be `Content-Type: application/json` (415) and, from a browser, same-origin (403).
+
+The same port serves the static `web/` app and the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags:
+`--connect` (default `tcp/127.0.0.1:7447`, attached at startup), `--bind` (default
+`127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`, published on host
+loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache`, `--allowed-hosts`
+— each with an `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback
+(`ASTRUM_WEB_ALLOWED_HOSTS` for the last). `astrum export` takes
 the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,
 `events`, and `meta` with their counts, the embedded `scenario` TOML and its aircraft `models`
 as `[{"id","model"},…]`, `[]` without a scenario) to `--out` (env fallbacks `ASTRUM_BAG` /
@@ -660,7 +712,7 @@ sim's endpoint.
 
 ```
 assets/            logos
-config/            scenarios (example, demo, quad, formation, smoke), sweeps, demos/ run files
+config/            scenarios (example, demo, quad, formation, smoke), sweeps, demos/ run files, controllers.toml (controller catalog)
 controllers/       out-of-sim flight controllers: README.md (the SDK contract), common/ (C++ SDK), cpp/, python/ (Python SDK + example), optimal/, examples/out_of_tree/
 crates/            Rust workspace — astrum-fdm/geo/proto/net/bag/sim/env/web
 docker/            Dockerfile, entrypoint, pinned Python requirements

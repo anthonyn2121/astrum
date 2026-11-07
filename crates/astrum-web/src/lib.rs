@@ -2,8 +2,8 @@
 //! browser-based 3-D replay renderer (`web/`).
 //!
 //! It defines ONE JSON shape per message kind — [`FrameJson`] for telemetry,
-//! [`EventJson`] for `astrum/events`, [`AircraftModel`] for the fleet's JSBSim
-//! models — used by both delivery paths:
+//! [`EventJson`] for `astrum/events`, [`astrum_bag::AircraftModel`] for the
+//! fleet's JSBSim models — used by both delivery paths:
 //!
 //! * **live / replay stream** — the `astrum-web` binary ([`server`]) attaches a
 //!   [`bridge::Bridge`] to the live sim *or* `astrum-bag-play`, tracks the newest
@@ -23,8 +23,9 @@ pub mod bridge;
 pub mod export;
 pub mod server;
 
+use astrum_bag::{aircraft_models, AircraftModel};
 use astrum_proto::{Enu, Event, EventKind, Telemetry, VehicleKind};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// The renderer's name for a vehicle class (matches the scenario `kind` field
 /// and the browser's mesh factory).
@@ -253,44 +254,6 @@ pub fn events_message(events: &[Event]) -> String {
     let events: Vec<EventJson> = events.iter().map(EventJson::from_event).collect();
     serde_json::to_string(&EventsMessage { kind: "events", events: &events })
         .unwrap_or_else(|e| unreachable!("EventJson serialisation failed: {e}"))
-}
-
-/// One aircraft's JSBSim model as the scenario declares it. Telemetry carries
-/// only the vehicle class, so this is how the renderer learns that, say,
-/// aircraft 1 is an F-16 (and draws the daytime environment for it).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct AircraftModel {
-    pub id: u32,
-    /// The scenario's `model` string, e.g. `"f16"` or `"c172x"`.
-    pub model: String,
-}
-
-/// The part of a scenario TOML [`aircraft_models`] reads; every other key is
-/// ignored, so scenario schema changes elsewhere cannot break it.
-#[derive(Deserialize)]
-struct ScenarioFleet {
-    #[serde(default)]
-    aircraft: Vec<ScenarioAircraft>,
-}
-
-#[derive(Deserialize)]
-struct ScenarioAircraft {
-    id: Option<u32>,
-    model: Option<String>,
-}
-
-/// The `[[aircraft]]` ids and models of a scenario TOML, sorted by id. Entries
-/// missing either field are skipped; TOML that does not parse (or whose fleet
-/// has the wrong shape) yields none — the renderer then keeps its default look.
-pub fn aircraft_models(scenario_toml: &str) -> Vec<AircraftModel> {
-    let Ok(fleet) = toml::from_str::<ScenarioFleet>(scenario_toml) else { return Vec::new() };
-    let mut models: Vec<AircraftModel> = fleet
-        .aircraft
-        .into_iter()
-        .filter_map(|a| Some(AircraftModel { id: a.id?, model: a.model? }))
-        .collect();
-    models.sort_by_key(|m| m.id);
-    models
 }
 
 /// One live WebSocket message: the fleet's aircraft models.

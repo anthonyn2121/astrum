@@ -130,6 +130,23 @@ fn there_is_exactly_one_environment_the_empty_world() {
 }
 
 #[test]
+fn every_environment_metric_is_a_field_of_the_run_metrics() {
+    // The ids an environment advertises name `astrum_bag::metrics::RunMetrics`
+    // fields; the web reads them out of that JSON by these names.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty.mcap");
+    astrum_bag::BagWriter::create(&path, None).unwrap().finish().unwrap();
+    let bag = astrum_bag::BagReader::open(&path).unwrap();
+    let json = serde_json::to_value(astrum_bag::metrics::compute(&bag).unwrap()).unwrap();
+    let fields = json.as_object().unwrap();
+    for env in environments() {
+        for id in &env.metrics {
+            assert!(fields.contains_key(*id), "environment {}: metric {id} is not a field", env.id);
+        }
+    }
+}
+
+#[test]
 fn the_empty_world_offers_every_bundled_scenario_origin_once() {
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
     let empty = environment("empty").unwrap();

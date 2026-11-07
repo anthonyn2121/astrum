@@ -8,10 +8,11 @@ mod common;
 use std::path::Path;
 use std::time::Duration;
 
+use astrum_bag::aircraft_models;
 use astrum_net::{ScenarioServer, Session};
 use astrum_web::bridge::Bridge;
 use astrum_web::server::{host_allowed, origin_allowed, parse_tile};
-use astrum_web::{aircraft_models, models_message, run_message};
+use astrum_web::{models_message, run_message};
 use axum::body::{to_bytes, Body};
 use axum::http::header::{HOST, ORIGIN};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};

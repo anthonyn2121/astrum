@@ -74,6 +74,9 @@ enum Cmd {
     /// Bake a bag into a replay JSON the browser opens offline (astrum-web-export).
     #[command(disable_help_flag = true)]
     Export(Forward),
+    /// Reduce a bag to its run metrics as JSON (astrum-bag-metrics).
+    #[command(disable_help_flag = true)]
+    Metrics(Forward),
 }
 
 // The tool's arguments, passed on as they are (`--help` shows the tool's own).
@@ -162,6 +165,7 @@ fn main() -> ExitCode {
         Cmd::Record(f) => exec_tool("astrum-bag-record", &f.args),
         Cmd::Play(f) => exec_tool("astrum-bag-play", &f.args),
         Cmd::Export(f) => exec_tool("astrum-web-export", &f.args),
+        Cmd::Metrics(f) => exec_tool("astrum-bag-metrics", &f.args),
     }
 }
 

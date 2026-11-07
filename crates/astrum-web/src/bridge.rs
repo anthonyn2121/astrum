@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use astrum_bag::aircraft_models;
 use astrum_net::zenoh::Wait;
 use astrum_net::{fetch_scenario, EventReceiver, LatestTelemetry, NetError, Selection, Session};
 use astrum_proto::Telemetry;
@@ -39,7 +40,7 @@ use axum::extract::ws::Utf8Bytes;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
-use crate::{aircraft_models, events_message, models_message, run_message, snapshot_message};
+use crate::{events_message, models_message, run_message, snapshot_message};
 
 /// The newest encoded fleet snapshot (`None` until the current run has one).
 pub type Snapshot = Option<Utf8Bytes>;
