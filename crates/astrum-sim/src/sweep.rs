@@ -5,9 +5,9 @@
 //! This module plans a file (parse it, expand its grid, build and validate
 //! every run's scenario up front, so a typo fails before anything flies), runs
 //! runs in-process ([`run_in_process`], for scenarios nothing external
-//! controls), drives a pool of runs ([`execute`]) and writes the summary. The
-//! `astrum` binary adds process mode: a sim plus external controllers per run,
-//! each on its own Zenoh endpoint, and `astrum run`'s single live run.
+//! controls), drives a pool of runs ([`execute`]) and writes the summary.
+//! Process mode — a sim plus external controllers per run, each on its own
+//! Zenoh endpoint — is [`crate::launch::run_processes`].
 //!
 //! A run file is a sweep file without a grid (no `vary`, one repeat); a bare
 //! scenario is a run file with nothing but `base` ([`SweepFile::for_scenario`]).
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::components::{SimClock, SimParams, SimStatus};
 use crate::record;
@@ -360,8 +360,10 @@ fn check_run(file: &SweepFile, purpose: Purpose, run: &Run) -> Result<(), String
     Ok(())
 }
 
-/// How a run ended.
-#[derive(Debug, Clone, PartialEq)]
+/// How a run ended. Serialised as `{"kind": "ok"}` or `{"kind": "failed" |
+/// "stopped", "reason": "..."}`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "lowercase")]
 pub enum Status {
     Ok,
     Failed(String),
@@ -370,7 +372,7 @@ pub enum Status {
 }
 
 /// What one run produced.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Outcome {
     pub status: Status,
     /// Sim time reached, if known.

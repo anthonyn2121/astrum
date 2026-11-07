@@ -148,8 +148,11 @@ pub struct AircraftSpec {
     pub ammo: Option<u16>,
 }
 
-/// Models ASTRUM has tuned profiles for.
-const KNOWN_MODELS: &[(&str, VehicleKind, Option<AutopilotProfile>)] = &[
+/// Models ASTRUM has tuned profiles for: model name (a JSBSim aircraft
+/// directory), its vehicle kind, and — fixed-wing only — its autopilot gains.
+/// A scenario aircraft of one of these models needs no `kind` or
+/// `autopilot_profile`; any other model must state them.
+pub const KNOWN_MODELS: &[(&str, VehicleKind, Option<AutopilotProfile>)] = &[
     ("c172x", VehicleKind::FixedWing, Some(AutopilotProfile::Trainer)),
     ("f16", VehicleKind::FixedWing, Some(AutopilotProfile::Fighter)),
     ("F450", VehicleKind::Multirotor, None),
