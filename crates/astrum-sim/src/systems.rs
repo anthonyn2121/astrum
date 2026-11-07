@@ -349,7 +349,8 @@ pub struct Pacer {
 }
 
 impl Pacer {
-    /// `speed` as validated by the scenario: `0` or at least [`MIN_SPEED`].
+    /// `speed` as validated by the scenario: `0` or at least
+    /// [`astrum_net::MIN_SPEED`].
     pub fn new(dt: f64, speed: f64) -> Self {
         Self { period: Self::period(dt, speed), next: None }
     }
@@ -368,9 +369,6 @@ impl Pacer {
         self.next = None;
     }
 }
-
-/// Slowest supported `sim.speed` other than `0` (unpaced).
-pub const MIN_SPEED: f64 = 1e-3;
 
 /// How far the pacer may fall behind its schedule (sleep overshoot, a slow
 /// tick) and still catch up, so a high speed factor is met on average; beyond

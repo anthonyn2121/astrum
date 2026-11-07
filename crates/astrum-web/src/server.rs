@@ -1,36 +1,29 @@
-//! The `astrum-web` HTTP service: the telemetry WebSocket, the slippy-map tile
-//! proxy, and the static renderer, all on one [`Router`].
+//! The `astrum-web` HTTP service: the telemetry WebSocket, the JSON [`api`],
+//! the slippy-map tile proxy, and the static renderer, all on one [`Router`].
 //!
-//! Telemetry fan-out is latest-value: a blocking thread runs [`pump_snapshots`],
-//! which turns the newest sample of every aircraft into ONE JSON message per
-//! snapshot (at most `1 / min_period` per second, and only when something
-//! changed) and stores it in a [`watch`] channel. Each browser's task forwards
-//! the newest stored message; a browser that falls behind simply skips to the
-//! newest one, and a browser that connects mid-run gets the current snapshot at
-//! once. The payload is a [`Utf8Bytes`], so handing it to N clients is N
-//! reference-count bumps, not N copies.
+//! Each browser's WebSocket task forwards the [`Bridge`]'s feeds on one
+//! socket: the current run note first (on connect and on every attach or
+//! detach), the newest fleet snapshot and aircraft-models message (latest
+//! value: a browser that falls behind skips to the newest one, one that
+//! connects mid-run gets the current ones at once), and every event batch of
+//! its current run, in order. The run note always goes out before anything of
+//! the run it announces.
 //!
-//! Events are NOT latest-value: [`pump_events`] encodes each batch of
-//! `astrum/events` into one `{"type":"events",…}` message and sends it on a
-//! [`broadcast`] channel, which every browser's task forwards in order on the
-//! same socket. A browser gets only the events sent after it connected (no
-//! history); one that falls more than [`EVENT_BACKLOG`] batches behind loses
-//! the oldest of them.
+//! The WebSocket and every `/api` route answer only requests whose `Host` is
+//! `localhost`, an IP literal, or one of [`Config::allowed_hosts`]
+//! ([`host_allowed`]): a page on a domain an attacker re-points at this
+//! server (DNS rebinding) is same-origin with it, so the `Origin` check alone
+//! cannot stop it. Static files and map tiles hold nothing private and stay
+//! open.
 //!
-//! The fleet's aircraft models are latest-value too, and rarely change:
-//! [`pump_models`] polls the sim's (or replay's) `astrum/scenario` queryable,
-//! encodes its `[[aircraft]]` models as one `{"type":"models",…}` message and
-//! stores it in a second [`watch`] channel only when it differs from the
-//! current one. Each browser gets the current message on connect and every
-//! change after that, on the same socket.
+//! [`api`]: crate::api
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use astrum_net::{fetch_scenario, EventReceiver, LatestTelemetry, NetError, Session};
-use astrum_proto::Telemetry;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, State};
@@ -46,10 +39,7 @@ use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::{aircraft_models, events_message, models_message, snapshot_message};
-
-/// The newest encoded fleet snapshot (`None` until the first one).
-pub type Snapshot = Option<Utf8Bytes>;
+use crate::bridge::{Bridge, EventBatch, RunNote, Snapshot};
 
 /// Highest slippy-map zoom the tile proxy accepts.
 pub const MAX_ZOOM: u32 = 22;
@@ -57,13 +47,6 @@ pub const MAX_ZOOM: u32 = 22;
 const MAX_TILE_BYTES: usize = 8 * 1024 * 1024;
 /// Idle WebSocket keep-alive: detects browsers that vanished without a close.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
-/// How often an idle pump re-checks whether anyone is still listening.
-const IDLE_POLL: Duration = Duration::from_secs(1);
-/// Event batches buffered per browser before the slowest one starts losing them.
-pub const EVENT_BACKLOG: usize = 1024;
-/// How long one scenario poll waits for the sim's reply: short, because no
-/// reply simply keeps the models already sent.
-const SCENARIO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -74,13 +57,15 @@ pub struct Config {
     pub tile_url: String,
     /// On-disk tile cache directory.
     pub tile_cache: PathBuf,
+    /// Host names (no port) the WebSocket and the API answer besides
+    /// `localhost` and IP literals; compared case-insensitively.
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone)]
-struct AppState {
-    telemetry: watch::Receiver<Snapshot>,
-    events: broadcast::Sender<Utf8Bytes>,
-    models: watch::Receiver<Option<Utf8Bytes>>,
+pub(crate) struct AppState {
+    pub(crate) bridge: Bridge,
+    pub(crate) allowed_hosts: Arc<[String]>,
     tiles: Arc<TileProxy>,
 }
 
@@ -90,16 +75,11 @@ struct TileProxy {
     client: reqwest::Client,
 }
 
-/// Build the service: `GET /telemetry` (WebSocket: fleet snapshots from
-/// `telemetry`, event batches from `events` and the newest aircraft-models
-/// message from `models`), `GET /tiles/<z>/<x>/<y>.jpg`, and every other path
+/// Build the service: `GET /telemetry` (WebSocket: `bridge`'s run notes, fleet
+/// snapshots, aircraft-models messages and event batches), the JSON API under
+/// `/api` ([`crate::api`]), `GET /tiles/<z>/<x>/<y>.jpg`, and every other path
 /// served from `cfg.root`.
-pub fn router(
-    cfg: Config,
-    telemetry: watch::Receiver<Snapshot>,
-    events: broadcast::Sender<Utf8Bytes>,
-    models: watch::Receiver<Option<Utf8Bytes>>,
-) -> reqwest::Result<Router> {
+pub fn router(cfg: Config, bridge: Bridge) -> reqwest::Result<Router> {
     // Bounded timeouts so an offline upstream fails fast (the renderer then
     // shows the plain grid where the tile would be).
     let client = reqwest::Client::builder()
@@ -113,16 +93,42 @@ pub fn router(
     let static_files =
         SetResponseHeaderLayer::if_not_present(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
             .layer(ServeDir::new(cfg.root));
+    let state = AppState { bridge, allowed_hosts: cfg.allowed_hosts.into(), tiles };
+    // The guard wraps the whole API, fallbacks included, so no route added
+    // there can escape it. Nested as a service, the API also gets `/api` and
+    // `/api/` themselves (a nested router would leave `/api/` to the static
+    // files).
+    let api: Router = crate::api::router()
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::api::guard))
+        .with_state(state.clone());
     Ok(Router::new()
         .route("/telemetry", get(telemetry_ws))
         .route("/tiles/{*rest}", get(tile))
+        .nest_service("/api", api)
         .fallback_service(static_files)
-        .with_state(AppState { telemetry, events, models, tiles }))
+        .with_state(state))
 }
 
-/// Whether a WebSocket upgrade may proceed: requests without an `Origin`
-/// (non-browser clients) are allowed; a browser request must come from a page
-/// served by this host, so an arbitrary web page cannot read the telemetry.
+/// Whether the request's `Host` (port ignored) is one this server answers
+/// for: `localhost`, an IP literal, or one of `allowed` (case-insensitive). A
+/// request without a readable `Host` is refused.
+pub fn host_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let Some(Ok(host)) = headers.get(HOST).map(|h| h.to_str()) else { return false };
+    let Ok(host) = host.parse::<Authority>() else { return false };
+    if host.as_str().contains('@') {
+        return false;
+    }
+    let name = host.host();
+    let bare = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).unwrap_or(name);
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<IpAddr>().is_ok()
+        || allowed.iter().any(|a| a.eq_ignore_ascii_case(bare))
+}
+
+/// Whether a WebSocket upgrade or a state-changing API request may proceed:
+/// requests without an `Origin` (non-browser clients) are allowed; a browser
+/// request must come from a page served by this host, so another site's page
+/// can neither read the telemetry nor drive the sim.
 pub fn origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(ORIGIN) else { return true };
     let Some(host) = headers.get(HOST) else { return false };
@@ -157,35 +163,60 @@ async fn telemetry_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if !host_allowed(&headers, &state.allowed_hosts) {
+        return (StatusCode::FORBIDDEN, "WebSocket refused: host not allowed").into_response();
+    }
     if !origin_allowed(&headers) {
         return (StatusCode::FORBIDDEN, "cross-origin WebSocket refused").into_response();
     }
-    let rx = state.telemetry.clone();
-    let events = state.events.subscribe(); // events from now on
-    let models = state.models.clone();
-    ws.on_upgrade(move |socket| stream_snapshots(socket, rx, events, models))
+    let feeds = Feeds {
+        runs: state.bridge.runs(),
+        snapshots: state.bridge.snapshots(),
+        models: state.bridge.models(),
+        events: state.bridge.events(), // events from now on
+    };
+    ws.on_upgrade(move |socket| stream(socket, feeds))
 }
 
-/// Forward the newest snapshot, every event batch and the newest models
-/// message to one browser until it leaves.
-async fn stream_snapshots(
-    mut socket: WebSocket,
-    mut rx: watch::Receiver<Snapshot>,
-    mut events: broadcast::Receiver<Utf8Bytes>,
-    mut models: watch::Receiver<Option<Utf8Bytes>>,
-) {
-    // Send the current snapshot and models straight away.
-    rx.mark_changed();
+/// One browser's subscriptions to the bridge.
+struct Feeds {
+    runs: watch::Receiver<RunNote>,
+    snapshots: watch::Receiver<Snapshot>,
+    models: watch::Receiver<Option<Utf8Bytes>>,
+    events: broadcast::Receiver<EventBatch>,
+}
+
+/// Forward the run notes, the newest snapshot and models message, and the
+/// current run's event batches to one browser until it leaves.
+async fn stream(mut socket: WebSocket, feeds: Feeds) {
+    let Feeds { mut runs, mut snapshots, mut models, mut events } = feeds;
+    // Send the current run, snapshot and models straight away.
+    runs.mark_changed();
+    snapshots.mark_changed();
     models.mark_changed();
+    let mut run = runs.borrow().run;
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // the first tick is immediate
     loop {
+        // Biased: a run note is published before anything of its run, so
+        // checking it first sends it first.
         tokio::select! {
-            changed = rx.changed() => {
+            biased;
+            changed = runs.changed() => {
                 if changed.is_err() {
-                    break; // the pump is gone
+                    break; // the bridge is gone
                 }
-                let snapshot = rx.borrow_and_update().clone();
+                let note = runs.borrow_and_update().clone();
+                run = note.run;
+                if socket.send(Message::Text(note.message)).await.is_err() {
+                    break;
+                }
+            }
+            changed = snapshots.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let snapshot = snapshots.borrow_and_update().clone();
                 if let Some(text) = snapshot {
                     if socket.send(Message::Text(text)).await.is_err() {
                         break;
@@ -194,7 +225,7 @@ async fn stream_snapshots(
             }
             changed = models.changed() => {
                 if changed.is_err() {
-                    break; // the pump is gone
+                    break;
                 }
                 let message = models.borrow_and_update().clone();
                 if let Some(text) = message {
@@ -204,13 +235,14 @@ async fn stream_snapshots(
                 }
             }
             batch = events.recv() => match batch {
-                Ok(text) => {
-                    if socket.send(Message::Text(text)).await.is_err() {
+                Ok(batch) if batch.run == run => {
+                    if socket.send(Message::Text(batch.message)).await.is_err() {
                         break;
                     }
                 }
+                Ok(_) => {} // queued before this browser heard of the run change
                 Err(RecvError::Lagged(_)) => {} // this browser fell behind; those batches are gone
-                Err(RecvError::Closed) => break, // the pump is gone
+                Err(RecvError::Closed) => break,
             },
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break,
@@ -222,98 +254,6 @@ async fn stream_snapshots(
                 }
             }
         }
-    }
-}
-
-/// Publish fleet snapshots from `latest` into `tx`: at most one per
-/// `min_period`, and only when the fleet state differs from the last one sent.
-/// Samples that arrive while throttled are folded into the next snapshot.
-///
-/// Blocking — run it on a dedicated thread. Returns `Ok` once every receiver
-/// is gone, or the transport error that stopped it.
-pub fn pump_snapshots(
-    latest: &mut LatestTelemetry,
-    tx: &watch::Sender<Snapshot>,
-    min_period: Duration,
-) -> Result<(), NetError> {
-    let mut sent: Vec<Telemetry> = Vec::new();
-    let mut sent_at: Option<Instant> = None;
-    loop {
-        match latest.wait(IDLE_POLL) {
-            Ok(()) => {}
-            Err(NetError::Timeout) if tx.is_closed() => return Ok(()),
-            Err(NetError::Timeout) => continue,
-            Err(e) => return Err(e),
-        }
-        if let Some(at) = sent_at {
-            let due = at + min_period;
-            let now = Instant::now();
-            if due > now {
-                std::thread::sleep(due - now);
-            }
-        }
-        // Mark what arrived while throttled as seen; the snapshot below has it.
-        let _ = latest.wait(Duration::ZERO);
-        let snapshot = latest.snapshot();
-        if snapshot == sent {
-            continue;
-        }
-        tx.send_replace(Some(Utf8Bytes::from(snapshot_message(&snapshot))));
-        sent = snapshot;
-        sent_at = Some(Instant::now());
-    }
-}
-
-/// Forward every event from `events` into `tx`, one message per batch of
-/// events that arrived together, in order. Batches sent while no browser is
-/// connected are dropped.
-///
-/// Blocking — run it on a dedicated thread. Runs until the transport fails and
-/// returns that error.
-pub fn pump_events(events: &EventReceiver, tx: &broadcast::Sender<Utf8Bytes>) -> NetError {
-    loop {
-        let first = match events.recv_timeout(IDLE_POLL) {
-            Ok(e) => e,
-            Err(NetError::Timeout) => continue,
-            Err(e) => return e,
-        };
-        let mut batch = vec![first];
-        batch.extend(events.drain());
-        let _ = tx.send(Utf8Bytes::from(events_message(&batch)));
-    }
-}
-
-/// Keep `tx` holding the fleet's aircraft-models message: ask `session` for the
-/// scenario at once and then every `poll`, and store a new message only when
-/// it differs from the current one, so browsers hear of the fleet once per
-/// change (a restarted sim or replay may fly another scenario). A poll nobody
-/// answers — no sim yet, or between replays — keeps the last message; so does
-/// a reply that is not UTF-8.
-///
-/// Blocking — run it on a dedicated thread. Runs until the transport fails and
-/// returns that error.
-pub fn pump_models(
-    session: &Session,
-    tx: &watch::Sender<Option<Utf8Bytes>>,
-    poll: Duration,
-) -> NetError {
-    loop {
-        let asked = Instant::now();
-        match fetch_scenario(session, SCENARIO_TIMEOUT) {
-            Ok(Some(scenario)) => {
-                let message = models_message(&aircraft_models(&scenario));
-                tx.send_if_modified(|current| {
-                    if current.as_ref().is_some_and(|c| c.as_str() == message) {
-                        return false;
-                    }
-                    *current = Some(Utf8Bytes::from(message));
-                    true
-                });
-            }
-            Ok(None) | Err(NetError::BadScenario(_)) => {}
-            Err(e) => return e,
-        }
-        std::thread::sleep(poll.saturating_sub(asked.elapsed()));
     }
 }
 

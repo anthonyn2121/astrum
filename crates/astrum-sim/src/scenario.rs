@@ -3,13 +3,13 @@
 //! `config/scenario.example.toml`); unknown keys are errors, and every value is
 //! validated before the sim starts.
 
+use astrum_net::{speed_ok, MIN_SPEED};
 use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 
 use crate::components::{AutopilotProfile, VehicleKind};
-use crate::systems::MIN_SPEED;
 
 /// Top-level scenario document.
 #[derive(Resource, Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -282,7 +282,7 @@ impl Scenario {
                 s.max_time_s
             )));
         }
-        if !(s.speed == 0.0 || (s.speed.is_finite() && s.speed >= MIN_SPEED)) {
+        if !speed_ok(s.speed, MIN_SPEED) {
             return Err(ScenarioError(format!(
                 "sim.speed must be 0 (as fast as possible) or >= {MIN_SPEED}, got {}",
                 s.speed

@@ -54,6 +54,7 @@ const state = {
   prevPlayhead: NaN, // last frame's playhead; events crossed since get flashed
   fleetDirty: true,
   models: new Map(), // aircraft id -> JSBSim model (scenario), when known
+  liveRun: null,     // the bridge's run id on this connection, once announced
 };
 
 // ---- colours ----
@@ -190,6 +191,17 @@ const net = new Net({
     }
   },
   onModels: (models) => { state.models = models; },
+  onRun: (run) => {
+    // The bridge was attached to another sim or run: start a fresh timeline
+    // (its models follow), following it live like a fresh connection.
+    if (state.liveRun !== null && run !== state.liveRun) {
+      startLiveRun();
+      state.models = new Map();
+      state.followLive = true;
+      state.playing = true;
+    }
+    state.liveRun = run;
+  },
   onStatus: (st, label) => {
     state.status = st;
     ui.setStatus(st, label);
@@ -226,6 +238,7 @@ function startLiveRun() {
 function connect(url) {
   startLiveRun();
   state.models = new Map(); // the bridge sends the scenario's models on connect
+  state.liveRun = null; // ...and its run, which this connection starts on
   state.mode = "live";
   state.wsUrl = url;
   state.fileError = "";

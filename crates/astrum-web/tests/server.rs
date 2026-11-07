@@ -1,52 +1,29 @@
 //! Behaviour of the HTTP side of `astrum-web`: tile-path validation and the
 //! cache-backed tile proxy, static serving confinement, the WebSocket Origin
-//! check, and the aircraft-models message (its pump and its delivery).
+//! check, and what one browser's WebSocket carries (run notes, snapshots,
+//! events, aircraft models) as the bridge attaches to real Zenoh hubs.
+
+mod common;
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use astrum_net::{ScenarioServer, Session};
-use astrum_web::server::{origin_allowed, parse_tile, pump_models, router, Config, Snapshot};
-use astrum_web::{aircraft_models, models_message};
+use astrum_web::bridge::Bridge;
+use astrum_web::server::{host_allowed, origin_allowed, parse_tile};
+use astrum_web::{aircraft_models, models_message, run_message};
 use axum::body::{to_bytes, Body};
-use axum::extract::ws::Utf8Bytes;
 use axum::http::header::{HOST, ORIGIN};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::Router;
+use common::{config, endpoint, Sim, SECRET};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, watch};
 use tower::ServiceExt;
 
-const SECRET: &str = "top-secret-outside-root";
-
-/// The server's latest-value feeds; a browser's stream ends once one closes,
-/// so a streaming test keeps them alive.
-struct Feeds {
-    _telemetry: watch::Sender<Snapshot>,
-    models: watch::Sender<Option<Utf8Bytes>>,
-}
-
-/// A server over a temp tree: `<tmp>/web/index.html`, `<tmp>/secret.txt`
-/// (outside the static root), and a cache-only tile cache holding `14/3/5.jpg`.
-fn app_with_feeds(tmp: &Path) -> (Router, Feeds) {
-    let web = tmp.join("web");
-    std::fs::create_dir_all(&web).unwrap();
-    std::fs::write(web.join("index.html"), "<h1>astrum</h1>").unwrap();
-    std::fs::write(tmp.join("secret.txt"), SECRET).unwrap();
-    let cache = tmp.join("tiles");
-    std::fs::create_dir_all(cache.join("14/3")).unwrap();
-    std::fs::write(cache.join("14/3/5.jpg"), b"\xff\xd8jpeg").unwrap();
-    let cfg = Config { root: web, tile_url: String::new(), tile_cache: cache };
-    let (telemetry, rx) = watch::channel::<Snapshot>(None);
-    let (events, _) = broadcast::channel(1);
-    let (models, models_rx) = watch::channel(None);
-    let app = router(cfg, rx, events, models_rx).unwrap();
-    (app, Feeds { _telemetry: telemetry, models })
-}
-
+/// A server over a temp tree ([`common::app`]) with a detached bridge.
 fn app(tmp: &Path) -> Router {
-    app_with_feeds(tmp).0
+    common::app(tmp, Bridge::new(config()))
 }
 
 async fn get(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {
@@ -175,16 +152,45 @@ fn origin_check_rejects_cross_origin_pages() {
     assert!(!origin_allowed(&headers(Some("http://localhost:8080"), None)));
 }
 
-/// Send a raw WebSocket upgrade for `/telemetry` and read the response head:
-/// its status code and whatever bytes followed the head.
-async fn upgrade(
-    stream: &mut TcpStream,
-    addr: std::net::SocketAddr,
-    origin: Option<&str>,
-) -> (String, Vec<u8>) {
+#[test]
+fn host_check_accepts_localhost_ip_literals_and_allowed_names_only() {
+    let allowed = ["studio.lan".to_owned()];
+    for host in [
+        "localhost",
+        "localhost:8080",
+        "LOCALHOST:8080",
+        "127.0.0.1:8080",
+        "0.0.0.0",
+        "192.168.1.20:8080",
+        "[::1]:8080",
+        "[fe80::1]",
+        "studio.lan:8080",
+        "Studio.Lan",
+    ] {
+        assert!(host_allowed(&headers(None, Some(host)), &allowed), "{host}");
+    }
+    for host in [
+        "evil.example",
+        "evil.example:8080",
+        "localhost.evil.example",
+        "127.0.0.1.nip.io",
+        "studio.lan.evil.example",
+        "lan",
+        "user@localhost:8080",
+        "",
+    ] {
+        assert!(!host_allowed(&headers(None, Some(host)), &allowed), "{host}");
+    }
+    assert!(!host_allowed(&headers(None, None), &allowed), "a missing Host is refused");
+    assert!(!host_allowed(&headers(None, Some("studio.lan")), &[]), "listed names only");
+}
+
+/// Send a raw WebSocket upgrade for `/telemetry` naming `host` and read the
+/// response head: its status code and whatever bytes followed the head.
+async fn upgrade(stream: &mut TcpStream, host: &str, origin: Option<&str>) -> (String, Vec<u8>) {
     let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
     let req = format!(
-        "GET /telemetry HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+        "GET /telemetry HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{origin}\r\n"
     );
     stream.write_all(req.as_bytes()).await.unwrap();
@@ -203,10 +209,11 @@ async fn upgrade(
     (status, buf.split_off(head_end))
 }
 
-/// Status code of a raw WebSocket upgrade against a running server.
-async fn upgrade_status(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
+/// Status code of a raw WebSocket upgrade naming `host` against a running
+/// server.
+async fn upgrade_status(addr: std::net::SocketAddr, host: &str, origin: Option<&str>) -> String {
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    upgrade(&mut stream, addr, origin).await.0
+    upgrade(&mut stream, host, origin).await.0
 }
 
 /// Split one complete server frame (unmasked, unfragmented) off the front of
@@ -248,76 +255,110 @@ async fn next_text(stream: &mut TcpStream, buf: &mut Vec<u8>) -> String {
 }
 
 #[tokio::test]
-async fn websocket_upgrade_enforces_origin() {
+async fn websocket_upgrade_enforces_origin_and_host() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = app(tmp.path());
+    let app = common::app_allowing(tmp.path(), Bridge::new(config()), &["studio.lan"]);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
+    let here = addr.to_string();
 
-    assert_eq!(upgrade_status(addr, None).await, "101");
-    assert_eq!(upgrade_status(addr, Some(&format!("http://{addr}"))).await, "101");
-    assert_eq!(upgrade_status(addr, Some("http://evil.example")).await, "403");
-    assert_eq!(upgrade_status(addr, Some("http://127.0.0.1:1")).await, "403");
+    assert_eq!(upgrade_status(addr, &here, None).await, "101");
+    assert_eq!(upgrade_status(addr, &here, Some(&format!("http://{addr}"))).await, "101");
+    assert_eq!(upgrade_status(addr, &here, Some("http://evil.example")).await, "403");
+    assert_eq!(upgrade_status(addr, &here, Some("http://127.0.0.1:1")).await, "403");
+    // Same-origin pages on the names a browser reaches this server by.
+    for host in ["localhost:8080", "[::1]:8080", "studio.lan:8080"] {
+        assert_eq!(upgrade_status(addr, host, Some(&format!("http://{host}"))).await, "101");
+    }
+    // A rebound attacker domain is same-origin with itself, but not allowed.
+    let rebound = "evil.example:8080";
+    assert_eq!(upgrade_status(addr, rebound, Some("http://evil.example:8080")).await, "403");
+    assert_eq!(upgrade_status(addr, rebound, None).await, "403");
+}
+
+/// Serve `bridge` on an ephemeral port and open a WebSocket to it: the stream
+/// and the bytes already read past the upgrade.
+async fn browser(tmp: &Path, bridge: Bridge) -> (TcpStream, Vec<u8>) {
+    let app = common::app(tmp, bridge);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (status, buf) = upgrade(&mut stream, &addr.to_string(), None).await;
+    assert_eq!(status, "101");
+    (stream, buf)
 }
 
 const F16_PAIR: &str =
     "[[aircraft]]\nid = 1\nmodel = \"f16\"\n[[aircraft]]\nid = 2\nmodel = \"f16\"\n";
 const TRAINER: &str = "[[aircraft]]\nid = 1\nmodel = \"c172x\"\n";
 
-#[tokio::test]
-async fn websocket_sends_the_models_on_connect_and_on_every_change() {
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_sends_the_run_then_the_models_on_connect_and_on_every_change() {
+    let at = endpoint(0);
+    let hub = Session::listen(&at).unwrap();
+    let scenario = ScenarioServer::serve(&hub, F16_PAIR.to_owned()).unwrap();
+    let bridge = Bridge::new(config());
+    bridge.attach(&at);
     let tmp = tempfile::tempdir().unwrap();
-    let (app, feeds) = app_with_feeds(tmp.path());
-    let first = models_message(&aircraft_models(F16_PAIR));
-    feeds.models.send_replace(Some(Utf8Bytes::from(first.clone())));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await });
+    let (mut stream, mut buf) = browser(tmp.path(), bridge.clone()).await;
 
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let (status, mut buf) = upgrade(&mut stream, addr, None).await;
-    assert_eq!(status, "101");
-    // No snapshot yet, so the models message is the first thing sent.
+    assert_eq!(next_text(&mut stream, &mut buf).await, run_message(1, Some(&at)));
+    // No telemetry, so the models message is the next thing sent.
+    let first = models_message(&aircraft_models(F16_PAIR));
     assert_eq!(next_text(&mut stream, &mut buf).await, first);
 
+    drop(scenario);
+    let _scenario = ScenarioServer::serve(&hub, TRAINER.to_owned()).unwrap();
     let second = models_message(&aircraft_models(TRAINER));
-    feeds.models.send_replace(Some(Utf8Bytes::from(second.clone())));
     assert_eq!(next_text(&mut stream, &mut buf).await, second);
 }
 
-/// Poll `rx` until it holds `want` (marking it seen), failing after 10 s.
-fn wait_for(rx: &mut watch::Receiver<Option<Utf8Bytes>>, want: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while rx.borrow_and_update().as_ref().map(Utf8Bytes::as_str) != Some(want) {
-        assert!(Instant::now() < deadline, "the models message never became {want}");
-        std::thread::sleep(Duration::from_millis(20));
+/// The aircraft a `frames` or `events` message is about.
+fn aircraft(msg: &serde_json::Value) -> Vec<u64> {
+    let (list, key) = match msg["type"].as_str() {
+        Some("frames") => ("frames", "id"),
+        Some("events") => ("events", "aircraft_id"),
+        _ => return Vec::new(),
+    };
+    msg[list].as_array().unwrap().iter().map(|x| x[key].as_u64().unwrap()).collect()
+}
+
+/// Read messages until both a `frames` and an `events` message about aircraft
+/// `id` arrived, asserting that every frame and event in between is about it.
+async fn until_flying(stream: &mut TcpStream, buf: &mut Vec<u8>, id: u64) {
+    let (mut frames, mut events) = (false, false);
+    while !(frames && events) {
+        let text = next_text(stream, buf).await;
+        let msg: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let about = aircraft(&msg);
+        assert!(about.iter().all(|&a| a == id), "expected only aircraft {id}: {text}");
+        match msg["type"].as_str() {
+            Some("frames") => frames |= !about.is_empty(),
+            Some("events") => events |= !about.is_empty(),
+            _ => {}
+        }
     }
 }
 
-#[test]
-fn models_pump_publishes_each_new_fleet_once_and_keeps_it_while_unanswered() {
-    let endpoint = format!("tcp/127.0.0.1:{}", 40_000 + std::process::id() % 20_000);
-    let hub = Session::listen(&endpoint).unwrap();
-    let client = Session::connect(&endpoint, Duration::from_secs(10)).unwrap();
-    let scenario = ScenarioServer::serve(&hub, F16_PAIR.to_owned()).unwrap();
-    let (tx, mut rx) = watch::channel(None);
-    let poll = Duration::from_millis(100);
-    std::thread::spawn(move || pump_models(&client, &tx, poll));
+#[tokio::test(flavor = "multi_thread")]
+async fn reattaching_announces_a_new_run_and_never_mixes_the_sims() {
+    let (a, b) = (endpoint(1), endpoint(2));
+    let _sim_a = Sim::flying(&a, 1);
+    let _sim_b = Sim::flying(&b, 2);
+    let bridge = Bridge::new(config());
+    bridge.attach(&a);
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut stream, mut buf) = browser(tmp.path(), bridge.clone()).await;
 
-    let first = models_message(&aircraft_models(F16_PAIR));
-    wait_for(&mut rx, &first);
-    // The same scenario on every poll is not a change.
-    std::thread::sleep(poll * 5);
-    assert!(!rx.has_changed().unwrap());
+    assert_eq!(next_text(&mut stream, &mut buf).await, run_message(1, Some(&a)));
+    until_flying(&mut stream, &mut buf, 1).await;
 
-    // Unanswered polls (each waits out its timeout) keep the last fleet.
-    drop(scenario);
-    std::thread::sleep(Duration::from_millis(2500));
-    assert!(!rx.has_changed().unwrap());
-    assert_eq!(rx.borrow().as_ref().map(Utf8Bytes::as_str), Some(first.as_str()));
-
-    // A sim that comes back with another fleet replaces it.
-    let _scenario = ScenarioServer::serve(&hub, TRAINER.to_owned()).unwrap();
-    wait_for(&mut rx, &models_message(&aircraft_models(TRAINER)));
+    assert_eq!(bridge.attach(&b), 2);
+    let note = run_message(2, Some(&b));
+    // Skip the old run's tail, up to the new run's note.
+    while next_text(&mut stream, &mut buf).await != note {}
+    // After the note: only the new sim's telemetry and events.
+    until_flying(&mut stream, &mut buf, 2).await;
 }

@@ -3,8 +3,10 @@
 //  * WebSocket — the `astrum-web` bridge streams fleet snapshots,
 //    `{"type":"frames","frames":[FrameJson…]}`, run events,
 //    `{"type":"events","events":[EventJson…]}`, from the live sim or
-//    `astrum-bag-play`, and each aircraft's JSBSim model from the scenario,
-//    `{"type":"models","models":[{"id","model"}…]}` (on connect and on change).
+//    `astrum-bag-play`, each aircraft's JSBSim model from the scenario,
+//    `{"type":"models","models":[{"id","model"}…]}` (on connect and on change),
+//    and which run it carries, `{"type":"run","run":N,"endpoint"}` (on connect
+//    and whenever the bridge is attached elsewhere: a new run starts there).
 //    The store buffers frames and events so you can scrub back through what's
 //    been received (events only from when this page connected).
 //  * File — an `astrum-web-export` document (a whole bag baked to JSON). Loaded
@@ -32,10 +34,11 @@ export function parseModels(list) {
 }
 
 export class Net {
-  constructor({ onFrames, onEvents, onModels, onStatus }) {
+  constructor({ onFrames, onEvents, onModels, onRun, onStatus }) {
     this.onFrames = onFrames;
     this.onEvents = onEvents || (() => {});
     this.onModels = onModels || (() => {});
+    this.onRun = onRun || (() => {});
     this.onStatus = onStatus || (() => {});
     this.ws = null;
   }
@@ -68,6 +71,7 @@ export class Net {
       if (msg.type === "frames" && Array.isArray(msg.frames)) this.onFrames(msg.frames);
       else if (msg.type === "events" && Array.isArray(msg.events)) this.onEvents(msg.events);
       else if (msg.type === "models") this.onModels(parseModels(msg.models));
+      else if (msg.type === "run" && Number.isInteger(msg.run)) this.onRun(msg.run);
     };
   }
 
