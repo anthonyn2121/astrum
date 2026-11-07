@@ -597,6 +597,21 @@ curved WGS84 surface; every other platform keeps the dark ENU grid. Presentation
 plot channels and event filters persist in `localStorage`. Three.js and uPlot are vendored under
 `web/vendor/`.
 
+**Sandbox** (`/sandbox.html?scenario=<name>`, or `/sandbox.html` for a new scenario from the empty
+environment's sim defaults and a chosen location) is the scenario editor: the fleet at its initial
+conditions on a top-down, north-up map over aerial imagery (any platform; an orbit view too).
+Click / Shift+click / Shift+drag selects; drag moves the selection on the horizontal plane at its
+altitude; the yellow knobs rotate the heading (Shift snaps to 5°) and raise or lower it (or
+Alt+drag); wheel zooms, drag on empty map pans. The inspector edits every aircraft field (id,
+model, team, lat/lon or ENU about the origin, altitude HAE, heading, climb, bank, TAS, trim,
+control rate, health, ammo for fixed-wing); **Spawn** places N aircraft of a model in line abreast,
+trail, a grid or at random in a box around the view centre (unique ids, TAS 0 for multirotors,
+previewed as translucent ghosts); duplicate, delete, undo / redo (Ctrl+Z / Ctrl+Shift+Z) and the
+world origin (fields, a location, or pick on the map; optionally moving the fleet with it) round it
+off. A live panel shows the scenario as JSON in `Scenario`'s own serde shape (copyable), with the
+problems `Scenario::validate` would report (unique ids, |climb|, |bank| < 90, finite numbers, …)
+inline.
+
 Both data paths feed one JSON frame shape (`astrum_web::FrameJson`) and one event shape
 (`astrum_web::EventJson`, see [Events](#events)), so the live stream and an offline export can't
 drift:

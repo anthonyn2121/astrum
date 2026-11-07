@@ -374,9 +374,12 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 
 The renderer is static files under `web/` (Three.js and uPlot vendored in `web/vendor/`; the
 modules live in `web/js/`: `main.js` owns playback and selection state, `store.js` the timeline,
-`scene.js`/`meshes.js` the 3-D view, `ui.js` the shell and transport, `fleet.js`, `inspector.js`,
-`eventlog.js` and `plots.js` the docks, `geometry.js` the relative geometry); the bridge and
-exporter are the two binaries in `crates/astrum-web/`, both projecting telemetry through the one
+`scene.js`/`meshes.js` the 3-D view, `environment.js` the sky / map, `geo.js` WGS84 geodetic ⇄
+ECEF ⇄ ENU (the same math as `crates/astrum-geo`, to ~1e-8 m), `ui.js` the shell and transport,
+`fleet.js`, `inspector.js`, `eventlog.js` and `plots.js` the docks, `geometry.js` the relative
+geometry, `api.js` the one `/api` fetch helper; `sandbox.js` + `editstore.js` the scenario
+editor page `sandbox.html`); the bridge and exporter are the two binaries in `crates/astrum-web/`,
+both projecting telemetry through the one
 `astrum_web::FrameJson` shape. The bridge sends one batched snapshot of the fleet at most
 `--max-hz` (default 30) times per second. Telemetry carries only the vehicle class, so the bridge
 also polls `astrum/scenario` every 5 s and sends each aircraft's JSBSim model
@@ -390,6 +393,22 @@ whole nested API service, so new routes inherit the Host, Origin and JSON-body c
 values are checked by `astrum_net::ControlRequest::validate` against `astrum_net::MIN_SPEED`, the
 one limit the sim and the API share.
 
+**Scene edit API** (the sandbox; sweep previews build on it). `Scene.setEditing({onSelect, onEdit,
+onPoint})` turns on edit mode (and the `"map"` environment: imagery for any fleet); the scene only
+*reports* what the pointer did and draws what its store says. `onSelect(ids, "replace" | "toggle" |
+"add")` for clicks / Shift+clicks / Shift+boxes; `onEdit({type: "move" | "raise" | "rotate", phase:
+"start" | "move" | "end" | "cancel", changes})` with `[{id, e, n, u}]` (ENU m) or `[{id,
+heading_deg}]` (a grid bearing; `geo.js` `Datum.northBearing` converts to the true heading); and
+`onPoint({e, n})` for a click on empty ground. Presses on an aircraft or knob are taken in the
+capture phase, so OrbitControls and the tracked-view hand-off never steal them. `setSelection(ids)`
+(last = primary, which gets the handles), `cancelEdit()`, `setOrigin(lat°, lon°, alt)` (the map
+datum from a `[world]`, no telemetry), `setCameraMode("map")` (orthographic, north up; pans and
+zooms by itself), `viewCenter()` / `setViewCenter(e, n)`, and `setGhosts([{kind, e, n, u,
+heading_deg, climb_deg?, bank_deg?, color?}])` (an instanced translucent preview layer; `null`
+clears). Static initial conditions render through `editstore.js`'s `EditStore.setScenario(world,
+aircraft, kindOf)`, which offers what `Scene.update` reads from a store (`ids()`, `track(id).kind`,
+`sampleAt(id, t)`).
+
 **Ground map and sky.** Only when the fleet includes an **F-16** (a scenario `model` starting with
 `f16`; the bridge polls the sim's scenario and sends `{"type":"models",…}`, exports carry
 `meta.models`) does the renderer switch to daytime: a sky dome with the sun, a drifting cumulus deck
@@ -397,7 +416,9 @@ one limit the sim and the API share.
 in level-of-detail rings around the ground point below the camera — fine tiles near it, coarser
 ones out to ~150 km — each tile placed at its exact WGS84 position in the scenario's ENU frame, so
 the map follows the Earth's curvature and stays under the aircraft however far they fly. Every other
-platform (c172x, F450, unknown) keeps the dark ENU grid with no map. Tiles are served by
+platform (c172x, F450, unknown) keeps the dark ENU grid with no map in the viewer; the sandbox
+editor always shows the map (the `"map"` look: daylight, no clouds), its origin set from the
+scenario's `[world]`. Tiles are served by
 `astrum web` at `/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every
 tile under `tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling,
 and an area viewed once while online works **offline** afterward; a tile that 404s (offline +
