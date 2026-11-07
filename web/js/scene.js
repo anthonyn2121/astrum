@@ -172,12 +172,13 @@ const _geo = { lat: 0, lon: 0, h: 0 };
 function blend(dt, tau) { return 1 - Math.exp(-dt / tau); }
 
 // Unit flight-path direction of a sample in world (three) axes; the heading
-// when it is too slow for the velocity to mean anything. `horizontal` drops the
-// vertical component (the side view's track).
-function pathDir(s, horizontal, out) {
+// (`psi`, the fleet entry's grid bearing) when it is too slow for the velocity
+// to mean anything. `horizontal` drops the vertical component (the side
+// view's track).
+function pathDir(s, psi, horizontal, out) {
   out.set(s.vel_e_mps, horizontal ? 0 : s.vel_u_mps, -s.vel_n_mps);
   const speed = out.length();
-  if (speed < SLOW_MPS) return out.set(Math.sin(s.psi_rad), 0, -Math.cos(s.psi_rad));
+  if (speed < SLOW_MPS) return out.set(Math.sin(psi), 0, -Math.cos(psi));
   return out.divideScalar(speed);
 }
 
@@ -886,7 +887,7 @@ export class Scene {
       if (tgt) _v.subVectors(tgt.group.position, p);
       const los = tgt ? _v.length() : 0;
       if (los > 1e-3) _v.divideScalar(los);
-      else pathDir(own.sample, false, _v);
+      else pathDir(own.sample, own.psi, false, _v);
       smoothDir(this._chaseDir, _v, snap ? 1 : blend(dt, TAU_CHASE_DIR));
       _wantCam.copy(this._chaseDir).multiplyScalar(-CHASE.back * zoom).addScaledVector(UP, CHASE.rise * zoom);
       if (los > 1e-3) _wantLook.subVectors(tgt.group.position, p);
@@ -930,7 +931,7 @@ export class Scene {
         }
       }
       if (!haveLos) {
-        pathDir(own.sample, true, _v);
+        pathDir(own.sample, own.psi, true, _v);
         _want.copy(p);
       }
       smoothDir(this._sideDir, _v, snap ? 1 : blend(dt, TAU_SIDE_DIR));
