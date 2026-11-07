@@ -178,7 +178,10 @@ dependencies = [
  "clap",
  "ctrlc",
  "mcap",
+ "serde",
+ "serde_json",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

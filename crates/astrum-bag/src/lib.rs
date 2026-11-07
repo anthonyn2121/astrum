@@ -17,7 +17,10 @@
 //! [`BagWriter`] / [`BagReader`] are the file API; [`Recorder`] and [`replay`]
 //! are the record and replay loops behind the `astrum-bag-record` /
 //! `astrum-bag-play` binaries, written against a [`Session`] so they run on an
-//! in-process session in tests.
+//! in-process session in tests. [`metrics::compute`] reduces a bag to run
+//! metrics (the `astrum-bag-metrics` binary).
+
+pub mod metrics;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -62,6 +65,8 @@ pub enum BagError {
     UnknownTopic(String),
     /// The Zenoh transport failed.
     Net(NetError),
+    /// The bag's recorded scenario is not a valid scenario TOML.
+    Scenario(String),
 }
 
 impl fmt::Display for BagError {
@@ -73,6 +78,7 @@ impl fmt::Display for BagError {
                 write!(f, "not an ASTRUM telemetry/command/events topic: {t:?}")
             }
             BagError::Net(e) => write!(f, "{e}"),
+            BagError::Scenario(e) => write!(f, "recorded scenario ({SCENARIO_METADATA}): {e}"),
         }
     }
 }
@@ -83,7 +89,7 @@ impl std::error::Error for BagError {
             BagError::Io(e) => Some(e),
             BagError::Mcap(e) => Some(e),
             BagError::Net(e) => Some(e),
-            BagError::UnknownTopic(_) => None,
+            BagError::UnknownTopic(_) | BagError::Scenario(_) => None,
         }
     }
 }
