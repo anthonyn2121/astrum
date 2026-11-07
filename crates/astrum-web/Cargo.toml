@@ -25,6 +25,8 @@ path = "src/bin/export.rs"
 astrum-proto = { path = "../astrum-proto" }
 astrum-net = { path = "../astrum-net" }
 astrum-bag = { path = "../astrum-bag" }
+# The studio's catalogs (scenarios, environments, controllers) and, later, runs.
+astrum-sim = { path = "../astrum-sim" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use astrum_web::bridge::{Bridge, BridgeConfig};
+use astrum_web::catalogs::Catalogs;
 use astrum_web::server::{self, Config};
 use clap::Parser;
 
@@ -80,6 +81,11 @@ struct Cli {
     /// is refused, so a rebound attacker domain cannot reach them.
     #[arg(long, env = "ASTRUM_WEB_ALLOWED_HOSTS", value_delimiter = ',')]
     allowed_hosts: Vec<String>,
+
+    /// Config directory: the controller catalog (`controllers.toml`, read at
+    /// startup) and the scenarios (`scenario.<name>.toml`) the studio offers.
+    #[arg(long, env = "ASTRUM_CONFIG_DIR", default_value = "config")]
+    config_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -100,6 +106,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         allowed_hosts.push(host.to_owned());
     }
+    let catalogs = Catalogs::load(&cli.config_dir).map_err(|e| e.to_string())?;
     let bridge = Bridge::new(BridgeConfig { min_period, models_poll: MODELS_POLL });
     bridge.attach(&cli.connect);
 
@@ -108,6 +115,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tile_url: cli.tile_url,
         tile_cache: cli.tile_cache,
         allowed_hosts,
+        catalogs,
     };
     let tiles = if cfg.tile_url.is_empty() {
         format!("cache-only ({})", cfg.tile_cache.display())

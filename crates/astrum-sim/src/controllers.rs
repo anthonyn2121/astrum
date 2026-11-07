@@ -102,7 +102,8 @@ pub struct ControllerSpec {
     /// The law reads other aircraft's telemetry (e.g. a formation follower).
     #[serde(default)]
     pub needs_fleet: bool,
-    #[serde(default, rename = "param")]
+    /// `[[controller.param]]` tables in the catalog; `params` in JSON.
+    #[serde(default, rename(deserialize = "param"))]
     pub params: Vec<ParamSpec>,
 }
 

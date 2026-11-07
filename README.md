@@ -632,15 +632,22 @@ to use the viewer by name from another machine. JSON API: `GET /api/bridge` →
 `{endpoint, run, connected, status}` (`status` is the sim's `astrum ctl status` JSON, or null);
 `POST /api/bridge/control` with `{"action":"pause"|"resume"}`, `{"action":"step","ticks":N}` or
 `{"action":"speed","value":X}` → `{"ok":true}`, or `{"error":…}` with 400 (bad body), 409 (sim
-refused), 503 (no sim). All `/api` requests are subject to the `Host` check (403); non-GET ones
-must also be `Content-Type: application/json` (415) and, from a browser, same-origin (403).
+refused), 503 (no sim). The studio's catalogs are read-only routes over `--config-dir` (default
+`config`): `GET /api/environments` (each environment's locations, sim defaults, models and metric
+ids), `GET /api/models` (model, kind, autopilot profile), `GET /api/controllers` (the controller
+catalog, `{"entries":[…]}`), `GET /api/scenarios` (every `scenario.<name>.toml` there — name,
+summary, environment, fleet, or the error that makes it unflyable) and `GET
+/api/scenarios/<name>` (one scenario in full; 404 when missing, 422 when invalid). All `/api`
+requests are subject to the `Host` check (403); non-GET ones must also be `Content-Type:
+application/json` (415) and, from a browser, same-origin (403).
 
 The same port serves the static `web/` app and the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags:
 `--connect` (default `tcp/127.0.0.1:7447`, attached at startup), `--bind` (default
 `127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`, published on host
-loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache`, `--allowed-hosts`
-— each with an `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback
-(`ASTRUM_WEB_ALLOWED_HOSTS` for the last). `astrum export` takes
+loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache`, `--allowed-hosts`,
+`--config-dir` (its `controllers.toml` is read at startup; a broken one stops the server) — each
+with an `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback
+(`ASTRUM_WEB_ALLOWED_HOSTS` and `ASTRUM_CONFIG_DIR` for the last two). `astrum export` takes
 the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,
 `events`, and `meta` with their counts, the embedded `scenario` TOML and its aircraft `models`
 as `[{"id","model"},…]`, `[]` without a scenario) to `--out` (env fallbacks `ASTRUM_BAG` /

@@ -17,17 +17,33 @@
 //!   [`astrum_net::MIN_SPEED`]), relayed to the attached sim: 200
 //!   `{"ok":true}`; 400 for a bad body; 409 with the sim's reason when it
 //!   refuses; 503 when no sim is reachable.
+//! * **`GET /api/environments`** — every environment
+//!   ([`astrum_sim::catalog::Environment`]): id, name, description, locations,
+//!   sim defaults, models, metric ids.
+//! * **`GET /api/models`** — the models ASTRUM has profiles for
+//!   ([`ModelEntry`](crate::catalogs::ModelEntry)): model, kind, autopilot
+//!   profile.
+//! * **`GET /api/controllers`** — the controller catalog (`{"entries": [...]}`,
+//!   [`astrum_sim::controllers::ControllerSpec`] each).
+//! * **`GET /api/scenarios`** — every `config/scenario.<name>.toml`
+//!   ([`ScenarioEntry`](crate::catalogs::ScenarioEntry)): name, path, summary,
+//!   environment, error (invalid files are listed too), fleet.
+//! * **`GET /api/scenarios/<name>`** — one scenario in full
+//!   ([`ScenarioDoc`](crate::catalogs::ScenarioDoc)): 400 for a name that
+//!   cannot be a file name, 404 when there is none, 422 when the file is not a
+//!   valid scenario.
 //!
-//! Zenoh's calls block, so they run on tokio's blocking pool.
+//! Zenoh's calls and file reads block, so they run on tokio's blocking pool.
 //!
 //! [`host_allowed`]: crate::server::host_allowed
 
 use std::time::Duration;
 
 use astrum_net::{fetch_status, send_control, ControlRequest, NetError, RunStatus, MIN_SPEED};
+use astrum_sim::catalog::environments;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::header::{CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
@@ -37,6 +53,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::BridgeInfo;
+use crate::catalogs::{models, ScenarioError};
 use crate::server::{host_allowed, origin_allowed, AppState};
 
 /// Longest a file-like name ([`safe_name`]) may be.
@@ -52,10 +69,51 @@ pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/bridge", get(bridge_info))
         .route("/bridge/control", post(control))
+        .route("/environments", get(|| async { json(StatusCode::OK, &environments()) }))
+        .route("/models", get(|| async { json(StatusCode::OK, &models()) }))
+        .route("/controllers", get(controllers))
+        .route("/scenarios", get(scenarios))
+        .route("/scenarios/{name}", get(scenario))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no such API route") })
         .method_not_allowed_fallback(|| async {
             error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed on this API route")
         })
+}
+
+async fn controllers(State(state): State<AppState>) -> Response {
+    json(StatusCode::OK, state.catalogs.controllers())
+}
+
+async fn scenarios(State(state): State<AppState>) -> Response {
+    let catalogs = state.catalogs.clone();
+    match tokio::task::spawn_blocking(move || catalogs.scenarios()).await {
+        Ok(Ok(entries)) => json(StatusCode::OK, &entries),
+        Ok(Err(e)) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("listing {}: {e}", state.catalogs.config_dir().display()),
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn scenario(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let catalogs = state.catalogs.clone();
+    let found = match tokio::task::spawn_blocking(move || catalogs.scenario(&name)).await {
+        Ok(found) => found,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    match found {
+        Ok(doc) => json(StatusCode::OK, &doc),
+        Err(e) => {
+            let status = match e {
+                ScenarioError::BadName(_) => StatusCode::BAD_REQUEST,
+                ScenarioError::NotFound(_) => StatusCode::NOT_FOUND,
+                ScenarioError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                ScenarioError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error(status, &e.to_string())
+        }
+    }
 }
 
 /// Check `name` for use as a file-name component (`config/scenario.<name>.toml`

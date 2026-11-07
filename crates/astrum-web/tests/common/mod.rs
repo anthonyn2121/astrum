@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use astrum_net::{EventPublisher, Session, TelemetryPublisher};
 use astrum_proto::{encode_event, Event, EventKind, Telemetry};
 use astrum_web::bridge::{Bridge, BridgeConfig};
+use astrum_web::catalogs::Catalogs;
 use astrum_web::server::{router, Config};
 use axum::Router;
 
@@ -91,6 +92,15 @@ pub fn app(tmp: &Path, bridge: Bridge) -> Router {
 
 /// [`app`], also answering for the host names `allowed_hosts`.
 pub fn app_allowing(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str]) -> Router {
+    build(tmp, bridge, allowed_hosts, repo_catalogs())
+}
+
+/// [`app`] over `catalogs` instead of the repository's `config/`.
+pub fn app_with_catalogs(tmp: &Path, bridge: Bridge, catalogs: Catalogs) -> Router {
+    build(tmp, bridge, &[], catalogs)
+}
+
+fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs) -> Router {
     let web = tmp.join("web");
     std::fs::create_dir_all(&web).unwrap();
     std::fs::write(web.join("index.html"), "<h1>astrum</h1>").unwrap();
@@ -103,6 +113,17 @@ pub fn app_allowing(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str]) -> Route
         tile_url: String::new(),
         tile_cache: cache,
         allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_owned()).collect(),
+        catalogs,
     };
     router(cfg, bridge).unwrap()
+}
+
+/// The repository's `config/`: its controller catalog and bundled scenarios.
+pub fn repo_config() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config")
+}
+
+/// [`Catalogs`] over [`repo_config`].
+pub fn repo_catalogs() -> Catalogs {
+    Catalogs::load(repo_config()).unwrap()
 }

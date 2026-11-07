@@ -20,6 +20,7 @@
 
 pub mod api;
 pub mod bridge;
+pub mod catalogs;
 pub mod export;
 pub mod server;
 

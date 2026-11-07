@@ -40,6 +40,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::bridge::{Bridge, EventBatch, RunNote, Snapshot};
+use crate::catalogs::Catalogs;
 
 /// Highest slippy-map zoom the tile proxy accepts.
 pub const MAX_ZOOM: u32 = 22;
@@ -60,12 +61,15 @@ pub struct Config {
     /// Host names (no port) the WebSocket and the API answer besides
     /// `localhost` and IP literals; compared case-insensitively.
     pub allowed_hosts: Vec<String>,
+    /// The config directory's controller catalog and scenarios (`/api`).
+    pub catalogs: Catalogs,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) bridge: Bridge,
     pub(crate) allowed_hosts: Arc<[String]>,
+    pub(crate) catalogs: Arc<Catalogs>,
     tiles: Arc<TileProxy>,
 }
 
@@ -93,7 +97,12 @@ pub fn router(cfg: Config, bridge: Bridge) -> reqwest::Result<Router> {
     let static_files =
         SetResponseHeaderLayer::if_not_present(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
             .layer(ServeDir::new(cfg.root));
-    let state = AppState { bridge, allowed_hosts: cfg.allowed_hosts.into(), tiles };
+    let state = AppState {
+        bridge,
+        allowed_hosts: cfg.allowed_hosts.into(),
+        catalogs: Arc::new(cfg.catalogs),
+        tiles,
+    };
     // The guard wraps the whole API, fallbacks included, so no route added
     // there can escape it. Nested as a service, the API also gets `/api` and
     // `/api/` themselves (a nested router would leave `/api/` to the static

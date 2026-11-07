@@ -256,6 +256,7 @@ dependencies = [
  "astrum-bag",
  "astrum-net",
  "astrum-proto",
+ "astrum-sim",
  "axum",
  "clap",
  "reqwest",
