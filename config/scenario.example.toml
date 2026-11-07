@@ -43,6 +43,10 @@ lockstep_timeout_s = 30.0
 # needs `kind = "fixed-wing" | "multirotor"` and, if fixed-wing,
 # `autopilot_profile = "trainer" | "fighter"`. Fixed-wing aircraft are trimmed
 # for level flight at spawn (`trim = false` to skip); a failed trim is fatal.
+# `climb_deg` (flight-path angle, + = climbing) and `bank_deg` (+ = right wing
+# down), both default 0 and strictly within ±90: a trimmed aircraft is trimmed
+# into that steady climb and, if banked, a steady coordinated turn; an untrimmed
+# one (multirotor, `trim = false`) simply starts with that velocity and roll.
 # `control_rate_hz` (default: every tick) publishes that aircraft's telemetry —
 # and, in lockstep, waits for its commands — at a lower rate that divides
 # rate_hz; the last command holds in between.

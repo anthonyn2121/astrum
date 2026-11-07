@@ -24,6 +24,7 @@
 //! let mut fdm = Fdm::load("/opt/jsbsim/share/jsbsim".as_ref(), "c172x")?;
 //! fdm.set_initial_conditions(&InitialConditions {
 //!     lat_geod_deg: 37.6, lon_deg: -122.4, alt_hae_m: 1500.0, psi_true_deg: 90.0, tas_mps: 55.0,
+//!     gamma_deg: 0.0, phi_deg: 0.0,
 //! })?;
 //! fdm.run_ic()?;
 //! fdm.start_engines()?;
@@ -105,6 +106,11 @@ pub struct InitialConditions {
     pub psi_true_deg: f64,
     /// True airspeed, m/s.
     pub tas_mps: f64,
+    /// Flight-path angle (climb), degrees; + = climbing. A trim holds it.
+    pub gamma_deg: f64,
+    /// Bank angle, degrees; + = right wing down. [`TrimMode::Full`] re-trims it
+    /// to wings level; [`TrimMode::Turn`] holds it as a coordinated turn.
+    pub phi_deg: f64,
 }
 
 /// One instance's state after a step, in SI units (angles in radians).
@@ -184,6 +190,9 @@ pub enum TrimMode {
     Full = 1,
     /// On-ground trim.
     Ground = 2,
+    /// Steady coordinated turn at the IC bank (`ic/phi-deg`): load factor
+    /// 1/cos φ, turn rate g·tan φ / V (JSBSim `tTurn`).
+    Turn = 5,
 }
 
 // --- FFI -------------------------------------------------------------------
@@ -341,7 +350,7 @@ impl Fdm {
         self.check(st)
     }
 
-    /// Stage initial conditions (level flight: zero bank and flight-path angle).
+    /// Stage initial conditions (position, heading, airspeed, flight-path angle, bank).
     /// They take effect on the next [`run_ic`](Self::run_ic) / [`reset`](Self::reset).
     pub fn set_initial_conditions(&mut self, ic: &InitialConditions) -> Result<()> {
         {
@@ -358,9 +367,11 @@ impl Fdm {
             self.check(st)?;
         }
         self.set("ic/psi-true-deg", ic.psi_true_deg)?;
-        self.set("ic/phi-deg", 0.0)?;
-        self.set("ic/gamma-deg", 0.0)?;
-        self.set("ic/vt-fps", ic.tas_mps / FT_TO_M)
+        // Speed first: JSBSim scales the existing velocity vector, so the angles
+        // set afterwards orient a non-zero velocity rather than being lost.
+        self.set("ic/vt-fps", ic.tas_mps / FT_TO_M)?;
+        self.set("ic/phi-deg", ic.phi_deg)?;
+        self.set("ic/gamma-deg", ic.gamma_deg)
     }
 
     /// Apply the staged initial conditions.

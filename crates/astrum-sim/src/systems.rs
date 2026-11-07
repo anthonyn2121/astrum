@@ -41,12 +41,15 @@ fn initial_conditions(spec: &AircraftSpec) -> InitialConditions {
         alt_hae_m: spec.alt_hae_m,
         psi_true_deg: spec.heading_deg,
         tas_mps: spec.tas_mps,
+        gamma_deg: spec.climb_deg,
+        phi_deg: spec.bank_deg,
     }
 }
 
 /// Everything after the ICs are applied: engines on, the multirotor SCAS
-/// engaged, the trim (if configured).
-fn finish_init(fdm: &mut Fdm, class: &AircraftClass) -> Result<(), FdmError> {
+/// engaged, the trim (if configured) — wings-level, or a coordinated turn when
+/// the spec banks.
+fn finish_init(fdm: &mut Fdm, spec: &AircraftSpec, class: &AircraftClass) -> Result<(), FdmError> {
     // An airborne start: without this a piston engine is off and throttle inert.
     fdm.start_engines()?;
     if class.kind == VehicleKind::Multirotor {
@@ -54,7 +57,7 @@ fn finish_init(fdm: &mut Fdm, class: &AircraftClass) -> Result<(), FdmError> {
         fdm.set(prop::SCAS_ENGAGE, 1.0)?;
     }
     if class.trim {
-        fdm.trim(TrimMode::Full)?;
+        fdm.trim(if spec.bank_deg == 0.0 { TrimMode::Full } else { TrimMode::Turn })?;
     }
     Ok(())
 }
@@ -72,7 +75,7 @@ pub fn build_fdm(
     fdm.set(prop::RANDOM_SEED, fdm_seed(seed, spec.id)).map_err(ctx)?;
     fdm.set_initial_conditions(&initial_conditions(spec)).map_err(ctx)?;
     fdm.run_ic().map_err(ctx)?;
-    finish_init(&mut fdm, class).map_err(ctx)?;
+    finish_init(&mut fdm, spec, class).map_err(ctx)?;
     Ok(fdm)
 }
 
@@ -89,7 +92,7 @@ pub fn reset_fdm(
     fdm.set(prop::RANDOM_SEED, fdm_seed(seed, spec.id)).map_err(ctx)?;
     fdm.set_initial_conditions(&initial_conditions(spec)).map_err(ctx)?;
     fdm.reset().map_err(ctx)?;
-    finish_init(fdm, class).map_err(ctx)
+    finish_init(fdm, spec, class).map_err(ctx)
 }
 
 /// Map JSBSim's state onto the world grid.

@@ -91,3 +91,25 @@ fn invalid_values_are_rejected() {
         control("1.0").replace("rate_hz = 120.0", "rate_hz = 120.0\ncommand_lease_s = 0.0");
     assert!(Scenario::from_toml_str(&no_lease).is_ok());
 }
+
+#[test]
+fn climb_and_bank_are_bounded_and_omitted_when_zero() {
+    let with =
+        |k: &str, v: &str| BASE.replace("tas_mps = 55.0", &format!("tas_mps = 55.0\n{k} = {v}"));
+    for key in ["climb_deg", "bank_deg"] {
+        for bad in ["90.0", "-90.0", "120.0", "nan", "inf"] {
+            let e = err(&with(key, bad));
+            assert!(e.contains("aircraft 1") && e.contains(key), "{key} = {bad}: {e}");
+        }
+        for ok in ["89.9", "-89.9", "0.0", "30.0"] {
+            let s = Scenario::from_toml_str(&with(key, ok)).unwrap();
+            assert_eq!(Scenario::from_toml_str(&s.to_toml()).unwrap(), s, "{key} = {ok}");
+        }
+    }
+    let s = Scenario::from_toml_str(BASE).unwrap();
+    assert_eq!((s.aircraft[0].climb_deg, s.aircraft[0].bank_deg), (0.0, 0.0), "default 0");
+    let toml = s.to_toml();
+    assert!(!toml.contains("climb_deg") && !toml.contains("bank_deg"), "zero omitted:\n{toml}");
+    let banked = Scenario::from_toml_str(&with("bank_deg", "-20.0")).unwrap().to_toml();
+    assert!(banked.contains("bank_deg = -20.0") && !banked.contains("climb_deg"), "{banked}");
+}
