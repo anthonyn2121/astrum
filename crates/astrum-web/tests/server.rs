@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use astrum_net::{ScenarioServer, Session};
 use astrum_web::bridge::Bridge;
-use astrum_web::server::{origin_allowed, parse_tile};
+use astrum_web::server::{host_allowed, origin_allowed, parse_tile};
 use astrum_web::{aircraft_models, models_message, run_message};
 use axum::body::{to_bytes, Body};
 use axum::http::header::{HOST, ORIGIN};
@@ -152,16 +152,45 @@ fn origin_check_rejects_cross_origin_pages() {
     assert!(!origin_allowed(&headers(Some("http://localhost:8080"), None)));
 }
 
-/// Send a raw WebSocket upgrade for `/telemetry` and read the response head:
-/// its status code and whatever bytes followed the head.
-async fn upgrade(
-    stream: &mut TcpStream,
-    addr: std::net::SocketAddr,
-    origin: Option<&str>,
-) -> (String, Vec<u8>) {
+#[test]
+fn host_check_accepts_localhost_ip_literals_and_allowed_names_only() {
+    let allowed = ["studio.lan".to_owned()];
+    for host in [
+        "localhost",
+        "localhost:8080",
+        "LOCALHOST:8080",
+        "127.0.0.1:8080",
+        "0.0.0.0",
+        "192.168.1.20:8080",
+        "[::1]:8080",
+        "[fe80::1]",
+        "studio.lan:8080",
+        "Studio.Lan",
+    ] {
+        assert!(host_allowed(&headers(None, Some(host)), &allowed), "{host}");
+    }
+    for host in [
+        "evil.example",
+        "evil.example:8080",
+        "localhost.evil.example",
+        "127.0.0.1.nip.io",
+        "studio.lan.evil.example",
+        "lan",
+        "user@localhost:8080",
+        "",
+    ] {
+        assert!(!host_allowed(&headers(None, Some(host)), &allowed), "{host}");
+    }
+    assert!(!host_allowed(&headers(None, None), &allowed), "a missing Host is refused");
+    assert!(!host_allowed(&headers(None, Some("studio.lan")), &[]), "listed names only");
+}
+
+/// Send a raw WebSocket upgrade for `/telemetry` naming `host` and read the
+/// response head: its status code and whatever bytes followed the head.
+async fn upgrade(stream: &mut TcpStream, host: &str, origin: Option<&str>) -> (String, Vec<u8>) {
     let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
     let req = format!(
-        "GET /telemetry HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+        "GET /telemetry HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{origin}\r\n"
     );
     stream.write_all(req.as_bytes()).await.unwrap();
@@ -180,10 +209,11 @@ async fn upgrade(
     (status, buf.split_off(head_end))
 }
 
-/// Status code of a raw WebSocket upgrade against a running server.
-async fn upgrade_status(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
+/// Status code of a raw WebSocket upgrade naming `host` against a running
+/// server.
+async fn upgrade_status(addr: std::net::SocketAddr, host: &str, origin: Option<&str>) -> String {
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    upgrade(&mut stream, addr, origin).await.0
+    upgrade(&mut stream, host, origin).await.0
 }
 
 /// Split one complete server frame (unmasked, unfragmented) off the front of
@@ -225,17 +255,26 @@ async fn next_text(stream: &mut TcpStream, buf: &mut Vec<u8>) -> String {
 }
 
 #[tokio::test]
-async fn websocket_upgrade_enforces_origin() {
+async fn websocket_upgrade_enforces_origin_and_host() {
     let tmp = tempfile::tempdir().unwrap();
-    let app = app(tmp.path());
+    let app = common::app_allowing(tmp.path(), Bridge::new(config()), &["studio.lan"]);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
+    let here = addr.to_string();
 
-    assert_eq!(upgrade_status(addr, None).await, "101");
-    assert_eq!(upgrade_status(addr, Some(&format!("http://{addr}"))).await, "101");
-    assert_eq!(upgrade_status(addr, Some("http://evil.example")).await, "403");
-    assert_eq!(upgrade_status(addr, Some("http://127.0.0.1:1")).await, "403");
+    assert_eq!(upgrade_status(addr, &here, None).await, "101");
+    assert_eq!(upgrade_status(addr, &here, Some(&format!("http://{addr}"))).await, "101");
+    assert_eq!(upgrade_status(addr, &here, Some("http://evil.example")).await, "403");
+    assert_eq!(upgrade_status(addr, &here, Some("http://127.0.0.1:1")).await, "403");
+    // Same-origin pages on the names a browser reaches this server by.
+    for host in ["localhost:8080", "[::1]:8080", "studio.lan:8080"] {
+        assert_eq!(upgrade_status(addr, host, Some(&format!("http://{host}"))).await, "101");
+    }
+    // A rebound attacker domain is same-origin with itself, but not allowed.
+    let rebound = "evil.example:8080";
+    assert_eq!(upgrade_status(addr, rebound, Some("http://evil.example:8080")).await, "403");
+    assert_eq!(upgrade_status(addr, rebound, None).await, "403");
 }
 
 /// Serve `bridge` on an ephemeral port and open a WebSocket to it: the stream
@@ -246,7 +285,7 @@ async fn browser(tmp: &Path, bridge: Bridge) -> (TcpStream, Vec<u8>) {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    let (status, buf) = upgrade(&mut stream, addr, None).await;
+    let (status, buf) = upgrade(&mut stream, &addr.to_string(), None).await;
     assert_eq!(status, "101");
     (stream, buf)
 }
@@ -318,7 +357,8 @@ async fn reattaching_announces_a_new_run_and_never_mixes_the_sims() {
 
     assert_eq!(bridge.attach(&b), 2);
     let note = run_message(2, Some(&b));
-    while next_text(&mut stream, &mut buf).await != note {} // the old run's tail
-                                                            // After the note: only the new sim's telemetry and events.
+    // Skip the old run's tail, up to the new run's note.
+    while next_text(&mut stream, &mut buf).await != note {}
+    // After the note: only the new sim's telemetry and events.
     until_flying(&mut stream, &mut buf, 2).await;
 }

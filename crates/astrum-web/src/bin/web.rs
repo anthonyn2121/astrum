@@ -11,9 +11,10 @@
 //!    connect and whenever the bridge is attached elsewhere (everything after
 //!    it belongs to the new run). The upstream is the Zenoh stream, so the
 //!    source is either the live sim or `astrum-bag-play`. Upgrades from another
-//!    origin are refused.
+//!    origin, or naming a `Host` other than `localhost`, an IP address or one
+//!    of `--allowed-hosts`, are refused.
 //!  * **`/api/…`** — the JSON API (`astrum_web::api`): bridge status and run
-//!    control.
+//!    control, behind the same `Host` check.
 //!  * **`GET /tiles/<z>/<x>/<y>.jpg`** — slippy-map tile proxy with a disk cache.
 //!  * **`GET /…`** — static files from `--root`.
 //!
@@ -72,6 +73,13 @@ struct Cli {
     /// tile fetched once while online is served from here afterwards (offline).
     #[arg(long, env = "ASTRUM_TILE_CACHE", default_value = "tilecache")]
     tile_cache: PathBuf,
+
+    /// Extra host names (comma-separated, no port) the telemetry WebSocket and
+    /// `/api` answer for, besides `localhost` and IP addresses — e.g. the
+    /// machine's DNS name when browsing to it from elsewhere. Any other `Host`
+    /// is refused, so a rebound attacker domain cannot reach them.
+    #[arg(long, env = "ASTRUM_WEB_ALLOWED_HOSTS", value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
 }
 
 #[tokio::main]
@@ -81,10 +89,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("--max-hz must be a positive number, got {}", cli.max_hz).into());
     }
     let min_period = Duration::from_secs_f64(1.0 / cli.max_hz);
+    let mut allowed_hosts = Vec::new();
+    for host in cli.allowed_hosts.iter().map(|h| h.trim()).filter(|h| !h.is_empty()) {
+        if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+            return Err(format!(
+                "--allowed-hosts: {host:?} is not a bare host name (letters, digits, '.', '-'; \
+                 no port)"
+            )
+            .into());
+        }
+        allowed_hosts.push(host.to_owned());
+    }
     let bridge = Bridge::new(BridgeConfig { min_period, models_poll: MODELS_POLL });
     bridge.attach(&cli.connect);
 
-    let cfg = Config { root: cli.root, tile_url: cli.tile_url, tile_cache: cli.tile_cache };
+    let cfg = Config {
+        root: cli.root,
+        tile_url: cli.tile_url,
+        tile_cache: cli.tile_cache,
+        allowed_hosts,
+    };
     let tiles = if cfg.tile_url.is_empty() {
         format!("cache-only ({})", cfg.tile_cache.display())
     } else {

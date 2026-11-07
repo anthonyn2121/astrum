@@ -9,8 +9,16 @@
 //! its current run, in order. The run note always goes out before anything of
 //! the run it announces.
 //!
+//! The WebSocket and every `/api` route answer only requests whose `Host` is
+//! `localhost`, an IP literal, or one of [`Config::allowed_hosts`]
+//! ([`host_allowed`]): a page on a domain an attacker re-points at this
+//! server (DNS rebinding) is same-origin with it, so the `Origin` check alone
+//! cannot stop it. Static files and map tiles hold nothing private and stay
+//! open.
+//!
 //! [`api`]: crate::api
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -49,11 +57,15 @@ pub struct Config {
     pub tile_url: String,
     /// On-disk tile cache directory.
     pub tile_cache: PathBuf,
+    /// Host names (no port) the WebSocket and the API answer besides
+    /// `localhost` and IP literals; compared case-insensitively.
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) bridge: Bridge,
+    pub(crate) allowed_hosts: Arc<[String]>,
     tiles: Arc<TileProxy>,
 }
 
@@ -81,17 +93,41 @@ pub fn router(cfg: Config, bridge: Bridge) -> reqwest::Result<Router> {
     let static_files =
         SetResponseHeaderLayer::if_not_present(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
             .layer(ServeDir::new(cfg.root));
+    let state = AppState { bridge, allowed_hosts: cfg.allowed_hosts.into(), tiles };
+    // The guard wraps the whole API, fallbacks included, so no route added
+    // there can escape it. Nested as a service, the API also gets `/api` and
+    // `/api/` themselves (a nested router would leave `/api/` to the static
+    // files).
+    let api: Router = crate::api::router()
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::api::guard))
+        .with_state(state.clone());
     Ok(Router::new()
         .route("/telemetry", get(telemetry_ws))
         .route("/tiles/{*rest}", get(tile))
-        .nest("/api", crate::api::router())
+        .nest_service("/api", api)
         .fallback_service(static_files)
-        .with_state(AppState { bridge, tiles }))
+        .with_state(state))
+}
+
+/// Whether the request's `Host` (port ignored) is one this server answers
+/// for: `localhost`, an IP literal, or one of `allowed` (case-insensitive). A
+/// request without a readable `Host` is refused.
+pub fn host_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let Some(Ok(host)) = headers.get(HOST).map(|h| h.to_str()) else { return false };
+    let Ok(host) = host.parse::<Authority>() else { return false };
+    if host.as_str().contains('@') {
+        return false;
+    }
+    let name = host.host();
+    let bare = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).unwrap_or(name);
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<IpAddr>().is_ok()
+        || allowed.iter().any(|a| a.eq_ignore_ascii_case(bare))
 }
 
 /// Whether a WebSocket upgrade or a state-changing API request may proceed:
 /// requests without an `Origin` (non-browser clients) are allowed; a browser
-/// request must come from a page served by this host, so an arbitrary web page
+/// request must come from a page served by this host, so another site's page
 /// can neither read the telemetry nor drive the sim.
 pub fn origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(ORIGIN) else { return true };
@@ -127,6 +163,9 @@ async fn telemetry_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if !host_allowed(&headers, &state.allowed_hosts) {
+        return (StatusCode::FORBIDDEN, "WebSocket refused: host not allowed").into_response();
+    }
     if !origin_allowed(&headers) {
         return (StatusCode::FORBIDDEN, "cross-origin WebSocket refused").into_response();
     }

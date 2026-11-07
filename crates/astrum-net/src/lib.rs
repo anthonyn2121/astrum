@@ -794,6 +794,9 @@ impl PresenceWatcher {
 
 // --- Run control ----------------------------------------------------------------
 
+/// Slowest supported `sim.speed` other than `0` (unpaced).
+pub const MIN_SPEED: f64 = 1e-3;
+
 /// A request on `astrum/control/*`. Control decides only when ticks run (pause,
 /// step, pace), never what a tick computes, so a lockstep run is unchanged by it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -819,6 +822,18 @@ impl ControlRequest {
         }
     }
 
+    /// Check a request's values: `Step` needs at least one tick, `Speed` must
+    /// be 0 (unpaced) or finite and at least `min_speed`.
+    pub fn validate(self, min_speed: f64) -> Result<Self, String> {
+        match self {
+            ControlRequest::Step(0) => Err("step needs ticks >= 1, got 0".into()),
+            ControlRequest::Speed(x) if !(x == 0.0 || (x.is_finite() && x >= min_speed)) => {
+                Err(format!("speed must be 0 (unpaced) or >= {min_speed}, got {x}"))
+            }
+            valid => Ok(valid),
+        }
+    }
+
     /// Parse and check a request; `min_speed` is the slowest non-zero speed.
     fn parse(
         key: &str,
@@ -826,21 +841,24 @@ impl ControlRequest {
         min_speed: f64,
     ) -> Result<Self, String> {
         let op = key.strip_prefix(keys::CONTROL_PREFIX).and_then(|k| k.strip_prefix('/'));
-        match op {
-            Some("pause") => Ok(ControlRequest::Pause),
-            Some("resume") => Ok(ControlRequest::Resume),
+        let request = match op {
+            Some("pause") => ControlRequest::Pause,
+            Some("resume") => ControlRequest::Resume,
             Some("step") => match param("ticks").map(|t| t.parse::<u64>()) {
-                Some(Ok(n)) if n > 0 => Ok(ControlRequest::Step(n)),
-                _ => Err("step needs ?ticks=<N> with N >= 1".into()),
+                Some(Ok(n)) => ControlRequest::Step(n),
+                _ => return Err("step needs ?ticks=<N> with N >= 1".into()),
             },
             Some("speed") => match param("value").map(|v| v.parse::<f64>()) {
-                Some(Ok(x)) if x == 0.0 || (x.is_finite() && x >= min_speed) => {
-                    Ok(ControlRequest::Speed(x))
+                Some(Ok(x)) => ControlRequest::Speed(x),
+                _ => {
+                    return Err(format!(
+                        "speed needs ?value=<X> with X = 0 (unpaced) or >= {min_speed}"
+                    ))
                 }
-                _ => Err(format!("speed needs ?value=<X> with X = 0 (unpaced) or >= {min_speed}")),
             },
-            _ => Err(format!("unknown control {key} (pause, resume, step, speed)")),
-        }
+            _ => return Err(format!("unknown control {key} (pause, resume, step, speed)")),
+        };
+        request.validate(min_speed)
     }
 }
 

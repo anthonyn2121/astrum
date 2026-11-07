@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use astrum_bag::wall_clock_ns;
 use astrum_net::{
     CommandReceiver, CommandReject, ControlServer, EventPublisher, Presence, PresenceWatcher,
-    Session, TelemetryPublisher, TickPublisher,
+    Session, TelemetryPublisher, TickPublisher, MIN_SPEED,
 };
 use astrum_proto::{
     encode_command, encode_telemetry, Aero, BodyRates, CombatStatus, Command, Euler, EventKind,
@@ -35,7 +35,7 @@ use crate::control::Board;
 use crate::events::EventLog;
 use crate::pilot::{apply_command, enter_failsafe, Pilot, Refusal};
 use crate::record::TickRecorder;
-use crate::systems::{StopRequested, MIN_SPEED};
+use crate::systems::StopRequested;
 use crate::RunMode;
 
 /// Put `app` on the bus: telemetry and events out, commands in, controller

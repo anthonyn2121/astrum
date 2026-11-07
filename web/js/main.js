@@ -193,10 +193,12 @@ const net = new Net({
   onModels: (models) => { state.models = models; },
   onRun: (run) => {
     // The bridge was attached to another sim or run: start a fresh timeline
-    // (its models follow).
+    // (its models follow), following it live like a fresh connection.
     if (state.liveRun !== null && run !== state.liveRun) {
       startLiveRun();
       state.models = new Map();
+      state.followLive = true;
+      state.playing = true;
     }
     state.liveRun = run;
   },

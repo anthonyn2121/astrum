@@ -208,21 +208,29 @@ impl Bridge {
 
     /// The current attachment.
     pub fn info(&self) -> BridgeInfo {
-        let current = self.shared.lock();
-        let attachment = current.attachment.as_ref();
-        BridgeInfo {
-            endpoint: attachment.map(|a| a.endpoint.clone()),
-            run: current.run,
-            connected: attachment.is_some_and(|a| a.connected),
-        }
+        self.link().0
     }
 
     /// The attached session while a sim is reachable through it, for relaying
     /// requests to the sim. Its Zenoh calls block: make them (and drop the
     /// handle) off the async runtime's worker threads.
     pub fn session(&self) -> Option<Session> {
+        self.link().1
+    }
+
+    /// [`info`](Self::info) and [`session`](Self::session) read together, so
+    /// they describe the same attachment.
+    pub fn link(&self) -> (BridgeInfo, Option<Session>) {
         let current = self.shared.lock();
-        current.attachment.as_ref().filter(|a| a.connected).and_then(|a| a.session.clone())
+        let attachment = current.attachment.as_ref();
+        let connected = attachment.is_some_and(|a| a.connected);
+        let info = BridgeInfo {
+            endpoint: attachment.map(|a| a.endpoint.clone()),
+            run: current.run,
+            connected,
+        };
+        let session = attachment.filter(|_| connected).and_then(|a| a.session.clone());
+        (info, session)
     }
 
     /// The newest fleet snapshot of the current run.
@@ -353,17 +361,17 @@ impl Feed {
             let latest = &mut latest;
             let pumps = [
                 spawn()
-                    .name("telemetry".into())
+                    .name("bridge-telemetry".into())
                     .spawn_scoped(scope, move || {
                         halting(pump_snapshots(latest, self, stop, config.min_period))
                     })
                     .expect("spawning the telemetry thread"),
                 spawn()
-                    .name("events".into())
+                    .name("bridge-events".into())
                     .spawn_scoped(scope, move || halting(pump_events(&events, self, stop)))
                     .expect("spawning the events thread"),
                 spawn()
-                    .name("models".into())
+                    .name("bridge-models".into())
                     .spawn_scoped(scope, move || {
                         halting(pump_models(session, self, stop, config.models_poll))
                     })

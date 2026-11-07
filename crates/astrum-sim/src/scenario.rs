@@ -3,13 +3,13 @@
 //! `config/scenario.example.toml`); unknown keys are errors, and every value is
 //! validated before the sim starts.
 
+use astrum_net::MIN_SPEED;
 use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 
 use crate::components::{AutopilotProfile, VehicleKind};
-use crate::systems::MIN_SPEED;
 
 /// Top-level scenario document.
 #[derive(Resource, Debug, Clone, PartialEq, Deserialize, Serialize)]

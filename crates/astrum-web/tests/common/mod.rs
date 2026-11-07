@@ -17,10 +17,12 @@ use astrum_web::server::{router, Config};
 use axum::Router;
 
 /// A Zenoh endpoint on this process's own port block (`n` < 10), so parallel
-/// tests and concurrently running test binaries do not collide.
+/// tests and concurrently running test binaries do not collide. The band
+/// (11000–16999) is below the Linux ephemeral range and clear of the other
+/// crates' test ports (astrum-net: 20000–39999).
 pub fn endpoint(n: u32) -> String {
     assert!(n < 10);
-    format!("tcp/127.0.0.1:{}", 40_000 + (std::process::id() % 2_000) * 10 + n)
+    format!("tcp/127.0.0.1:{}", 11_000 + (std::process::id() % 600) * 10 + n)
 }
 
 /// Fast pumps, so tests see changes quickly.
@@ -84,6 +86,11 @@ pub const SECRET: &str = "top-secret-outside-root";
 /// `<tmp>/secret.txt` (outside the static root), and a cache-only tile cache
 /// holding `14/3/5.jpg`.
 pub fn app(tmp: &Path, bridge: Bridge) -> Router {
+    app_allowing(tmp, bridge, &[])
+}
+
+/// [`app`], also answering for the host names `allowed_hosts`.
+pub fn app_allowing(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str]) -> Router {
     let web = tmp.join("web");
     std::fs::create_dir_all(&web).unwrap();
     std::fs::write(web.join("index.html"), "<h1>astrum</h1>").unwrap();
@@ -91,6 +98,11 @@ pub fn app(tmp: &Path, bridge: Bridge) -> Router {
     let cache = tmp.join("tiles");
     std::fs::create_dir_all(cache.join("14/3")).unwrap();
     std::fs::write(cache.join("14/3/5.jpg"), b"\xff\xd8jpeg").unwrap();
-    let cfg = Config { root: web, tile_url: String::new(), tile_cache: cache };
+    let cfg = Config {
+        root: web,
+        tile_url: String::new(),
+        tile_cache: cache,
+        allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_owned()).collect(),
+    };
     router(cfg, bridge).unwrap()
 }
