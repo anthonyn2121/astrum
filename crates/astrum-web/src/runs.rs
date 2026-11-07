@@ -29,9 +29,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use astrum_bag::BagReader;
 use astrum_net::{speed_ok, MIN_SPEED};
 use astrum_sim::controllers::ControllerCatalog;
-use astrum_sim::launch::{Children, LiveRun, LiveSpec, Log, LogLine, LogStream};
+use astrum_sim::launch::{Children, ControllerCmd, LiveRun, LiveSpec, Log, LogLine, LogStream};
 use astrum_sim::scenario::Scenario;
-use astrum_sim::sweep::{Outcome, Status};
+use astrum_sim::sweep::Outcome;
 use astrum_sim::systems::StopRequested;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -281,10 +281,8 @@ struct AssignmentBody {
 struct Plan {
     name: Option<String>,
     scenario: Scenario,
-    controllers: Vec<String>,
-    /// Each controller's name in the run's log and messages, in
-    /// `controllers` order: `aircraft <id>`.
-    labels: Vec<String>,
+    /// Named by their aircraft: "aircraft 1's controller", source "aircraft 1".
+    controllers: Vec<ControllerCmd>,
     assignments: Vec<Assignment>,
 }
 
@@ -398,20 +396,18 @@ impl Runs {
         };
         let listen = format!("tcp/127.0.0.1:{port}");
         let bag = dir.join(BAG_FILE);
-        let labels = Arc::new(plan.labels);
         let (tx, rx) = mpsc::channel();
         // The log thread keeps the run's lines in the channel until the run's
         // record (and its log ring) is installed, and discards them if it
         // never is; it ends once the run's processes (the senders) are gone.
         let (log_installed_tx, log_installed) = mpsc::channel::<()>();
         let logs = self.clone();
-        let (log_id, log_labels) = (id.clone(), Arc::clone(&labels));
+        let log_id = id.clone();
         let log_thread =
             std::thread::Builder::new().name(format!("run-log-{id}")).spawn(move || {
                 let keep = log_installed.recv().is_ok();
-                for mut line in rx {
+                for line in rx {
                     if keep {
-                        relabel_line(&mut line, &log_labels);
                         logs.push_log(&log_id, line);
                     }
                 }
@@ -443,7 +439,6 @@ impl Runs {
                 drop(log_installed_tx);
                 let _ = log_thread.join();
                 let _ = std::fs::remove_dir_all(&dir);
-                let why = relabel(&why.to_string(), &labels);
                 return Err(RunError::Failed(format!("starting the run: {why}")));
             }
         };
@@ -459,7 +454,7 @@ impl Runs {
             let outcome = live.wait();
             let _ = log_thread.join();
             let _ = installed.recv();
-            monitor.finish(&monitor_id, &monitor_dir, outcome, &labels, &done_tx);
+            monitor.finish(&monitor_id, &monitor_dir, outcome, &done_tx);
         });
         let handle = match handle {
             Ok(handle) => handle,
@@ -514,16 +509,10 @@ impl Runs {
     }
 
     /// The run has ended (every process reaped, its log drained): write its
-    /// metrics, mark it finished, and send the bridge back to `--connect` if
-    /// it is still on this run.
-    fn finish(
-        &self,
-        id: &str,
-        dir: &Path,
-        mut outcome: Outcome,
-        labels: &[String],
-        done: &watch::Sender<bool>,
-    ) {
+    /// metrics, send the bridge back to `--connect` if it still carries this
+    /// run, then mark the run finished — so whoever sees `finished` also sees
+    /// the bridge back home.
+    fn finish(&self, id: &str, dir: &Path, outcome: Outcome, done: &watch::Sender<bool>) {
         if dir.join(BAG_FILE).is_file() {
             if let Err(why) = write_metrics(dir) {
                 self.push_log(
@@ -536,23 +525,15 @@ impl Runs {
                 );
             }
         }
-        outcome.status = match outcome.status {
-            Status::Failed(why) => Status::Failed(relabel(&why, labels)),
-            Status::Stopped(why) => Status::Stopped(relabel(&why, labels)),
-            Status::Ok => Status::Ok,
-        };
-        let bridge_run = {
-            let mut state = self.lock();
-            let record = state.current.as_mut().filter(|r| r.view.id == id);
-            record.map(|record| {
-                record.view.state = RunState::Finished;
-                record.view.finished_at_ms = Some(now_ms());
-                record.view.outcome = Some(outcome);
-                record.bridge_run
-            })
-        };
+        let bridge_run =
+            self.lock().current.as_ref().filter(|r| r.view.id == id).map(|r| r.bridge_run);
         if bridge_run.is_some_and(|run| self.0.bridge.info().run == run) {
             self.0.bridge.attach(&self.0.cfg.connect);
+        }
+        if let Some(record) = self.lock().current.as_mut().filter(|r| r.view.id == id) {
+            record.view.state = RunState::Finished;
+            record.view.finished_at_ms = Some(now_ms());
+            record.view.outcome = Some(outcome);
         }
         done.send_replace(true);
     }
@@ -689,8 +670,16 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
             })?;
         }
     }
-    let labels = assignments.iter().map(|a| format!("aircraft {}", a.aircraft)).collect();
-    Ok(Plan { name, scenario, controllers, labels, assignments })
+    let controllers = controllers
+        .into_iter()
+        .zip(&assignments)
+        .map(|(command, a)| ControllerCmd {
+            command,
+            name: format!("aircraft {}'s controller", a.aircraft),
+            source: format!("aircraft {}", a.aircraft),
+        })
+        .collect();
+    Ok(Plan { name, scenario, controllers, assignments })
 }
 
 /// Check that a controller's program can start: a path (relative to the
@@ -717,33 +706,6 @@ fn find_program(program: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("`{program}` not found on PATH"))
-    }
-}
-
-/// `text` with a leading `controller <k>` (the supervisor's name for the k-th
-/// controller started) replaced by `labels[k-1]`'s controller.
-fn relabel(text: &str, labels: &[String]) -> String {
-    // Longest number first: `controller 12` is not `controller 1` + "2".
-    for (k, label) in labels.iter().enumerate().rev() {
-        let name = format!("controller {}", k + 1);
-        if let Some(rest) = text.strip_prefix(&name) {
-            if rest.is_empty() || rest.starts_with([' ', ':']) {
-                return format!("{label}'s controller{rest}");
-            }
-        }
-    }
-    text.to_owned()
-}
-
-/// A log line with the k-th controller's source (`ctl<k>`) named by its
-/// aircraft, and the supervisor's messages relabelled.
-fn relabel_line(line: &mut LogLine, labels: &[String]) {
-    if let Some(k) = line.source.strip_prefix("ctl").and_then(|k| k.parse::<usize>().ok()) {
-        if let Some(label) = k.checked_sub(1).and_then(|i| labels.get(i)) {
-            line.source.clone_from(label);
-        }
-    } else if line.source == "astrum" {
-        line.line = relabel(&line.line, labels);
     }
 }
 

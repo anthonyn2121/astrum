@@ -82,12 +82,15 @@ export class RunPanel {
       panel: $("runPanel"), id: $("runId"), state: $("runState"), stop: $("runStopBtn"),
       collapse: $("runCollapseBtn"), body: $("runBody"), info: $("runInfo"), error: $("runError"),
       result: $("runResult"), outcome: $("runOutcome"), metrics: $("runMetrics"), replay: $("runReplayBtn"),
+      moved: $("runMovedNote"),
       log: $("runLog"), logCount: $("runLogCount"), logLines: $("runLogLines"),
     };
     this.view = null;        // the run's RunView while it is the current run
     this.current = false;    // it is the server's current run
     this.done = false;       // finished (or not current): nothing left to poll
     this.resultShown = false;
+    this.replayable = false; // finished with a recording to replay
+    this.missing = false;    // no such run here, or it has no recording
     this.logNext = 0;        // the next log seq to ask for
     this.logTotal = 0;
     this.timer = 0;
@@ -212,6 +215,8 @@ export class RunPanel {
     setText(el.outcome, this.view?.outcome
       ? [outcomeText(this.view.outcome), paceText(this.view.outcome)].filter(Boolean).join(" · ")
       : "");
+    // Only a run this server flew and finished moved the live stream on.
+    el.moved.hidden = !this.current;
     try {
       const metrics = await getRunMetrics(this.runId);
       el.metrics.replaceChildren();
@@ -222,9 +227,16 @@ export class RunPanel {
         dd.textContent = text;
         el.metrics.append(dt, dd);
       }
+      this.replayable = true;
     } catch (e) {
       // No recording (404), or no such run (400): nothing to replay either.
-      if (e instanceof ApiError && (e.status === 404 || e.status === 400)) el.replay.hidden = true;
+      if (e instanceof ApiError && (e.status === 404 || e.status === 400)) {
+        el.replay.hidden = true;
+        el.moved.hidden = true;
+        this.missing = true;
+      } else {
+        this.replayable = true; // the replay may still load
+      }
       this._error(`metrics: ${e.message || e}`);
     }
   }
@@ -234,10 +246,12 @@ export class RunPanel {
     btn.disabled = true;
     btn.textContent = "Stopping…";
     try {
-      this.view = await stopRun();
+      const view = await stopRun();
+      // Final from here on: a poll in flight must not bring back "running".
+      this.view = view;
       this.current = true;
-      await this._pollLog().catch(() => {});
       this.done = true;
+      await this._pollLog().catch(() => {});
       this._error("");
     } catch (e) {
       this._error(`stop: ${e.message || e}`);

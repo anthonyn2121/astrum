@@ -178,9 +178,9 @@ function validAircraftDefault(row, p) {
   return Number.isInteger(d) && d !== row.aircraft.id && state.scenario.aircraft.some((o) => o.id === d) ? d : null;
 }
 
-// Whose initial conditions a target param starts from: the aircraft the
-// controller follows when it has an `aircraft` param (a formation follower
-// holds its leader's altitude), else the controlled aircraft itself.
+// Whose initial conditions a target param starts from: the aircraft picked in
+// the controller's `aircraft` param (a formation follower holds its leader's
+// altitude), else — none picked, or no such param — the controlled aircraft.
 function targetSource(row) {
   for (const [, f] of row.fields) {
     if (f.spec.type !== "aircraft") continue;
@@ -277,8 +277,10 @@ function paramValue(row, p) {
   const raw = row.fields.get(p.name).input.value.trim();
   const fleetIds = state.scenario.aircraft.map((a) => a.id);
   if (raw === "") {
-    // Empty: the catalog default — for an aircraft, only a valid one.
-    if (p.type === "aircraft") return validAircraftDefault(row, p) != null ? { value: undefined } : { error: "pick an aircraft" };
+    // An aircraft select left on (or set back to) "— pick an aircraft —"
+    // asks for a pick, whatever the catalog default; elsewhere empty means
+    // the catalog default.
+    if (p.type === "aircraft") return { error: "pick an aircraft" };
     return p.default != null ? { value: undefined } : { error: "required" };
   }
   switch (p.type) {

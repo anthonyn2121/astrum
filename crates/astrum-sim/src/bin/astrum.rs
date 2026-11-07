@@ -28,8 +28,8 @@ use std::time::Instant;
 
 use astrum_sim::catalog;
 use astrum_sim::launch::{
-    connect_endpoint, run_processes, run_timeout, sibling, Children, Companion, LiveRun, LiveSpec,
-    Log, ProcessCtx, StartError,
+    connect_endpoint, numbered, run_processes, run_timeout, sibling, Children, Companion, LiveRun,
+    LiveSpec, Log, ProcessCtx, StartError,
 };
 use astrum_sim::sweep::{
     execute, run_in_process, write_summary, Purpose, Status, Sweep, SweepFile,
@@ -303,7 +303,7 @@ fn run(args: &RunArgs) -> ExitCode {
         listen: args.listen.clone(),
         record: args.record.clone(),
         companions,
-        controllers,
+        controllers: numbered(controllers),
         run_timeout: run_timeout(sweep.file.run_timeout_s),
         fail_fast: true,
         log: Log::Terminal,

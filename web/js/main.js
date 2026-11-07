@@ -426,7 +426,8 @@ function emptyText() {
   if (state.mode === "file" || state.fileError) return state.fileError || "The recording has no telemetry.";
   const url = state.wsUrl || defaultWsUrl();
   if (state.status === "connecting") return `Connecting to ${url}…`;
-  if (runPanel?.done) return `Run ${runId} has ended; open its full replay from the run panel.`;
+  if (runPanel?.replayable) return `Run ${runId} has ended; open its full replay from the run panel.`;
+  if (runPanel?.missing) return `This server has no recorded run ${runId}. Start one from Interactive, or open a recording.`;
   if (state.connected) {
     return runId ? `Connected to ${url}. Waiting for run ${runId}'s first frame.`
       : `Connected to ${url}. Waiting for the first frame.`;

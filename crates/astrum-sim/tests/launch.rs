@@ -18,8 +18,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use astrum_sim::launch::{
-    connect_endpoint, run_processes, Children, Companion, LiveRun, LiveSpec, Log, LogLine,
-    LogStream, ProcessCtx, StartError,
+    connect_endpoint, numbered, run_processes, Children, Companion, ControllerCmd, LiveRun,
+    LiveSpec, Log, LogLine, LogStream, ProcessCtx, StartError,
 };
 use astrum_sim::scenario::Scenario;
 use astrum_sim::sweep::{Outcome, Purpose, Status, Sweep, SweepFile};
@@ -97,7 +97,7 @@ fn output_arrives_as_whole_tagged_lines_and_a_clean_sim_exit_is_ok() {
     );
     let (log, rx) = channel();
     let mut s = spec(sim, log);
-    s.controllers = vec!["sh -c 'echo \"ctl at $ASTRUM_ZENOH_CONNECT\"'".into()];
+    s.controllers = numbered(["sh -c 'echo \"ctl at $ASTRUM_ZENOH_CONNECT\"'"]);
     let children = Children::new();
     let live = LiveRun::start(s, &children).unwrap();
     assert_eq!(live.endpoint(), "tcp/127.0.0.1:27600");
@@ -167,7 +167,7 @@ fn a_failing_controller_fails_the_run_and_fail_fast_stops_it() {
     let dir = tempfile::tempdir().unwrap();
     let sim = script(dir.path(), "sim", UNTIL_TERM);
     let mut s = spec(sim, channel().0);
-    s.controllers = vec!["sh -c 'exit 0'".into(), "sh -c 'exit 3'".into()];
+    s.controllers = numbered(["sh -c 'exit 0'", "sh -c 'exit 3'"]);
     let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
     assert_eq!(outcome.status, Status::Failed("controller 2 exited (exit status: 3)".into()));
 }
@@ -179,16 +179,37 @@ fn a_controller_failing_fast_is_the_problem_even_if_the_stopped_sim_dies_of_the_
     // No TERM trap: the fail-fast SIGTERM kills it.
     let sim = script(dir.path(), "sim", "while true; do sleep 0.02; done");
     let mut s = spec(sim, channel().0);
-    s.controllers = vec!["sh -c 'exit 3'".into()];
+    s.controllers = numbered(["sh -c 'exit 3'"]);
     let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
     assert_eq!(outcome.status, Status::Failed("controller 1 exited (exit status: 3)".into()));
 
     // A sim that fails by its own exit code is still the problem.
     let sim = script(dir.path(), "sim2", "trap 'exit 2' TERM\nwhile true; do sleep 0.02; done");
     let mut s = spec(sim, channel().0);
-    s.controllers = vec!["sh -c 'exit 3'".into()];
+    s.controllers = numbered(["sh -c 'exit 3'"]);
     let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
     assert_eq!(outcome.status, Status::Failed("sim exited (exit status: 2)".into()));
+}
+
+#[test]
+fn a_controller_carries_its_own_name_and_log_source() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let sim = script(dir.path(), "sim", UNTIL_TERM);
+    let (log, rx) = channel();
+    let mut s = spec(sim, log);
+    s.controllers = vec![ControllerCmd {
+        command: "sh -c 'echo up; exit 3'".into(),
+        name: "aircraft 7's controller".into(),
+        source: "aircraft 7".into(),
+    }];
+    let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
+    assert_eq!(
+        outcome.status,
+        Status::Failed("aircraft 7's controller exited (exit status: 3)".into())
+    );
+    let lines: Vec<LogLine> = rx.try_iter().collect();
+    assert!(lines.contains(&line("aircraft 7", LogStream::Stdout, "up")), "{lines:?}");
 }
 
 #[test]
@@ -198,7 +219,7 @@ fn without_fail_fast_the_run_flies_on_and_fails_at_its_end() {
     let sim = script(dir.path(), "sim", "sleep 0.3\necho done");
     let (log, rx) = channel();
     let mut s = spec(sim, log);
-    s.controllers = vec!["sh -c 'exit 3'".into()];
+    s.controllers = numbered(["sh -c 'exit 3'"]);
     s.fail_fast = false;
     let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
     assert_eq!(outcome.status, Status::Failed("controller 1 exited (exit status: 3)".into()));
@@ -211,7 +232,7 @@ fn a_sim_that_fails_by_itself_is_the_problem_even_after_a_controller_quit() {
     let dir = tempfile::tempdir().unwrap();
     let sim = script(dir.path(), "sim", "sleep 0.2\nexit 2");
     let mut s = spec(sim, channel().0);
-    s.controllers = vec!["sh -c 'exit 1'".into()];
+    s.controllers = numbered(["sh -c 'exit 1'"]);
     s.fail_fast = false;
     let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
     assert_eq!(outcome.status, Status::Failed("sim exited (exit status: 2)".into()));
@@ -241,7 +262,7 @@ fn companions_and_controllers_are_stopped_with_the_run() {
     let sim = script(dir.path(), "sim", "sleep 0.2");
     let mut s = spec(sim, channel().0);
     s.companions = vec![companion("sleep", &["30"], None)];
-    s.controllers = vec!["sleep 30".into()];
+    s.controllers = numbered(["sleep 30"]);
     let children = Children::new();
     let outcome = LiveRun::start(s, &children).unwrap().wait();
     assert_eq!(outcome.status, Status::Ok);
@@ -255,14 +276,14 @@ fn a_controller_that_cannot_start_is_an_error_and_leaves_nothing_running() {
     let dir = tempfile::tempdir().unwrap();
     let sim = script(dir.path(), "sim", UNTIL_TERM);
     let mut s = spec(sim, channel().0);
-    s.controllers = vec!["sh -c 'sleep 30'".into(), "/nonexistent/ctl --id 2".into()];
+    s.controllers = numbered(["sh -c 'sleep 30'", "/nonexistent/ctl --id 2"]);
     let children = Children::new();
     let Err(StartError::Launch(why)) = LiveRun::start(s, &children) else { panic!("started") };
     assert!(why.starts_with("controller 2: starting `/nonexistent/ctl`: "), "{why}");
     assert!(children.pids().is_empty());
 
     let mut s = spec(dir.path().join("sim"), channel().0);
-    s.controllers = vec!["unbalanced 'quote".into()];
+    s.controllers = numbered(["unbalanced 'quote"]);
     let Err(StartError::Launch(why)) = LiveRun::start(s, &children) else { panic!("started") };
     assert_eq!(why, "controller 1: cannot split `unbalanced 'quote`");
 }
@@ -283,7 +304,7 @@ fn dropping_a_running_run_stops_it_and_reaps_its_processes() {
     let dir = tempfile::tempdir().unwrap();
     let sim = script(dir.path(), "sim", UNTIL_TERM);
     let mut s = spec(sim, channel().0);
-    s.controllers = vec!["sleep 30".into()];
+    s.controllers = numbered(["sleep 30"]);
     let children = Children::new();
     let live = LiveRun::start(s, &children).unwrap();
     assert_eq!(children.pids().len(), 2);
@@ -299,7 +320,7 @@ fn file_logs_hold_each_process_and_point_at_the_sim_log_on_failure() {
     let sim = script(dir.path(), "sim", &format!("sleep 0.3\n{STOPPED}\nexit 1"));
     let mut s = spec(sim, Log::Files { dir: dir.path().to_owned(), stem: "run-0007".into() });
     s.scenario_file = Some(dir.path().join("run-0007.toml"));
-    s.controllers = vec!["echo hello".into()];
+    s.controllers = numbered(["echo hello"]);
     s.fail_fast = false;
     let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
     assert_eq!(
@@ -400,7 +421,7 @@ fn a_background_grandchild_holding_the_output_does_not_hold_up_the_run() {
     let sim = script(dir.path(), "sim", "sleep 0.3");
     let (log, rx) = channel();
     let mut s = spec(sim, log);
-    s.controllers = vec!["sh -c 'sleep 6 & echo started'".into()];
+    s.controllers = numbered(["sh -c 'sleep 6 & echo started'"]);
     let outcome = LiveRun::start(s, &Children::new()).unwrap().wait();
     assert_eq!(outcome.status, Status::Ok);
     assert!(outcome.wall_s < 3.0, "waited {} s for the grandchild", outcome.wall_s);
@@ -415,7 +436,7 @@ fn a_companion_is_announced_once_started_before_the_controllers() {
     let (log, rx) = channel();
     let mut s = spec(sim, log);
     s.companions = vec![companion("sleep", &["30"], Some("viewer: http://localhost:8080"))];
-    s.controllers = vec!["echo ctl".into()];
+    s.controllers = numbered(["echo ctl"]);
     assert_eq!(LiveRun::start(s, &Children::new()).unwrap().wait().status, Status::Ok);
     let lines: Vec<LogLine> = rx.try_iter().collect();
     let at = |l: LogLine| lines.iter().position(|x| *x == l);

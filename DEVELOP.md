@@ -400,10 +400,11 @@ aircraft instead of failing in `LiveRun::start`) and launched on the blocking po
 (`LiveRun::start` with `Log::Channel`), so a client that goes away mid-request cannot leave a
 half-started run. The log and monitor threads exist before the run's record is installed and act
 only once it is (a failed install drops the run and its lines); the monitor `wait`s for the run,
-drains its log, writes `metrics.json` and only then marks it finished — so `finished` means the
-metrics are on disk — and sends the bridge back to `--connect` if it still carries the run.
-Controllers are named by aircraft: `ctl<k>` log sources and the supervisor's `controller <k>`
-become `aircraft <id>` (spawn order = assignment order). Stop requests flip the run's own stop
+drains its log, writes `metrics.json`, sends the bridge back to `--connect` if it still carries
+the run, and only then marks it finished — so `finished` means the metrics are on disk and the
+bridge is home. Each `LiveSpec` controller is a `launch::ControllerCmd` carrying its name and log
+source: `astrum run` and sweeps use `launch::numbered` (`controller k` / `ctlk`), studio runs
+name them by aircraft (`aircraft N's controller` / `aircraft N`). Stop requests flip the run's own stop
 handle and await the monitor's `watch` channel; nothing holds a lock across an await. The log
 ring's `seq` is monotonic over the server's lifetime (a reader's stale `since` never hides a new
 run's lines). `astrum-web` stops the active run when it is told to shut down (`Runs::close`) and
