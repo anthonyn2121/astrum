@@ -1,8 +1,11 @@
 //! `astrum-web` — stream live/replayed telemetry to the browser and serve the
 //! static 3-D renderer, on one port.
 //!
-//!  * **`GET /telemetry`** (WebSocket) — one JSON message per fleet snapshot,
-//!    `{"type":"frames","frames":[FrameJson…]}`, at most `--max-hz` per second,
+//!  * **`GET /telemetry`** (WebSocket) — every aircraft's telemetry thinned to
+//!    at most `--sample-hz` samples per SIM second (plus each aircraft's
+//!    newest), batched as `{"type":"frames","frames":[FrameJson…]}` at most
+//!    `--max-hz` times per wall second (several samples per aircraft each,
+//!    time-ordered per aircraft),
 //!    plus every `astrum/events` event as `{"type":"events","events":[EventJson…]}`
 //!    (in order, never throttled; a browser that connects mid-run gets only the
 //!    events from then on), plus the scenario's aircraft models as
@@ -56,9 +59,15 @@ struct Cli {
     #[arg(long, env = "ASTRUM_WEB_ROOT", default_value = "web")]
     root: PathBuf,
 
-    /// Most fleet snapshots per second sent to each browser.
+    /// Most sample batches per (wall) second sent to each browser.
     #[arg(long, env = "ASTRUM_WEB_MAX_HZ", default_value_t = 30.0)]
     max_hz: f64,
+
+    /// Most telemetry samples per aircraft per SIM second sent to each browser
+    /// (each batch also carries every aircraft's newest sample), so trails stay
+    /// smooth when the sim runs faster than real time.
+    #[arg(long, env = "ASTRUM_WEB_SAMPLE_HZ", default_value_t = 30.0)]
+    sample_hz: f64,
 
     /// Upstream slippy-map tile template (`{z}`/`{x}`/`{y}` placeholders); the
     /// renderer's ground map is proxied + cached through `/tiles/`. Default: Esri
@@ -91,10 +100,14 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    if !(cli.max_hz.is_finite() && cli.max_hz > 0.0) {
-        return Err(format!("--max-hz must be a positive number, got {}", cli.max_hz).into());
-    }
-    let min_period = Duration::from_secs_f64(1.0 / cli.max_hz);
+    let period = |flag: &str, hz: f64| -> Result<Duration, String> {
+        Some(hz)
+            .filter(|hz| hz.is_finite() && *hz > 0.0)
+            .and_then(|hz| Duration::try_from_secs_f64(1.0 / hz).ok())
+            .ok_or_else(|| format!("{flag} must be a positive number, got {hz}"))
+    };
+    let min_period = period("--max-hz", cli.max_hz)?;
+    let sample_period = period("--sample-hz", cli.sample_hz)?;
     let mut allowed_hosts = Vec::new();
     for host in cli.allowed_hosts.iter().map(|h| h.trim()).filter(|h| !h.is_empty()) {
         if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
@@ -107,7 +120,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         allowed_hosts.push(host.to_owned());
     }
     let catalogs = Catalogs::load(&cli.config_dir).map_err(|e| e.to_string())?;
-    let bridge = Bridge::new(BridgeConfig { min_period, models_poll: MODELS_POLL });
+    let bridge = Bridge::new(BridgeConfig { min_period, sample_period, models_poll: MODELS_POLL });
     bridge.attach(&cli.connect);
 
     let cfg = Config {
@@ -131,8 +144,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr = listener.local_addr()?;
     println!("[astrum-web] serving {root} on http://{addr}");
     println!(
-        "[astrum-web] telemetry WebSocket at ws://{addr}/telemetry (attached to {}, ≤{} Hz)",
-        cli.connect, cli.max_hz
+        "[astrum-web] telemetry WebSocket at ws://{addr}/telemetry (attached to {}, ≤{} \
+         samples per sim second in ≤{} batches per second)",
+        cli.connect, cli.sample_hz, cli.max_hz
     );
     println!("[astrum-web] map tiles: {tiles}");
 

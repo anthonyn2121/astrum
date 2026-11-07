@@ -337,3 +337,91 @@ fn render_unbounded_numbers_exactly_and_rejects_unprintable_ones() {
     }
     assert_eq!(argv(-0.0), rest("-0"));
 }
+
+// --- `astrum controllers` -------------------------------------------------------
+
+const CATALOG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/controllers.toml");
+
+/// `astrum controllers --config <shipped catalog> <args>`: exit code, stdout, stderr.
+fn cli(args: &[&str]) -> (Option<i32>, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_astrum"))
+        .arg("controllers")
+        .args(args)
+        .args(["--config", CATALOG])
+        .output()
+        .unwrap();
+    let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
+    (out.status.code(), text(out.stdout), text(out.stderr))
+}
+
+#[test]
+fn cli_lists_every_entry_with_its_kinds_and_name() {
+    let (code, stdout, _) = cli(&[]);
+    assert_eq!(code, Some(0));
+    // Columns are separated by two or more spaces (names hold single ones).
+    let rows: Vec<Vec<&str>> = stdout
+        .lines()
+        .map(|l| l.split("  ").map(str::trim).filter(|c| !c.is_empty()).collect())
+        .collect();
+    let want: Vec<Vec<String>> = shipped()
+        .entries()
+        .iter()
+        .map(|e| {
+            let kinds: Vec<&str> = e
+                .kinds
+                .iter()
+                .map(|k| match k {
+                    VehicleKind::FixedWing => "fixed-wing",
+                    VehicleKind::Multirotor => "multirotor",
+                })
+                .collect();
+            vec![e.id.clone(), kinds.join(","), e.name.clone()]
+        })
+        .collect();
+    assert_eq!(rows, want);
+    assert_eq!(rows[1], ["cpp-autopilot", "fixed-wing,multirotor", "C++ autopilot"]);
+}
+
+#[test]
+fn cli_render_prints_the_catalogs_command_line() {
+    let (code, stdout, _) =
+        cli(&["render", "py-formation", "--id", "3", "--fleet", "1,2,3", "--param", "slot=left"]);
+    assert_eq!(code, Some(0));
+    let params = BTreeMap::from([("slot".to_owned(), toml::Value::String("left".into()))]);
+    let line = shipped().get("py-formation").unwrap().render(3, &params, &[1, 2, 3]).unwrap();
+    assert_eq!(stdout, format!("{line}\n"));
+    // Values parse as TOML: an integer is a valid number.
+    let (code, stdout, _) = cli(&["render", "cpp-hold", "--id", "1", "--param", "alt=4572"]);
+    assert_eq!(code, Some(0));
+    assert!(split(stdout.trim_end()).windows(2).any(|w| w == ["--alt", "4572"]), "{stdout}");
+}
+
+#[test]
+fn cli_render_errors_exit_2_naming_the_entry_or_param() {
+    let cases: [(&[&str], &str); 5] = [
+        (&["render", "nope", "--id", "1"], "unknown controller `nope`"),
+        (
+            &["render", "cpp-hold", "--id", "1", "--param", "bogus=1"],
+            "unknown controller param `bogus`",
+        ),
+        (&["render", "cpp-hold", "--id", "1", "--param", "alt=high"], "controller param `alt`"),
+        (
+            &["render", "cpp-hold", "--id", "1", "--param", "alt=1", "--param", "alt=2"],
+            "param `alt` given twice",
+        ),
+        // The leader must be in the fleet, which defaults to the flown aircraft alone.
+        (&["render", "py-formation", "--id", "2"], "aircraft 1 is not in the scenario"),
+    ];
+    for (args, message) in cases {
+        let (code, stdout, stderr) = cli(args);
+        assert_eq!(code, Some(2), "{args:?}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        assert!(stderr.starts_with("[astrum] ") && stderr.contains(message), "{args:?}: {stderr}");
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_astrum"))
+        .args(["controllers", "--config", "/nonexistent/controllers.toml"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent/controllers.toml"));
+}

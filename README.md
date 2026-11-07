@@ -46,8 +46,9 @@ to a commanded heading/altitude over Zenoh (`config/demos/python.toml` runs the 
 controller). `config/demos/quad.toml` flies ASTRUM's second vehicle class — an **F450 quadrotor**
 that climbs and yaws under the built-in multirotor hover-hold autopilot.
 `config/demos/formation.toml` flies a figure-eight leader with three decentralized MPC followers.
-`make smoke` flies every `config/demos/*.toml` in lockstep, as fast as possible, and fails on the
-first failure. `--watch` adds the 3-D renderer to any run.
+`make smoke` flies every `config/demos/*.toml`, then every controller-catalog entry once with its
+defaults, in lockstep, as fast as possible, and fails on the first failure. `--watch` adds the 3-D
+renderer to any run.
 
 ## Architecture & data flow
 
@@ -458,6 +459,10 @@ parameter values into one `controllers` command line, refusing unknown, out-of-r
 wrongly-typed values, so a browser never supplies a command. The C++ entries need the programs
 built (`cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release && cmake --build
 build/controllers -j`, which `astrum` does for you); the Python ones run with `python3`.
+`astrum controllers [--config FILE]` lists the entries (id, kinds, name); `astrum controllers
+render ID --id N [--param NAME=VALUE]... [--fleet IDS]` prints the command line `render` makes
+(values parse as TOML; unset ones take their defaults; `--fleet` lists the scenario's aircraft
+for `aircraft` parameters, default just `N`) and exits 2 with the catalog's message on a bad one.
 
 ## Wire protocol, telemetry & commands
 
@@ -503,10 +508,13 @@ Events and `TickEnd` are the exception: published with `Block` at priority `Data
 with a FIFO (`astrum_net::EventReceiver`, the SDKs' `EventSubscriber`). Per tick the sim sends the
 due telemetry (aircraft id ascending), then the events, then `TickEnd`.
 The sim also offers Zenoh's **low-latency transport** (no batching, no fragmentation, and a single
-lane per link — priorities reorder nothing on it) and the C++ and Python clients ask for it
+lane per link — priorities reorder nothing on it) and every client asks for it — the C++ and
+Python SDKs and the Rust tools (`astrum_net::Session::connect`: recorder, web bridge, `astrum ctl`)
 (`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 % more lockstep throughput for
-the C++ demo sweep (~2 % with Python controllers). A client that doesn't ask, or a sim that
-doesn't offer it, falls back to the default transport.
+the C++ demo sweep (~2 % with Python controllers), and it sidesteps a Zenoh 1.10 bug that, on the
+default transport, stopped all telemetry to a client after its first dropped sample (DEVELOP §1).
+Nothing is dropped on it (a client that falls behind slows the sim) and a message must fit one
+frame, so a scenario TOML over 31 KiB (~200 aircraft) is refused.
 
 **Topology.** The sim (or `astrum play`) **listens as a Zenoh router** on
 `tcp/0.0.0.0:7447`; every other process — recorder, web bridge, C++ and Python controllers —
@@ -610,9 +618,14 @@ astrum run config/scenario.example.toml --watch
 astrum export recordings/session.mcap --out recordings/session.json
 ```
 
-`astrum web` is an axum/tokio server. A latest-value Zenoh subscriber feeds one batched JSON
-snapshot of the whole fleet at most `--max-hz` times per second (default 30), fanned out to every
-browser over the WebSocket `GET /telemetry` (a slow browser skips to the newest snapshot). Events
+`astrum web` is an axum/tokio server. A sampling Zenoh subscriber (`astrum_net::SampledTelemetry`)
+thins every aircraft's telemetry to at most `--sample-hz` samples per SIM second (default 30) plus
+its newest, and the bridge sends what arrived as one `{"type":"frames","frames":[…]}` batch at
+most `--max-hz` times per wall second (default 30) — several samples per aircraft, time-ordered
+per aircraft, at most 120 per aircraft (the newest) — fanned out to every browser over the
+WebSocket `GET /telemetry`. So a sim at 100× real time still draws smooth trails and plots (at
+1× each batch is the aircraft's newest sample, as before). A slow browser skips to the newest
+batch: it loses the skipped batches' samples (a gap in its timeline), never falls behind. Events
 are never dropped or throttled: each batch goes to every browser as `{"type":"events","events":[…]}`
 on the same socket, from the moment it connected. The fleet's JSBSim models, which telemetry does
 not carry, come from the sim's (or `astrum play`'s) `astrum/scenario` reply, polled every 5 s:
@@ -644,8 +657,9 @@ application/json` (415) and, from a browser, same-origin (403).
 The same port serves the static `web/` app and the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags:
 `--connect` (default `tcp/127.0.0.1:7447`, attached at startup), `--bind` (default
 `127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`, published on host
-loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache`, `--allowed-hosts`,
-`--config-dir` (its `controllers.toml` is read at startup; a broken one stops the server) — each
+loopback), `--root` (default `web`), `--max-hz`, `--sample-hz`, `--tile-url`, `--tile-cache`,
+`--allowed-hosts`, `--config-dir` (its `controllers.toml` is read at startup; a broken one stops
+the server) — each
 with an `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback
 (`ASTRUM_WEB_ALLOWED_HOSTS` and `ASTRUM_CONFIG_DIR` for the last two). `astrum export` takes
 the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,

@@ -5,12 +5,13 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use astrum_bag::aircraft_models;
 use astrum_net::{ScenarioServer, Session};
-use astrum_web::bridge::Bridge;
+use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::server::{host_allowed, origin_allowed, parse_tile};
 use astrum_web::{models_message, run_message};
 use axum::body::{to_bytes, Body};
@@ -362,4 +363,97 @@ async fn reattaching_announces_a_new_run_and_never_mixes_the_sims() {
     while next_text(&mut stream, &mut buf).await != note {}
     // After the note: only the new sim's telemetry and events.
     until_flying(&mut stream, &mut buf, 2).await;
+}
+
+/// A `frames` message's samples as `(aircraft id, tick)`, in message order;
+/// `None` for any other message.
+fn samples(text: &str) -> Option<Vec<(u64, u64)>> {
+    let msg: serde_json::Value = serde_json::from_str(text).unwrap();
+    let frames = msg["frames"].as_array()?;
+    Some(frames.iter().map(|f| (f["id"].as_u64().unwrap(), f["tick"].as_u64().unwrap())).collect())
+}
+
+/// One aircraft's ticks in a batch.
+fn ticks_of(batch: &[(u64, u64)], id: u64) -> Vec<u64> {
+    batch.iter().filter(|(a, _)| *a == id).map(|&(_, t)| t).collect()
+}
+
+/// [`config`] batching at the default 30 Hz.
+fn at_30_hz() -> BridgeConfig {
+    BridgeConfig { min_period: Duration::from_secs_f64(1.0 / 30.0), ..config() }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn faster_than_real_time_a_browser_gets_each_aircrafts_trail_at_the_sample_rate() {
+    // 120 Hz ticks at 50× real time, sampled at 30 Hz of sim time: every 4th
+    // tick, ~50 per aircraft per batch where one-per-flush gave one.
+    let at = endpoint(3);
+    let _sim = Sim::paced(&at, &[1, 2], 120.0, 50.0);
+    let bridge = Bridge::new(at_30_hz());
+    bridge.attach(&at);
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut stream, mut buf) = browser(tmp.path(), bridge.clone()).await;
+
+    // Per aircraft: (tick, whether it ended its batch). The first batch with
+    // both aircraft is only an anchor: the trails may begin before it, and
+    // before their spacing does.
+    let mut trails: BTreeMap<u64, Vec<(u64, bool)>> = BTreeMap::new();
+    let mut batches = 0;
+    while trails.get(&1).map_or(0, Vec::len) < 600 {
+        let Some(batch) = samples(&next_text(&mut stream, &mut buf).await) else { continue };
+        if batches == 0 && ticks_of(&batch, 2).is_empty() {
+            continue; // the bridge has not heard aircraft 2 yet
+        }
+        for id in [1, 2] {
+            let ticks = ticks_of(&batch, id);
+            assert!(!ticks.is_empty(), "a batch without aircraft {id}: {batch:?}");
+            let trail = trails.entry(id).or_default();
+            let from = if batches == 0 { ticks.len() - 1 } else { 0 };
+            let last = ticks.len() - 1;
+            trail.extend(ticks.iter().enumerate().skip(from).map(|(i, &t)| (t, i == last)));
+        }
+        batches += 1;
+    }
+    for (id, trail) in &trails {
+        for pair in trail.windows(2) {
+            let ((a, _), (b, ends_batch)) = (pair[0], pair[1]);
+            // Never a gap longer than one sample period, within or across
+            // batches; exactly one period except up to a batch's newest.
+            assert!(b > a && b - a <= 4, "aircraft {id}: tick {a} then {b}");
+            if !ends_batch {
+                assert_eq!(b - a, 4, "aircraft {id}: tick {a} then {b}");
+            }
+        }
+    }
+    let per_batch = trails[&1].len() / batches;
+    assert!(per_batch >= 20, "{per_batch} samples per batch at 50× real time");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn at_real_time_a_browser_gets_one_sample_per_aircraft_per_batch() {
+    // A 50 Hz sim at 1×, batched at 30 Hz: as before thinning, each batch is
+    // the aircraft's newest sample (two only when a flush ran a tick late).
+    let at = endpoint(4);
+    let _sim = Sim::flying(&at, 1);
+    let bridge = Bridge::new(at_30_hz());
+    bridge.attach(&at);
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut stream, mut buf) = browser(tmp.path(), bridge.clone()).await;
+
+    let mut counts = Vec::new();
+    let mut newest = 0;
+    let mut started = None;
+    while counts.len() < 45 {
+        let Some(batch) = samples(&next_text(&mut stream, &mut buf).await) else { continue };
+        let ticks = ticks_of(&batch, 1);
+        assert!(ticks.iter().all(|&t| t > newest), "{newest} then {ticks:?}");
+        newest = *ticks.last().unwrap();
+        counts.push(ticks.len());
+        started.get_or_insert_with(std::time::Instant::now);
+    }
+    let elapsed = started.unwrap().elapsed().as_secs_f64();
+    assert!(elapsed >= 44.0 / 30.0 * 0.95, "45 batches in {elapsed} s: over 30 Hz");
+    assert!(counts.iter().all(|&n| n <= 2), "{counts:?}");
+    let single = counts.iter().filter(|&&n| n == 1).count();
+    assert!(single * 10 >= counts.len() * 9, "{counts:?}");
 }
