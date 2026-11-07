@@ -27,6 +27,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::Ordering;
@@ -245,24 +246,57 @@ impl Proc {
         Ok(Self { name: name.into(), child, group, copiers, registries, reaped: false })
     }
 
+    /// Signal the child (or its process group). Only ever called before
+    /// [`Proc::reap`]: until then an exited child stays a zombie, so its pid
+    /// and the process group it leads cannot be reused by a stranger.
     fn signal(&self, sig: libc::c_int) {
-        send(self.child.id(), self.group, sig);
+        if !self.reaped {
+            send(self.child.id(), self.group, sig);
+        }
+    }
+
+    /// The child's exit status once it has exited; `None` while it runs.
+    /// Does not reap it (`WNOWAIT`): only [`Proc::reap`] does, after the last
+    /// signal to its pid or group.
+    fn exited(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.reaped {
+            return self.child.try_wait();
+        }
+        // SAFETY: an all-zero siginfo_t is valid; waitid(2) on our own child
+        // with WNOWAIT only reads its state.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        let pid = self.child.id() as libc::id_t;
+        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, flags) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: waitid filled in a SIGCHLD siginfo (si_pid 0: no exit yet).
+        let (child, status) = unsafe { (info.si_pid(), info.si_status()) };
+        if child == 0 {
+            return Ok(None);
+        }
+        // The wait(2) status word ExitStatus wraps.
+        let raw = match info.si_code {
+            libc::CLD_EXITED => (status & 0xff) << 8,
+            libc::CLD_DUMPED => status | 0x80,
+            _ => status,
+        };
+        Ok(Some(ExitStatus::from_raw(raw)))
     }
 
     fn running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        matches!(self.exited(), Ok(None))
     }
 
-    /// Kill the child if it still runs, wait for it, kill what is left of the
-    /// process group it leads (a background grandchild would hold its output
-    /// open), and flush its output.
+    /// Kill the child if it still runs and what is left of the process group
+    /// it leads (a background grandchild would hold its output open), take it
+    /// out of the registries, then wait for it — the pid is released only
+    /// after the last signal — and flush its output.
     fn reap(&mut self) -> Option<ExitStatus> {
         if !self.reaped {
-            self.reaped = true;
             if self.running() {
-                self.signal(libc::SIGKILL);
+                send(self.child.id(), self.group, libc::SIGKILL);
             }
-            let _ = self.child.wait();
             let pid = self.child.id();
             if self.group {
                 send(pid, true, libc::SIGKILL);
@@ -270,11 +304,13 @@ impl Proc {
             for r in [&self.registries.shared, &self.registries.own] {
                 r.lock().retain(|&(p, _)| p != pid);
             }
+            self.reaped = true;
+            let _ = self.child.wait();
             for copier in self.copiers.drain(..) {
                 let _ = copier.join();
             }
         }
-        self.child.wait().ok()
+        self.child.try_wait().ok().flatten()
     }
 }
 
@@ -410,7 +446,7 @@ fn supervise(
     let mut stopped: Option<String> = None;
     let mut companion_gone = vec![false; companions.len()];
     let sim_status = loop {
-        match sim.child.try_wait() {
+        match sim.exited() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(e) => {
@@ -420,7 +456,7 @@ fn supervise(
             }
         }
         for c in controllers.iter_mut() {
-            if let Ok(Some(status)) = c.child.try_wait() {
+            if let Ok(Some(status)) = c.exited() {
                 if !status.success() && problem.is_none() {
                     problem = Some(format!("{} exited ({status})", c.name));
                     if how.fail_fast {
@@ -431,7 +467,7 @@ fn supervise(
         }
         for (c, gone) in companions.iter_mut().zip(&mut companion_gone) {
             if !*gone {
-                if let Ok(Some(status)) = c.child.try_wait() {
+                if let Ok(Some(status)) = c.exited() {
                     *gone = true;
                     let msg = format!("{} exited ({status}); the run goes on", c.name);
                     how.log.say(LogStream::Stderr, msg);

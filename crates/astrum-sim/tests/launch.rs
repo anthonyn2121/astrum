@@ -542,6 +542,7 @@ fn astrum_run_exits_1_when_the_sim_fails_or_cannot_start() {
 
 #[test]
 fn astrum_run_exits_2_on_an_invalid_file() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("bad.toml");
     std::fs::write(&file, "[sim]\nrate_hz = \n").unwrap();
