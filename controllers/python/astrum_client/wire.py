@@ -577,33 +577,40 @@ def decode_event(payload: bytes) -> Event:
 
 
 def encode_command(cmd: Command) -> bytes:
-    """Encode a :class:`Command` exactly as given (callers saturate first)."""
+    """Encode a :class:`Command` exactly as given (callers saturate first).
+
+    Control values and the trigger are coerced to built-in ``float``/``bool``: pycapnp
+    rejects other numeric scalars (e.g. ``numpy.float64``) a law may return."""
     msg = _schema().Command.new_message()
     msg.targetId = cmd.target_id
     msg.seq = cmd.seq
     msg.telemetryTick = cmd.telemetry_tick
-    msg.trigger = cmd.trigger
+    msg.trigger = bool(cmd.trigger)
     msg.epoch = cmd.epoch
     c = cmd.control
     if isinstance(c, RawActuators):
         raw = msg.control.init("raw")
         raw.aileron, raw.elevator, raw.rudder, raw.throttle = (
-            c.aileron,
-            c.elevator,
-            c.rudder,
-            c.throttle,
+            float(c.aileron),
+            float(c.elevator),
+            float(c.rudder),
+            float(c.throttle),
         )
     elif isinstance(c, MultirotorRaw):
         mr = msg.control.init("multirotor")
         mr.rollRate, mr.pitchRate, mr.yawRate, mr.collective = (
-            c.roll_rate,
-            c.pitch_rate,
-            c.yaw_rate,
-            c.collective,
+            float(c.roll_rate),
+            float(c.pitch_rate),
+            float(c.yaw_rate),
+            float(c.collective),
         )
     elif isinstance(c, AutopilotTargets):
         ap = msg.control.init("autopilot")
-        ap.headingRad, ap.altHaeM, ap.tasMps = c.heading_rad, c.alt_hae_m, c.tas_mps
+        ap.headingRad, ap.altHaeM, ap.tasMps = (
+            float(c.heading_rad),
+            float(c.alt_hae_m),
+            float(c.tas_mps),
+        )
     else:
         raise TypeError(f"not a Control: {c!r}")
     return msg.to_bytes()
