@@ -577,5 +577,9 @@ ui.setWsUrl(initialUrl);
 connect(initialUrl); // auto-attach to the local bridge; the user can open a file instead
 simControl.start();
 runPanel?.start();
-if (sweepId !== null) openSweepRun(sweepId, params.get("run") ?? "");
+if (sweepId !== null) {
+  const n = params.get("run") ?? "";
+  if (sweepId !== "" && /^\d+$/.test(n)) openSweepRun(sweepId, n);
+  else fileFailed("The address needs ?sweep=<id>&run=<number>.");
+}
 requestAnimationFrame(tick);

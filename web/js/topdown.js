@@ -81,6 +81,18 @@ function segmentDistance(a, b, x, y) {
   return Math.hypot(a.x + t * dx - x, a.y + t * dy - y);
 }
 
+// The [e, n] bounds of a polyline, in metres: { e0, e1, n0, n1 }.
+function boundsOf(pts) {
+  const b = { e0: Infinity, e1: -Infinity, n0: Infinity, n1: -Infinity };
+  for (const [e, n] of pts) {
+    b.e0 = Math.min(b.e0, e);
+    b.e1 = Math.max(b.e1, e);
+    b.n0 = Math.min(b.n0, n);
+    b.n1 = Math.max(b.n1, n);
+  }
+  return b;
+}
+
 // The [e, n] places of a layer: each path's points, else each item's position.
 function* placesOf(layer) {
   for (const it of layer.items) {
@@ -106,6 +118,9 @@ export class TopDown {
   #fitPending = false; // fit() ran while the canvas had no size
   #raf = 0;
   #drag = null; // { x, y, startX, startY, moved } while a pointer drags
+  #boxes = new WeakMap(); // path item -> its bounds in metres (set by setLayers)
+  #hoverFrame = 0; // the hover test queued for the next frame
+  #hoverAt = null; // the pointer position it tests
 
   constructor(canvas, { onHover, onPick } = {}) {
     this.#canvas = canvas;
@@ -120,7 +135,7 @@ export class TopDown {
     canvas.addEventListener("pointermove", (e) => this.#move(e), { signal });
     canvas.addEventListener("pointerup", (e) => this.#up(e), { signal });
     canvas.addEventListener("pointercancel", () => this.#release(), { signal });
-    canvas.addEventListener("pointerleave", (e) => { if (!this.#drag) this.#onHover?.(null, this.#pos(e)); }, { signal });
+    canvas.addEventListener("pointerleave", (e) => { this.#cancelHover(); if (!this.#drag) this.#onHover?.(null, this.#pos(e)); }, { signal });
     canvas.addEventListener("wheel", (e) => this.#wheel(e), { passive: false, signal });
     canvas.addEventListener("dblclick", () => this.fit(), { signal });
     canvas.addEventListener("keydown", (e) => this.#key(e), { signal });
@@ -135,6 +150,11 @@ export class TopDown {
   // The layers to show, drawn in order.
   setLayers(layers) {
     this.#layers = layers;
+    this.#boxes = new WeakMap();
+    for (const layer of layers) {
+      if (layer.kind !== "paths") continue;
+      for (const item of layer.items) if (item.pts.length) this.#boxes.set(item, boundsOf(item.pts));
+    }
     this.#schedule();
   }
 
@@ -176,6 +196,7 @@ export class TopDown {
     this.#ro.disconnect();
     cancelAnimationFrame(this.#raf);
     this.#raf = 0;
+    this.#cancelHover();
     this.#layers = [];
   }
 
@@ -402,6 +423,8 @@ export class TopDown {
       for (const item of layer.items) {
         let d;
         if (layer.kind === "paths") {
+          const box = this.#boxes.get(item);
+          if (!box || !this.#near(box, x, y)) continue;
           d = this.#pathDistance(item.pts, x, y);
           if (d > PATH_HIT_PX) continue;
         } else {
@@ -415,6 +438,16 @@ export class TopDown {
       }
     }
     return best;
+  }
+
+  // Whether (x, y), CSS px, is within PATH_HIT_PX of the screen box of `b`.
+  #near(b, x, y) {
+    const xa = this.#screenX(b.e0);
+    const xb = this.#screenX(b.e1);
+    const ya = this.#screenY(b.n0);
+    const yb = this.#screenY(b.n1);
+    return x >= Math.min(xa, xb) - PATH_HIT_PX && x <= Math.max(xa, xb) + PATH_HIT_PX
+      && y >= Math.min(ya, yb) - PATH_HIT_PX && y <= Math.max(ya, yb) + PATH_HIT_PX;
   }
 
   // The distance, CSS px, from (x, y) to the polyline `pts` ([e, n] metres).
@@ -449,15 +482,32 @@ export class TopDown {
     const p = this.#pos(e);
     const d = this.#drag;
     if (!d) {
-      this.#onHover?.(this.#hit(p.x, p.y), p);
+      this.#hoverLater(p);
       return;
     }
+    this.#cancelHover();
     // The content follows the pointer.
     this.#shift(-(p.x - d.x) / this.#scale, (p.y - d.y) / this.#scale);
     if (Math.hypot(p.x - d.startX, p.y - d.startY) > DRAG_SLOP_PX) d.moved = true;
     d.x = p.x;
     d.y = p.y;
     this.#onHover?.(null, p);
+  }
+
+  // A hover test per animation frame, at the pointer's latest position.
+  #hoverLater(p) {
+    this.#hoverAt = p;
+    if (this.#hoverFrame) return;
+    this.#hoverFrame = requestAnimationFrame(() => {
+      this.#hoverFrame = 0;
+      const at = this.#hoverAt;
+      this.#onHover?.(this.#hit(at.x, at.y), at);
+    });
+  }
+
+  #cancelHover() {
+    cancelAnimationFrame(this.#hoverFrame);
+    this.#hoverFrame = 0;
   }
 
   #up(e) {

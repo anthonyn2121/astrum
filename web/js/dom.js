@@ -18,6 +18,7 @@ export function h(tag, attrs = {}, ...children) {
 
 // Show `msg` in `node` (hidden when empty).
 export function showError(node, msg) {
-  node.textContent = msg || "";
-  node.hidden = !msg;
+  const text = msg || "";
+  if (node.textContent !== text) node.textContent = text;
+  node.hidden = !text;
 }

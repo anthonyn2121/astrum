@@ -28,7 +28,7 @@
           <span id="stateReason" class="muted small"></span>
         </div>
         <div class="progress-line">
-          <progress id="progress" value="0" max="1"></progress>
+          <progress id="progress" value="0" max="1" aria-label="Sweep progress"></progress>
           <span id="progressText" class="mono"></span>
         </div>
         <p class="chips">
@@ -48,6 +48,7 @@
           <button id="stopBtn" type="button" hidden>Stop sweep</button>
         </div>
         <p id="actionError" class="form-error" role="alert" hidden></p>
+        <p id="pollNote" class="muted small" hidden></p>
         <p id="pollError" class="form-error" role="alert" hidden></p>
       </section>
 
