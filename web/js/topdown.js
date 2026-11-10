@@ -1,8 +1,10 @@
 // A top-down picture on a canvas: north up, east right, metres. A view is a
 // centre (metres east and north) and a scale (CSS px per metre). Layers are
 // drawn in order over a grid: `arrows` (a filled triangle along each item's
-// heading, with an optional label) and `dots` (a small translucent disc, with a
-// heading tick when given), so a cloud of planned starts reads as density.
+// heading, with an optional label), `dots` (a small translucent disc, with a
+// heading tick when given, and an optional radius in px) and `paths` (polylines,
+// each with an optional end marker: a dot, or an X), so a cloud of planned
+// starts or of flown tracks reads as density.
 // Drag pans; the wheel zooms about the cursor; `+` and `-` zoom, the arrow keys
 // pan, and `0`, double-click or fit() frame every item. Hover reports the
 // nearest item within HIT_PX as onHover(item | null, {x, y}); click reports it
@@ -18,6 +20,11 @@ const DOT_RADIUS_PX = 2;
 const DOT_ALPHA = 0.7;
 const TICK_PX = 9;
 const HIT_PX = 10;
+const PATH_HIT_PX = 8; // a path is hit within this distance of its nearest segment
+const PATH_WIDTH_PX = 1.5;
+const PATH_ALPHA = 0.5;
+const END_DOT_PX = 3;
+const END_X_PX = 4;
 const DRAG_SLOP_PX = 4;
 const GRID_PX = 90; // the grid's spacing, about this many CSS px
 const BAR_PX = 100; // the scale bar's length, about this many CSS px
@@ -63,6 +70,23 @@ function haloText(ctx, text, x, y, color, halo) {
   ctx.strokeText(text, x, y);
   ctx.fillStyle = color;
   ctx.fillText(text, x, y);
+}
+
+// The distance, CSS px, from (x, y) to the segment from a to b (both {x, y}).
+function segmentDistance(a, b, x, y) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  const t = len2 === 0 ? 0 : clamp(((x - a.x) * dx + (y - a.y) * dy) / len2, 0, 1);
+  return Math.hypot(a.x + t * dx - x, a.y + t * dy - y);
+}
+
+// The [e, n] places of a layer: each path's points, else each item's position.
+function* placesOf(layer) {
+  for (const it of layer.items) {
+    if (layer.kind === "paths") yield* it.pts;
+    else yield [it.e, it.n];
+  }
 }
 
 export class TopDown {
@@ -128,11 +152,11 @@ export class TopDown {
     let n0 = Infinity;
     let n1 = -Infinity;
     for (const layer of this.#layers) {
-      for (const it of layer.items) {
-        e0 = Math.min(e0, it.e);
-        e1 = Math.max(e1, it.e);
-        n0 = Math.min(n0, it.n);
-        n1 = Math.max(n1, it.n);
+      for (const [e, n] of placesOf(layer)) {
+        e0 = Math.min(e0, e);
+        e1 = Math.max(e1, e);
+        n0 = Math.min(n0, n);
+        n1 = Math.max(n1, n);
       }
     }
     if (e0 > e1) {
@@ -200,6 +224,7 @@ export class TopDown {
     for (const layer of this.#layers) {
       if (layer.kind === "arrows") this.#arrows(layer.items, theme);
       else if (layer.kind === "dots") this.#dots(layer.items);
+      else if (layer.kind === "paths") this.#paths(layer.items);
       else throw new Error(`topdown: unknown layer kind ${layer.kind}`);
     }
     this.#scaleBar(theme);
@@ -265,7 +290,7 @@ export class TopDown {
       const { x, y } = this.#screen(it.e, it.n);
       ctx.fillStyle = it.color;
       ctx.beginPath();
-      ctx.arc(x, y, DOT_RADIUS_PX, 0, 2 * Math.PI);
+      ctx.arc(x, y, it.radius ?? DOT_RADIUS_PX, 0, 2 * Math.PI);
       ctx.fill();
       if (it.heading_deg != null) {
         ctx.strokeStyle = it.color;
@@ -273,6 +298,42 @@ export class TopDown {
         ctx.moveTo(x, y);
         ctx.lineTo(x + TICK_PX * Math.sin(it.heading_deg * DEG), y - TICK_PX * Math.cos(it.heading_deg * DEG));
         ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Polylines in screen space, each with an optional end marker at its last point.
+  #paths(items) {
+    const ctx = this.#ctx;
+    ctx.lineJoin = "round";
+    for (const it of items) {
+      ctx.strokeStyle = it.color;
+      ctx.fillStyle = it.color;
+      ctx.lineWidth = it.width ?? PATH_WIDTH_PX;
+      ctx.globalAlpha = it.alpha ?? PATH_ALPHA;
+      ctx.beginPath();
+      it.pts.forEach(([e, n], i) => {
+        const { x, y } = this.#screen(e, n);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      if (it.end && it.pts.length) {
+        const [e, n] = it.pts[it.pts.length - 1];
+        const { x, y } = this.#screen(e, n);
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        if (it.end === "x") {
+          ctx.moveTo(x - END_X_PX, y - END_X_PX);
+          ctx.lineTo(x + END_X_PX, y + END_X_PX);
+          ctx.moveTo(x + END_X_PX, y - END_X_PX);
+          ctx.lineTo(x - END_X_PX, y + END_X_PX);
+          ctx.stroke();
+        } else {
+          ctx.arc(x, y, END_DOT_PX, 0, 2 * Math.PI);
+          ctx.fill();
+        }
       }
     }
     ctx.globalAlpha = 1;
@@ -332,19 +393,38 @@ export class TopDown {
     this.#schedule();
   }
 
-  // The item under (x, y), CSS px, the nearest within HIT_PX over every layer.
+  // The item under (x, y), CSS px, the nearest within HIT_PX over every layer; a
+  // path counts within PATH_HIT_PX of its nearest segment.
   #hit(x, y) {
     let best = null;
     let bestD = HIT_PX;
     for (const layer of this.#layers) {
       for (const item of layer.items) {
-        const p = this.#screen(item.e, item.n);
-        const d = Math.hypot(p.x - x, p.y - y);
+        let d;
+        if (layer.kind === "paths") {
+          d = this.#pathDistance(item.pts, x, y);
+          if (d > PATH_HIT_PX) continue;
+        } else {
+          const p = this.#screen(item.e, item.n);
+          d = Math.hypot(p.x - x, p.y - y);
+        }
         if (d <= bestD) {
           best = item;
           bestD = d;
         }
       }
+    }
+    return best;
+  }
+
+  // The distance, CSS px, from (x, y) to the polyline `pts` ([e, n] metres).
+  #pathDistance(pts, x, y) {
+    let best = Infinity;
+    let prev = null;
+    for (const [e, n] of pts) {
+      const p = this.#screen(e, n);
+      best = Math.min(best, prev ? segmentDistance(prev, p, x, y) : Math.hypot(p.x - x, p.y - y));
+      prev = p;
     }
     return best;
   }

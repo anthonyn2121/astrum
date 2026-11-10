@@ -20,25 +20,32 @@
 //! this server does not own was interrupted: it is reported as `interrupted`,
 //! and its unfinished runs as `stopped`.
 //!
+//! `GET …/tracks` serves the flight tracks of each finished run ([`astrum_bag::tracks`]), cached beside
+//! its bag as `run-NNNN.tracks-<points>.json`: rebuilt when the bag is newer than the cache or the
+//! cache does not read.
+//!
 //! A stop request ends the sweep's processes as it asks them to end: once
 //! [`STOP_GRACE`] has passed while the sweep is still active, its processes are
 //! killed, and again every second, until the supervisor has ended.
 
 use std::fmt;
 use std::io;
+use std::ops::RangeInclusive;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use astrum_bag::tracks::{tracks as bag_tracks, AircraftTrack};
+use astrum_bag::BagReader;
 use astrum_sim::launch::{run_processes, Children, ProcessCtx};
 use astrum_sim::sweep::{execute, run_in_process, Purpose, RunEvent, Status, Sweep};
 use astrum_sim::systems::StopRequested;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
@@ -775,6 +782,39 @@ impl SweepRuns {
             refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("{}: {e}", bag.display()))
         })
     }
+
+    /// The flight tracks (thinned to `query`'s `points`) of the runs in its `from` / `count` range that
+    /// finished with a readable bag. Blocks.
+    fn tracks_of(&self, id: &str, query: &TracksQuery) -> Result<TracksBody, Refusal> {
+        let view = self.view_of(id)?;
+        let params = TracksParams::parse(query)?;
+        let dir = self.0.cfg.dir.join(id);
+        let end = params.from.saturating_add(params.count);
+        let runs = view
+            .runs
+            .iter()
+            .filter(|run| (params.from..end).contains(&run.run))
+            .filter(|run| {
+                matches!(run.status, EntryStatus::Ok | EntryStatus::Failed | EntryStatus::Stopped)
+            })
+            .filter_map(|run| {
+                let aircraft = run_tracks(&dir, run.run, params.points)?;
+                Some(RunTracks {
+                    run: run.run,
+                    status: run.status,
+                    sim_time_s: run.sim_time_s,
+                    aircraft,
+                })
+            })
+            .collect();
+        Ok(TracksBody {
+            points: params.points,
+            from: params.from,
+            count: params.count,
+            total: view.total,
+            runs,
+        })
+    }
 }
 
 /// Holds a sweep's `starting` mark: clears it when dropped, however the start ends.
@@ -1078,6 +1118,156 @@ impl Results {
     }
 }
 
+// --- Flight tracks ------------------------------------------------------------------
+
+/// `count` of `GET /api/sweeps/<id>/tracks` when not given, and its largest.
+const TRACKS_COUNT: usize = 100;
+const TRACKS_MAX_COUNT: usize = 500;
+/// `points` of that route when not given, and its range.
+const TRACKS_POINTS: usize = 80;
+const TRACKS_MIN_POINTS: usize = 2;
+const TRACKS_MAX_POINTS: usize = 400;
+
+/// The query of `GET /api/sweeps/<id>/tracks`, as sent.
+#[derive(Deserialize)]
+pub(crate) struct TracksQuery {
+    from: Option<String>,
+    count: Option<String>,
+    points: Option<String>,
+}
+
+/// The query's parameters, checked.
+struct TracksParams {
+    from: usize,
+    count: usize,
+    points: usize,
+}
+
+impl TracksParams {
+    fn parse(query: &TracksQuery) -> Result<Self, Refusal> {
+        let from = match query.from.as_deref() {
+            None => 1,
+            Some(text) => text.parse::<usize>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                refuse(
+                    StatusCode::BAD_REQUEST,
+                    format!("from {text:?}: want a whole number from 1"),
+                )
+            })?,
+        };
+        Ok(Self {
+            from,
+            count: bounded(query.count.as_deref(), "count", 1..=TRACKS_MAX_COUNT, TRACKS_COUNT)?,
+            points: bounded(
+                query.points.as_deref(),
+                "points",
+                TRACKS_MIN_POINTS..=TRACKS_MAX_POINTS,
+                TRACKS_POINTS,
+            )?,
+        })
+    }
+}
+
+/// A query parameter as a whole number in `range`, `default` when absent.
+fn bounded(
+    text: Option<&str>,
+    name: &str,
+    range: RangeInclusive<usize>,
+    default: usize,
+) -> Result<usize, Refusal> {
+    let Some(text) = text else { return Ok(default) };
+    text.parse::<usize>().ok().filter(|n| range.contains(n)).ok_or_else(|| {
+        refuse(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{name} {text:?}: want a whole number from {} to {}",
+                range.start(),
+                range.end()
+            ),
+        )
+    })
+}
+
+/// An aircraft's track as the API reports it and a run's cache holds it: the
+/// fields of [`AircraftTrack`].
+#[derive(Debug, Serialize, Deserialize)]
+struct TrackDoc {
+    id: u32,
+    model: Option<String>,
+    t: Vec<f64>,
+    e: Vec<f64>,
+    n: Vec<f64>,
+    u: Vec<f64>,
+    died_at_s: Option<f64>,
+}
+
+impl TrackDoc {
+    /// Whether the four arrays are one length: a cache that is not is recomputed.
+    fn well_formed(&self) -> bool {
+        let len = self.t.len();
+        self.e.len() == len && self.n.len() == len && self.u.len() == len
+    }
+}
+
+impl From<AircraftTrack> for TrackDoc {
+    fn from(a: AircraftTrack) -> Self {
+        Self { id: a.id, model: a.model, t: a.t, e: a.e, n: a.n, u: a.u, died_at_s: a.died_at_s }
+    }
+}
+
+/// One run in a tracks reply.
+#[derive(Serialize)]
+struct RunTracks {
+    run: usize,
+    status: EntryStatus,
+    sim_time_s: Option<f64>,
+    aircraft: Vec<TrackDoc>,
+}
+
+/// A `GET /api/sweeps/<id>/tracks` reply.
+#[derive(Serialize)]
+struct TracksBody {
+    points: usize,
+    from: usize,
+    count: usize,
+    total: usize,
+    runs: Vec<RunTracks>,
+}
+
+/// Run `run`'s tracks in `dir` thinned to `points`: from its cache when that is
+/// not older than its bag, else from the bag, which then fills the cache. `None`
+/// when the bag is missing or unreadable.
+fn run_tracks(dir: &Path, run: usize, points: usize) -> Option<Vec<TrackDoc>> {
+    let bag = dir.join(format!("run-{run:04}.mcap"));
+    let cache = dir.join(format!("run-{run:04}.tracks-{points}.json"));
+    let bag_time = modified(&bag)?;
+    if let Some(tracks) = read_cache(&cache, bag_time) {
+        return Some(tracks);
+    }
+    let reader = BagReader::open(&bag).ok()?;
+    let aircraft = bag_tracks(&reader, points).ok()?.aircraft;
+    let tracks: Vec<TrackDoc> = aircraft.into_iter().map(TrackDoc::from).collect();
+    // The cache only saves the next call its computation, so a write that fails costs nothing.
+    if let Ok(bytes) = serde_json::to_vec(&tracks) {
+        let _ = write_atomic(&cache, &bytes);
+    }
+    Some(tracks)
+}
+
+/// The cached tracks at `cache`, if it is no older than the bag (`bag_time`) and
+/// reads as well-formed tracks; a corrupt one is `None`.
+fn read_cache(cache: &Path, bag_time: SystemTime) -> Option<Vec<TrackDoc>> {
+    if modified(cache)? < bag_time {
+        return None;
+    }
+    let tracks: Vec<TrackDoc> = serde_json::from_slice(&std::fs::read(cache).ok()?).ok()?;
+    tracks.iter().all(TrackDoc::well_formed).then_some(tracks)
+}
+
+/// When `path` was last modified, if it can be read.
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 // --- HTTP ---------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -1164,5 +1354,19 @@ pub(crate) async fn replay(
         Ok(Ok(doc)) => json(StatusCode::OK, &doc),
         Ok(Err(refusal)) => refusal.respond(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("exporting the run: {e}")),
+    }
+}
+
+/// `GET /api/sweeps/<id>/tracks?from=&count=&points=`: the flight tracks of the runs in range.
+pub(crate) async fn tracks(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(query): Query<TracksQuery>,
+) -> Response {
+    let sweeps = state.sweeps.clone();
+    match tokio::task::spawn_blocking(move || sweeps.tracks_of(&id, &query)).await {
+        Ok(Ok(body)) => json(StatusCode::OK, &body),
+        Ok(Err(refusal)) => refusal.respond(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &format!("reading the tracks: {e}")),
     }
 }

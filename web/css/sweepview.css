@@ -75,3 +75,30 @@ button.sort {
 button.sort:hover { color: var(--accent); }
 th[aria-sort="ascending"] button.sort::after { content: " ▲"; color: var(--accent); }
 th[aria-sort="descending"] button.sort::after { content: " ▼"; color: var(--accent); }
+
+/* The All runs panel (sweeptracks.js on topdown.js): the legend, the canvas, its tooltip and the time bar. */
+.tracks-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted); font-size: 12px; }
+.tracks-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: var(--muted); }
+.swatch.ok { background: var(--ok); }
+.swatch.failed { background: var(--live); }
+.swatch.stopped { background: var(--warn); }
+.swatch.selected { background: var(--accent); }
+.tracks-wrap { position: relative; min-width: 0; margin: 0 0 12px; }
+.tracks-canvas {
+  display: block; width: 100%; height: 420px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel-solid);
+}
+.tracks-canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (max-width: 800px) { .tracks-canvas { height: 300px; } }
+.tracks-tip {
+  position: absolute; top: 0; left: 0; max-width: 260px; padding: 6px 9px; pointer-events: none;
+  background: var(--panel-raised); border: 1px solid var(--line); border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums;
+}
+.tracks-tip div { white-space: nowrap; }
+.tracks-tip-head { font-weight: 600; }
+.tracks-time { display: flex; align-items: center; gap: 12px; margin: 0 0 10px; }
+.tracks-time input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
+.tracks-time output { min-width: 96px; text-align: right; font-variant-numeric: tabular-nums; }
+.tracks-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }

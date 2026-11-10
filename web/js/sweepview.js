@@ -10,6 +10,7 @@
 import { ApiError, getSweep, getSweepResults, stopSweep } from "./api.js";
 import { $, h, showError } from "./dom.js";
 import { fmtTime } from "./format.js";
+import { SweepTracks } from "./sweeptracks.js";
 
 const POLL_MS = 1000;
 const RUN_STATES = ["queued", "running", "ok", "failed", "stopped"];
@@ -44,6 +45,8 @@ const state = {
   timer: 0,
 };
 
+const allRuns = new SweepTracks({ onSelect: (n) => select(n) });
+
 // ---- the summary ----
 
 function render(view) {
@@ -70,6 +73,7 @@ function render(view) {
   el.out.textContent = view.out;
   el.stopBtn.hidden = !running;
   renderStrip(view.runs);
+  allRuns.update(view);
   refreshResults(view, running);
 }
 
@@ -120,6 +124,7 @@ function markSelected() {
 // Select run `n` (from the strip or the table): its row is brought into view.
 function select(n) {
   state.selected = n;
+  allRuns.setSelected(n);
   markSelected();
   el.results.querySelector(`tbody tr[data-run="${n}"]`)?.scrollIntoView({ block: "nearest" });
 }

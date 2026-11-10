@@ -74,3 +74,6 @@ export const getSweeps = () => apiGet("/sweeps");
 export const getSweep = (id) => apiGet(`/sweeps/${encodeURIComponent(id)}`);
 export const getSweepResults = (id) => apiGet(`/sweeps/${encodeURIComponent(id)}/results`);
 export const getSweepReplay = (id, n) => apiGet(`/sweeps/${encodeURIComponent(id)}/runs/${encodeURIComponent(n)}/replay`);
+// The flight tracks of runs `from`…`from + count - 1` (1-based), thinned to 80 points each.
+export const getSweepTracks = (id, from, count) =>
+  apiGet(`/sweeps/${encodeURIComponent(id)}/tracks?from=${from}&count=${count}&points=80`);
