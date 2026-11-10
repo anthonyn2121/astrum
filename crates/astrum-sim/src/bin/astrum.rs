@@ -63,8 +63,8 @@ enum Cmd {
         #[arg(default_value = "config")]
         dir: PathBuf,
     },
-    /// List the controller catalog (`config/controllers.toml`), or render one
-    /// entry as a run file's `controllers` command line.
+    /// List the controller catalog (`<config dir>/controllers.toml`), or render
+    /// one entry as a run file's `controllers` command line.
     Controllers(ControllersArgs),
     /// Control a running sim: status, pause, resume, step, speed (astrum-ctl).
     #[command(disable_help_flag = true)]
@@ -134,9 +134,15 @@ struct RunArgs {
 
 #[derive(Args)]
 struct ControllersArgs {
-    /// The controller catalog.
-    #[arg(long, global = true, value_name = "FILE", default_value = "config/controllers.toml")]
-    config: PathBuf,
+    /// The config directory holding `controllers.toml`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        env = "ASTRUM_CONFIG_DIR",
+        default_value = "config"
+    )]
+    config_dir: PathBuf,
 
     #[command(subcommand)]
     cmd: Option<ControllersCmd>,
@@ -509,7 +515,7 @@ fn list(dir: &Path) -> ExitCode {
 // --- astrum controllers -------------------------------------------------------
 
 fn controllers(args: ControllersArgs) -> ExitCode {
-    let catalog = match ControllerCatalog::load(&args.config) {
+    let catalog = match ControllerCatalog::load(args.config_dir.join("controllers.toml")) {
         Ok(catalog) => catalog,
         Err(e) => {
             eprintln!("[astrum] {e}");

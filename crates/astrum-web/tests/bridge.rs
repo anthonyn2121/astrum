@@ -108,7 +108,7 @@ fn detaching_stops_publishing() {
 }
 
 #[test]
-fn a_batch_holds_at_most_batch_samples_per_aircraft_the_newest() {
+fn a_batch_holds_at_most_batch_samples_per_aircraft_spread_over_the_whole_burst() {
     let at = endpoint(6);
     let hub = Session::listen(&at).unwrap();
     // One batch per 2 s, so a burst lands in a single batch.
@@ -140,8 +140,14 @@ fn a_batch_holds_at_most_batch_samples_per_aircraft_the_newest() {
         batch = ticks(&snapshots.borrow_and_update());
         batch.last() == Some(&1000)
     });
-    let newest: Vec<u64> = (1001 - BATCH_SAMPLES as u64..=1000).collect();
-    assert_eq!(batch, newest);
+    // 1000 samples do not fit 120: the trail halves until they do (every 16th
+    // tick fits) and still covers the whole burst, from its first sample to
+    // its newest — not just the newest 120 ticks.
+    assert!(batch.len() <= BATCH_SAMPLES, "{} samples", batch.len());
+    assert_eq!(batch.first(), Some(&1));
+    let widest = batch.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!((1..=17).contains(&widest), "gaps up to {widest} ticks in {batch:?}");
+    assert!(batch.len() >= 1000 / 17, "{} samples", batch.len());
 }
 
 const F16_PAIR: &str =
@@ -185,22 +191,24 @@ fn models_publish_each_new_fleet_once_and_survive_unanswered_polls() {
 
 #[test]
 fn a_large_fleets_models_reach_the_bridge() {
-    // The scenario reply must fit one low-latency frame: 64 aircraft as the sim
-    // serves them is well inside `astrum_net::MAX_SCENARIO_BYTES`.
+    // A 1000-aircraft scenario is ~150 KB: far over one low-latency frame
+    // (~48 KiB on loopback), so it only arrives because queries use their own
+    // default-transport link, which fragments.
     let at = endpoint(7);
     let hub = Session::listen(&at).unwrap();
     let mut toml = String::from("[sim]\nrate_hz = 120.0\n");
-    for id in 1..=64 {
+    for id in 1..=1000 {
         toml += &format!(
             "\n[[aircraft]]\nid = {id}\nmodel = \"f16\"\nlat_deg = 37.6188\nlon_deg = -122.3756\n\
              alt_hae_m = 4572.0\nheading_deg = 63.0\ntas_mps = 120.0\nteam = 0\nhealth = 100.0\n"
         );
     }
+    assert!(toml.len() > 100_000);
     let _scenario = ScenarioServer::serve(&hub, toml.clone()).unwrap();
     let bridge = Bridge::new(config());
     let mut rx = bridge.models();
     bridge.attach(&at);
     let models = aircraft_models(&toml);
-    assert_eq!(models.len(), 64);
+    assert_eq!(models.len(), 1000);
     wait_for(&mut rx, &models_message(&models));
 }

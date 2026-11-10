@@ -14,10 +14,12 @@
 //!   order (an aircraft with none repeats its newest, so every batch shows the
 //!   whole fleet), at most [`BATCH_SAMPLES`] per aircraft: faster than real
 //!   time the browser still gets an even trail, not one sample per flush.
-//!   Past the cap a batch keeps each aircraft's newest samples, so a sim
-//!   faster than `BATCH_SAMPLES` × sample period per flush leaves gaps between
-//!   batches. A browser that falls behind skips to the newest batch and loses
-//!   the samples of the batches it skipped (a gap in its timeline, not a
+//!   Past the cap the trail is halved — every other sample kept, the newest
+//!   always, the sample period doubled — so a sim faster than `BATCH_SAMPLES` ×
+//!   sample period per flush still gets a batch that spans the whole interval
+//!   since the last one, at a coarser resolution (a power-of-two multiple of the
+//!   sample period). A browser that falls behind skips to the newest batch and
+//!   loses the samples of the batches it skipped (a gap in its timeline, not a
 //!   delay); one that connects mid-run gets the current batch at once. The
 //!   payload is a [`Utf8Bytes`], so handing it to N browsers is N
 //!   reference-count bumps, not N copies.
@@ -54,10 +56,11 @@ use crate::{events_message, frames_message, models_message, run_message};
 pub type Snapshot = Option<Utf8Bytes>;
 
 /// Most samples of one aircraft in one batch. With the default 30 Hz sample
-/// rate and 30 batches per second, a batch spans up to 4 s of sim time, so
-/// trails stay gap-free up to 120× real time — above what the bundled
-/// scenarios fly at `--speed 0` — while one browser receives at most 3600
-/// samples (~2.6 MB of JSON) per aircraft per second.
+/// rate and 30 batches per second, a batch spans up to 4 s of sim time at the
+/// full rate, so trails keep the full resolution up to 120× real time; faster,
+/// they halve (a 400× sim keeps every 4th–8th sample, ~0.15–0.3 s apart) with
+/// no gap. One browser receives at most 3600 samples (~2.6 MB of JSON) per
+/// aircraft per second.
 pub const BATCH_SAMPLES: usize = 120;
 
 /// Event batches buffered per browser before the slowest one starts losing them.
@@ -335,7 +338,7 @@ impl Feed {
                 a.session = None;
                 a.connected = false;
             });
-            let _ = session.raw().close().wait();
+            let _ = session.close();
         }
     }
 
@@ -348,7 +351,7 @@ impl Feed {
             match Session::connect(endpoint, CONNECT_ATTEMPT) {
                 Ok(session) if self.current() => return Some(session),
                 Ok(session) => {
-                    let _ = session.raw().close().wait();
+                    let _ = session.close();
                     return None;
                 }
                 Err(e) => {

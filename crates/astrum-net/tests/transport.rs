@@ -195,16 +195,32 @@ fn sampled_telemetry_keeps_one_sample_per_period_of_sim_time_plus_the_newest() {
 }
 
 #[test]
-fn sampled_telemetry_caps_each_aircraft_at_its_newest_samples() {
+fn sampled_telemetry_halves_its_trail_at_the_cap_instead_of_dropping_the_oldest() {
     let session = Session::in_process().unwrap();
     let mut publisher = TelemetryPublisher::new(&session);
-    let mut sub = sampled(&session, &mut publisher, &[1], 1e-9, 10);
-    for tick in 1..=100 {
+    // 120 Hz ticks thinned to 30 Hz (every 4th), at most 10 pending.
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 10);
+    for tick in 1..=400 {
         publisher.publish(&sample(1, tick)).unwrap();
     }
     settle(&mut sub);
-    assert_eq!(ticks(&sub.take()), (91..=100).map(|t| (1, t)).collect::<Vec<_>>());
-    assert_eq!(sub.capped(), 91);
+    let batch: Vec<u64> = sub.take().iter().map(|t| t.tick).collect();
+    // Newest-kept would be ticks 364..=400 only; halving covers the whole 400
+    // ticks, first sample to newest, within the cap...
+    assert!(batch.len() <= 10, "{batch:?}");
+    assert_eq!((batch.first(), batch.last()), (Some(&0), Some(&400)), "{batch:?}");
+    // ...at the period the cap forces: 4 ticks doubled four times is 64.
+    let widest = batch.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!((32..=65).contains(&widest), "gaps up to {widest} ticks in {batch:?}");
+    assert!(sub.capped() > 0);
+
+    // A take resets the period: the next stretch is thinned to every 4th tick
+    // again.
+    for tick in 401..=420 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [404, 408, 412, 416, 420].map(|t| (1, t)));
 }
 
 #[test]

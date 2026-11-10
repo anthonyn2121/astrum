@@ -51,17 +51,24 @@ Rules every client follows (the C++ and Python SDKs implement them for you — s
   declared publishers; events and `TickEnd`: `Block`, priority `Data`. **Every client** — the
   controller SDKs and `astrum_net::Session::connect` (recorder, web bridge, `astrum ctl`) — asks for
   Zenoh's low-latency transport (`transport/unicast/lowlatency = true`,
-  `transport/unicast/qos/enabled = false`), which has one lane per link: priorities reorder nothing
-  on it. The recorder and bridge must not use the default transport: Zenoh 1.10's transmission
-  pipeline on a link without QoS lanes (the sim's router disables them for low latency) sets the
-  congestion flag on bit `Priority::DEFAULT` but `refill` clears the bit of queue 0
-  (`zenoh-transport` `src/common/pipeline.rs`), so after one dropped sample a client never
-  received telemetry again (the bridge went blank at `--speed 0`, or after a hiccup even at 1×;
-  `crates/astrum-net/tests/low_latency.rs` reproduces it). On low latency nothing is dropped — a
-  client that falls behind slows the sim — and there is no fragmentation: a message must fit one
-  frame (the TCP link's Zenoh MTU: ~48 KiB on loopback, ≥ 32 KiB on any link), so
-  `ScenarioServer` refuses a scenario TOML over `MAX_SCENARIO_BYTES` (31 KiB, ~200 aircraft) and
-  `astrum-sim` / `astrum play` exit with that error.
+  `transport/unicast/qos/enabled = false`) for its streams; it has one lane per link, so priorities
+  reorder nothing on it. The recorder and bridge must not use the default transport for them:
+  Zenoh 1.10's transmission pipeline on a link without QoS lanes (the sim's router disables them
+  for low latency) sets the congestion flag on bit `Priority::DEFAULT` but `refill` clears the bit
+  of queue 0 (`zenoh-transport` `src/common/pipeline.rs`, `push_network_message` / both `refill`
+  impls; 1.10.2, the latest, is the same), so after one dropped sample a client never received
+  telemetry again — the bridge went blank at `--speed 0`, or after a hiccup even at 1×. (On the
+  default transport ~7000 of a 20000-sample burst arrived, then none; `tests/low_latency.rs` pins
+  that a slow client keeps receiving on the clients' transport.) The price: nothing is dropped on
+  low latency, so **a client that falls behind slows the sim, and one that stops reading — a
+  suspended recorder, web bridge, `astrum ctl` or controller — freezes it, and its control plane
+  with it, until it reads again or its connection dies** (the command lease does not release it:
+  measured, a stopped bridge held `--speed 0` at one tick for 43 s). There is also no
+  fragmentation (a message must fit one frame: the TCP link's Zenoh MTU, ~48 KiB on loopback, ≥ 32
+  KiB on any link), so a Rust client's **queries** — scenario, status, control — use a second
+  session on the default transport (`Session::connect` opens both; `Session::close` closes both):
+  their replies are `Block`, which the latch does not touch, and fragment, so a scenario of any
+  size arrives.
 - Telemetry subscriptions are **latest-value** (one slot per aircraft), never a FIFO — except the
   web bridge's `SampledTelemetry`, a bounded trail thinned by sim time.
 - **One command per telemetry sample**, carrying the controller instance's random `epoch`, `seq`
@@ -392,7 +399,9 @@ modules live in `web/js/`: `main.js` owns playback and selection state, `store.j
 exporter are the two binaries in `crates/astrum-web/`, both projecting telemetry through the one
 `astrum_web::FrameJson` shape. The bridge thins every aircraft's telemetry by sim time
 (`astrum_net::SampledTelemetry`: at most `--sample-hz`, default 30, samples per sim second plus
-the newest, at most `BATCH_SAMPLES` = 120 pending per aircraft) and sends what arrived as one
+the newest; at most `BATCH_SAMPLES` = 120 pending per aircraft, past which the trail is halved —
+every other sample, the newest always, and the period doubled — so a batch always spans the whole
+stretch since the last one) and sends what arrived as one
 `frames` batch at most `--max-hz` (default 30) times per second, so trails stay smooth faster
 than real time; `store.js` appends each aircraft's samples in order and keeps 20 min of sim time
 at 30 Hz (`LIVE_CAPACITY`). Telemetry carries only the vehicle class, so the bridge

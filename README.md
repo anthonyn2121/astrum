@@ -459,7 +459,7 @@ parameter values into one `controllers` command line, refusing unknown, out-of-r
 wrongly-typed values, so a browser never supplies a command. The C++ entries need the programs
 built (`cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release && cmake --build
 build/controllers -j`, which `astrum` does for you); the Python ones run with `python3`.
-`astrum controllers [--config FILE]` lists the entries (id, kinds, name); `astrum controllers
+`astrum controllers [--config-dir DIR]` lists the entries (id, kinds, name); `astrum controllers
 render ID --id N [--param NAME=VALUE]... [--fleet IDS]` prints the command line `render` makes
 (values parse as TOML; unset ones take their defaults; `--fleet` lists the scenario's aircraft
 for `aircraft` parameters, default just `N`) and exits 2 with the catalog's message on a bad one.
@@ -508,13 +508,15 @@ Events and `TickEnd` are the exception: published with `Block` at priority `Data
 with a FIFO (`astrum_net::EventReceiver`, the SDKs' `EventSubscriber`). Per tick the sim sends the
 due telemetry (aircraft id ascending), then the events, then `TickEnd`.
 The sim also offers Zenoh's **low-latency transport** (no batching, no fragmentation, and a single
-lane per link — priorities reorder nothing on it) and every client asks for it — the C++ and
-Python SDKs and the Rust tools (`astrum_net::Session::connect`: recorder, web bridge, `astrum ctl`)
-(`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 % more lockstep throughput for
-the C++ demo sweep (~2 % with Python controllers), and it sidesteps a Zenoh 1.10 bug that, on the
-default transport, stopped all telemetry to a client after its first dropped sample (DEVELOP §1).
-Nothing is dropped on it (a client that falls behind slows the sim) and a message must fit one
-frame, so a scenario TOML over 31 KiB (~200 aircraft) is refused.
+lane per link — priorities reorder nothing on it) and every client asks for it for its streams —
+the C++ and Python SDKs and the Rust tools (`astrum_net::Session::connect`: recorder, web bridge,
+`astrum ctl`) (`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 % more lockstep
+throughput for the C++ demo sweep (~2 % with Python controllers), and it sidesteps a Zenoh 1.10 bug
+that, on the default transport, stopped all telemetry to a client after its first dropped sample
+(DEVELOP §1). Nothing is dropped on it, so a client that falls behind paces the sim and **one that
+stops reading — a suspended recorder, viewer bridge or controller — freezes it, control plane
+included, until it reads again**. A Rust client's queries (scenario, status, control) use a second,
+default-transport link, so a scenario of any size reaches it.
 
 **Topology.** The sim (or `astrum play`) **listens as a Zenoh router** on
 `tcp/0.0.0.0:7447`; every other process — recorder, web bridge, C++ and Python controllers —
@@ -622,7 +624,9 @@ astrum export recordings/session.mcap --out recordings/session.json
 thins every aircraft's telemetry to at most `--sample-hz` samples per SIM second (default 30) plus
 its newest, and the bridge sends what arrived as one `{"type":"frames","frames":[…]}` batch at
 most `--max-hz` times per wall second (default 30) — several samples per aircraft, time-ordered
-per aircraft, at most 120 per aircraft (the newest) — fanned out to every browser over the
+per aircraft, at most 120 per aircraft (past that the trail is halved: every other sample, the
+newest always, so a 400× sim shows its whole flight at ~0.15–0.3 s resolution rather than the
+last few seconds) — fanned out to every browser over the
 WebSocket `GET /telemetry`. So a sim at 100× real time still draws smooth trails and plots (at
 1× each batch is the aircraft's newest sample, as before). A slow browser skips to the newest
 batch: it loses the skipped batches' samples (a gap in its timeline), never falls behind. Events

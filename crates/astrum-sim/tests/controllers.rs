@@ -340,14 +340,15 @@ fn render_unbounded_numbers_exactly_and_rejects_unprintable_ones() {
 
 // --- `astrum controllers` -------------------------------------------------------
 
-const CATALOG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/controllers.toml");
+const CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config");
 
-/// `astrum controllers --config <shipped catalog> <args>`: exit code, stdout, stderr.
+/// `astrum controllers --config-dir <shipped config> <args>`: exit code,
+/// stdout, stderr.
 fn cli(args: &[&str]) -> (Option<i32>, String, String) {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_astrum"))
         .arg("controllers")
         .args(args)
-        .args(["--config", CATALOG])
+        .args(["--config-dir", CONFIG])
         .output()
         .unwrap();
     let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
@@ -419,7 +420,7 @@ fn cli_render_errors_exit_2_naming_the_entry_or_param() {
         assert!(stderr.starts_with("[astrum] ") && stderr.contains(message), "{args:?}: {stderr}");
     }
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_astrum"))
-        .args(["controllers", "--config", "/nonexistent/controllers.toml"])
+        .args(["controllers", "--config-dir", "/nonexistent"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));

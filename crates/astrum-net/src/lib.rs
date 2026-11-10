@@ -44,15 +44,18 @@
 //! are not batched (`express`) and are marked `InteractiveHigh`. Events and
 //! tick ends must not be lost, so they block rather than drop and are marked
 //! `Data`. What the priority buys depends on the link's transport. The sim's
-//! router offers Zenoh's low-latency transport and every client asks for it —
-//! the C++ and Python controllers (every lockstep round trip counts) and
-//! [`Session::connect`] (recorder, web bridge, ctl), which on the default
-//! transport could lose all telemetry to a Zenoh 1.10 congestion bug (see
-//! `LOW_LATENCY`). It has ONE lane per link, no batching and no fragmentation,
-//! so priorities reorder nothing — messages arrive in the order the sim sent
-//! them — nothing is dropped (a client that falls behind slows the sender, so
-//! `CongestionControl::Drop` drops nothing here), and every message must fit in
-//! one transport frame ([`MAX_SCENARIO_BYTES`]).
+//! router offers Zenoh's low-latency transport and every client asks for it for
+//! its publish/subscribe link — the C++ and Python controllers (every lockstep
+//! round trip counts) and [`Session::connect`] (recorder, web bridge, ctl),
+//! which on the default transport could lose all telemetry to a Zenoh 1.10
+//! congestion bug (see `LOW_LATENCY`). It has ONE lane per link, no batching and
+//! no fragmentation, so priorities reorder nothing — messages arrive in the
+//! order the sim sent them — nothing is dropped (a client that falls behind
+//! slows the sender, so `CongestionControl::Drop` drops nothing here), and a
+//! message must fit in one transport frame, which the stream's samples and
+//! events do by a wide margin. Queries and their replies (scenario, status,
+//! control) go over a second, default-transport link, where a large reply is
+//! fragmented and — being `Block`, not droppable — cannot trip the latch.
 //!
 //! Every call uses Zenoh's synchronous `.wait()` resolver; Zenoh runs its own
 //! runtime internally, so these wrappers drop into synchronous code as-is.
@@ -163,8 +166,6 @@ pub enum NetError {
     BadScenario(String),
     /// The sim refused a control request (the reason it gave).
     Refused(String),
-    /// A message would not fit one frame of the low-latency transport.
-    TooLarge(String),
 }
 
 impl fmt::Display for NetError {
@@ -175,7 +176,6 @@ impl fmt::Display for NetError {
             NetError::Zenoh(e) => write!(f, "zenoh error: {e}"),
             NetError::BadScenario(e) => write!(f, "scenario reply is not UTF-8: {e}"),
             NetError::Refused(why) => write!(f, "refused: {why}"),
-            NetError::TooLarge(what) => write!(f, "too large: {what}"),
         }
     }
 }
@@ -189,29 +189,38 @@ fn zerr<E: fmt::Display>(e: E) -> NetError {
     NetError::Zenoh(e.to_string())
 }
 
-/// A Zenoh session. Cheap to clone (an `Arc` inside).
+/// A Zenoh session. Cheap to clone (an `Arc` or two inside).
+///
+/// A client ([`connect`](Self::connect)) holds two links to the hub: `z`, on
+/// the low-latency transport, carries every subscription, publication and
+/// liveliness token; `q`, on the default transport, carries queries and their
+/// replies. A hub ([`listen`](Self::listen)) and an in-process session need only
+/// `z`.
 #[derive(Clone)]
 pub struct Session {
     z: zenoh::Session,
+    q: Option<zenoh::Session>,
 }
 
 /// Zenoh's low-latency transport — no batching, no QoS lanes, no fragmentation:
-/// the sim's router offers it and every client asks for it (the C++ and Python
-/// SDKs set the same two keys). Besides the shorter lockstep round trip it
-/// avoids a Zenoh 1.10 bug in the default transport: on a link without QoS
-/// lanes (the router turns them off for this transport) the transmission
-/// pipeline marks congestion on the `Priority::DEFAULT` bit but clears the bit
-/// of queue 0 (`zenoh-transport` `src/common/pipeline.rs`,
+/// the sim's router offers it and every client asks for it for its streams (the
+/// C++ and Python SDKs set the same two keys). Besides the shorter lockstep
+/// round trip it avoids a Zenoh 1.10 bug in the default transport: on a link
+/// without QoS lanes (the router turns them off for this transport) the
+/// transmission pipeline marks congestion on the `Priority::DEFAULT` bit but
+/// clears the bit of queue 0 (`zenoh-transport` `src/common/pipeline.rs`,
 /// `push_network_message` / `refill`), so once a client fell behind and one
 /// droppable sample was dropped, every later droppable message to it —
-/// telemetry, commands — was dropped for the rest of the session. On this
-/// transport a write to a client that falls behind blocks the sender instead
-/// (nothing is dropped; a client that stops reading stalls the sim until its
-/// lease expires), and a message must fit in one frame — a larger one is
-/// silently lost. The frame is the TCP link's Zenoh MTU, a multiple of half the
-/// socket's MSS below 64 KiB (`zenoh-link-tcp` `src/unicast.rs`): ~48 KiB on
-/// loopback, ~64 KiB on a 1500-byte Ethernet link, never below 32 KiB. Of the
-/// replies, only the scenario's can grow that large ([`MAX_SCENARIO_BYTES`]).
+/// telemetry, commands — was dropped for the rest of the session. (1.10.2, the
+/// latest, has the same code.) On this transport a write to a client that falls
+/// behind blocks the sender instead (nothing is dropped), and **a client that
+/// stops reading — a suspended recorder, web bridge, ctl or controller —
+/// freezes the sim, and with it the control plane, until it reads again or its
+/// connection dies**; the sim's command lease never releases it. A message must
+/// also fit in one frame (the TCP link's Zenoh MTU, ~48 KiB on loopback, never
+/// below 32 KiB), which is why queries do not use it: only droppable messages
+/// can latch, and query replies are not droppable, so they travel the
+/// fragmenting default transport.
 const LOW_LATENCY: [(&str, &str); 2] =
     [("transport/unicast/lowlatency", "true"), ("transport/unicast/qos/enabled", "false")];
 
@@ -235,22 +244,24 @@ impl Session {
     }
 
     /// Open a session that CONNECTS to the hub at `endpoint` (recorder / web /
-    /// ctl) as a Zenoh **client** on the low-latency transport (`LOW_LATENCY`):
-    /// the hub routes everything for it, including other clients' publications.
-    /// Waits up to `timeout` for the hub (a sim still loading its aircraft),
-    /// then fails; once connected, Zenoh reconnects by itself if the hub
-    /// restarts.
+    /// ctl) as a Zenoh **client**: the hub routes everything for it, including
+    /// other clients' publications. Its streams ride the low-latency transport
+    /// (`LOW_LATENCY`); a second link on the default transport carries its
+    /// queries, so a reply of any size gets through. Waits up to `timeout` for
+    /// the hub (a sim still loading its aircraft), then fails; once connected,
+    /// Zenoh reconnects by itself if the hub restarts.
     pub fn connect(endpoint: &str, timeout: Duration) -> Result<Self> {
         let timeout_ms = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
-        Self::open(
-            &[
-                ("scouting/multicast/enabled", "false".into()),
-                ("mode", r#""client""#.into()),
-                ("connect/endpoints", format!(r#"["{endpoint}"]"#)),
-                ("connect/timeout_ms", timeout_ms.to_string()),
-            ],
-            &LOW_LATENCY,
-        )
+        let patches = [
+            ("scouting/multicast/enabled", "false".into()),
+            ("mode", r#""client""#.into()),
+            ("connect/endpoints", format!(r#"["{endpoint}"]"#)),
+            ("connect/timeout_ms", timeout_ms.to_string()),
+        ];
+        let z = Self::open_raw(&patches, &LOW_LATENCY)?;
+        // The hub is up now, so this one connects at once.
+        let q = Self::open_raw(&patches, &[])?;
+        Ok(Self { z, q: Some(q) })
     }
 
     /// An isolated in-process session (no endpoints) whose publishers deliver to
@@ -263,13 +274,30 @@ impl Session {
     }
 
     fn open(patches: &[(&str, String)], transport: &[(&str, &str)]) -> Result<Self> {
+        Ok(Self { z: Self::open_raw(patches, transport)?, q: None })
+    }
+
+    fn open_raw(patches: &[(&str, String)], transport: &[(&str, &str)]) -> Result<zenoh::Session> {
         let mut config = zenoh::Config::default();
         let transport = transport.iter().map(|&(key, value)| (key, value.to_owned()));
         for (key, value) in patches.iter().cloned().chain(transport) {
             config.insert_json5(key, &value).map_err(zerr)?;
         }
-        let z = zenoh::open(config).wait().map_err(zerr)?;
-        Ok(Self { z })
+        zenoh::open(config).wait().map_err(zerr)
+    }
+
+    /// The session queries go through: the client's default-transport link,
+    /// else the one session.
+    fn queries(&self) -> &zenoh::Session {
+        self.q.as_ref().unwrap_or(&self.z)
+    }
+
+    /// Close the session (both links of a client). Other clones of it stop
+    /// working too.
+    pub fn close(&self) -> Result<()> {
+        let q = self.q.as_ref().map(|q| q.close().wait().map_err(zerr));
+        self.z.close().wait().map_err(zerr)?;
+        q.unwrap_or(Ok(()))
     }
 
     /// The underlying Zenoh session (raw recording / replay, advanced use).
@@ -419,26 +447,33 @@ const SPACING_SLACK: f64 = 1e-6;
 /// One aircraft's trail in a [`SampledTelemetry`].
 #[derive(Default)]
 struct Trail {
-    /// Samples not yet taken, oldest first. Each is at least one period of sim
-    /// time after the one before it (the first: after the last one taken),
-    /// except the last, which is always the newest sample received.
+    /// Samples not yet taken, oldest first. Each is at least one trail period
+    /// of sim time after the one before it (the first: after the last one
+    /// taken), except the last, which is always the newest sample received.
     pending: VecDeque<Telemetry>,
     /// The newest sample received.
     newest: Option<Telemetry>,
     /// Sim time of the last sample taken (`None` until one is, and after the
     /// aircraft's clock went backwards).
     taken: Option<f64>,
+    /// Times the cap halved `pending` since the last take: the trail's period
+    /// is the base period doubled this many times.
+    halvings: u32,
 }
 
 impl Trail {
-    /// Add `t`, thinning to one sample per `period` of sim time and keeping at
-    /// most `cap` pending (the newest). Returns the samples dropped by the cap.
+    /// Add `t`, thinning to one sample per trail period of sim time (`period`
+    /// doubled once per halving). When more than `cap` would be pending, keep
+    /// every other one — the newest always — and double the period, so the
+    /// batch still spans the whole stretch since the last take, at a coarser
+    /// resolution. Returns the samples the halving dropped.
     fn add(&mut self, t: Telemetry, period: f64, cap: usize) -> u64 {
         if self.newest.is_some_and(|n| t.sim_time_s < n.sim_time_s) {
             // The clock went backwards: a restarted sim or replay. The old
             // run's samples go, so a trail is always time-ordered.
             self.pending.clear();
             self.taken = None;
+            self.halvings = 0;
         }
         self.newest = Some(t);
         let len = self.pending.len();
@@ -446,6 +481,7 @@ impl Trail {
             self.pending.push_back(t);
             return 0;
         }
+        let period = period * 2f64.powi(self.halvings.try_into().unwrap_or(i32::MAX));
         let before = if len >= 2 { Some(self.pending[len - 2].sim_time_s) } else { self.taken };
         let tail = &mut self.pending[len - 1];
         let spaced = before.is_none_or(|b| tail.sim_time_s - b >= period * (1.0 - SPACING_SLACK));
@@ -455,10 +491,21 @@ impl Trail {
         }
         self.pending.push_back(t);
         if self.pending.len() > cap {
-            self.pending.pop_front();
-            return 1;
+            return self.halve();
         }
         0
+    }
+
+    /// Keep every other pending sample, counting back from the newest (which
+    /// stays), and double the period; returns how many went. Kept samples are
+    /// two old periods apart, so they still satisfy the doubled one.
+    fn halve(&mut self) -> u64 {
+        let before = self.pending.len();
+        let mut kept: Vec<Telemetry> = self.pending.iter().rev().step_by(2).copied().collect();
+        kept.reverse();
+        self.pending = kept.into();
+        self.halvings = self.halvings.saturating_add(1);
+        (before - self.pending.len()) as u64
     }
 }
 
@@ -476,14 +523,21 @@ struct SampledState {
 /// looked. Samples are decoded and thinned on Zenoh's receive thread, so a slow
 /// consumer never blocks the transport, and memory stays bounded:
 ///
-/// * **thinned by sim time** — an aircraft's pending samples are at least
-///   `period` of sim time apart, except that the newest sample received is
-///   always pending too (it replaces a previous newest that was closer than
-///   `period` to the sample before it). So between two takes an aircraft gains
-///   at most one sample per `period` plus its newest, and consecutive kept
-///   samples are never more than `period` plus one publication interval apart.
-/// * **capped** — at most `cap` samples per aircraft wait to be taken; past
-///   that the oldest go ([`capped`](Self::capped) counts them).
+/// * **thinned by sim time** — an aircraft's pending samples are at least one
+///   trail period of sim time apart (`period`, doubled once per halving, below),
+///   except that the newest sample received is always pending too (it replaces
+///   a previous newest that was closer than a period to the sample before it).
+///   So between two takes an aircraft gains at most one sample per period plus
+///   its newest, and consecutive kept samples are never more than a trail period
+///   plus one publication interval apart.
+/// * **capped by halving** — at most `cap` samples per aircraft wait to be
+///   taken. A sim far faster than real time would pass the cap within one
+///   batch; rather than drop the oldest (a batch that covers only its newest
+///   seconds), the trail keeps every other pending sample and doubles its
+///   period, again each time the cap is passed, so a batch always spans the
+///   whole stretch since the last take at the finest resolution `cap` allows.
+///   A take resets the period. ([`capped`](Self::capped) counts the samples
+///   halving dropped.)
 /// * **time-ordered** — a sample older than the aircraft's newest (a restarted
 ///   sim or replay) discards that aircraft's pending samples first.
 ///
@@ -580,6 +634,7 @@ impl SampledTelemetry {
             match trail.pending.back() {
                 Some(last) => {
                     trail.taken = Some(last.sim_time_s);
+                    trail.halvings = 0;
                     batch.extend(trail.pending.drain(..));
                 }
                 None => batch.extend(trail.newest),
@@ -895,12 +950,6 @@ impl TickReceiver {
 
 // --- Scenario -----------------------------------------------------------------
 
-/// Largest scenario TOML a [`ScenarioServer`] serves: its reply must fit one
-/// frame of the low-latency transport on any link (at least 32 KiB, see
-/// `LOW_LATENCY`), with room for the key and headers: about 200 aircraft (one
-/// takes ~140 bytes of the TOML `astrum-sim` serves).
-pub const MAX_SCENARIO_BYTES: usize = 31 * 1024;
-
 /// Answers `get astrum/scenario` with the sim's scenario TOML for as long as it
 /// is alive.
 pub struct ScenarioServer {
@@ -908,15 +957,9 @@ pub struct ScenarioServer {
 }
 
 impl ScenarioServer {
-    /// Serve `scenario_toml`; [`NetError::TooLarge`] past
-    /// [`MAX_SCENARIO_BYTES`], which no low-latency client could receive.
+    /// Serve `scenario_toml`. A client receives it over its query link, so a
+    /// scenario of any size arrives (the default transport fragments).
     pub fn serve(session: &Session, scenario_toml: String) -> Result<Self> {
-        if scenario_toml.len() > MAX_SCENARIO_BYTES {
-            return Err(NetError::TooLarge(format!(
-                "the scenario TOML is {} bytes; at most {MAX_SCENARIO_BYTES} fit one reply",
-                scenario_toml.len()
-            )));
-        }
         let queryable = session
             .z
             .declare_queryable(keys::SCENARIO)
@@ -945,7 +988,8 @@ pub fn fetch_scenario(session: &Session, timeout: Duration) -> Result<Option<Str
         }
         let attempt = left.min(SCENARIO_RETRY);
         let started = Instant::now();
-        let replies = session.z.get(keys::SCENARIO).timeout(attempt).wait().map_err(zerr)?;
+        let replies =
+            session.queries().get(keys::SCENARIO).timeout(attempt).wait().map_err(zerr)?;
         while let Ok(reply) = replies.recv() {
             if let Ok(sample) = reply.result() {
                 let text = String::from_utf8(sample.payload().to_bytes().into_owned())
@@ -1181,7 +1225,7 @@ impl ControlServer {
 
 /// One query, one reply: its payload, or the sim's refusal.
 fn query_one(session: &Session, selector: &str, timeout: Duration) -> Result<Vec<u8>> {
-    let replies = session.z.get(selector).timeout(timeout).wait().map_err(zerr)?;
+    let replies = session.queries().get(selector).timeout(timeout).wait().map_err(zerr)?;
     match replies.recv_timeout(timeout + Duration::from_millis(100)) {
         Ok(Some(reply)) => match reply.result() {
             Ok(sample) => Ok(sample.payload().to_bytes().into_owned()),

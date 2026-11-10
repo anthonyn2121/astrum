@@ -1,27 +1,28 @@
-//! The clients' transport against a real hub over TCP: `Session::connect` uses
-//! Zenoh's low-latency transport, where a client that falls behind slows the
-//! publisher instead of losing samples — and so never trips Zenoh 1.10's
-//! congestion latch, which on the default transport dropped every later sample
-//! to such a client (with the default transport the burst test fails: ~7000 of
-//! the 20000 samples arrive, then none) — and where one message must fit in one
-//! frame.
+//! The clients' transport against a real hub over TCP: `Session::connect` puts
+//! its streams on Zenoh's low-latency transport, where a client that falls
+//! behind slows the publisher instead of losing samples — and so never trips
+//! Zenoh 1.10's congestion latch, which on the default transport dropped every
+//! later sample to such a client (with the default transport the burst test
+//! fails: ~7000 of the 20000 samples arrive, then none) — and its queries on a
+//! second, default-transport link, where a reply of any size is fragmented.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use astrum_net::{
-    fetch_scenario, keys, zenoh, NetError, ScenarioServer, Session, TelemetryPublisher,
-    MAX_SCENARIO_BYTES,
+    fetch_scenario, keys, send_control, zenoh, ControlRequest, ControlServer, NetError,
+    ScenarioServer, Session, TelemetryPublisher, MIN_SPEED,
 };
 use astrum_proto::{decode_telemetry, Telemetry};
 use zenoh::Wait;
 
-/// A hub and a client on this process's port `n` (< 10) of the 20000–39999
-/// band (topology.rs uses the band's first port per pid).
+/// A hub and a client on this process's port `n` (< 10) of a 10-port block
+/// derived from the pid, below the Linux ephemeral range (32768+) and clear of
+/// astrum-web's tests (10000–19999).
 fn hub_and_client(n: u32) -> (Session, Session) {
     assert!(n < 10);
-    let port = 20_000 + (std::process::id() % 1_900) * 10 + 10 + n;
+    let port = 20_000 + (std::process::id() % 1_000) * 10 + n;
     let endpoint = format!("tcp/127.0.0.1:{port}");
     let hub = Session::listen(&endpoint).unwrap();
     let client = Session::connect(&endpoint, Duration::from_secs(10)).unwrap();
@@ -93,26 +94,29 @@ fn fleet(n: u32) -> String {
 }
 
 #[test]
-fn a_large_fleets_scenario_fits_one_message_and_reaches_a_client() {
+fn a_scenario_of_any_size_reaches_a_client() {
+    // Queries ride the client's default-transport link, which fragments: far
+    // more than one low-latency frame (~48 KiB on loopback, 32 KiB at least) —
+    // and, for the 250-aircraft fleet, the size the old cap refused — arrives.
     let (hub, client) = hub_and_client(1);
-    let toml = fleet(64);
-    let _server = ScenarioServer::serve(&hub, toml.clone()).unwrap();
-    assert_eq!(fetch_scenario(&client, Duration::from_secs(5)).unwrap(), Some(toml));
+    for n in [64, 250, 2000] {
+        let toml = fleet(n);
+        let server = ScenarioServer::serve(&hub, toml.clone()).unwrap();
+        let got = fetch_scenario(&client, Duration::from_secs(10)).unwrap();
+        assert_eq!(got.as_deref(), Some(toml.as_str()), "{n} aircraft ({} bytes)", toml.len());
+        drop(server);
+    }
+    assert!(fleet(2000).len() > 200 * 1024);
 }
 
 #[test]
-fn the_largest_servable_scenario_reaches_a_client_and_a_larger_one_is_refused() {
+fn control_replies_reach_a_client() {
+    // Control queries use the same link as the scenario's: a client's `get`
+    // gets its reply, and a refused request its reason.
     let (hub, client) = hub_and_client(2);
-    let mut toml = fleet(1);
-    toml += "\n# padding";
-    toml += &"x".repeat(MAX_SCENARIO_BYTES - toml.len() - 1);
-    toml += "\n";
-    assert_eq!(toml.len(), MAX_SCENARIO_BYTES);
-    let server = ScenarioServer::serve(&hub, toml.clone()).unwrap();
-    assert_eq!(fetch_scenario(&client, Duration::from_secs(5)).unwrap(), Some(toml.clone()));
-    drop(server);
-
-    let err = ScenarioServer::serve(&hub, toml + "#").err().expect("an oversized scenario");
-    let NetError::TooLarge(why) = err else { panic!("{err}") };
-    assert!(why.contains(&format!("{} bytes", MAX_SCENARIO_BYTES + 1)), "{why}");
+    let sim = ControlServer::serve(&hub, MIN_SPEED).unwrap();
+    send_control(&client, ControlRequest::Pause, Duration::from_secs(5)).unwrap();
+    assert_eq!(sim.wait(Duration::from_secs(5)), [ControlRequest::Pause]);
+    let refused = send_control(&client, ControlRequest::Step(0), Duration::from_secs(5));
+    assert!(matches!(refused, Err(NetError::Refused(_))), "{refused:?}");
 }
