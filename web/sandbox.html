@@ -30,6 +30,9 @@
           <button id="viewOrbitBtn" aria-pressed="false" title="3-D orbit view (O)">Orbit</button>
         </div>
         <button id="fitBtn" title="Frame every aircraft (F)">Fit</button>
+        <button id="saveBtn" type="button" title="Save as config/scenario.<name>.toml">Save…</button>
+        <button id="checkBtn" type="button" title="Validate the scenario and check each aircraft trims">Check</button>
+        <button id="runBtn" type="button" class="primary" title="Fly this scenario with controllers">Run</button>
       </div>
     </header>
 
@@ -158,11 +161,30 @@
         <section class="sb-section" aria-labelledby="jsonTitle">
           <h2 id="jsonTitle" class="sb-h">Scenario JSON <button id="copyBtn" type="button" class="mini">Copy</button> <span id="copyStatus" class="muted small" role="status"></span></h2>
           <ul id="issues" class="sb-issues" aria-label="Problems"></ul>
+          <section id="checkResult" aria-label="Check result" aria-live="polite" hidden></section>
           <pre id="scenarioJson" class="sb-json" tabindex="0" aria-label="Scenario JSON"></pre>
         </section>
       </div>
     </aside>
   </div>
+  <dialog id="saveDialog" aria-labelledby="saveTitle">
+    <form id="saveForm" class="sb-form" method="dialog">
+      <h2 id="saveTitle" class="sb-h sb-span">Save scenario</h2>
+      <label class="sb-span">Name
+        <input id="saveName" type="text" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}" required placeholder="my-scenario" autocomplete="off" />
+      </label>
+      <label class="sb-span">Summary
+        <input id="saveSummary" type="text" maxlength="200" placeholder="one line, shown in the scenario list" autocomplete="off" />
+      </label>
+      <p id="saveError" class="sb-error sb-span" role="alert" hidden></p>
+      <p id="saveNote" class="muted small sb-span" hidden>Saved before it runs</p>
+      <div class="sb-span sb-dialog-actions">
+        <button id="saveSubmitBtn" type="submit" class="primary">Save</button>
+        <button id="saveReplaceBtn" type="button" hidden>Replace existing</button>
+        <button id="saveCancelBtn" type="button">Cancel</button>
+      </div>
+    </form>
+  </dialog>
 
   <script type="module" src="./js/sandbox.js"></script>
 </body>

@@ -16,7 +16,7 @@
 import { Scene } from "./scene.js";
 import { EditStore } from "./editstore.js";
 import { Datum, DEG2RAD } from "./geo.js";
-import { getEnvironments, getModels, getScenario } from "./api.js";
+import { ApiError, checkScenario, getEnvironments, getModels, getScenario, saveScenario } from "./api.js";
 
 const DEFAULT_ENVIRONMENT = "empty";
 const HISTORY_MAX = 200;            // undo steps kept
@@ -54,6 +54,11 @@ const state = {
   pickingOrigin: false,
   previewSpawn: false,
   spawnSeed: 1,      // the random pattern's seed; advances after each spawn
+  savedName: null,      // the scenario's name on the server (null until loaded or saved)
+  savedSummary: "",     // its summary there
+  savedJson: null,      // scenarioDoc() as JSON at load / save; isDirty() compares to it
+  checked: null,        // scenarioDoc() as JSON that the check result is for
+  runAfterSave: false,  // Run is waiting for its save
 };
 
 const store = new EditStore();
@@ -752,7 +757,9 @@ function refresh() {
   scene.setSelection(state.selection);
   const issues = renderIssues();
   renderFleet(issues);
-  $("scenarioJson").textContent = JSON.stringify(scenarioDoc(), null, 2);
+  const doc = scenarioDoc();
+  if (state.checked !== null && state.checked !== JSON.stringify(doc)) clearCheck();
+  $("scenarioJson").textContent = JSON.stringify(doc, null, 2);
   $("undoBtn").disabled = !state.undo.length;
   $("redoBtn").disabled = !state.redo.length;
   updatePreview();
@@ -827,6 +834,143 @@ function syncSwatches() {
   }
 }
 
+// ---- Save, check, run ------------------------------------------------------
+
+const isDirty = () => JSON.stringify(scenarioDoc()) !== state.savedJson;
+
+function setBusy(busy) {
+  for (const id of ["saveBtn", "checkBtn", "runBtn", "saveSubmitBtn", "saveReplaceBtn"]) $(id).disabled = busy;
+}
+
+// Show a check result (or a pending note) for the scenario JSON `json`: a
+// summary line, then one line per item (`ok` items green, the rest red).
+function showResult(json, { summary, items, failed }) {
+  state.checked = json;
+  const head = document.createElement("p");
+  head.className = failed ? "sb-error" : "small";
+  head.textContent = summary;
+  const ul = document.createElement("ul");
+  ul.className = "sb-issues";
+  ul.replaceChildren(...items.map(({ text, ok }) => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    if (ok) li.className = "sb-ok";
+    return li;
+  }));
+  $("checkResult").replaceChildren(head, ul);
+  $("checkResult").hidden = false;
+}
+
+function clearCheck() {
+  state.checked = null;
+  $("checkResult").replaceChildren();
+  $("checkResult").hidden = true;
+}
+
+// The check's reply as a result: the scenario's problems, else each trim.
+function checkResult(reply) {
+  if (reply.errors.length) {
+    return {
+      summary: `${reply.errors.length} problem(s) — the scenario is not valid`,
+      items: reply.errors.map((text) => ({ text, ok: false })),
+      failed: true,
+    };
+  }
+  const trims = reply.trim;
+  if (!trims.length) return { summary: "No fixed-wing aircraft to trim-check.", items: [], failed: false };
+  const items = trims.map((t) => (t.ok
+    ? { text: `aircraft ${t.aircraft} (${t.model}): trim ok`, ok: true }
+    : { text: `aircraft ${t.aircraft} (${t.model}): trim FAILED — ${t.error}`, ok: false }));
+  const failed = trims.filter((t) => !t.ok).length;
+  return failed
+    ? { summary: `${failed} of ${trims.length} aircraft will not trim — the sim would refuse to start`, items, failed: true }
+    : { summary: `All ${trims.length} trims ok`, items, failed: false };
+}
+
+async function check() {
+  const doc = scenarioDoc();
+  const json = JSON.stringify(doc);
+  showResult(json, { summary: "Checking the scenario and its trims…", items: [], failed: false });
+  setBusy(true);
+  try {
+    const reply = await checkScenario(doc);
+    if (state.checked === json) showResult(json, checkResult(reply));
+  } catch (err) {
+    if (state.checked === json) showResult(json, { summary: err.message, items: [], failed: true });
+  } finally {
+    setBusy(false);
+  }
+}
+
+function openSaveDialog(note = "") {
+  $("saveName").value = state.savedName ?? "";
+  $("saveSummary").value = state.savedSummary;
+  $("saveNote").textContent = note;
+  $("saveNote").hidden = !note;
+  $("saveReplaceBtn").hidden = true;
+  showSaveError();
+  $("saveDialog").showModal();
+  $("saveName").focus();
+}
+
+function showSaveError(msg = "") {
+  $("saveError").textContent = msg;
+  $("saveError").hidden = !msg;
+}
+
+// Save the scenario as `name`; `overwrite` replaces an existing file.
+async function saveAs(name, summary, overwrite) {
+  const doc = scenarioDoc();
+  setBusy(true);
+  try {
+    const entry = await saveScenario(name, { scenario: doc, summary, overwrite });
+    state.savedName = entry.name;
+    state.savedSummary = summary;
+    state.savedJson = JSON.stringify(doc);
+    $("sourceLabel").textContent = entry.path;
+    document.title = `ASTRUM · Sandbox · ${entry.name}`;
+    history.replaceState(null, "", `?scenario=${encodeURIComponent(entry.name)}`);
+    const runAfter = state.runAfterSave;
+    state.runAfterSave = false;
+    $("saveDialog").close();
+    if (runAfter && !isDirty()) location.href = `interactive.html?scenario=${encodeURIComponent(entry.name)}`;
+  } catch (err) {
+    showSaveError(err.message);
+    $("saveReplaceBtn").hidden = !(err instanceof ApiError && err.status === 409);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function submitSave() {
+  if (validate(state.scenario).length) {
+    showSaveError("Fix the problems listed in the Scenario JSON panel first.");
+    return;
+  }
+  saveAs($("saveName").value.trim(), $("saveSummary").value.trim(), false);
+}
+
+function replaceSave() {
+  saveAs($("saveName").value.trim(), $("saveSummary").value.trim(), true);
+}
+
+// Run needs a saved, clean scenario: save first when it is not, then open
+// Interactive on it.
+function run() {
+  const json = JSON.stringify(scenarioDoc());
+  const issues = validate(state.scenario);
+  if (issues.length) {
+    showResult(json, { summary: "Fix these first:", items: issues.map((i) => ({ text: i.msg, ok: false })), failed: true });
+    return;
+  }
+  if (state.savedName && json === state.savedJson) {
+    location.href = `interactive.html?scenario=${encodeURIComponent(state.savedName)}`;
+    return;
+  }
+  state.runAfterSave = true;
+  openSaveDialog("Saved before it runs");
+}
+
 // ---- Wiring ----------------------------------------------------------------
 
 function wire() {
@@ -838,6 +982,17 @@ function wire() {
   $("dupBtn").addEventListener("click", duplicate);
   $("delBtn").addEventListener("click", removeSelected);
   $("copyBtn").addEventListener("click", copyJson);
+  $("saveBtn").addEventListener("click", () => openSaveDialog());
+  $("checkBtn").addEventListener("click", check);
+  $("runBtn").addEventListener("click", run);
+  $("saveForm").addEventListener("submit", (e) => { e.preventDefault(); submitSave(); });
+  $("saveReplaceBtn").addEventListener("click", replaceSave);
+  $("saveCancelBtn").addEventListener("click", () => $("saveDialog").close());
+  $("saveName").addEventListener("input", () => { $("saveReplaceBtn").hidden = true; });
+  $("saveDialog").addEventListener("close", () => { state.runAfterSave = false; });
+  window.addEventListener("beforeunload", (e) => {
+    if (state.scenario && isDirty() && (state.scenario.aircraft.length || state.savedName)) e.returnValue = "";
+  });
   $("pickOriginBtn").addEventListener("click", () => setPicking(!state.pickingOrigin));
   $("worldLocation").addEventListener("change", (e) => {
     const l = state.env?.locations?.[Number(e.target.value)];
@@ -887,6 +1042,12 @@ function wire() {
   section.addEventListener("focusout", () => setTimeout(() => preview(section.matches(":hover")), 0));
 
   document.addEventListener("keydown", (e) => {
+    if (e.key.toLowerCase() === "s" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      if (!$("saveDialog").open) openSaveDialog();
+      return;
+    }
+    if ($("saveDialog").open) return; // the dialog owns the keys while it is open
     const typing = e.target.closest?.("input, select, textarea");
     const mod = e.ctrlKey || e.metaKey;
     if (e.key === "Escape") {
@@ -942,11 +1103,14 @@ async function load() {
       state.env = envs.find((e) => e.id === doc.environment) ?? state.env;
       $("sourceLabel").textContent = doc.path;
       document.title = `ASTRUM · Sandbox · ${doc.name}`;
+      state.savedName = doc.name;
+      state.savedSummary = doc.summary ?? "";
     } catch (err) {
       showLoadError(`Scenario "${name}": ${err.message} — starting a new scenario instead.`);
     }
   }
   if (!state.scenario) state.scenario = newScenario(state.env);
+  state.savedJson = state.savedName ? JSON.stringify(scenarioDoc()) : null;
   fillModelSelect($("spawnModel"), null);
   $("spawnModel").dispatchEvent(new Event("change"));
   refresh();
