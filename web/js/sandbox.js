@@ -26,7 +26,7 @@ const MAX_TEAM = 255;               // u8
 const VIEW_KEEP_M = 100000;         // an origin move keeps the view on its ground within this range
 const MAX_AMMO = 65535;             // u16
 const MAX_SPAWN = 200;
-const MIN_SPEED = 0.01;             // astrum_net::MIN_SPEED (sim.speed: 0 or ≥ this)
+const MIN_SPEED = 0.001;            // astrum_net::MIN_SPEED (sim.speed: 0 or ≥ this)
 // A spawned aircraft's TAS by model, and by kind for other models: a fast
 // cruise for the jets, hover (0) for multirotors.
 const SPAWN_TAS = { f16: 150, c172x: 55 };
