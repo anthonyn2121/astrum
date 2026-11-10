@@ -38,7 +38,7 @@
 //!   its [`ScenarioEntry`](crate::catalogs::ScenarioEntry); 400 for a bad name,
 //!   summary or body, 409 when the file exists and `overwrite` is not set, 422
 //!   for an invalid scenario, 500 when it cannot be written.
-//! * **`POST /api/scenarios/check`** — `{"scenario": {…}}` → 200
+//! * **`POST /api/scenario-check`** — `{"scenario": {…}}` → 200
 //!   `{"errors": […], "trim": [{"aircraft", "model", "ok", "error"}]}`: the
 //!   scenario's errors (then no trims), or whether each aircraft whose class
 //!   trims does so at its initial conditions. 400 for a bad body or more than
@@ -102,7 +102,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/models", get(|| async { json(StatusCode::OK, &models()) }))
         .route("/controllers", get(controllers))
         .route("/scenarios", get(scenarios))
-        .route("/scenarios/check", post(crate::scenarios::check))
+        .route("/scenario-check", post(crate::scenarios::check))
         .route("/scenarios/{name}", get(scenario).put(crate::scenarios::save))
         .route("/runs", post(runs::start))
         .route("/runs/current", get(runs::current).delete(runs::stop))

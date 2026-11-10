@@ -733,7 +733,7 @@ summary, environment, fleet, or the error that makes it unflyable) and `GET
 /api/scenarios/<name>` with `{"scenario": {…}, "summary": "…", "overwrite": false}` saves it as
 `config/scenario.<name>.toml` (201 created, 200 replaced; 409 when it exists and `overwrite` is not
 true; 400 for a bad name or summary; 422 for an invalid scenario or a model that is not a plain
-name), and `POST /api/scenarios/check` with `{"scenario": {…}}` writes nothing: 200 `{"errors":
+name), and `POST /api/scenario-check` with `{"scenario": {…}}` writes nothing: 200 `{"errors":
 […], "trim": [{aircraft, model, ok, error}]}`, the scenario's errors or whether each aircraft that
 trims does so at its initial conditions. All `/api`
 requests are subject to the `Host` check (403); non-GET ones must also be `Content-Type:

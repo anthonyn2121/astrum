@@ -1,5 +1,5 @@
 //! The studio's scenario writes and checks: `PUT /api/scenarios/<name>` saves
-//! a scenario as `config/scenario.<name>.toml`, and `POST /api/scenarios/check`
+//! a scenario as `config/scenario.<name>.toml`, and `POST /api/scenario-check`
 //! reports whether a scenario is valid and whether its fixed-wing aircraft
 //! trim, without writing anything.
 //!
@@ -36,7 +36,7 @@ struct SaveBody {
     overwrite: bool,
 }
 
-/// A `POST /api/scenarios/check` body.
+/// A `POST /api/scenario-check` body.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckBody {
@@ -109,7 +109,7 @@ pub(crate) async fn save(
     }
 }
 
-/// `POST /api/scenarios/check`: problems are data (200), not HTTP errors.
+/// `POST /api/scenario-check`: problems are data (200), not HTTP errors.
 pub(crate) async fn check(body: Result<Bytes, BytesRejection>) -> Response {
     let body = match body {
         Ok(body) => body,

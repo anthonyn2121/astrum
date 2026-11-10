@@ -1,7 +1,7 @@
 //! The studio's scenario writes and checks through the router: `PUT
 //! /api/scenarios/<name>` saves a scenario (201 created, 200 replaced, 409
 //! without `overwrite`, 400 for a bad name or summary, 422 for an invalid
-//! scenario); `POST /api/scenarios/check` reports its errors and each trim.
+//! scenario); `POST /api/scenario-check` reports its errors and each trim.
 
 mod common;
 
@@ -222,7 +222,7 @@ async fn check_reports_each_trim_and_writes_nothing() {
         common::app_with_catalogs(tmp.path(), Bridge::new(config()), Catalogs::load(&dir).unwrap());
 
     let (status, reply) =
-        send(&app, Method::POST, "/api/scenarios/check", &json!({"scenario": pair()}).to_string())
+        send(&app, Method::POST, "/api/scenario-check", &json!({"scenario": pair()}).to_string())
             .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert_eq!(reply["errors"], json!([]));
@@ -237,7 +237,7 @@ async fn check_reports_each_trim_and_writes_nothing() {
 
     let banked = with_aircraft(|a| a[1]["bank_deg"] = json!(60.0));
     let (status, reply) =
-        send(&app, Method::POST, "/api/scenarios/check", &json!({"scenario": banked}).to_string())
+        send(&app, Method::POST, "/api/scenario-check", &json!({"scenario": banked}).to_string())
             .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert_eq!(reply["errors"], json!([]));
@@ -260,7 +260,7 @@ async fn check_reports_an_invalid_scenario_as_one_error_and_no_trims() {
     let unsafe_model = with_aircraft(|a| a[1]["model"] = json!("../x"));
     for (scenario, needle) in [(duplicate, "duplicate aircraft id 7"), (unsafe_model, "model")] {
         let body = json!({"scenario": scenario}).to_string();
-        let (status, reply) = send(&app, Method::POST, "/api/scenarios/check", &body).await;
+        let (status, reply) = send(&app, Method::POST, "/api/scenario-check", &body).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
         assert_eq!(reply["trim"], json!([]));
         let errors = reply["errors"].as_array().unwrap();
@@ -287,11 +287,11 @@ async fn check_takes_at_most_512_aircraft() {
         json!({"scenario": doc}).to_string()
     };
 
-    let (status, reply) = send(&app, Method::POST, "/api/scenarios/check", &fleet(512)).await;
+    let (status, reply) = send(&app, Method::POST, "/api/scenario-check", &fleet(512)).await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert_eq!(reply, json!({"errors": [], "trim": []}));
 
-    let (status, reply) = send(&app, Method::POST, "/api/scenarios/check", &fleet(513)).await;
+    let (status, reply) = send(&app, Method::POST, "/api/scenario-check", &fleet(513)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
     assert!(reply["error"].as_str().unwrap().contains("513 aircraft"), "{reply}");
 }
