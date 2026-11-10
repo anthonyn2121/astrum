@@ -724,12 +724,18 @@ to use the viewer by name from another machine. JSON API: `GET /api/bridge` →
 `{endpoint, run, connected, status}` (`status` is the sim's `astrum ctl status` JSON, or null);
 `POST /api/bridge/control` with `{"action":"pause"|"resume"}`, `{"action":"step","ticks":N}` or
 `{"action":"speed","value":X}` → `{"ok":true}`, or `{"error":…}` with 400 (bad body), 409 (sim
-refused), 503 (no sim). The studio's catalogs are read-only routes over `--config-dir` (default
+refused), 503 (no sim). The studio's catalog and scenario routes work on `--config-dir` (default
 `config`): `GET /api/environments` (each environment's locations, sim defaults, models and metric
 ids), `GET /api/models` (model, kind, autopilot profile), `GET /api/controllers` (the controller
 catalog, `{"entries":[…]}`), `GET /api/scenarios` (every `scenario.<name>.toml` there — name,
 summary, environment, fleet, or the error that makes it unflyable) and `GET
-/api/scenarios/<name>` (one scenario in full; 404 when missing, 422 when invalid). All `/api`
+/api/scenarios/<name>` (one scenario in full; 404 when missing, 422 when invalid), `PUT
+/api/scenarios/<name>` with `{"scenario": {…}, "summary": "…", "overwrite": false}` saves it as
+`config/scenario.<name>.toml` (201 created, 200 replaced; 409 when it exists and `overwrite` is not
+true; 400 for a bad name or summary; 422 for an invalid scenario or a model that is not a plain
+name), and `POST /api/scenarios/check` with `{"scenario": {…}}` writes nothing: 200 `{"errors":
+[…], "trim": [{aircraft, model, ok, error}]}`, the scenario's errors or whether each aircraft that
+trims does so at its initial conditions. All `/api`
 requests are subject to the `Host` check (403); non-GET ones must also be `Content-Type:
 application/json` (415) and, from a browser, same-origin (403).
 

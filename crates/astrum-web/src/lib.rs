@@ -24,6 +24,7 @@ pub mod bridge;
 pub mod catalogs;
 pub mod export;
 pub mod runs;
+pub mod scenarios;
 pub mod server;
 
 use astrum_bag::{aircraft_models, AircraftModel};
