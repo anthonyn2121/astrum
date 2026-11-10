@@ -18,6 +18,7 @@ import { $, h, showError } from "./dom.js";
 import { ControllerForm } from "./ctlform.js";
 import { ScenarioPicker } from "./scenariopicker.js";
 import { VariationForm } from "./variation.js";
+import { StartCloud } from "./startcloud.js";
 
 const PLAN_DEBOUNCE_MS = 400;
 const PLAN_ROWS = 20;        // the plan table's rows; the rest is counted
@@ -33,6 +34,8 @@ const el = {
   checkTrims: $("checkTrims"), saveForm: $("saveForm"), saveName: $("saveName"), saveSummary: $("saveSummary"),
   saveError: $("saveError"), saveSubmit: $("saveSubmit"), saveReplace: $("saveReplace"), saveResult: $("saveResult"),
   variation: $("variation"),
+  startPanel: $("startPanel"), startLegend: $("startLegend"), startTip: $("startTip"),
+  startCanvas: $("startCanvas"), startFit: $("startFit"),
   runSweep: $("runSweep"), activeSweep: $("activeSweep"), activeSweepId: $("activeSweepId"),
   activeSweepProgress: $("activeSweepProgress"), activeSweepOpen: $("activeSweepOpen"),
   activeSweepStop: $("activeSweepStop"), activeSweepError: $("activeSweepError"),
@@ -58,6 +61,7 @@ const picker = new ScenarioPicker({
   envList: $("envList"), scenarioList: $("scenarioList"), scenarioEmpty: $("scenarioEmpty"),
   scenarioError: $("scenarioError"), onChange: onPick,
 });
+const cloud = new StartCloud({ canvas: el.startCanvas, legend: el.startLegend, tip: el.startTip, fitBtn: el.startFit });
 
 // ---- the scenario ----
 
@@ -71,6 +75,8 @@ function onPick(entry, doc, error) {
   el.fleetEmpty.hidden = !!entry && !error;
   el.fleetEmpty.textContent = error ? `Cannot read scenario ${entry.name}: ${error}` : "Pick a scenario first.";
   showError(el.fleetError, "");
+  el.startPanel.hidden = !doc;
+  cloud.set(doc, null);
   if (doc) el.maxTime.value = String(defaultMaxTime(doc));
   changed();
 }
@@ -137,6 +143,7 @@ function clearPlan() {
   el.planTable.replaceChildren();
   el.planWrap.hidden = true;
   showError(el.planMore, "");
+  cloud.set(state.doc, null);
 }
 
 // The form changed: the plan is out of date. Plan again once the form has
@@ -183,6 +190,7 @@ const formatValue = (v) => (typeof v === "number" ? v.toFixed(3) : String(v));
 // counted, and the trim check when it was asked for.
 function renderPlan(plan) {
   showError(el.planError, "");
+  cloud.set(state.doc, plan);
   el.planSummary.textContent = `${plan.runs} runs · ${plan.in_process ? "in-process" : "with controllers (processes)"}`;
   const withSample = plan.rows.some((r) => r.sample != null);
   const shown = plan.rows.slice(0, PLAN_ROWS);
