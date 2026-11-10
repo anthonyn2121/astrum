@@ -7,7 +7,9 @@
 mod common;
 
 use astrum_sim::scenario::Scenario;
-use astrum_web::assign::{assign, find_program, scenario_input, AssignmentBody, InputError};
+use astrum_web::assign::{
+    assign, check_programs, find_program, scenario_input, AssignmentBody, InputError,
+};
 use astrum_web::catalogs::Catalogs;
 use common::{repo_catalogs, repo_config};
 use serde_json::{json, Value};
@@ -47,7 +49,7 @@ fn a_saved_name_resolves_to_its_scenario() {
 #[test]
 fn an_unknown_name_is_a_bad_request_naming_it() {
     let err = scenario_input(json!("missing"), &repo_catalogs()).unwrap_err();
-    assert!(matches!(&err, InputError::Bad(m) if m.contains("missing")), "{err:?}");
+    assert_eq!(err, InputError::Bad("scenario: no scenario named \"missing\"".into()));
 }
 
 #[test]
@@ -58,7 +60,9 @@ fn an_invalid_saved_scenario_is_invalid_and_named() {
     std::fs::write(dir.path().join("scenario.broken.toml"), "[world\n").unwrap();
     let catalogs = Catalogs::load(dir.path()).unwrap();
     let err = scenario_input(json!("broken"), &catalogs).unwrap_err();
-    assert!(matches!(&err, InputError::Invalid(m) if m.contains("broken")), "{err:?}");
+    let Err(parse) = Scenario::from_toml_str("[world\n") else { panic!("the fixture parses") };
+    let path = dir.path().join("scenario.broken.toml");
+    assert_eq!(err, InputError::Invalid(format!("{}: {parse}", path.display())));
 }
 
 #[test]
@@ -166,4 +170,92 @@ fn a_missing_path_names_the_program() {
 fn a_missing_bare_name_is_not_on_path() {
     let err = find_program("astrum-no-such-program-xyz").unwrap_err();
     assert_eq!(err, "`astrum-no-such-program-xyz` not found on PATH");
+}
+
+#[test]
+fn a_given_param_overrides_its_default_and_an_omitted_one_shows_its_default() {
+    let catalogs = repo_catalogs();
+    let requests = [request(json!({
+        "aircraft": 1, "controller": "cpp-hold", "params": {"heading": 270.0}
+    }))];
+    let (_, views) = assign(&mut fleet(), &requests, catalogs.controllers()).unwrap();
+    assert_eq!(views[0].params["heading"], json!(270.0));
+    assert_eq!(views[0].params["alt"], json!(1500.0));
+    assert_eq!(views[0].params["max-bank"], json!(25.0));
+}
+
+#[test]
+fn an_integer_param_stays_an_integer_in_the_view() {
+    let catalogs = repo_catalogs();
+    let requests = [request(json!({
+        "aircraft": 1, "controller": "cpp-hold", "params": {"alt": 1600}
+    }))];
+    let (_, views) = assign(&mut fleet(), &requests, catalogs.controllers()).unwrap();
+    let alt = &views[0].params["alt"];
+    assert!(alt.is_i64(), "{alt}");
+    assert_eq!(alt.as_i64(), Some(1600));
+}
+
+#[test]
+fn a_kind_mismatch_names_the_aircraft_kind_and_what_the_controller_flies() {
+    let catalogs = repo_catalogs();
+    let requests = [request(json!({"aircraft": 2, "controller": "cpp-hold"}))];
+    let err = assign(&mut fleet(), &requests, catalogs.controllers()).unwrap_err();
+    assert_eq!(
+        err,
+        "aircraft 2: controller \"cpp-hold\" does not fly multirotor aircraft (it flies fixed-wing)"
+    );
+}
+
+#[test]
+fn check_programs_names_a_controller_whose_program_is_missing() {
+    let catalogs = repo_catalogs();
+    let requests = [request(json!({"aircraft": 1, "controller": "cpp-hold"}))];
+    let (_, views) = assign(&mut fleet(), &requests, catalogs.controllers()).unwrap();
+    let err = check_programs(&views, catalogs.controllers()).unwrap_err();
+    assert!(
+        err.starts_with(
+            "aircraft 1: controller `cpp-hold`: `build/controllers/cpp/astrum-controller` not found or not executable (build the C++ controllers: "
+        ),
+        "{err}"
+    );
+    assert!(err.contains("cmake -S controllers"), "{err}");
+}
+
+#[test]
+fn check_programs_accepts_controllers_whose_programs_exist() {
+    let catalogs = repo_catalogs();
+    let requests = [request(json!({"aircraft": 1, "controller": "py-hold"}))];
+    let (_, views) = assign(&mut fleet(), &requests, catalogs.controllers()).unwrap();
+    assert_eq!(check_programs(&views, catalogs.controllers()), Ok(()));
+}
+
+#[test]
+fn a_missing_build_path_names_the_program_and_how_to_build_it() {
+    let err = find_program("build/controllers/cpp/astrum-controller").unwrap_err();
+    assert!(
+        err.starts_with(
+            "`build/controllers/cpp/astrum-controller` not found or not executable (build the C++ controllers: "
+        ),
+        "{err}"
+    );
+    assert!(err.contains("cmake -S controllers"), "{err}");
+}
+
+#[test]
+fn a_file_without_the_executable_bit_is_not_a_program() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("astrum-controller");
+    std::fs::write(&path, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        find_program(path.to_str().unwrap()),
+        Err(format!("`{}` not found or not executable", path.display()))
+    );
+}
+
+#[test]
+fn a_bare_name_on_path_can_start() {
+    assert_eq!(find_program("sh"), Ok(()));
 }
