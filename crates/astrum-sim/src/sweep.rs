@@ -43,7 +43,8 @@ use crate::perturb::{self, Axis, Group, Offset, Perturb};
 use crate::record;
 use crate::rng::SplitMix64;
 use crate::scenario::Scenario;
-use crate::systems::{build_fdm, StopRequested};
+use crate::systems::StopRequested;
+use crate::trim;
 use crate::{build_app, run_to_exit, RunMode};
 
 /// A run or sweep file (TOML). Paths are relative to the working directory.
@@ -481,8 +482,8 @@ impl Sweep {
     }
 
     /// Build and trim every aircraft whose class trims at every run's initial
-    /// conditions, in run order — the sim's own FDM build ([`build_fdm`]), so
-    /// a run that would fail its spawn trim fails here, before anything flies.
+    /// conditions, in run order — the sim's own FDM build ([`trim::check_aircraft`]),
+    /// so a run that would fail its spawn trim fails here, before anything flies.
     /// Identical builds (same aircraft, ICs, rate and seed) are trimmed once.
     /// JSBSim serialises model loads and trims process-wide, so this runs on
     /// the calling thread (about 8 ms per F-16). The error names the first
@@ -511,7 +512,7 @@ impl Sweep {
                 if !seen.insert(format!("{}|{}|{class:?}|{bits:?}|{}", a.id, a.model, s.sim.seed)) {
                     continue;
                 }
-                build_fdm(a, &class, 1.0 / s.sim.rate_hz, s.sim.seed).map_err(|e| {
+                trim::check_aircraft(s, a).map_err(|e| {
                     let values = describe(&self.value_keys, &run.values);
                     err(format!("run {} ({values}): {e}", run.index + 1))
                 })?;

@@ -36,6 +36,7 @@ pub mod scenario;
 pub mod step_pool;
 pub mod sweep;
 pub mod systems;
+pub mod trim;
 
 use bevy::prelude::*;
 

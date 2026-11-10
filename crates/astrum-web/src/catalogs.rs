@@ -25,6 +25,9 @@ pub const CONTROLLERS_FILE: &str = "controllers.toml";
 /// The environment of every scenario until a scenario can name its own.
 pub const DEFAULT_ENVIRONMENT: &str = "empty";
 
+/// Longest scenario summary, in characters.
+const SUMMARY_MAX_CHARS: usize = 200;
+
 /// A model ASTRUM has tuned profiles for.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelEntry {
@@ -98,6 +101,29 @@ impl fmt::Display for ScenarioError {
     }
 }
 
+/// Why [`Catalogs::save_scenario`] wrote nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveError {
+    /// The name cannot be a file name ([`safe_name`]).
+    BadName(String),
+    /// The summary is not one line of at most [`SUMMARY_MAX_CHARS`] characters.
+    BadSummary(String),
+    /// The file exists and may not be replaced.
+    Exists(String),
+    /// Writing the file failed.
+    Io(String),
+}
+
+impl fmt::Display for SaveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadName(msg) | Self::BadSummary(msg) | Self::Exists(msg) | Self::Io(msg) => {
+                f.write_str(msg)
+            }
+        }
+    }
+}
+
 /// The config directory and the controller catalog read from it.
 #[derive(Debug, Clone)]
 pub struct Catalogs {
@@ -139,19 +165,7 @@ impl Catalogs {
             if !path.is_file() {
                 continue;
             }
-            let text = std::fs::read_to_string(&path)?;
-            let (error, aircraft) = match Scenario::from_toml_str(&text) {
-                Ok(scenario) => (None, fleet(&scenario)),
-                Err(e) => (Some(e.to_string()), Vec::new()),
-            };
-            entries.push(ScenarioEntry {
-                name,
-                path: path.display().to_string(),
-                summary: summary(&text),
-                environment: DEFAULT_ENVIRONMENT,
-                error,
-                aircraft,
-            });
+            entries.push(scenario_entry(&path, name)?);
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
@@ -177,6 +191,65 @@ impl Catalogs {
             scenario,
         })
     }
+
+    /// Save `scenario` as `scenario.<name>.toml`, preceded by a `# <summary>`
+    /// line unless `summary` is empty. The file is written beside its target
+    /// and renamed over it, so a reader sees the old file or the new one. An
+    /// existing file is replaced only with `overwrite`. Returns the file's
+    /// listing entry and `true` when the file was created (`false`: replaced).
+    pub fn save_scenario(
+        &self,
+        name: &str,
+        scenario: &Scenario,
+        summary: &str,
+        overwrite: bool,
+    ) -> Result<(ScenarioEntry, bool), SaveError> {
+        let path = self.scenario_path(name).map_err(SaveError::BadName)?;
+        if summary.contains(['\n', '\r']) {
+            return Err(SaveError::BadSummary("summary must be a single line".into()));
+        }
+        let chars = summary.chars().count();
+        if chars > SUMMARY_MAX_CHARS {
+            return Err(SaveError::BadSummary(format!(
+                "summary must be at most {SUMMARY_MAX_CHARS} characters, got {chars}"
+            )));
+        }
+        let existed = path.exists();
+        if existed && !overwrite {
+            return Err(SaveError::Exists(format!(
+                "scenario \"{name}\" exists; send overwrite: true to replace it"
+            )));
+        }
+        let header = if summary.is_empty() { String::new() } else { format!("# {summary}\n") };
+        let text = format!("{header}{}", scenario.to_toml());
+        let tmp = self.config_dir.join(format!(".scenario.{name}.toml.tmp"));
+        let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            // The target is untouched; the temporary file is not wanted.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(SaveError::Io(format!("saving {}: {e}", path.display())));
+        }
+        let saved = scenario_entry(&path, name.to_owned())
+            .map_err(|e| SaveError::Io(format!("reading {}: {e}", path.display())))?;
+        Ok((saved, !existed))
+    }
+}
+
+/// The listing entry of the scenario file `path`, named `name`.
+fn scenario_entry(path: &Path, name: String) -> io::Result<ScenarioEntry> {
+    let text = std::fs::read_to_string(path)?;
+    let (error, aircraft) = match Scenario::from_toml_str(&text) {
+        Ok(scenario) => (None, fleet(&scenario)),
+        Err(e) => (Some(e.to_string()), Vec::new()),
+    };
+    Ok(ScenarioEntry {
+        name,
+        path: path.display().to_string(),
+        summary: summary(&text),
+        environment: DEFAULT_ENVIRONMENT,
+        error,
+        aircraft,
+    })
 }
 
 /// `<name>` of a `scenario.<name>.toml` path whose name is [`safe_name`].

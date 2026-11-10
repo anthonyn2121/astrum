@@ -5,8 +5,9 @@ mod common;
 
 use std::path::Path;
 
+use astrum_sim::scenario::Scenario;
 use astrum_web::bridge::Bridge;
-use astrum_web::catalogs::Catalogs;
+use astrum_web::catalogs::{Catalogs, SaveError};
 use axum::body::{to_bytes, Body};
 use axum::http::header::HOST;
 use axum::http::{Request, StatusCode};
@@ -170,4 +171,51 @@ fn a_config_dir_without_a_valid_controller_catalog_is_refused() {
     assert!(err.contains("controllers.toml"), "{err}");
     std::fs::write(tmp.path().join("controllers.toml"), "[[controller]]\nid = \"x\"\n").unwrap();
     assert!(Catalogs::load(tmp.path()).is_err());
+}
+
+const ONE_SHIP: &str = "[world]\norigin_lat_deg = 37.0\norigin_lon_deg = -122.0\n\
+                        origin_alt_hae_m = 0.0\n[sim]\nrate_hz = 120.0\n\
+                        [[aircraft]]\nid = 1\nmodel = \"F450\"\nlat_deg = 37.0\n\
+                        lon_deg = -122.0\nalt_hae_m = 50.0\nheading_deg = 0.0\ntas_mps = 0.0\n";
+
+#[test]
+fn save_scenario_writes_the_file_it_names_and_refuses_what_it_cannot_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = config_dir(tmp.path());
+    let catalogs = Catalogs::load(&dir).unwrap();
+    let scenario = Scenario::from_toml_str(ONE_SHIP).unwrap();
+    let file = dir.join("scenario.solo.toml");
+
+    let (entry, created) = catalogs.save_scenario("solo", &scenario, "One ship.", false).unwrap();
+    assert!(created);
+    assert_eq!(entry.summary, "One ship.");
+    let listed = catalogs.scenarios().unwrap().into_iter().find(|e| e.name == "solo").unwrap();
+    assert_eq!(entry, listed);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text, format!("# One ship.\n{}", scenario.to_toml()));
+
+    // An empty summary writes no comment line, and replacing the file reports `false`.
+    let (entry, created) = catalogs.save_scenario("solo", &scenario, "", true).unwrap();
+    assert!(!created);
+    assert_eq!(entry.summary, "");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), scenario.to_toml());
+
+    let exists = catalogs.save_scenario("solo", &scenario, "x", false).unwrap_err();
+    assert_eq!(exists.to_string(), "scenario \"solo\" exists; send overwrite: true to replace it");
+
+    for name in ["", "a.b", "../x"] {
+        let e = catalogs.save_scenario(name, &scenario, "", true).unwrap_err();
+        assert!(matches!(e, SaveError::BadName(_)), "{name:?}: {e}");
+    }
+    let long = "x".repeat(201);
+    for summary in ["one\ntwo", "one\rtwo", long.as_str()] {
+        let e = catalogs.save_scenario("solo", &scenario, summary, true).unwrap_err();
+        assert!(matches!(e, SaveError::BadSummary(_)), "{e}");
+    }
+
+    // A directory where the file would go: the rename fails and the temporary file goes too.
+    let e = catalogs.save_scenario("dir", &scenario, "", true).unwrap_err();
+    assert!(matches!(e, SaveError::Io(_)), "{e}");
+    assert!(!dir.join(".scenario.dir.toml.tmp").exists());
+    assert!(!dir.join(".scenario.solo.toml.tmp").exists());
 }

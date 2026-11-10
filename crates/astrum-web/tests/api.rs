@@ -114,6 +114,8 @@ async fn every_api_path_and_method_is_guarded() {
         "/api/runs/current/log",
         "/api/runs/some-run/replay",
         "/api/runs/some-run/metrics",
+        "/api/scenarios/check",
+        "/api/scenarios/some-name",
         "/api/nope",
         "/api",
         "/api/",
