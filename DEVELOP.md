@@ -451,6 +451,16 @@ waits for it after serving (`Runs::shutdown`). Its tests (`tests/runs.rs`) fly a
 stand-in sim and the real one, which must be built first (`cargo build -p astrum-sim`; or set
 `ASTRUM_SKIP_REAL_SIM=1`).
 
+**Web sweeps** (`crates/astrum-web/src/sweepruns.rs`): `SweepRuns` owns the one web sweep, as `Runs`
+owns the live run, and is independent of it. A start resolves the request (`sweeps::resolve`), plans it
+with `Sweep::plan_scenario`, refuses what `astrum sweep` refuses (no `astrum-sim`, too few ports, a
+failed `check_trim`) and only then creates `<runs-dir>/sweeps/<id>/`. A supervisor thread runs
+`sweep::execute` with `run_in_process` or `launch::run_processes`, exactly as the CLI does, and its
+`on_event` updates the in-memory run states; `meta.json` is rewritten atomically when it ends, before
+the record says so. A sweep that the disk says is `running` but no server owns reads back as
+`interrupted`. Tests (`tests/sweepruns.rs`) fly the `pair` scenario in-process, and one process-mode
+sweep on the real sim with the Python controller (same build requirement as `tests/runs.rs`).
+
 **Scene edit API** (the sandbox; sweep previews build on it). `Scene.setEditing({onSelect, onEdit,
 onPoint})` turns on edit mode (and the `"map"` environment: imagery for any fleet); the scene only
 *reports* what the pointer did and draws what its store says. `onSelect(ids, "replace" | "toggle" |

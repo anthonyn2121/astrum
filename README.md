@@ -742,7 +742,7 @@ trims does so at its initial conditions. All `/api`
 requests are subject to the `Host` check (403); non-GET ones must also be `Content-Type:
 application/json` (415) and, from a browser, same-origin (403).
 
-Sweeps (planned and saved, never flown here): `POST /api/sweeps/plan` with `{"scenario": "<name>",
+Sweeps: planned and saved, and flown from the browser. `POST /api/sweeps/plan` with `{"scenario": "<name>",
 "assignments": [{"aircraft", "controller", "params"}], "perturb": [{"aircraft": [2], "forward_m":
 {"uniform": 300}}], "vary": {"aircraft.2.offset.forward_m": [-200, 0, 200]}, "samples", "sample_seed",
 "min_separation_m", "min_alt_hae_m", "repeats", "max_time_s", "run_timeout_s", "jobs", "check_trim"}`
@@ -756,6 +756,25 @@ is this config directory's `scenario.<name>.toml`, or the error that makes the f
 `GET /api/sweeps/saved/<name>` reads one back as a request; 422 for a sweep the Sweeps page cannot edit
 (settings its request would not write back, such as `speed`, `out` or hand-written `controllers`); run
 such a file with `astrum sweep` instead.
+
+`POST /api/sweeps` takes the same body and starts the sweep in the background, as `astrum sweep` flies it
+(in-process, or in process mode with the request's assignments as controllers). It writes
+`<--runs-dir>/sweeps/<id>/` (`<id>` = UTC `yyyymmdd-hhmmss-<scenario>`): `request.json`, `sweep.toml`,
+`meta.json` (the state, rewritten when the sweep ends), `summary.csv` and per run `run-NNNN.mcap` and
+`run-NNNN.metrics.json`. Run N of a process-mode sweep listens on `27500 + N - 1`. Refused before
+anything is written: 400 for a bad request, 409 while another sweep runs (the message names it), 422 for
+a sweep that cannot fly (no `astrum-sim` for process mode, too few ports, a failed trim check) → 201 with
+its view otherwise. One sweep runs at a time, independent of the live run. `GET /api/sweeps/current` →
+`{"sweep": …|null}` (the latest since the server started); `DELETE /api/sweeps/current` stops it (200 with
+its final view; the runs not yet started stay `queued`; 404 when none runs). `GET /api/sweeps` → the
+sweeps newest first, `[{id, scenario, state, total, ok, failed, started_at, wall_s}]`. `GET
+/api/sweeps/<id>` → the sweep's view: `state` (`running`, `finished`, `stopped`, `failed`, or
+`interrupted` for a sweep whose server went away), its counts and each run's `status` (`queued`,
+`running`, `ok`, `failed`, `stopped`) with reason, sim time and wall time. `GET
+/api/sweeps/<id>/results` → `summary.csv` as `{"columns": […], "rows": [[…]]}` (numbers as numbers, empty
+cells as null; 404 until it is written). `GET /api/sweeps/<id>/runs/<n>/replay` (`n` 1-based) → run n's
+replay document, as `GET /api/runs/<id>/replay` (400 outside the plan, 404 without a bag, 409 while it
+runs). Ids are checked as path segments (400 for `..`, `/` and the like).
 
 Live interactive runs — one at a time, owned by the server: `POST /api/runs` with
 `{"scenario": "<name>" | {…scenario…}, "assignments": [{"aircraft": 1, "controller": "cpp-hold",
@@ -778,7 +797,7 @@ replay. `GET /api/runs/current` → `{"run": …|null}` (the latest since the se
 last 5000 output lines; a controller's `source` is its aircraft, `aircraft 1`);
 `GET /api/runs/<id>/replay` (the `astrum-replay` export) and `GET /api/runs/<id>/metrics`
 (`astrum metrics` JSON) serve any run under the runs dir (400 for an id that is not a plain name,
-404 when unknown or unrecorded, 409 while it runs). Stopping the server stops the active run first.
+404 when unknown or unrecorded, 409 while it runs). Stopping the server stops the active run and sweep first.
 
 The same port serves the static `web/` app and the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags:
 `--connect` (default `tcp/127.0.0.1:7447`, attached at startup), `--bind` (default

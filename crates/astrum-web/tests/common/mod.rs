@@ -16,6 +16,7 @@ use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::catalogs::Catalogs;
 use astrum_web::runs::{Runs, RunsConfig};
 use astrum_web::server::{router, Config};
+use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig};
 use axum::Router;
 
 /// A Zenoh endpoint on this process's own port block (`n` < 10), so parallel
@@ -145,7 +146,7 @@ pub fn app_with_runs(tmp: &Path, bridge: Bridge, catalogs: Catalogs, sim: &Path)
     let cfg =
         RunsConfig { dir: tmp.join("runs"), sim: sim.to_owned(), connect: RUNS_CONNECT.into() };
     let runs = Runs::new(cfg, bridge.clone());
-    (build_with(tmp, bridge, &[], catalogs, runs.clone()), runs)
+    (build_with(tmp, bridge, &[], catalogs, runs.clone(), default_sweeps(tmp)), runs)
 }
 
 fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs) -> Router {
@@ -155,7 +156,40 @@ fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs)
         sim: tmp.join("no-astrum-sim"),
         connect: RUNS_CONNECT.into(),
     };
-    build_with(tmp, bridge.clone(), allowed_hosts, catalogs, Runs::new(cfg, bridge))
+    let runs = Runs::new(cfg, bridge.clone());
+    build_with(tmp, bridge, allowed_hosts, catalogs, runs, default_sweeps(tmp))
+}
+
+/// The sweep runner of a test tree: sweeps under `<tmp>/runs/sweeps`, process
+/// mode flying `sim` with run N on `base_port + N - 1`.
+fn sweep_runs(tmp: &Path, sim: &Path, base_port: u16) -> SweepRuns {
+    let cfg =
+        SweepRunsConfig { dir: tmp.join("runs").join("sweeps"), sim: sim.to_owned(), base_port };
+    SweepRuns::new(cfg)
+}
+
+/// [`sweep_runs`] for tests that fly no sweep.
+fn default_sweeps(tmp: &Path) -> SweepRuns {
+    sweep_runs(tmp, &tmp.join("no-astrum-sim"), 27500)
+}
+
+/// [`app`] over `catalogs` whose web sweeps fly `sim` (process mode) on ports
+/// from `base_port`; also the sweep runner, for shutting it down.
+pub fn app_with_sweeps(
+    tmp: &Path,
+    bridge: Bridge,
+    catalogs: Catalogs,
+    sim: &Path,
+    base_port: u16,
+) -> (Router, SweepRuns) {
+    let sweeps = sweep_runs(tmp, sim, base_port);
+    let cfg = RunsConfig {
+        dir: tmp.join("runs"),
+        sim: tmp.join("no-astrum-sim"),
+        connect: RUNS_CONNECT.into(),
+    };
+    let runs = Runs::new(cfg, bridge.clone());
+    (build_with(tmp, bridge, &[], catalogs, runs, sweeps.clone()), sweeps)
 }
 
 fn build_with(
@@ -164,6 +198,7 @@ fn build_with(
     allowed_hosts: &[&str],
     catalogs: Catalogs,
     runs: Runs,
+    sweeps: SweepRuns,
 ) -> Router {
     let web = tmp.join("web");
     std::fs::create_dir_all(&web).unwrap();
@@ -179,6 +214,7 @@ fn build_with(
         allowed_hosts: allowed_hosts.iter().map(|h| (*h).to_owned()).collect(),
         catalogs,
         runs,
+        sweeps,
     };
     router(cfg, bridge).unwrap()
 }
