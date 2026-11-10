@@ -20,6 +20,7 @@
 //! Keeping the shapes here means the live stream and the exporter cannot drift.
 
 pub mod api;
+pub mod assign;
 pub mod bridge;
 pub mod catalogs;
 pub mod export;
