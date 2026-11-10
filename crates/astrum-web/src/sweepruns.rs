@@ -14,17 +14,24 @@
 //! CLI does and keeps the sweep's per-run state in memory for the API.
 //!
 //! Every sweep directory under the sweeps dir (this server's or an earlier
-//! one's) serves its results and its runs' replays. A sweep whose `meta.json`
-//! says `running` but which this server does not own was interrupted: it is
-//! reported as `interrupted`, and its unfinished runs as `stopped`.
+//! one's) serves its results and its runs' replays; the list reads each sweep's
+//! `meta.json` only, and skips a sweep whose meta (or, for an interrupted one,
+//! summary) cannot be read. A sweep whose `meta.json` says `running` but which
+//! this server does not own was interrupted: it is reported as `interrupted`,
+//! and its unfinished runs as `stopped`.
+//!
+//! A stop request ends the sweep's processes as it asks them to end: once
+//! [`STOP_GRACE`] has passed while the sweep is still active, its processes are
+//! killed, and again every second, until the supervisor has ended.
 
 use std::fmt;
 use std::io;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use astrum_sim::launch::{run_processes, Children, ProcessCtx};
 use astrum_sim::sweep::{execute, run_in_process, Purpose, RunEvent, Status, Sweep};
@@ -59,6 +66,13 @@ const SUMMARY_FILE: &str = "summary.csv";
 /// Why a sweep whose server went away is reported as `interrupted`.
 const INTERRUPTED: &str = "the server stopped before the sweep ended";
 
+/// How long a stop request gets before the sweep's processes are killed.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+/// How often a stopped sweep's processes are killed again until it has ended.
+const KILL_EVERY: Duration = Duration::from_secs(1);
+/// How often the escalation checks whether the sweep has ended.
+const TICK: Duration = Duration::from_millis(10);
+
 /// Where sweeps go, what flies them, and the first port process-mode runs
 /// listen on.
 #[derive(Debug, Clone)]
@@ -70,6 +84,8 @@ pub struct SweepRunsConfig {
     /// Run N (1-based) of a process-mode sweep listens on
     /// `tcp/127.0.0.1:<base_port + N - 1>`.
     pub base_port: u16,
+    /// How long a stop request waits before the sweep's processes are killed.
+    pub stop_grace: Duration,
 }
 
 /// A sweep's lifecycle.
@@ -119,7 +135,6 @@ impl RunEntry {
 
 /// A sweep's `meta.json`: written at start, rewritten when the sweep ends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Meta {
     id: String,
     scenario: String,
@@ -134,6 +149,12 @@ struct Meta {
     wall_s: Option<f64>,
     /// The varied and drawn keys: the summary's columns after `sample`.
     keys: Vec<String>,
+    /// Runs ok and failed, written when the sweep ends: `None` while it runs and
+    /// in a meta written before they were kept.
+    #[serde(default)]
+    ok: Option<usize>,
+    #[serde(default)]
+    failed: Option<usize>,
 }
 
 /// A sweep as the API reports it.
@@ -257,8 +278,8 @@ struct Inner {
 struct SweepsState {
     /// The latest sweep since the server started.
     current: Option<Record>,
-    /// A sweep is being started (it has no record yet).
-    starting: bool,
+    /// A sweep is being started: its id, once its directory exists.
+    starting: Option<Option<String>>,
     /// Shutting down: no new sweeps.
     closed: bool,
 }
@@ -299,6 +320,9 @@ impl Record {
                 meta.reason = e.reason.clone();
                 meta.ended_at = Some(iso_utc(e.at_ms));
                 meta.wall_s = Some(secs(self.started_ms, e.at_ms));
+                meta.ok = Some(self.runs.iter().filter(|r| r.status == EntryStatus::Ok).count());
+                meta.failed =
+                    Some(self.runs.iter().filter(|r| r.status == EntryStatus::Failed).count());
             }
             None => meta.wall_s = Some(secs(self.started_ms, now_ms())),
         }
@@ -324,32 +348,43 @@ struct Job {
 }
 
 impl Job {
-    /// Fly every run as `astrum sweep` does, then record how the sweep ended.
+    /// Fly every run as `astrum sweep` does, then record how the sweep ended. A
+    /// panic while flying ends it `failed` all the same, so it never stays
+    /// `running` and blocks the next start.
     fn run(self) {
         let Self { sweeps, id, dir, sweep, stop, children, sim, base_port, done } = self;
-        let on_event = |event: RunEvent| sweeps.record(&id, event);
-        let jobs = sweep.jobs(None);
-        let outcome = if sweep.in_process() {
-            execute(&sweep, jobs, &stop, on_event, |run| {
-                run_in_process(run, &dir.join(format!("{}.mcap", run.stem())), &stop)
-            })
-        } else {
-            let ctx = ProcessCtx {
-                sweep: &sweep,
-                out: &dir,
-                sim: &sim,
-                base_port,
-                stop: &stop,
-                children: &children,
-            };
-            execute(&sweep, jobs, &stop, on_event, |run| run_processes(&ctx, run))
-        };
-        let (state, reason) = match outcome {
-            Ok(_) if stop.requested() => (SweepState::Stopped, None),
-            Ok(_) => (SweepState::Finished, None),
-            Err(e) => {
+        let flown = catch_unwind(AssertUnwindSafe(|| {
+            let on_event = |event: RunEvent| sweeps.record(&id, event);
+            let jobs = sweep.jobs(None);
+            if sweep.in_process() {
+                execute(&sweep, jobs, &stop, on_event, |run| {
+                    run_in_process(run, &dir.join(format!("{}.mcap", run.stem())), &stop)
+                })
+            } else {
+                let ctx = ProcessCtx {
+                    sweep: &sweep,
+                    out: &dir,
+                    sim: &sim,
+                    base_port,
+                    stop: &stop,
+                    children: &children,
+                };
+                execute(&sweep, jobs, &stop, on_event, |run| run_processes(&ctx, run))
+            }
+        }));
+        let (state, reason) = match flown {
+            Ok(Ok(outcomes)) => {
+                // A run that never started or ended stopped makes the sweep
+                // stopped; a stop that came after the last run leaves it finished.
+                let cut_short = outcomes
+                    .iter()
+                    .any(|o| o.as_ref().is_none_or(|o| matches!(o.status, Status::Stopped(_))));
+                (if cut_short { SweepState::Stopped } else { SweepState::Finished }, None)
+            }
+            Ok(Err(e)) => {
                 (SweepState::Failed, Some(format!("writing the results to {}: {e}", dir.display())))
             }
+            Err(_) => (SweepState::Failed, Some("the sweep's supervisor panicked".to_owned())),
         };
         sweeps.end(&id, &dir, Ended { state, reason, at_ms: now_ms() }, &done);
     }
@@ -392,7 +427,7 @@ impl SweepRuns {
     /// being started) has ended.
     pub fn shutdown(&self) {
         self.close();
-        while self.lock().starting {
+        while self.lock().starting.is_some() {
             std::thread::sleep(Duration::from_millis(20));
         }
         let supervisor = self.lock().current.as_mut().and_then(|r| r.supervisor.take());
@@ -402,33 +437,30 @@ impl SweepRuns {
     }
 
     /// Check the request, plan it and start the sweep. Blocks (file reads,
-    /// JSBSim trims, directory writes): call it on a blocking thread.
+    /// JSBSim trims, directory writes): call it on a blocking thread. A
+    /// conflicting request is refused before anything is planned.
     fn start_blocking(&self, req: SweepRequest, catalogs: &Catalogs) -> Result<SweepView, Refusal> {
+        admit(&self.lock())?;
         let resolved = resolve(&req, catalogs)?;
         let sweep =
             Sweep::plan_scenario(resolved.file, resolved.scenario, &req.scenario, Purpose::Sweep)
                 .map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-        {
-            let mut state = self.lock();
-            if state.closed {
-                return Err(refuse(StatusCode::SERVICE_UNAVAILABLE, "the server is shutting down"));
-            }
-            if state.starting {
-                return Err(refuse(StatusCode::CONFLICT, "another sweep is being started"));
-            }
-            if let Some(active) = state.current.as_ref().filter(|r| r.active()) {
-                return Err(refuse(
-                    StatusCode::CONFLICT,
-                    format!("a sweep is already running: {}", active.base.id),
-                ));
-            }
-            state.starting = true;
-        }
-        let started = self.launch(&req, sweep);
-        self.lock().starting = false;
-        started
+        let _starting = self.begin()?;
+        self.launch(&req, sweep)
     }
 
+    /// Mark a sweep as starting, after checking again that one may start. The
+    /// mark clears when the guard drops, however the start ends.
+    fn begin(&self) -> Result<Starting, Refusal> {
+        let mut state = self.lock();
+        admit(&state)?;
+        state.starting = Some(None);
+        Ok(Starting(self.clone()))
+    }
+
+    /// Start the sweep: its directory, its record and its supervisor. The record
+    /// is installed before `meta.json` is written, so a reader never finds the
+    /// sweep on disk and not in memory.
     fn launch(&self, req: &SweepRequest, mut sweep: Sweep) -> Result<SweepView, Refusal> {
         let cfg = &self.0.cfg;
         if !sweep.in_process() {
@@ -464,6 +496,7 @@ impl SweepRuns {
         let (id, dir) = new_run_dir(&cfg.dir, &utc_stamp(started_ms), &req.scenario)
             .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         sweep.out = dir.clone();
+        self.lock().starting = Some(Some(id.clone()));
         let base = Meta {
             id: id.clone(),
             scenario: req.scenario.clone(),
@@ -476,63 +509,75 @@ impl SweepRuns {
             ended_at: None,
             wall_s: None,
             keys: sweep.value_keys.clone(),
+            ok: None,
+            failed: None,
+        };
+        let stop = StopRequested::default();
+        let (done_tx, done) = watch::channel(false);
+        // The supervisor flies the job it is sent once the sweep's files are written.
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let supervisor = std::thread::Builder::new()
+            .name(format!("sweep-{id}"))
+            .spawn(move || {
+                if let Ok(job) = job_rx.recv() {
+                    job.run();
+                }
+            })
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&dir);
+                refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("starting the sweep: {e}"))
+            })?;
+        let escalation = {
+            let (stop, done, children) = (stop.clone(), done.clone(), self.0.children.clone());
+            let grace = cfg.stop_grace;
+            std::thread::Builder::new()
+                .name(format!("sweep-{id}-stop"))
+                .spawn(move || escalate(stop, children, grace, done))
+        };
+        if let Err(e) = escalation {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("starting the sweep: {e}"),
+            ));
+        }
+        let runs = (1..=sweep.runs.len()).map(RunEntry::queued).collect();
+        let record = Record {
+            base: base.clone(),
+            started_ms,
+            out: dir.clone(),
+            ended: None,
+            runs,
+            stop: stop.clone(),
+            done,
+            supervisor: Some(supervisor),
+        };
+        let (previous, view) = {
+            let mut state = self.lock();
+            if state.closed {
+                stop.0.store(true, Ordering::Relaxed);
+            }
+            let view = record.view();
+            (state.current.replace(record), view)
         };
         if let Err(why) = write_start(&dir, req, &sweep, &base) {
+            self.lock().current = previous;
             let _ = std::fs::remove_dir_all(&dir);
             return Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, why));
         }
-
-        let stop = StopRequested::default();
-        let (done_tx, done) = watch::channel(false);
-        // The supervisor waits for the record below, so its first event finds it.
-        let (installed_tx, installed) = mpsc::channel::<()>();
-        let runs = (1..=sweep.runs.len()).map(RunEntry::queued).collect();
         let job = Job {
             sweeps: self.clone(),
-            id: id.clone(),
-            dir: dir.clone(),
+            id,
+            dir,
             sweep,
-            stop: stop.clone(),
+            stop,
             children: self.0.children.clone(),
             sim: cfg.sim.clone(),
             base_port: cfg.base_port,
             done: done_tx,
         };
-        let spawned = std::thread::Builder::new().name(format!("sweep-{id}")).spawn(move || {
-            if installed.recv().is_ok() {
-                job.run();
-            }
-        });
-        let supervisor = match spawned {
-            Ok(handle) => handle,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(refuse(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("starting the sweep: {e}"),
-                ));
-            }
-        };
-        let record = Record {
-            base,
-            started_ms,
-            out: dir,
-            ended: None,
-            runs,
-            stop,
-            done,
-            supervisor: Some(supervisor),
-        };
-        let view = {
-            let mut state = self.lock();
-            if state.closed {
-                record.stop.0.store(true, Ordering::Relaxed);
-            }
-            let view = record.view();
-            state.current = Some(record);
-            view
-        };
-        let _ = installed_tx.send(());
+        // Cannot fail: the supervisor waits for this job.
+        let _ = job_tx.send(job);
         Ok(view)
     }
 
@@ -561,13 +606,17 @@ impl SweepRuns {
     }
 
     /// The supervisor is done: write the sweep's meta, then mark the sweep
-    /// ended, so whoever sees it ended also sees its meta on disk.
+    /// ended, so whoever sees it ended also sees its meta on disk. A meta that
+    /// cannot be written keeps the outcome; the write error joins the reason.
     fn end(&self, id: &str, dir: &Path, mut ended: Ended, done: &watch::Sender<bool>) {
         let meta =
             self.lock().current.as_ref().filter(|r| r.base.id == id).map(|r| r.meta(Some(&ended)));
         if let Some(meta) = meta {
             if let Err(why) = write_meta(dir, &meta) {
-                ended = Ended { state: SweepState::Failed, reason: Some(why), at_ms: ended.at_ms };
+                ended.reason = Some(match ended.reason.take() {
+                    Some(reason) => format!("{reason}; {why}"),
+                    None => why,
+                });
             }
         }
         if let Some(record) = self.lock().current.as_mut().filter(|r| r.base.id == id) {
@@ -604,14 +653,16 @@ impl SweepRuns {
 
     /// The sweep `id` as the API reports it: the live one, else from disk.
     fn view_of(&self, id: &str) -> Result<SweepView, Refusal> {
-        let dir = self.dir_of(id)?;
+        check_id(id)?;
         if let Some(view) = self.live(id) {
             return Ok(view);
         }
+        let dir = self.dir_of(id)?;
         disk_view(&dir, read_meta(&dir)?)
     }
 
-    /// Every sweep under the sweeps dir, newest first. Blocks.
+    /// Every sweep under the sweeps dir, newest first. Blocks. A sweep whose
+    /// meta (or, for an interrupted one, summary) cannot be read is left out.
     fn list(&self) -> Result<Vec<SweepSummary>, Refusal> {
         let dir = &self.0.cfg.dir;
         let entries = match std::fs::read_dir(dir) {
@@ -636,7 +687,41 @@ impl SweepRuns {
         }
         // Ids start with their UTC stamp, so reverse name order is newest first.
         ids.sort_unstable_by(|a, b| b.cmp(a));
-        ids.iter().map(|id| self.view_of(id).map(|view| SweepSummary::of(&view))).collect()
+        Ok(ids.iter().filter_map(|id| self.summary_of(id)).collect())
+    }
+
+    /// `id`'s line of the list: from memory for the live sweep, else from its
+    /// meta alone. Only a sweep that says `running` (interrupted) or predates
+    /// the counts in its meta reads its summary. `None` when that cannot be read.
+    fn summary_of(&self, id: &str) -> Option<SweepSummary> {
+        if let Some(view) = self.live(id) {
+            return Some(SweepSummary::of(&view));
+        }
+        let dir = self.0.cfg.dir.join(id);
+        let meta = read_meta(&dir).ok()?;
+        let (ok, failed) = match (meta.state, meta.ok, meta.failed) {
+            (SweepState::Running, ..) | (_, None, _) | (_, _, None) => {
+                let runs = read_runs(&dir, meta.total).ok()?;
+                let count =
+                    |status: EntryStatus| runs.iter().filter(|r| r.status == status).count();
+                (count(EntryStatus::Ok), count(EntryStatus::Failed))
+            }
+            (_, Some(ok), Some(failed)) => (ok, failed),
+        };
+        let state = match meta.state {
+            SweepState::Running => SweepState::Interrupted,
+            state => state,
+        };
+        Some(SweepSummary {
+            id: meta.id,
+            scenario: meta.scenario,
+            state,
+            total: meta.total,
+            ok,
+            failed,
+            started_at: meta.started_at,
+            wall_s: meta.wall_s,
+        })
     }
 
     /// The sweep's `summary.csv`, parsed. Blocks.
@@ -689,6 +774,61 @@ impl SweepRuns {
         export_bag(&bag).map_err(|e| {
             refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("{}: {e}", bag.display()))
         })
+    }
+}
+
+/// Holds a sweep's `starting` mark: clears it when dropped, however the start ends.
+struct Starting(SweepRuns);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        self.0.lock().starting = None;
+    }
+}
+
+/// Refuse a sweep while the server is closing, one is being started or one is
+/// active. Plans nothing, so a conflicting request costs next to nothing.
+fn admit(state: &SweepsState) -> Result<(), Refusal> {
+    if state.closed {
+        return Err(refuse(StatusCode::SERVICE_UNAVAILABLE, "the server is shutting down"));
+    }
+    match &state.starting {
+        Some(Some(id)) => {
+            return Err(refuse(StatusCode::CONFLICT, format!("a sweep is already running: {id}")))
+        }
+        Some(None) => return Err(refuse(StatusCode::CONFLICT, "a sweep is already starting")),
+        None => {}
+    }
+    match state.current.as_ref().filter(|r| r.active()) {
+        Some(active) => Err(refuse(
+            StatusCode::CONFLICT,
+            format!("a sweep is already running: {}", active.base.id),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Kill the sweep's processes once a stop is requested and `grace` has passed,
+/// and again every [`KILL_EVERY`], until the supervisor has ended (`done`). The
+/// thread ends with the sweep: it is never left behind.
+fn escalate(stop: StopRequested, children: Children, grace: Duration, done: watch::Receiver<bool>) {
+    let mut stop_at: Option<Instant> = None;
+    let mut next_kill: Option<Instant> = None;
+    loop {
+        let finished = *done.borrow();
+        // `has_changed` errs once the sender is gone: the sweep never flew.
+        if finished || done.has_changed().is_err() {
+            return;
+        }
+        if stop.requested() {
+            let now = Instant::now();
+            let at = *stop_at.get_or_insert(now + grace);
+            if now >= at && next_kill.is_none_or(|t| now >= t) {
+                children.kill_all();
+                next_kill = Some(now + KILL_EVERY);
+            }
+        }
+        std::thread::sleep(TICK);
     }
 }
 
@@ -821,16 +961,24 @@ fn parse_status(cell: &str) -> (EntryStatus, Option<String>) {
     }
 }
 
-/// Parse RFC 4180 CSV: a `""` inside quotes is a quote, and commas and
-/// newlines inside quotes are cell text. LF or CRLF ends a row; blank lines
-/// are skipped. Nothing is rejected: an unclosed quote runs to the end.
+/// Parse RFC 4180 CSV: a quote opens a cell only at its start; inside quotes
+/// `""` is a quote and commas and newlines are cell text. LF or CRLF ends a
+/// row; blank lines are skipped, and a line holding only `""` is a row of one
+/// empty cell. Nothing is rejected: an unclosed quote runs to the end.
 fn parse_csv(text: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     let mut row = Vec::new();
     let mut cell = String::new();
     let mut quoted = false;
+    // The cell has no character of its own yet: a quote here opens it.
+    let mut fresh = true;
+    // The row has a character or a cell end on it (a blank line has neither).
+    let mut open = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        if c != '\n' && c != '\r' {
+            open = true;
+        }
         if quoted {
             match c {
                 '"' if chars.peek() == Some(&'"') => {
@@ -843,38 +991,75 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
             continue;
         }
         match c {
-            '"' => quoted = true,
-            ',' => row.push(std::mem::take(&mut cell)),
+            '"' if fresh => {
+                quoted = true;
+                fresh = false;
+            }
+            ',' => {
+                row.push(std::mem::take(&mut cell));
+                fresh = true;
+            }
             '\n' => {
-                if !row.is_empty() || !cell.is_empty() {
+                if open {
                     row.push(std::mem::take(&mut cell));
                     rows.push(std::mem::take(&mut row));
                 }
+                open = false;
+                fresh = true;
             }
             '\r' => {}
-            _ => cell.push(c),
+            _ => {
+                cell.push(c);
+                fresh = false;
+            }
         }
     }
-    if !row.is_empty() || !cell.is_empty() {
+    if open {
         row.push(cell);
         rows.push(row);
     }
     rows
 }
 
-/// A summary cell as JSON: an integer or a finite real as a number, an empty
-/// cell as null, anything else as its text.
+/// A summary cell as JSON: an empty cell as null; a canonical decimal integer
+/// (exact up to `u64`) and a finite plain real as numbers; anything else (a
+/// leading zero, a `+`, a space) as its text.
 fn cell_value(cell: &str) -> Value {
     if cell.is_empty() {
         return Value::Null;
     }
     if let Ok(i) = cell.parse::<i64>() {
-        return Value::from(i);
+        if i.to_string() == cell {
+            return Value::from(i);
+        }
+    }
+    if let Ok(u) = cell.parse::<u64>() {
+        if u.to_string() == cell {
+            return Value::from(u);
+        }
     }
     match cell.parse::<f64>() {
-        Ok(f) if f.is_finite() => Value::from(f),
+        Ok(f) if f.is_finite() && plain_real(cell) => Value::from(f),
         _ => Value::String(cell.to_owned()),
     }
+}
+
+/// Whether `cell` is written `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+fn plain_real(cell: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let body = cell.strip_prefix('-').unwrap_or(cell);
+    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (body, None),
+    };
+    let (int, frac) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let int_ok = digits(int) && (int == "0" || !int.starts_with('0'));
+    let frac_ok = frac.is_none_or(digits);
+    let exp_ok = exponent.is_none_or(|e| digits(e.strip_prefix(['+', '-']).unwrap_or(e)));
+    int_ok && frac_ok && exp_ok
 }
 
 /// A `GET /api/sweeps/<id>/results` reply.

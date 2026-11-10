@@ -16,7 +16,7 @@ use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::catalogs::Catalogs;
 use astrum_web::runs::{Runs, RunsConfig};
 use astrum_web::server::{router, Config};
-use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig};
+use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig, STOP_GRACE};
 use axum::Router;
 
 /// A Zenoh endpoint on this process's own port block (`n` < 10), so parallel
@@ -162,27 +162,33 @@ fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs)
 
 /// The sweep runner of a test tree: sweeps under `<tmp>/runs/sweeps`, process
 /// mode flying `sim` with run N on `base_port + N - 1`.
-fn sweep_runs(tmp: &Path, sim: &Path, base_port: u16) -> SweepRuns {
-    let cfg =
-        SweepRunsConfig { dir: tmp.join("runs").join("sweeps"), sim: sim.to_owned(), base_port };
+fn sweep_runs(tmp: &Path, sim: &Path, base_port: u16, stop_grace: Duration) -> SweepRuns {
+    let cfg = SweepRunsConfig {
+        dir: tmp.join("runs").join("sweeps"),
+        sim: sim.to_owned(),
+        base_port,
+        stop_grace,
+    };
     SweepRuns::new(cfg)
 }
 
 /// [`sweep_runs`] for tests that fly no sweep.
 fn default_sweeps(tmp: &Path) -> SweepRuns {
-    sweep_runs(tmp, &tmp.join("no-astrum-sim"), 27500)
+    sweep_runs(tmp, &tmp.join("no-astrum-sim"), 27500, STOP_GRACE)
 }
 
 /// [`app`] over `catalogs` whose web sweeps fly `sim` (process mode) on ports
-/// from `base_port`; also the sweep runner, for shutting it down.
+/// from `base_port`, a stop waiting `stop_grace` before its processes are
+/// killed; also the sweep runner, for shutting it down.
 pub fn app_with_sweeps(
     tmp: &Path,
     bridge: Bridge,
     catalogs: Catalogs,
     sim: &Path,
     base_port: u16,
+    stop_grace: Duration,
 ) -> (Router, SweepRuns) {
-    let sweeps = sweep_runs(tmp, sim, base_port);
+    let sweeps = sweep_runs(tmp, sim, base_port, stop_grace);
     let cfg = RunsConfig {
         dir: tmp.join("runs"),
         sim: tmp.join("no-astrum-sim"),

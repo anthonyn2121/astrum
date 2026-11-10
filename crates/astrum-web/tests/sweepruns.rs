@@ -7,13 +7,14 @@
 
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use astrum_sim::scenario::Scenario;
 use astrum_web::bridge::Bridge;
 use astrum_web::catalogs::Catalogs;
-use astrum_web::sweepruns::SweepRuns;
+use astrum_web::sweepruns::{SweepRuns, STOP_GRACE};
 use axum::body::{to_bytes, Body};
 use axum::http::header::{CONTENT_TYPE, HOST};
 use axum::http::{Method, Request, StatusCode};
@@ -25,6 +26,9 @@ use tower::ServiceExt;
 const LOCAL: &str = "localhost:8080";
 /// Where process-mode sweeps' runs listen (run N on `BASE_PORT + N - 1`).
 const BASE_PORT: u16 = 27840;
+/// The base port of the real-sim stop test: the two real-sim tests run at once,
+/// so each flies its run 1 on its own port.
+const STOP_TEST_PORT: u16 = 27850;
 
 /// Two F-16s level at 3000 m, heading east, 500 m apart (the second is 500 m north).
 fn pair() -> Value {
@@ -77,7 +81,19 @@ impl Tree {
 
     /// The router and the sweep runner, flying process-mode sweeps with `sim`.
     fn app(&self, sim: &Path) -> (Router, SweepRuns) {
-        common::app_with_sweeps(self.path(), Bridge::new(config()), self.catalogs(), sim, BASE_PORT)
+        self.app_stopping_in(sim, STOP_GRACE, BASE_PORT)
+    }
+
+    /// [`app`](Self::app), a stop waiting `grace` before the sweep's processes are killed.
+    fn app_stopping_in(&self, sim: &Path, grace: Duration, base_port: u16) -> (Router, SweepRuns) {
+        common::app_with_sweeps(
+            self.path(),
+            Bridge::new(config()),
+            self.catalogs(),
+            sim,
+            base_port,
+            grace,
+        )
     }
 
     /// The router and the sweep runner over no sim binary (in-process sweeps only).
@@ -168,6 +184,67 @@ fn files(dir: &Path) -> Vec<String> {
     names
 }
 
+/// A sweep directory with `meta` as its meta.json; the caller adds the rest.
+fn plant(tree: &Tree, id: &str, meta: &Value) -> PathBuf {
+    let dir = tree.dir_of(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+    dir
+}
+
+/// A sweep's meta as the studio writes it; `counts` (ok, failed) once it has ended.
+fn meta_of(id: &str, state: &str, total: usize, counts: Option<(usize, usize)>) -> Value {
+    let (ok, failed) =
+        counts.map_or((Value::Null, Value::Null), |(ok, failed)| (json!(ok), json!(failed)));
+    json!({
+        "id": id, "scenario": "pair", "state": state, "reason": null, "total": total,
+        "in_process": true, "jobs": 1, "started_at": "2026-01-01T00:00:00Z",
+        "ended_at": null, "wall_s": null, "keys": [], "ok": ok, "failed": failed
+    })
+}
+
+/// A `#!/bin/sh` program `body` at `dir/name`, executable.
+fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Writes a sim that ignores SIGTERM (the ignore survives `exec`, so only
+/// SIGKILL ends it) and a catalog whose one controller `sleeper` sleeps;
+/// returns the sim. The tree's catalog is read when its app is built.
+fn wedged_sim(tree: &Tree) -> PathBuf {
+    let sim = script(tree.path(), "wedged-sim", "trap '' TERM\nexec sleep 1000\n");
+    let hold = script(tree.path(), "sleeper", "exec sleep 1000\n");
+    let catalog = format!(
+        "[[controller]]\nid = \"sleeper\"\nname = \"Sleeper\"\ndescription = \"A stand-in.\"\n\
+         command = [{:?}]\nid_flag = \"--id\"\nkinds = [\"fixed-wing\"]\nneeds_fleet = false\n",
+        hold.display().to_string()
+    );
+    std::fs::write(tree.path().join("config").join("controllers.toml"), catalog).unwrap();
+    sim
+}
+
+/// A process-mode request flying one `sleeper` controller on aircraft 1, long enough to stop.
+fn wedged_request() -> Value {
+    request(json!({
+        "max_time_s": 600.0,
+        "assignments": [{"aircraft": 1, "controller": "sleeper"}]
+    }))
+}
+
+/// Once run 1's sim has been started, give its shell a moment to ignore TERM.
+async fn sim_started(tree: &Tree, id: &str) {
+    let log = tree.dir_of(id).join("run-0001.sim.log");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !log.exists() {
+        assert!(Instant::now() < deadline, "no sim log at {}", log.display());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
 #[tokio::test]
 async fn an_in_process_sweep_flies_to_its_end_and_is_served() {
     let tree = Tree::new();
@@ -242,7 +319,7 @@ async fn an_in_process_sweep_flies_to_its_end_and_is_served() {
 async fn a_second_sweep_is_refused_while_one_runs() {
     let tree = Tree::new();
     let (app, sweeps) = tree.app_in_process();
-    let long = request(json!({"repeats": 8, "jobs": 1, "max_time_s": 30.0}));
+    let long = request(json!({"repeats": 8, "jobs": 1, "max_time_s": 600.0}));
     let (status, first) = start(&app, &long).await;
     assert_eq!(status, StatusCode::CREATED, "{first}");
     let id = first["id"].as_str().unwrap().to_owned();
@@ -261,20 +338,37 @@ async fn a_second_sweep_is_refused_while_one_runs() {
 async fn a_stop_mid_run_leaves_the_rest_queued_and_a_new_sweep_starts() {
     let tree = Tree::new();
     let (app, sweeps) = tree.app_in_process();
-    let long = request(json!({"repeats": 8, "jobs": 1, "max_time_s": 30.0}));
-    let (status, _) = start(&app, &long).await;
-    assert_eq!(status, StatusCode::CREATED);
+    let long = request(json!({"repeats": 8, "jobs": 1, "max_time_s": 600.0}));
+    let (status, begun) = start(&app, &long).await;
+    assert_eq!(status, StatusCode::CREATED, "{begun}");
+    let id = begun["id"].as_str().unwrap().to_owned();
     wait_current(&app, "the first run to start", |s| s["runs"][0]["status"] == "running").await;
 
     let (status, stopped) = send(&app, Method::DELETE, "/api/sweeps/current", &json!({})).await;
     assert_eq!(status, StatusCode::OK, "{stopped}");
     assert_eq!(stopped["state"], "stopped");
-    let count = |key: &str| stopped[key].as_u64().unwrap();
-    assert_eq!(count("stopped") + count("queued") + count("ok") + count("failed"), count("total"));
-    assert!(count("queued") >= 1, "{stopped}");
+    let count = |view: &Value, key: &str| view[key].as_u64().unwrap();
+    let settled: u64 =
+        ["stopped", "queued", "ok", "failed"].iter().map(|k| count(&stopped, k)).sum();
+    assert_eq!(settled, count(&stopped, "total"), "{stopped}");
+    assert!(count(&stopped, "stopped") >= 1, "the run in flight ends stopped: {stopped}");
+    assert!(count(&stopped, "queued") >= 1, "{stopped}");
 
     let (status, reply) = send(&app, Method::DELETE, "/api/sweeps/current", &json!({})).await;
     assert_error(&(status, reply), StatusCode::NOT_FOUND, &["no sweep is running"]);
+
+    // The meta on disk says stopped; a fresh server over the same dir reads the same sweep.
+    let meta: Value =
+        serde_json::from_slice(&std::fs::read(tree.dir_of(&id).join("meta.json")).unwrap())
+            .unwrap();
+    assert_eq!(meta["state"], "stopped", "{meta}");
+    shutdown(sweeps).await;
+    let (app, sweeps) = tree.app_in_process();
+    let (status, reloaded) = get(&app, &format!("/api/sweeps/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "{reloaded}");
+    for key in ["state", "total", "queued", "ok", "failed", "stopped"] {
+        assert_eq!(reloaded[key], stopped[key], "{key}");
+    }
 
     let (status, next) = start(&app, &request(json!({"repeats": 1}))).await;
     assert_eq!(status, StatusCode::CREATED, "{next}");
@@ -402,6 +496,193 @@ async fn a_summary_cell_with_commas_and_quotes_reads_back_as_one_cell() {
     shutdown(sweeps).await;
 }
 
+#[tokio::test]
+async fn a_summary_reads_back_cell_by_cell() {
+    let tree = Tree::new();
+    let id = "20260101-000000-pair";
+    // CRLF ends; a u64 seed; `007`, ` 9 ` and `+3` stay text; a quote inside a
+    // cell is literal; a quoted cell holds a newline and `""`; a line of just
+    // `""` is a row; the last row has no line end.
+    let csv = "run,status,seed,sim_time_s,note\r\n\
+        1,ok,18446744073709551615,2.5,007\r\n\
+        2,ok, 9 ,+3,a\"b\r\n\
+        3,\"failed: line one\nline \"\"two\"\"\",-4,1e3,\r\n\
+        \"\"\n\
+        \n\
+        4,ok,1,1.50,end";
+    let dir = plant(&tree, id, &meta_of(id, "finished", 5, Some((4, 1))));
+    std::fs::write(dir.join("summary.csv"), csv).unwrap();
+
+    let (app, sweeps) = tree.app_in_process();
+    let (status, results) = get(&app, &format!("/api/sweeps/{id}/results")).await;
+    assert_eq!(status, StatusCode::OK, "{results}");
+    assert_eq!(results["columns"], json!(["run", "status", "seed", "sim_time_s", "note"]));
+    assert_eq!(
+        results["rows"],
+        json!([
+            [1, "ok", 18446744073709551615u64, 2.5, "007"],
+            [2, "ok", " 9 ", "+3", "a\"b"],
+            [3, "failed: line one\nline \"two\"", -4, 1000.0, null],
+            [null],
+            [4, "ok", 1, 1.5, "end"]
+        ])
+    );
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn an_empty_or_unterminated_summary_reads_back_what_it_holds() {
+    let tree = Tree::new();
+    let cases = [
+        ("20260101-000000-pair", "", json!([]), json!([])),
+        ("20260102-000000-pair", "run,status\n", json!(["run", "status"]), json!([])),
+        (
+            "20260103-000000-pair",
+            "run,status,seed\n1,ok,1\n2,\"oops,3\n",
+            json!(["run", "status", "seed"]),
+            json!([[1, "ok", 1], [2, "oops,3\n"]]),
+        ),
+    ];
+    let (app, sweeps) = tree.app_in_process();
+    for (id, csv, columns, rows) in cases {
+        let dir = plant(&tree, id, &meta_of(id, "finished", 1, Some((0, 0))));
+        std::fs::write(dir.join("summary.csv"), csv).unwrap();
+        let (status, results) = get(&app, &format!("/api/sweeps/{id}/results")).await;
+        assert_eq!(status, StatusCode::OK, "{results}");
+        assert_eq!(results["columns"], columns, "{id}");
+        assert_eq!(results["rows"], rows, "{id}");
+    }
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn the_list_skips_a_sweep_it_cannot_read_and_counts_a_finished_one_from_its_meta() {
+    let tree = Tree::new();
+    let (good, corrupt, unreadable) =
+        ("20260101-000000-pair", "20260102-000000-pair", "20260103-000000-pair");
+    // Finished, counts in its meta; its summary is a directory, so it cannot be read.
+    let dir = plant(&tree, good, &meta_of(good, "finished", 2, Some((2, 0))));
+    std::fs::create_dir(dir.join("summary.csv")).unwrap();
+    // A meta that is not JSON.
+    plant(&tree, corrupt, &meta_of(corrupt, "finished", 1, Some((1, 0))));
+    std::fs::write(tree.dir_of(corrupt).join("meta.json"), "{not json").unwrap();
+    // Running with no server behind it and no readable summary.
+    let dir = plant(&tree, unreadable, &meta_of(unreadable, "running", 1, None));
+    std::fs::create_dir(dir.join("summary.csv")).unwrap();
+
+    let (app, sweeps) = tree.app_in_process();
+    let (status, list) = get(&app, "/api/sweeps").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let listed = list.as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{list}");
+    assert_eq!(listed[0]["id"], good);
+    assert_eq!((listed[0]["ok"].clone(), listed[0]["failed"].clone()), (json!(2), json!(0)));
+    let reply = get(&app, &format!("/api/sweeps/{corrupt}")).await;
+    assert_error(&reply, StatusCode::INTERNAL_SERVER_ERROR, &["not a sweep's meta"]);
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn two_starts_at_once_admit_exactly_one() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let long = request(json!({"repeats": 8, "jobs": 1, "max_time_s": 600.0}));
+    let starts: Vec<_> = (0..2)
+        .map(|_| {
+            let (app, long) = (app.clone(), long.clone());
+            tokio::spawn(async move { start(&app, &long).await })
+        })
+        .collect();
+    let mut replies = Vec::new();
+    for s in starts {
+        replies.push(s.await.unwrap());
+    }
+    let created = replies.iter().filter(|r| r.0 == StatusCode::CREATED).count();
+    let refused: Vec<_> = replies.iter().filter(|r| r.0 == StatusCode::CONFLICT).collect();
+    assert_eq!((created, refused.len()), (1, 1), "{replies:?}");
+    assert_error(refused[0], StatusCode::CONFLICT, &["already"]);
+    let (status, stopped) = send(&app, Method::DELETE, "/api/sweeps/current", &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn jobs_above_256_are_refused_and_256_is_not() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let reply = start(&app, &request(json!({"jobs": 257}))).await;
+    assert_error(&reply, StatusCode::BAD_REQUEST, &["jobs: at most 256"]);
+    assert_eq!(reply.1["error"], "jobs: at most 256");
+    assert_eq!(std::fs::read_dir(tree.sweeps_dir()).map_or(0, Iterator::count), 0);
+    let (status, view) = start(&app, &request(json!({"jobs": 256, "repeats": 1}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    wait_state(&app, "finished").await;
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn a_meta_that_cannot_be_rewritten_keeps_the_outcome_and_says_why() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let long = request(json!({"repeats": 8, "jobs": 1, "max_time_s": 600.0}));
+    let (status, begun) = start(&app, &long).await;
+    assert_eq!(status, StatusCode::CREATED, "{begun}");
+    let id = begun["id"].as_str().unwrap().to_owned();
+    wait_current(&app, "the first run to start", |s| s["runs"][0]["status"] == "running").await;
+    // A directory where meta.json is: the sweep's final rewrite cannot replace it.
+    let meta = tree.dir_of(&id).join("meta.json");
+    std::fs::remove_file(&meta).unwrap();
+    std::fs::create_dir(&meta).unwrap();
+
+    let (status, stopped) = send(&app, Method::DELETE, "/api/sweeps/current", &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
+    assert!(stopped["reason"].as_str().unwrap_or_default().contains("meta.json"), "{stopped}");
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn a_sim_that_ignores_the_stop_is_killed_after_the_grace() {
+    let tree = Tree::new();
+    let sim = wedged_sim(&tree);
+    let (app, sweeps) = tree.app_stopping_in(&sim, Duration::from_millis(300), BASE_PORT);
+    let (status, view) = start(&app, &wedged_request()).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    assert_eq!(view["in_process"], false);
+    let id = view["id"].as_str().unwrap().to_owned();
+    wait_current(&app, "the run to start", |s| s["runs"][0]["status"] == "running").await;
+    sim_started(&tree, &id).await;
+
+    let (status, stopped) = tokio::time::timeout(
+        Duration::from_secs(30),
+        send(&app, Method::DELETE, "/api/sweeps/current", &json!({})),
+    )
+    .await
+    .expect("a stop the sim ignores hangs the sweep");
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
+    assert_eq!(stopped["runs"][0]["status"], "stopped", "{stopped}");
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn shutdown_ends_a_sweep_whose_sim_ignores_the_stop() {
+    let tree = Tree::new();
+    let sim = wedged_sim(&tree);
+    let (app, sweeps) = tree.app_stopping_in(&sim, Duration::from_millis(300), BASE_PORT);
+    let (status, view) = start(&app, &wedged_request()).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["id"].as_str().unwrap().to_owned();
+    wait_current(&app, "the run to start", |s| s["runs"][0]["status"] == "running").await;
+    sim_started(&tree, &id).await;
+
+    tokio::time::timeout(Duration::from_secs(30), shutdown(sweeps))
+        .await
+        .expect("shutdown hangs on a sim that ignores its stop");
+    let (_, current) = get(&app, "/api/sweeps/current").await;
+    assert_eq!(current["sweep"]["state"], "stopped", "{current}");
+}
+
 /// `target/<profile>/astrum-sim` next to this test's `deps/` directory, or
 /// `$ASTRUM_SIM_BIN`; `None` when it has not been built.
 fn real_sim() -> Option<PathBuf> {
@@ -413,18 +694,19 @@ fn real_sim() -> Option<PathBuf> {
     sim.is_file().then_some(sim)
 }
 
-#[tokio::test]
-async fn a_process_sweep_flies_the_real_sim_with_a_real_controller() {
+/// The tree of the real-sim tests: `py-hold` runs the repository's example
+/// controller (by absolute path: the sim's directory is not the repository's)
+/// and the sim to fly it with. `None` when no sim is built: a skip, which
+/// passes only with `ASTRUM_SKIP_REAL_SIM=1`.
+fn real_sim_tree() -> Option<(PathBuf, Tree)> {
     let Some(sim) = real_sim() else {
         assert!(
             std::env::var_os("ASTRUM_SKIP_REAL_SIM").is_some_and(|v| v == "1"),
             "no astrum-sim next to the test binaries: build it first (cargo build -p astrum-sim), \
              set ASTRUM_SIM_BIN, or skip this test with ASTRUM_SKIP_REAL_SIM=1"
         );
-        return;
+        return None;
     };
-    // The catalog's py-hold runs `controllers/python/example.py` relative to the
-    // sim's working directory, which is not the repository root under `cargo test`.
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../controllers/python/example.py");
     let example = example.canonicalize().unwrap();
     let controllers =
@@ -432,7 +714,12 @@ async fn a_process_sweep_flies_the_real_sim_with_a_real_controller() {
             "\"controllers/python/example.py\"",
             &format!("{:?}", example.display().to_string()),
         );
-    let tree = Tree::with_controllers(&controllers);
+    Some((sim, Tree::with_controllers(&controllers)))
+}
+
+#[tokio::test]
+async fn a_process_sweep_flies_the_real_sim_with_a_real_controller() {
+    let Some((sim, tree)) = real_sim_tree() else { return };
     let (app, sweeps) = tree.app(&sim);
     let body = request(json!({
         "max_time_s": 3.0,
@@ -450,5 +737,33 @@ async fn a_process_sweep_flies_the_real_sim_with_a_real_controller() {
     for run in done["runs"].as_array().unwrap() {
         assert_eq!(run["status"], "ok", "{run}");
     }
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn a_process_sweep_stopped_mid_run_ends_stopped_promptly() {
+    let Some((sim, tree)) = real_sim_tree() else { return };
+    // A stop waits 300 ms before any process is killed.
+    let (app, sweeps) = tree.app_stopping_in(&sim, Duration::from_millis(300), STOP_TEST_PORT);
+    let body = request(json!({
+        "max_time_s": 3600.0,
+        "repeats": 1,
+        "jobs": 1,
+        "assignments": [
+            {"aircraft": 1, "controller": "py-hold"},
+            {"aircraft": 2, "controller": "py-hold"}
+        ]
+    }));
+    let (status, view) = start(&app, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    wait_current(&app, "the run to start", |s| s["runs"][0]["status"] == "running").await;
+    let (status, stopped) = tokio::time::timeout(
+        Duration::from_secs(60),
+        send(&app, Method::DELETE, "/api/sweeps/current", &json!({})),
+    )
+    .await
+    .expect("a stop must end the sweep promptly");
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
     shutdown(sweeps).await;
 }

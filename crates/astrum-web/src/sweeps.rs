@@ -34,6 +34,8 @@ use crate::server::AppState;
 
 /// Most runs one request may plan: each is a scenario built and validated.
 pub const MAX_RUNS: u64 = 2000;
+/// Most workers one request may ask for (`jobs`; 0 means one per core).
+pub const MAX_JOBS: usize = 256;
 /// Longest saved sweep summary, in characters (as a scenario's).
 const SUMMARY_MAX_CHARS: usize = 200;
 /// The header comment that carries a saved sweep's assignments.
@@ -141,6 +143,9 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
     let runs = planned_runs(req);
     if runs > MAX_RUNS {
         return Err(SweepInputError::BadRequest(format!("plans {runs} runs; at most {MAX_RUNS}")));
+    }
+    if req.jobs > MAX_JOBS {
+        return Err(SweepInputError::BadRequest(format!("jobs: at most {MAX_JOBS}")));
     }
     if !(req.max_time_s.is_finite() && req.max_time_s > 0.0) {
         return Err(SweepInputError::BadRequest(format!(

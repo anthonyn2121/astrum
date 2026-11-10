@@ -459,7 +459,7 @@ failed `check_trim`) and only then creates `<runs-dir>/sweeps/<id>/`. A supervis
 `on_event` updates the in-memory run states; `meta.json` is rewritten atomically when it ends, before
 the record says so. A sweep that the disk says is `running` but no server owns reads back as
 `interrupted`. Tests (`tests/sweepruns.rs`) fly the `pair` scenario in-process, and one process-mode
-sweep on the real sim with the Python controller (same build requirement as `tests/runs.rs`).
+sweep on the real sim with the Python controller (same build requirement as `tests/runs.rs`). A stop request that the processes do not answer within `STOP_GRACE` (5 s, `SweepRunsConfig::stop_grace` in tests) is escalated to a kill, repeated every second until the supervisor ends; `GET /api/sweeps` reads each finished sweep's `meta.json` (its `ok`/`failed` counts) only, and skips a sweep whose meta or summary cannot be read.
 
 **Scene edit API** (the sandbox; sweep previews build on it). `Scene.setEditing({onSelect, onEdit,
 onPoint})` turns on edit mode (and the `"map"` environment: imagery for any fleet); the scene only

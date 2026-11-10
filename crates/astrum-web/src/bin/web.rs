@@ -38,7 +38,7 @@ use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::catalogs::Catalogs;
 use astrum_web::runs::{Runs, RunsConfig};
 use astrum_web::server::{self, Config};
-use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig};
+use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig, STOP_GRACE};
 use clap::Parser;
 
 /// How often the scenario is re-fetched, so a restarted sim or replay with
@@ -149,6 +149,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dir: runs.config().dir.join("sweeps"),
         sim: runs.config().sim.clone(),
         base_port: SWEEP_BASE_PORT,
+        stop_grace: STOP_GRACE,
     });
 
     let cfg = Config {
