@@ -20,11 +20,29 @@
     <h1>Sweeps</h1>
     <p class="muted lede">Build a sweep of a saved scenario: the runs it would fly are planned as you set it up, and a saved sweep runs from the command line with <code>astrum sweep</code>.</p>
 
+    <section id="activeSweep" class="banner" aria-live="polite" hidden>
+      <div class="banner-text">
+        <strong>A sweep is running:</strong> <span id="activeSweepId" class="mono"></span> · <span id="activeSweepProgress" class="mono"></span>
+      </div>
+      <div class="banner-actions">
+        <a id="activeSweepOpen" class="button primary" href="./sweep.html">Open</a>
+        <button id="activeSweepStop" type="button">Stop it</button>
+      </div>
+      <p id="activeSweepError" class="form-error" role="alert" hidden></p>
+    </section>
+
     <details id="savedSweeps" class="saved-sweeps">
       <summary>Saved sweeps</summary>
       <p id="savedError" class="form-error" role="alert" hidden></p>
       <p id="savedEmpty" class="muted small" hidden>No saved sweeps in the config directory.</p>
       <ul id="savedList" class="saved-list"></ul>
+    </details>
+
+    <details id="recentSweeps" class="saved-sweeps">
+      <summary>Recent sweeps</summary>
+      <p id="recentError" class="form-error" role="alert" hidden></p>
+      <p id="recentEmpty" class="muted small" hidden>No sweeps yet.</p>
+      <ul id="recentList" class="saved-list"></ul>
     </details>
 
     <p id="loadError" class="form-error" role="alert" hidden></p>
@@ -91,6 +109,7 @@
           </div>
           <p id="planMore" class="muted small" hidden></p>
           <div class="plan-actions">
+            <button id="runSweep" type="button" class="primary" disabled>Run sweep</button>
             <button id="checkTrims" type="button">Check trims</button>
           </div>
         </section>

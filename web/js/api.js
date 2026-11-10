@@ -64,3 +64,13 @@ export const planSweep = (request) => apiPost("/sweeps/plan", request);
 export const getSavedSweeps = () => apiGet("/sweeps/saved");
 export const getSavedSweep = (name) => apiGet(`/sweeps/saved/${encodeURIComponent(name)}`);
 export const saveSweep = (name, body) => apiPut("/sweeps/saved/" + encodeURIComponent(name), body);
+
+// Sweeps flown from the browser (crates/astrum-web/src/sweepruns.rs): one at a
+// time; the sweep page reads each one, and the viewer reads a run's bag.
+export const startSweep = (request) => apiPost("/sweeps", request);
+export const getCurrentSweep = () => apiGet("/sweeps/current").then((r) => r.sweep);
+export const stopSweep = () => apiDelete("/sweeps/current");
+export const getSweeps = () => apiGet("/sweeps");
+export const getSweep = (id) => apiGet(`/sweeps/${encodeURIComponent(id)}`);
+export const getSweepResults = (id) => apiGet(`/sweeps/${encodeURIComponent(id)}/results`);
+export const getSweepReplay = (id, n) => apiGet(`/sweeps/${encodeURIComponent(id)}/runs/${encodeURIComponent(n)}/replay`);
