@@ -108,6 +108,8 @@ code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 a.brand { color: inherit; text-decoration: none; }
 .source { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .source-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sweep-ref { flex: none; white-space: nowrap; color: var(--accent); text-decoration: none; }
+.sweep-ref:hover { text-decoration: underline; }
 .topbar-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex: none; }
 
 .pill {

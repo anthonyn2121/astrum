@@ -232,7 +232,7 @@ function renderPlan(plan) {
   setStale(false);
   showError(el.planError, "");
   cloud.set(state.doc, plan);
-  el.planSummary.textContent = `${plan.runs} runs · ${plan.in_process ? "in-process" : "with controllers (processes)"}`;
+  el.planSummary.textContent = `${plan.runs} ${plan.runs === 1 ? "run" : "runs"} · ${plan.in_process ? "in-process" : "with controllers (processes)"}`;
   const withSample = plan.rows.some((r) => r.sample != null);
   const shown = plan.rows.slice(0, PLAN_ROWS);
   el.planTable.replaceChildren(
@@ -495,6 +495,7 @@ function recentItem(sweep) {
 // ---- wiring ----
 
 el.form.addEventListener("change", changed); // any edit: the scenario, controllers, parameters, settings
+el.form.addEventListener("input", changed); // typing re-plans after the debounce, not only on blur
 el.form.addEventListener("submit", (e) => e.preventDefault());
 el.checkTrims.addEventListener("click", () => {
   const request = buildRequest();

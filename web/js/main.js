@@ -297,9 +297,11 @@ function fileFailed(msg) {
 // view.html?sweep=<id>&run=<n>: the header names the run, and its bag opens as a
 // studio run's replay does. A refusal (no such run, no bag) is the viewer's error.
 async function openSweepRun(id, n) {
-  document.getElementById("sweepNote").textContent = `Sweep ${id} · run ${n}`;
-  document.getElementById("sweepLink").href = `./sweep.html?id=${encodeURIComponent(id)}`;
-  document.getElementById("sweepRef").hidden = false;
+  const ref = document.getElementById("sweepRef");
+  ref.textContent = `← Sweep (run ${n})`;
+  ref.title = `Back to sweep ${id}`;
+  ref.href = `./sweep.html?id=${encodeURIComponent(id)}`;
+  ref.hidden = false;
   let doc;
   try {
     doc = await getSweepReplay(id, n);
