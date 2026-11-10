@@ -36,11 +36,12 @@ services:
       # binary defaults to loopback); the host side publishes on 127.0.0.1.
       ASTRUM_WEB_BIND: 0.0.0.0:8080
       ASTRUM_WEB_ROOT: /workspace/web
-      # Map-tile proxy settings and the browser frame-rate cap, passed through
-      # from the host when set (unset → astrum-web's defaults).
+      # Map-tile proxy settings and the browser batch / sample rates, passed
+      # through from the host when set (unset → astrum-web's defaults).
       ASTRUM_TILE_URL:
       ASTRUM_TILE_CACHE:
       ASTRUM_WEB_MAX_HZ:
+      ASTRUM_WEB_SAMPLE_HZ:
     ports:
       - "127.0.0.1:7447:7447"   # Zenoh (telemetry + commands) of `astrum run`'s sim
       - "127.0.0.1:8080:8080"   # viewer: HTTP + WebSocket

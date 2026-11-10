@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use astrum_net::{
-    fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, ScenarioServer,
-    Selection, Session, TelemetryPublisher, TickPublisher, TickReceiver,
+    fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, SampledTelemetry,
+    ScenarioServer, Selection, Session, TelemetryPublisher, TickPublisher, TickReceiver,
 };
 use astrum_proto::{encode_command, Command, Control, RawActuators, Telemetry, TickEnd};
 use zenoh::Wait;
@@ -132,6 +132,107 @@ fn wait_times_out_without_new_samples() {
     let session = Session::in_process().unwrap();
     let mut sub = LatestTelemetry::subscribe(&session, Selection::Fleet).unwrap();
     assert_eq!(sub.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+/// A fleet trail on `session` thinned to `period_s`, already receiving: it has
+/// seen tick 0 of every aircraft in `ids` (not yet taken).
+fn sampled(
+    session: &Session,
+    publisher: &mut TelemetryPublisher,
+    ids: &[u32],
+    period_s: f64,
+    cap: usize,
+) -> SampledTelemetry {
+    let mut sub = SampledTelemetry::subscribe(session, Selection::Fleet, period_s, cap).unwrap();
+    for _ in 0..1000 {
+        for &id in ids {
+            publisher.publish(&sample(id, 0)).unwrap();
+        }
+        if sub.wait(Duration::from_millis(1)).is_ok() {
+            break;
+        }
+    }
+    settle(&mut sub);
+    sub
+}
+
+/// Wait until `sub` has had no new sample for 50 ms: everything published has
+/// been delivered.
+fn settle(sub: &mut SampledTelemetry) {
+    while sub.wait(Duration::from_millis(50)).is_ok() {}
+}
+
+fn ticks(batch: &[Telemetry]) -> Vec<(u32, u64)> {
+    batch.iter().map(|t| (t.aircraft_id, t.tick)).collect()
+}
+
+#[test]
+fn sampled_telemetry_keeps_one_sample_per_period_of_sim_time_plus_the_newest() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    // 120 Hz ticks thinned to 30 Hz: every 4th tick.
+    let mut sub = sampled(&session, &mut publisher, &[1, 2], 1.0 / 30.0, 1000);
+    for tick in 1..=118 {
+        publisher.publish(&sample(2, tick)).unwrap();
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    // Ids ascending, each in time order; tick 118 is the newest, closer than a
+    // period to tick 116.
+    let every_4th = (0..=116).step_by(4).chain([118]);
+    let want: Vec<_> = every_4th.clone().map(|t| (1, t)).chain(every_4th.map(|t| (2, t))).collect();
+    assert_eq!(ticks(&sub.take()), want);
+
+    // Nothing new: each aircraft's newest again.
+    assert_eq!(ticks(&sub.take()), [(1, 118), (2, 118)]);
+    // The spacing carries on from the last sample taken, not from the grid.
+    for tick in 119..=128 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [(1, 122), (1, 126), (1, 128), (2, 118)]);
+    assert_eq!(sub.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+#[test]
+fn sampled_telemetry_halves_its_trail_at_the_cap_instead_of_dropping_the_oldest() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    // 120 Hz ticks thinned to 30 Hz (every 4th), at most 10 pending.
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 10);
+    for tick in 1..=400 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    let batch: Vec<u64> = sub.take().iter().map(|t| t.tick).collect();
+    // Newest-kept would be ticks 364..=400 only; halving covers the whole 400
+    // ticks, first sample to newest, within the cap...
+    assert!(batch.len() <= 10, "{batch:?}");
+    assert_eq!((batch.first(), batch.last()), (Some(&0), Some(&400)), "{batch:?}");
+    // ...at the period the cap forces: 4 ticks doubled four times is 64.
+    let widest = batch.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!((32..=65).contains(&widest), "gaps up to {widest} ticks in {batch:?}");
+    assert!(sub.capped() > 0);
+
+    // A take resets the period: the next stretch is thinned to every 4th tick
+    // again.
+    for tick in 401..=420 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [404, 408, 412, 416, 420].map(|t| (1, t)));
+}
+
+#[test]
+fn sampled_telemetry_drops_an_aircrafts_old_run_when_its_clock_goes_back() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 1000);
+    for tick in (1..=40).chain(0..=8) {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [(1, 0), (1, 4), (1, 8)]);
 }
 
 #[test]

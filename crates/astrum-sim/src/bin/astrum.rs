@@ -1,8 +1,9 @@
 //! `astrum`: ASTRUM's command line. Fly a scenario or run file live (`run`),
-//! many runs at once (`sweep`), list what a directory holds (`list`), and reach
-//! the other tools: `ctl`, `web`, `record`, `play` and `export` become the
-//! sibling binary (`astrum-ctl`, `astrum-web`, `astrum-bag-record`,
-//! `astrum-bag-play`, `astrum-web-export`) with the same arguments.
+//! many runs at once (`sweep`), list what a directory holds (`list`) or the
+//! controller catalog (`controllers`), and reach the other tools: `ctl`, `web`,
+//! `record`, `play` and `export` become the sibling binary (`astrum-ctl`,
+//! `astrum-web`, `astrum-bag-record`, `astrum-bag-play`, `astrum-web-export`)
+//! with the same arguments.
 //!
 //! `run` starts `astrum-sim`, the viewer (`--watch`) and the run file's
 //! controllers as child processes and streams their output, every line tagged
@@ -21,6 +22,7 @@
 //! Exit status: 0 ok, 1 a run not ok, 2 invalid input; a `run` stopped by
 //! Ctrl-C exits 130.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use astrum_sim::catalog;
+use astrum_sim::components::VehicleKind;
+use astrum_sim::controllers::ControllerCatalog;
 use astrum_sim::launch::{
     connect_endpoint, numbered, run_processes, run_timeout, sibling, Children, Companion, LiveRun,
     LiveSpec, Log, ProcessCtx, StartError,
@@ -60,6 +64,9 @@ enum Cmd {
         #[arg(default_value = "config")]
         dir: PathBuf,
     },
+    /// List the controller catalog (`<config dir>/controllers.toml`), or render
+    /// one entry as a run file's `controllers` command line.
+    Controllers(ControllersArgs),
     /// Control a running sim: status, pause, resume, step, speed (astrum-ctl).
     #[command(disable_help_flag = true)]
     Ctl(Forward),
@@ -127,6 +134,49 @@ struct RunArgs {
 }
 
 #[derive(Args)]
+struct ControllersArgs {
+    /// The config directory holding `controllers.toml`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DIR",
+        env = "ASTRUM_CONFIG_DIR",
+        default_value = "config"
+    )]
+    config_dir: PathBuf,
+
+    #[command(subcommand)]
+    cmd: Option<ControllersCmd>,
+}
+
+#[derive(Subcommand)]
+enum ControllersCmd {
+    /// Print the command line of entry ID flying one aircraft.
+    Render(RenderArgs),
+}
+
+#[derive(Args)]
+struct RenderArgs {
+    /// Catalog entry id (see `astrum controllers`).
+    #[arg(value_name = "ID")]
+    controller: String,
+
+    /// The aircraft the controller flies.
+    #[arg(long = "id", value_name = "N")]
+    aircraft: u32,
+
+    /// A parameter value (as TOML; a bare word is a string); unset ones take
+    /// the catalog default. Repeatable.
+    #[arg(long = "param", value_name = "NAME=VALUE", value_parser = parse_override)]
+    params: Vec<(String, toml::Value)>,
+
+    /// The scenario's aircraft ids (comma-separated), which `aircraft`
+    /// parameters must name. Default: just --id.
+    #[arg(long, value_name = "IDS", value_delimiter = ',')]
+    fleet: Vec<u32>,
+}
+
+#[derive(Args)]
 struct SweepArgs {
     /// Sweep file (TOML; see config/sweep.*.toml).
     sweep: PathBuf,
@@ -161,6 +211,7 @@ fn main() -> ExitCode {
         Cmd::Run(args) => run(&args),
         Cmd::Sweep(args) => sweep(args),
         Cmd::List { dir } => list(&dir),
+        Cmd::Controllers(args) => controllers(args),
         Cmd::Ctl(f) => exec_tool("astrum-ctl", &f.args),
         Cmd::Web(f) => exec_tool("astrum-web", &f.args),
         Cmd::Record(f) => exec_tool("astrum-bag-record", &f.args),
@@ -546,4 +597,63 @@ fn list(dir: &Path) -> ExitCode {
         println!("{kind:<8}  {path:<width$}  {about}");
     }
     ExitCode::SUCCESS
+}
+
+// --- astrum controllers -------------------------------------------------------
+
+fn controllers(args: ControllersArgs) -> ExitCode {
+    let catalog = match ControllerCatalog::load(args.config_dir.join("controllers.toml")) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!("[astrum] {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(ControllersCmd::Render(render)) = args.cmd else {
+        let rows: Vec<(&str, String, &str)> = catalog
+            .entries()
+            .iter()
+            .map(|e| (e.id.as_str(), kind_names(&e.kinds), e.name.as_str()))
+            .collect();
+        let id_width = rows.iter().map(|(id, ..)| id.len()).max().unwrap_or(0);
+        let kinds_width = rows.iter().map(|(_, kinds, _)| kinds.len()).max().unwrap_or(0);
+        for (id, kinds, name) in &rows {
+            println!("{id:<id_width$}  {kinds:<kinds_width$}  {name}");
+        }
+        return ExitCode::SUCCESS;
+    };
+    match render_controller(&catalog, &render) {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[astrum] {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `fixed-wing,multirotor`: the kinds as the catalog spells them.
+fn kind_names(kinds: &[VehicleKind]) -> String {
+    let name = |k: &VehicleKind| match toml::Value::try_from(k) {
+        Ok(toml::Value::String(s)) => s,
+        other => unreachable!("a vehicle kind serialises as a string, not {other:?}"),
+    };
+    kinds.iter().map(name).collect::<Vec<_>>().join(",")
+}
+
+fn render_controller(catalog: &ControllerCatalog, args: &RenderArgs) -> Result<String, String> {
+    let spec = catalog.get(&args.controller).ok_or_else(|| {
+        format!("unknown controller `{}` (see `astrum controllers`)", args.controller)
+    })?;
+    let mut params = BTreeMap::new();
+    for (name, value) in &args.params {
+        if params.insert(name.clone(), value.clone()).is_some() {
+            return Err(format!("controller `{}`: param `{name}` given twice", spec.id));
+        }
+    }
+    let fleet = if args.fleet.is_empty() { vec![args.aircraft] } else { args.fleet.clone() };
+    spec.render(args.aircraft, &params, &fleet)
+        .map_err(|e| format!("controller `{}`: {e}", spec.id))
 }

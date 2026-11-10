@@ -27,9 +27,13 @@ pub fn endpoint(n: u32) -> String {
     format!("tcp/127.0.0.1:{}", 10_000 + (std::process::id() % 1_000) * 10 + n)
 }
 
-/// Fast pumps, so tests see changes quickly.
+/// Fast pumps, so tests see changes quickly; the default sample rate (30 Hz).
 pub fn config() -> BridgeConfig {
-    BridgeConfig { min_period: Duration::from_millis(10), models_poll: Duration::from_millis(100) }
+    BridgeConfig {
+        min_period: Duration::from_millis(10),
+        sample_period: Duration::from_secs_f64(1.0 / 30.0),
+        models_poll: Duration::from_millis(100),
+    }
 }
 
 /// Poll `cond` every 20 ms until it holds, failing with `what` after 10 s.
@@ -41,8 +45,7 @@ pub fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
     }
 }
 
-/// A stand-in sim: a Zenoh hub on an endpoint that, until dropped, publishes
-/// aircraft `id`'s telemetry and a `controller-up` event for it every 20 ms.
+/// A stand-in sim: a Zenoh hub on an endpoint that publishes until dropped.
 pub struct Sim {
     pub hub: Session,
     stop: Arc<AtomicBool>,
@@ -50,6 +53,8 @@ pub struct Sim {
 }
 
 impl Sim {
+    /// Aircraft `id`'s telemetry (a 50 Hz sim at real time) and a
+    /// `controller-up` event for it every 20 ms.
     pub fn flying(endpoint: &str, id: u32) -> Self {
         let hub = Session::listen(endpoint).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -67,6 +72,34 @@ impl Sim {
                     Event { tick, sim_time_s, kind: EventKind::ControllerUp { aircraft_id: id } };
                 events.publish_raw(encode_event(&up)).unwrap();
                 std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Self { hub, stop, thread: Some(thread) }
+    }
+
+    /// A stand-in sim (no events) flying aircraft `ids` at `rate_hz` ticks per
+    /// sim second and `speed` times real time: as wall time reaches each tick
+    /// it publishes that tick's sample of every aircraft (ids ascending), with
+    /// `sim_time_s = tick / rate_hz`, until dropped.
+    pub fn paced(endpoint: &str, ids: &[u32], rate_hz: f64, speed: f64) -> Self {
+        let hub = Session::listen(endpoint).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (session, stopped, ids) = (hub.clone(), Arc::clone(&stop), ids.to_vec());
+        let thread = std::thread::spawn(move || {
+            let mut telemetry = TelemetryPublisher::new(&session);
+            let start = Instant::now();
+            let mut tick = 0;
+            while !stopped.load(Ordering::Relaxed) {
+                let due = (start.elapsed().as_secs_f64() * speed * rate_hz) as u64;
+                while tick < due {
+                    tick += 1;
+                    let sim_time_s = tick as f64 / rate_hz;
+                    for &aircraft_id in &ids {
+                        let t = Telemetry { aircraft_id, tick, sim_time_s, ..Telemetry::default() };
+                        telemetry.publish(&t).unwrap();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
         });
         Self { hub, stop, thread: Some(thread) }

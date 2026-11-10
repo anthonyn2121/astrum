@@ -6,12 +6,23 @@
 //! connects (retrying until a sim answers, so an attachment can exist while
 //! nothing is connected) and runs three pumps that publish into the channels:
 //!
-//! * **snapshots** (latest-value, [`watch`]): the newest sample of every
-//!   aircraft as ONE `{"type":"frames",…}` message, at most one per
-//!   [`BridgeConfig::min_period`] and only when something changed. A browser
-//!   that falls behind skips to the newest one; one that connects mid-run gets
-//!   the current snapshot at once. The payload is a [`Utf8Bytes`], so handing it
-//!   to N browsers is N reference-count bumps, not N copies.
+//! * **samples** (latest batch, [`watch`]): every aircraft's telemetry thinned
+//!   to at most one sample per [`BridgeConfig::sample_period`] of SIM time
+//!   (plus its newest), batched into ONE `{"type":"frames",…}` message per
+//!   [`BridgeConfig::min_period`] of wall time, only when something arrived.
+//!   A batch carries each aircraft's samples since the previous batch in time
+//!   order (an aircraft with none repeats its newest, so every batch shows the
+//!   whole fleet), at most [`BATCH_SAMPLES`] per aircraft: faster than real
+//!   time the browser still gets an even trail, not one sample per flush.
+//!   Past the cap the trail is halved — every other sample kept, the newest
+//!   always, the sample period doubled — so a sim faster than `BATCH_SAMPLES` ×
+//!   sample period per flush still gets a batch that spans the whole interval
+//!   since the last one, at a coarser resolution (a power-of-two multiple of the
+//!   sample period). A browser that falls behind skips to the newest batch and
+//!   loses the samples of the batches it skipped (a gap in its timeline, not a
+//!   delay); one that connects mid-run gets the current batch at once. The
+//!   payload is a [`Utf8Bytes`], so handing it to N browsers is N
+//!   reference-count bumps, not N copies.
 //! * **events** (in order, [`broadcast`]): each batch of `astrum/events` as one
 //!   `{"type":"events",…}` message, tagged with its run. A browser gets only the
 //!   batches sent after it subscribed; one that falls more than
@@ -22,8 +33,8 @@
 //!   nobody answers keeps the last message.
 //!
 //! Every attach or detach starts a new **run**: the previous attachment's
-//! pumps stop and its session closes, the snapshot and models are cleared (a
-//! new attachment starts from a fresh [`LatestTelemetry`], so no aircraft of
+//! pumps stop and its session closes, the batch and models are cleared (a
+//! new attachment starts from a fresh [`SampledTelemetry`], so no aircraft of
 //! the previous sim survives), and a `{"type":"run",…}` note is published.
 //! Pumps publish only while their run is current, checked under the same lock
 //! the switch takes, so nothing from an old run lands after its note.
@@ -34,16 +45,23 @@ use std::time::{Duration, Instant};
 
 use astrum_bag::aircraft_models;
 use astrum_net::zenoh::Wait;
-use astrum_net::{fetch_scenario, EventReceiver, LatestTelemetry, NetError, Selection, Session};
-use astrum_proto::Telemetry;
+use astrum_net::{fetch_scenario, EventReceiver, NetError, SampledTelemetry, Selection, Session};
 use axum::extract::ws::Utf8Bytes;
 use serde::Serialize;
 use tokio::sync::{broadcast, watch};
 
-use crate::{events_message, models_message, run_message, snapshot_message};
+use crate::{events_message, frames_message, models_message, run_message};
 
-/// The newest encoded fleet snapshot (`None` until the current run has one).
+/// The newest encoded sample batch (`None` until the current run has one).
 pub type Snapshot = Option<Utf8Bytes>;
+
+/// Most samples of one aircraft in one batch. With the default 30 Hz sample
+/// rate and 30 batches per second, a batch spans up to 4 s of sim time at the
+/// full rate, so trails keep the full resolution up to 120× real time; faster,
+/// they halve (a 400× sim keeps every 4th–8th sample, ~0.15–0.3 s apart) with
+/// no gap. One browser receives at most 3600 samples (~2.6 MB of JSON) per
+/// aircraft per second.
+pub const BATCH_SAMPLES: usize = 120;
 
 /// Event batches buffered per browser before the slowest one starts losing them.
 pub const EVENT_BACKLOG: usize = 1024;
@@ -64,8 +82,10 @@ const SCENARIO_TIMEOUT: Duration = Duration::from_secs(1);
 /// Pacing of the bridge's pumps.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BridgeConfig {
-    /// Shortest gap between two fleet snapshots.
+    /// Shortest wall-time gap between two sample batches.
     pub min_period: Duration,
+    /// Shortest sim-time gap between two samples of one aircraft.
+    pub sample_period: Duration,
     /// How often the scenario's aircraft models are re-fetched.
     pub models_poll: Duration,
 }
@@ -241,7 +261,7 @@ impl Bridge {
         (current.info(), current.session())
     }
 
-    /// The newest fleet snapshot of the current run.
+    /// The newest sample batch of the current run.
     pub fn snapshots(&self) -> watch::Receiver<Snapshot> {
         self.shared.snapshots.subscribe()
     }
@@ -318,7 +338,7 @@ impl Feed {
                 a.session = None;
                 a.connected = false;
             });
-            let _ = session.raw().close().wait();
+            let _ = session.close();
         }
     }
 
@@ -331,7 +351,7 @@ impl Feed {
             match Session::connect(endpoint, CONNECT_ATTEMPT) {
                 Ok(session) if self.current() => return Some(session),
                 Ok(session) => {
-                    let _ = session.raw().close().wait();
+                    let _ = session.close();
                     return None;
                 }
                 Err(e) => {
@@ -349,7 +369,12 @@ impl Feed {
     /// Run the three pumps on `session` and keep the link state fresh until
     /// the run is superseded (`Ok`) or a pump fails (its error).
     fn pump(&self, session: &Session) -> Result<(), NetError> {
-        let mut latest = LatestTelemetry::subscribe(session, Selection::Fleet)?;
+        let mut samples = SampledTelemetry::subscribe(
+            session,
+            Selection::Fleet,
+            self.shared.config.sample_period.as_secs_f64(),
+            BATCH_SAMPLES,
+        )?;
         let events = EventReceiver::subscribe(session)?;
         self.with_attachment(|a| {
             a.session = Some(session.clone());
@@ -366,12 +391,12 @@ impl Feed {
         };
         std::thread::scope(|scope| {
             let spawn = std::thread::Builder::new;
-            let latest = &mut latest;
+            let samples = &mut samples;
             let pumps = [
                 spawn()
                     .name("bridge-telemetry".into())
                     .spawn_scoped(scope, move || {
-                        halting(pump_snapshots(latest, self, stop, config.min_period))
+                        halting(pump_samples(samples, self, stop, config.min_period))
                     })
                     .expect("spawning the telemetry thread"),
                 spawn()
@@ -398,19 +423,18 @@ impl Feed {
     }
 }
 
-/// Publish fleet snapshots from `latest`: at most one per `min_period`, and
-/// only when the fleet state differs from the last one sent. Samples that
-/// arrive while throttled are folded into the next snapshot.
-fn pump_snapshots(
-    latest: &mut LatestTelemetry,
+/// Publish sample batches from `samples`: at most one per `min_period`, and
+/// only when a sample arrived since the last one. Samples that arrive while
+/// throttled go into the next batch.
+fn pump_samples(
+    samples: &mut SampledTelemetry,
     feed: &Feed,
     stop: &Stop<'_>,
     min_period: Duration,
 ) -> Result<(), NetError> {
-    let mut sent: Vec<Telemetry> = Vec::new();
     let mut sent_at: Option<Instant> = None;
     while !stop.stopped() {
-        match latest.wait(IDLE_POLL) {
+        match samples.wait(IDLE_POLL) {
             Ok(()) => {}
             Err(NetError::Timeout) => continue,
             Err(e) => return Err(e),
@@ -422,19 +446,12 @@ fn pump_snapshots(
                 std::thread::sleep(due - now);
             }
         }
-        // Mark what arrived while throttled as seen; the snapshot below has it.
-        let _ = latest.wait(Duration::ZERO);
-        let snapshot = latest.snapshot();
-        if snapshot == sent {
-            continue;
-        }
-        let message = Utf8Bytes::from(snapshot_message(&snapshot));
+        let message = Utf8Bytes::from(frames_message(&samples.take()));
         if !feed.publish(|s| {
             s.snapshots.send_replace(Some(message));
         }) {
             break;
         }
-        sent = snapshot;
         sent_at = Some(Instant::now());
     }
     Ok(())

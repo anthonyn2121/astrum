@@ -6,9 +6,9 @@
 //! fleet's JSBSim models — used by both delivery paths:
 //!
 //! * **live / replay stream** — the `astrum-web` binary ([`server`]) attaches a
-//!   [`bridge::Bridge`] to the live sim *or* `astrum-bag-play`, tracks the newest
-//!   telemetry of every aircraft and pushes rate-limited fleet snapshots
-//!   ([`snapshot_message`]), every event ([`events_message`]), the scenario's
+//!   [`bridge::Bridge`] to the live sim *or* `astrum-bag-play`, thins every
+//!   aircraft's telemetry by sim time and pushes rate-limited batches of it
+//!   ([`frames_message`]), every event ([`events_message`]), the scenario's
 //!   aircraft models ([`models_message`]) and each change of attachment
 //!   ([`run_message`]) to every connected browser over WebSocket, while also
 //!   serving the static renderer and the JSON [`api`] (including the studio's
@@ -123,7 +123,7 @@ impl FrameJson {
     }
 }
 
-/// One live WebSocket message: the newest state of every tracked aircraft.
+/// One live WebSocket message: a batch of telemetry samples.
 #[derive(Serialize)]
 struct FramesMessage<'a> {
     #[serde(rename = "type")]
@@ -131,10 +131,11 @@ struct FramesMessage<'a> {
     frames: &'a [FrameJson],
 }
 
-/// Encode a fleet snapshot as the live stream's message,
-/// `{"type":"frames","frames":[FrameJson…]}`.
-pub fn snapshot_message(snapshot: &[Telemetry]) -> String {
-    let frames: Vec<FrameJson> = snapshot.iter().map(FrameJson::from_telemetry).collect();
+/// Encode a batch of samples as the live stream's message,
+/// `{"type":"frames","frames":[FrameJson…]}`, in the batch's order (the bridge
+/// sends several samples per aircraft, time-ordered per aircraft).
+pub fn frames_message(samples: &[Telemetry]) -> String {
+    let frames: Vec<FrameJson> = samples.iter().map(FrameJson::from_telemetry).collect();
     // Serialising plain structs of numbers / static strings into a String
     // cannot fail (non-finite floats become `null`).
     serde_json::to_string(&FramesMessage { kind: "frames", frames: &frames })

@@ -48,11 +48,29 @@ Rules every client follows (the C++ and Python SDKs implement them for you — s
 [`controllers/README.md`](controllers/README.md)):
 
 - QoS for telemetry and commands: CongestionControl `Drop`, express, priority `InteractiveHigh`,
-  declared publishers; events and `TickEnd`: `Block`, priority `Data`. Controller sessions ask for
+  declared publishers; events and `TickEnd`: `Block`, priority `Data`. **Every client** — the
+  controller SDKs and `astrum_net::Session::connect` (recorder, web bridge, `astrum ctl`) — asks for
   Zenoh's low-latency transport (`transport/unicast/lowlatency = true`,
-  `transport/unicast/qos/enabled = false`), which has one lane per link: priorities reorder nothing
-  on it.
-- Telemetry subscriptions are **latest-value** (one slot per aircraft), never a FIFO.
+  `transport/unicast/qos/enabled = false`) for its streams; it has one lane per link, so priorities
+  reorder nothing on it. The recorder and bridge must not use the default transport for them:
+  Zenoh 1.10's transmission pipeline on a link without QoS lanes (the sim's router disables them
+  for low latency) sets the congestion flag on bit `Priority::DEFAULT` but `refill` clears the bit
+  of queue 0 (`zenoh-transport` `src/common/pipeline.rs`, `push_network_message` / both `refill`
+  impls; 1.10.2, the latest, is the same), so after one dropped sample a client never received
+  telemetry again — the bridge went blank at `--speed 0`, or after a hiccup even at 1×. (On the
+  default transport ~7000 of a 20000-sample burst arrived, then none; `tests/low_latency.rs` pins
+  that a slow client keeps receiving on the clients' transport.) The price: nothing is dropped on
+  low latency, so **a client that falls behind slows the sim, and one that stops reading — a
+  suspended recorder, web bridge, `astrum ctl` or controller — freezes it, and its control plane
+  with it, until it reads again or its connection dies** (the command lease does not release it:
+  measured, a stopped bridge held `--speed 0` at one tick for 43 s). There is also no
+  fragmentation (a message must fit one frame: the TCP link's Zenoh MTU, ~48 KiB on loopback, ≥ 32
+  KiB on any link), so a Rust client's **queries** — scenario, status, control — use a second
+  session on the default transport (`Session::connect` opens both; `Session::close` closes both):
+  their replies are `Block`, which the latch does not touch, and fragment, so a scenario of any
+  size arrives.
+- Telemetry subscriptions are **latest-value** (one slot per aircraft), never a FIFO — except the
+  web bridge's `SampledTelemetry`, a bounded trail thinned by sim time.
 - **One command per telemetry sample**, carrying the controller instance's random `epoch`, `seq`
   (strictly increasing from 1 within the epoch) and `telemetryTick` (the `Telemetry.tick` it
   answers). Raw commands are a **lease**: stop sending for `sim.command_lease_s` and the sim's
@@ -359,11 +377,13 @@ command, self-terminating, and tears itself down:
 
 ```bash
 astrum list                                # every scenario / run / sweep file, with its kind
+astrum controllers                         # the controller catalog: id, vehicle kinds, name
+astrum controllers render py-hold --id 1   # one entry's command line (--param NAME=VALUE, --fleet IDS)
 astrum run config/demos/cpp.toml           # C++ controller flies aircraft 1 in the bounded scenario
 astrum run config/demos/python.toml        # same, with the Python controller
 astrum run config/demos/quad.toml          # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
 astrum run config/demos/formation.toml     # leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
-make smoke                                 # every config/demos/*.toml in lockstep, as fast as possible; fails on the first failure (CI runs this)
+make smoke                                 # every config/demos/*.toml, then every catalog entry (10 s each), in lockstep, as fast as possible; fails on the first failure (CI runs this)
 ```
 
 `astrum` rebuilds the release binaries and the C++ controllers first when their sources
@@ -393,14 +413,20 @@ viewer page is `view.html`. The studio's other pages are `index.html` (home, `ho
 `editstore.js`), styled by `css/studio.css` / `css/sandbox.css` over `style.css`; every page
 reaches `/api` only through `js/api.js`. The bridge and
 exporter are the two binaries in `crates/astrum-web/`, both projecting telemetry through the one
-`astrum_web::FrameJson` shape. The bridge sends one batched snapshot of the fleet at most
-`--max-hz` (default 30) times per second. Telemetry carries only the vehicle class, so the bridge
+`astrum_web::FrameJson` shape. The bridge thins every aircraft's telemetry by sim time
+(`astrum_net::SampledTelemetry`: at most `--sample-hz`, default 30, samples per sim second plus
+the newest; at most `BATCH_SAMPLES` = 120 pending per aircraft, past which the trail is halved —
+every other sample, the newest always, and the period doubled — so a batch always spans the whole
+stretch since the last one) and sends what arrived as one
+`frames` batch at most `--max-hz` (default 30) times per second, so trails stay smooth faster
+than real time; `store.js` appends each aircraft's samples in order and keeps 20 min of sim time
+at 30 Hz (`LIVE_CAPACITY`). Telemetry carries only the vehicle class, so the bridge
 also polls `astrum/scenario` every 5 s and sends each aircraft's JSBSim model
 (`{"type":"models","models":[{"id","model"}…]}`) on connect and whenever it changes, and
 `{"type":"run","run":N,"endpoint"}` on connect and on every `Bridge::attach`/`detach`
 (`crates/astrum-web/src/bridge.rs`); exports carry the same models list as `meta.models`. The
 bridge owns the browser feeds for the server's lifetime; each run gets a fresh session and
-`LatestTelemetry`, and pumps publish only while their run is current, so nothing from an old run
+`SampledTelemetry`, and pumps publish only while their run is current, so nothing from an old run
 follows the new run's message. `/api` lives in `src/api.rs`; its guard (`api::guard`) wraps the
 whole nested API service, so new routes inherit the Host, Origin and JSON-body checks. Control
 values are checked by `astrum_net::ControlRequest::validate` against `astrum_net::MIN_SPEED`, the
@@ -460,8 +486,8 @@ scenario's `[world]`. Tiles are served by
 `astrum web` at `/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every
 tile under `tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling,
 and an area viewed once while online works **offline** afterward; a tile that 404s (offline +
-uncached) is skipped and the coarser level or the haze shows through. Set
-`ASTRUM_TILE_URL`, `ASTRUM_TILE_CACHE` or `ASTRUM_WEB_MAX_HZ` in the dev shell to override them:
+uncached) is skipped and the coarser level or the haze shows through. Set `ASTRUM_TILE_URL`,
+`ASTRUM_TILE_CACHE`, `ASTRUM_WEB_MAX_HZ` or `ASTRUM_WEB_SAMPLE_HZ` in the dev shell to override them:
 
 ```bash
 # Default: Esri World Imagery (global aerial, no key). Point elsewhere with:
