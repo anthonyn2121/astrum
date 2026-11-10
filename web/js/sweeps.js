@@ -311,8 +311,11 @@ async function boot() {
     return;
   }
   changed();
-  const want = new URLSearchParams(location.search).get("sweep");
+  const params = new URLSearchParams(location.search);
+  const want = params.get("sweep");
+  const scenario = params.get("scenario");
   if (want) openSweep(want);
+  else if (scenario !== null) picker.pick(scenario);
 }
 
 boot();

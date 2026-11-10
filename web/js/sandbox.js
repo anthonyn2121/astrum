@@ -58,7 +58,7 @@ const state = {
   savedSummary: "",     // its summary there
   savedJson: null,      // scenarioDoc() as JSON at load / save; isDirty() compares to it
   checked: null,        // scenarioDoc() as JSON that the check result is for
-  runAfterSave: false,  // Run is waiting for its save
+  afterSave: null,      // the page to open once the scenario is saved and clean: "run" | "sweep" (null: none)
   busy: true,           // a request is in flight, or the page is still loading
 };
 
@@ -843,7 +843,7 @@ const isDirty = () => JSON.stringify(scenarioDoc()) !== state.savedJson;
 
 function setBusy(busy) {
   state.busy = busy;
-  for (const id of ["saveBtn", "checkBtn", "runBtn", "saveSubmitBtn", "saveReplaceBtn", "saveCancelBtn"]) $(id).disabled = busy;
+  for (const id of ["saveBtn", "checkBtn", "runBtn", "sweepBtn", "saveSubmitBtn", "saveReplaceBtn", "saveCancelBtn"]) $(id).disabled = busy;
 }
 
 // Show a check result (or a pending note) for the scenario JSON `json`: a
@@ -934,10 +934,10 @@ async function saveAs(name, summary, overwrite) {
     $("sourceLabel").textContent = entry.path;
     document.title = `ASTRUM · Sandbox · ${entry.name}`;
     history.replaceState(null, "", `?scenario=${encodeURIComponent(entry.name)}`);
-    const runAfter = state.runAfterSave;
-    state.runAfterSave = false;
+    const target = state.afterSave;
+    state.afterSave = null;
     $("saveDialog").close();
-    if (runAfter && !isDirty()) location.href = `interactive.html?scenario=${encodeURIComponent(entry.name)}`;
+    if (target && !isDirty()) location.href = `${AFTER_SAVE[target].page}?scenario=${encodeURIComponent(entry.name)}`;
   } catch (err) {
     showSaveError(err.message);
     $("saveReplaceBtn").hidden = !(err instanceof ApiError && err.status === 409);
@@ -964,22 +964,31 @@ function replaceSave() {
   saveAs($("saveName").value.trim(), $("saveSummary").value.trim(), true);
 }
 
-// Run needs a saved, clean scenario: save first when it is not, then open
-// Interactive on it.
-function run() {
+// The page each save-then action opens once the scenario is saved and clean.
+const AFTER_SAVE = {
+  run: { page: "interactive.html", note: "Saved before it runs" },
+  sweep: { page: "sweeps.html", note: "Saved before the sweep is built" },
+};
+
+// Run and Sweep need a saved, clean scenario: save first when it is not (the
+// dialog then opens the target page), else open the target page on it.
+function saveThen(target) {
   const json = JSON.stringify(scenarioDoc());
   const issues = validate(state.scenario);
   if (issues.length) {
     showResult(json, { summary: "Fix these first:", items: issues.map((i) => ({ text: i.msg, ok: false })), failed: true });
     return;
   }
+  const { page, note } = AFTER_SAVE[target];
   if (state.savedName && json === state.savedJson) {
-    location.href = `interactive.html?scenario=${encodeURIComponent(state.savedName)}`;
+    location.href = `${page}?scenario=${encodeURIComponent(state.savedName)}`;
     return;
   }
-  state.runAfterSave = true;
-  openSaveDialog("Saved before it runs");
+  state.afterSave = target;
+  openSaveDialog(note);
 }
+
+const run = () => saveThen("run");
 
 // ---- Wiring ----------------------------------------------------------------
 
@@ -995,11 +1004,12 @@ function wire() {
   $("saveBtn").addEventListener("click", () => openSaveDialog());
   $("checkBtn").addEventListener("click", check);
   $("runBtn").addEventListener("click", run);
+  $("sweepBtn").addEventListener("click", () => saveThen("sweep"));
   $("saveForm").addEventListener("submit", (e) => { e.preventDefault(); submitSave(); });
   $("saveReplaceBtn").addEventListener("click", replaceSave);
   $("saveCancelBtn").addEventListener("click", () => $("saveDialog").close());
   $("saveName").addEventListener("input", () => { $("saveReplaceBtn").hidden = true; });
-  $("saveDialog").addEventListener("close", () => { state.runAfterSave = false; });
+  $("saveDialog").addEventListener("close", () => { state.afterSave = null; });
   $("saveDialog").addEventListener("cancel", (e) => { if (state.busy) e.preventDefault(); });
   window.addEventListener("beforeunload", (e) => {
     if (state.scenario && isDirty() && (state.scenario.aircraft.length || state.savedName)) e.returnValue = "";
