@@ -57,6 +57,41 @@
         <p class="muted small">Each square is a run; click one to select its row in the results.</p>
       </section>
 
+      <section class="sweep-section" aria-labelledby="allRunsHead">
+        <div class="results-head">
+          <h2 id="allRunsHead">All runs</h2>
+          <div class="tracks-legend">
+            <span><i class="swatch ok"></i>ok</span>
+            <span><i class="swatch failed"></i>failed</span>
+            <span><i class="swatch stopped"></i>stopped</span>
+            <span><i class="swatch selected"></i>selected</span>
+          </div>
+        </div>
+        <p id="tracksEmpty" class="muted">No finished runs yet.</p>
+        <p id="tracksNote" class="muted small" hidden></p>
+        <p id="tracksError" class="form-error" role="alert" hidden></p>
+        <div class="tracks-wrap">
+          <canvas id="tracksCanvas" class="tracks-canvas" aria-label="Flight paths of every finished run, top-down. Click a path to select its run. Arrow keys pan, plus and minus zoom, 0 fits."></canvas>
+          <div id="tracksTip" class="tracks-tip small" hidden></div>
+        </div>
+        <div class="tracks-time">
+          <input id="timeSlider" type="range" min="0" max="0" step="0.1" value="0" aria-label="Sim time" disabled />
+          <output id="timeLabel" class="mono" for="timeSlider">t = 0.0 s</output>
+        </div>
+        <div class="tracks-controls">
+          <button id="playBtn" type="button" disabled>Play</button>
+          <label class="filter-label">Speed
+            <select id="speedSelect">
+              <option value="1">1×</option>
+              <option value="4">4×</option>
+              <option value="16">16×</option>
+            </select>
+          </label>
+          <label class="filter-label"><input id="pathsToggle" type="checkbox" checked /> Paths</label>
+          <label class="filter-label"><input id="positionsToggle" type="checkbox" checked /> Positions at t</label>
+        </div>
+      </section>
+
       <section class="sweep-section" aria-labelledby="resultsHead">
         <div class="results-head">
           <h2 id="resultsHead">Results</h2>

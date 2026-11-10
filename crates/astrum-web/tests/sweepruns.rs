@@ -767,3 +767,174 @@ async fn a_process_sweep_stopped_mid_run_ends_stopped_promptly() {
     assert_eq!(stopped["state"], "stopped", "{stopped}");
     shutdown(sweeps).await;
 }
+
+/// `GET /api/sweeps/<id>/tracks` with the query string `query`.
+async fn get_tracks(app: &Router, id: &str, query: &str) -> (StatusCode, Value) {
+    get(app, &format!("/api/sweeps/{id}/tracks?{query}")).await
+}
+
+/// The run numbers of a tracks reply, in order.
+fn track_runs(reply: &Value) -> Vec<u64> {
+    reply["runs"].as_array().unwrap().iter().map(|r| r["run"].as_u64().unwrap()).collect()
+}
+
+/// Start four 2 s in-process `pair` runs, wait until they finish, and return the id.
+async fn finished_four(app: &Router) -> String {
+    let body = request(json!({
+        "samples": 4,
+        "sample_seed": 7,
+        "perturb": [{"aircraft": [2], "right_m": {"uniform": 100.0}}]
+    }));
+    let (status, view) = start(app, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    wait_state(app, "finished").await;
+    view["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn run_tracks_are_thinned_per_aircraft_and_paged() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let id = finished_four(&app).await;
+
+    let (status, all) = get_tracks(&app, &id, "points=10").await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["points"], 10);
+    assert_eq!(
+        (all["from"].as_u64(), all["count"].as_u64(), all["total"].as_u64()),
+        (Some(1), Some(100), Some(4))
+    );
+    assert_eq!(track_runs(&all), [1, 2, 3, 4]);
+    for run in all["runs"].as_array().unwrap() {
+        assert_eq!(run["status"], "ok", "{run}");
+        assert!((run["sim_time_s"].as_f64().unwrap() - 2.0).abs() < 0.05, "{run}");
+        let aircraft = run["aircraft"].as_array().unwrap();
+        let ids: Vec<u64> = aircraft.iter().map(|a| a["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, [1, 2], "{run}");
+        assert_eq!(aircraft[0]["model"], "f16", "{run}");
+        for track in aircraft {
+            let t = track["t"].as_array().unwrap();
+            for key in ["e", "n", "u"] {
+                assert_eq!(track[key].as_array().unwrap().len(), t.len(), "{track}");
+            }
+            assert!(!t.is_empty() && t.len() <= 10, "{track}");
+            let times: Vec<f64> = t.iter().map(|x| x.as_f64().unwrap()).collect();
+            assert!(times.windows(2).all(|w| w[0] < w[1]), "{track}");
+            assert_eq!(track["died_at_s"], Value::Null, "{track}");
+        }
+    }
+
+    let (status, page) = get_tracks(&app, &id, "from=3&count=2&points=10").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        (page["from"].as_u64(), page["count"].as_u64(), page["total"].as_u64()),
+        (Some(3), Some(2), Some(4))
+    );
+    assert_eq!(track_runs(&page), [3, 4]);
+    let (status, past) = get_tracks(&app, &id, "from=9").await;
+    assert_eq!(status, StatusCode::OK, "{past}");
+    assert!(track_runs(&past).is_empty(), "{past}");
+    let (status, default) = get_tracks(&app, &id, "").await;
+    assert_eq!(status, StatusCode::OK, "{default}");
+    assert_eq!(
+        (default["points"].as_u64(), default["from"].as_u64(), default["count"].as_u64()),
+        (Some(80), Some(1), Some(100))
+    );
+    let (status, limits) = get_tracks(&app, &id, "points=2&count=1").await;
+    assert_eq!(status, StatusCode::OK, "{limits}");
+    let (status, limits) = get_tracks(&app, &id, "points=400&count=500").await;
+    assert_eq!(status, StatusCode::OK, "{limits}");
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn tracks_refuse_bad_parameters_and_ids_by_name() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let id = finished_four(&app).await;
+    let bad = [
+        ("points=1", "points"),
+        ("points=401", "points"),
+        ("points=x", "points"),
+        ("count=0", "count"),
+        ("count=501", "count"),
+        ("from=0", "from"),
+        ("from=-1", "from"),
+    ];
+    for (query, name) in bad {
+        assert_error(&get_tracks(&app, &id, query).await, StatusCode::BAD_REQUEST, &[name]);
+    }
+    for unsafe_id in ["%2E%2E", "a%20b"] {
+        let reply = get(&app, &format!("/api/sweeps/{unsafe_id}/tracks")).await;
+        assert_error(&reply, StatusCode::BAD_REQUEST, &["sweep id"]);
+    }
+    assert_error(&get_tracks(&app, "nope", "").await, StatusCode::NOT_FOUND, &["\"nope\""]);
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn run_tracks_are_cached_beside_their_bags_and_a_corrupt_cache_is_rebuilt() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let id = finished_four(&app).await;
+    let dir = tree.dir_of(&id);
+    let cache = dir.join("run-0001.tracks-10.json");
+
+    assert!(!cache.exists());
+    let (status, first) = get_tracks(&app, &id, "points=10&count=1").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert!(cache.is_file(), "{:?}", files(&dir));
+    let (_, again) = get_tracks(&app, &id, "points=10&count=1").await;
+    assert_eq!(again, first);
+
+    std::fs::write(&cache, b"{ not tracks").unwrap();
+    let (status, rebuilt) = get_tracks(&app, &id, "points=10&count=1").await;
+    assert_eq!(status, StatusCode::OK, "{rebuilt}");
+    assert_eq!(rebuilt, first);
+    let cached: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    assert!(cached.is_array(), "{cached}");
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn a_run_whose_bag_is_gone_has_no_tracks_even_with_a_cache() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let id = finished_four(&app).await;
+    let (status, before) = get_tracks(&app, &id, "points=10").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(track_runs(&before), [1, 2, 3, 4]);
+
+    std::fs::remove_file(tree.dir_of(&id).join("run-0002.mcap")).unwrap();
+    let (status, after) = get_tracks(&app, &id, "points=10").await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(track_runs(&after), [1, 3, 4]);
+    assert_eq!(after["total"], 4);
+    shutdown(sweeps).await;
+}
+
+#[tokio::test]
+async fn a_run_that_has_not_finished_has_no_tracks_yet() {
+    let tree = Tree::new();
+    let (app, sweeps) = tree.app_in_process();
+    let long = request(json!({"repeats": 8, "jobs": 1, "max_time_s": 600.0}));
+    let (status, begun) = start(&app, &long).await;
+    assert_eq!(status, StatusCode::CREATED, "{begun}");
+    let id = begun["id"].as_str().unwrap().to_owned();
+    wait_current(&app, "the first run to start", |s| s["runs"][0]["status"] == "running").await;
+
+    let (_, before) = get(&app, "/api/sweeps/current").await;
+    let (status, reply) = get_tracks(&app, &id, "points=10").await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["total"], 8);
+    // Every run in the reply had finished when the sweep was read before the call.
+    for run in track_runs(&reply) {
+        let entry = &before["sweep"]["runs"][run as usize - 1];
+        let status = entry["status"].as_str().unwrap();
+        assert!(["ok", "failed", "stopped"].contains(&status), "run {run} is {status}: {reply}");
+    }
+
+    let (status, stopped) = send(&app, Method::DELETE, "/api/sweeps/current", &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    shutdown(sweeps).await;
+}

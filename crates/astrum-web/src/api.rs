@@ -89,6 +89,12 @@
 //!   sweep as an export document, as `GET /api/runs/<id>/replay` gives one; 400
 //!   for a number outside the plan, 404 when the run has no bag, 409 while the
 //!   run is still running.
+//! * **`GET /api/sweeps/<id>/tracks?from=&count=&points=`** — the flight tracks of the sweep's runs in
+//!   `[from, from + count)` (1-based `from`, default 1; `count` 1–500, default 100; `points` 2–400,
+//!   default 80): `{"points", "from", "count", "total", "runs": [{"run", "status", "sim_time_s",
+//!   "aircraft": [{"id", "model", "t", "e", "n", "u", "died_at_s"}]}]}`, the runs that finished with a
+//!   readable bag only (`status` is `ok`, `failed` or `stopped`). 400 for a parameter outside its range
+//!   (the message names it) or an unsafe id, 404 for an unknown one.
 //! * **`POST /api/runs`** — start the live interactive run
 //!   ([`crate::runs`]): `{"scenario": "<name>" | {…}, "assignments":
 //!   [{"aircraft", "controller", "params"}], "speed", "max_time_s"}` → 201
@@ -157,6 +163,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sweeps/current", get(crate::sweepruns::current).delete(crate::sweepruns::stop))
         .route("/sweeps/{id}", get(crate::sweepruns::view))
         .route("/sweeps/{id}/results", get(crate::sweepruns::results))
+        .route("/sweeps/{id}/tracks", get(crate::sweepruns::tracks))
         .route("/sweeps/{id}/runs/{n}/replay", get(crate::sweepruns::replay))
         .route("/runs", post(runs::start))
         .route("/runs/current", get(runs::current).delete(runs::stop))
