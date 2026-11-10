@@ -14,9 +14,9 @@ import { Scatter, themeColour } from "./scatter.js";
 import { SweepTracks } from "./sweeptracks.js";
 
 const POLL_MS = 1000;
+const RETRY_MAX_MS = 15000; // the longest wait before a failed read is retried
+const RESULTS_TRIES = 5; // tries at the results once the sweep has ended
 const RUN_STATES = ["queued", "running", "ok", "failed", "stopped"];
-// Columns with whole-number cells, shown unformatted; the rest show 3 decimals.
-const INTEGER_COLUMNS = new Set(["run", "seed", "sample"]);
 // Columns left out of the min / mean / max rows.
 const NO_STATS = new Set(["run", "seed", "sample", "wall_s", "speed_x", "status", "bag"]);
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
@@ -26,7 +26,7 @@ const el = {
   stateBadge: $("stateBadge"), stateReason: $("stateReason"), progress: $("progress"), progressText: $("progressText"),
   chipOk: $("chipOk"), chipFailed: $("chipFailed"), chipRunning: $("chipRunning"), chipQueued: $("chipQueued"),
   chipStopped: $("chipStopped"), mode: $("mode"), jobs: $("jobs"), wall: $("wall"), out: $("out"),
-  stopBtn: $("stopBtn"), actionError: $("actionError"), pollError: $("pollError"), strip: $("strip"),
+  stopBtn: $("stopBtn"), actionError: $("actionError"), pollError: $("pollError"), pollNote: $("pollNote"), strip: $("strip"),
   statusFilter: $("statusFilter"), resultsCount: $("resultsCount"), resultsNote: $("resultsNote"),
   resultsError: $("resultsError"), resultsWrap: $("resultsWrap"), results: $("results"),
   xAxis: $("xAxis"), yAxis: $("yAxis"), colourBy: $("colourBy"), compareEmpty: $("compareEmpty"),
@@ -37,10 +37,16 @@ const state = {
   id: null,
   view: null,        // the last SweepView
   wall: null,        // { s, at }: the wall time as read, and when (ms since the epoch)
-  squares: 0,        // runs with a square in the strip
-  selected: null,    // the selected run (1-based)
-  results: null,     // the last {columns, rows}
-  resultsKey: null,  // done / running counts at the last table fetch
+  squareOf: new Map(), // run -> its square in the strip
+  rows: new Map(), // run -> its table row: { tr, cells, replay, texts, classes, href }
+  selected: null, // the selected run (1-based)
+  results: null, // the last {columns, rows}
+  resultsJson: null, // the last results as JSON: an identical reply renders nothing
+  version: 0, // bumped with each new results: the footer's key
+  columnsKey: null, // the columns the table rows were built for
+  headKey: null, // the columns and sort the header was built for
+  footKey: null, // the results version and filter the footer was built for
+  resultsKey: null, // done / running counts at the last table fetch
   resultsFinal: false,
   resultsSeq: 0,
   sort: { col: "run", dir: 1 },
@@ -48,9 +54,18 @@ const state = {
   plot: { x: null, y: null, colour: null }, // the user's picks (null: the default)
   shown: null,       // the axes and colour plotted, after defaults
   timer: 0,
+  pollFails: 0, // failed polls in a row: the backoff
+  polling: false, // a poll is in flight
+  gone: false, // the sweep is unknown (404): polling has stopped
 };
 
 const allRuns = new SweepTracks({ onSelect: (n) => select(n) });
+
+// The table's parts are patched in place, not rebuilt on each refresh.
+const thead = h("thead");
+const tbody = h("tbody");
+const tfoot = h("tfoot");
+el.results.replaceChildren(thead, tbody, tfoot);
 
 // ---- the summary ----
 
@@ -85,7 +100,7 @@ function render(view) {
 // The clock between polls: a running sweep's wall time, counted up locally.
 setInterval(() => {
   const view = state.view;
-  if (view?.state === "running" && state.wall) {
+  if (view?.state === "running" && state.wall && !document.hidden) {
     el.wall.textContent = fmtTime(state.wall.s + (Date.now() - state.wall.at) / 1000);
   }
 }, 1000);
@@ -94,45 +109,53 @@ setInterval(() => {
 
 const runLabel = (run) => `run ${run.run}: ${run.status}${run.wall_s == null ? "" : `, ${run.wall_s.toFixed(1)} s`}`;
 
-// One square per run, made once; later polls only change their classes and names.
+// One square per run, made once; later polls change only the squares whose status changed.
 function renderStrip(runs) {
-  if (state.squares !== runs.length) {
+  if (state.squareOf.size !== runs.length) {
+    state.squareOf = new Map();
     el.strip.replaceChildren(...runs.map((run) => {
-      const square = h("button", { type: "button", class: "run-cell", "data-run": String(run.run), "aria-pressed": "false" });
-      square.addEventListener("click", () => select(run.run));
+      const square = h("button", { type: "button", class: "run-cell", "aria-pressed": "false" });
+      square.addEventListener("click", () => select(run.run, { scroll: true }));
+      state.squareOf.set(run.run, square);
       return square;
     }));
-    state.squares = runs.length;
+    paint(state.selected, true);
   }
-  runs.forEach((run) => {
-    const square = el.strip.children[run.run - 1];
-    for (const s of RUN_STATES) square.classList.toggle(s, s === run.status);
+  for (const run of runs) {
+    const square = state.squareOf.get(run.run);
+    if (square.dataset.status !== run.status) {
+      for (const s of RUN_STATES) square.classList.toggle(s, s === run.status);
+      square.dataset.status = run.status;
+    }
     const label = runLabel(run);
     if (square.getAttribute("aria-label") !== label) square.setAttribute("aria-label", label);
     const title = run.reason ? `${label} — ${run.reason}` : label;
     if (square.title !== title) square.title = title;
-  });
-  markSelected();
+  }
 }
 
-function markSelected() {
-  for (const square of el.strip.children) {
-    const on = Number(square.dataset.run) === state.selected;
+// Mark run `n`'s square and table row as selected, or not.
+function paint(n, on) {
+  const square = state.squareOf.get(n);
+  if (square) {
     square.classList.toggle("selected", on);
     square.setAttribute("aria-pressed", String(on));
   }
-  for (const row of el.results.querySelectorAll("tbody tr")) {
-    row.classList.toggle("selected", Number(row.dataset.run) === state.selected);
-  }
-  drawPlot();
+  state.rows.get(n)?.tr.classList.toggle("selected", on);
 }
 
-// Select run `n` (from the strip or the table): its row is brought into view.
-function select(n) {
-  state.selected = n;
-  allRuns.setSelected(n);
-  markSelected();
-  el.results.querySelector(`tbody tr[data-run="${n}"]`)?.scrollIntoView({ block: "nearest" });
+// Select run `n` (from the strip, the table, the scatter, the paths or the arrow
+// keys). Only a click on a strip square scrolls its table row into view.
+function select(n, { scroll = false } = {}) {
+  if (n !== state.selected) {
+    const prev = state.selected;
+    state.selected = n;
+    paint(prev, false);
+    paint(n, true);
+    allRuns.setSelected(n);
+    drawPlot();
+  }
+  if (scroll) state.rows.get(n)?.tr.scrollIntoView({ block: "nearest" });
 }
 
 // ---- the results ----
@@ -147,20 +170,33 @@ function refreshResults(view, running) {
   loadResults();
 }
 
-async function loadResults() {
+// A failed fetch once the sweep has ended is retried with the poll's backoff, up to
+// RESULTS_TRIES tries; while it runs, the next poll asks again.
+async function loadResults(tries = 1) {
   const seq = ++state.resultsSeq;
   try {
     const results = await getSweepResults(state.id);
     if (seq !== state.resultsSeq) return;
-    state.results = results;
     showError(el.resultsError, "");
     showError(el.resultsNote, "");
-    renderCompare();
-    renderTable();
+    const json = JSON.stringify(results);
+    if (json !== state.resultsJson) {
+      state.resultsJson = json;
+      state.results = results;
+      state.version++;
+      renderCompare();
+      renderTable();
+    }
   } catch (err) {
     if (seq !== state.resultsSeq) return;
     if (err instanceof ApiError && err.status === 404) {
       showError(el.resultsNote, "No results yet: the table appears once the sweep has written them.");
+    } else if (state.view?.state === "running") {
+      state.resultsKey = null;
+      showError(el.resultsError, `Cannot read the results: ${err.message || err}`);
+    } else if (tries < RESULTS_TRIES) {
+      showError(el.resultsNote, "Connection problem — retrying…");
+      setTimeout(() => loadResults(tries + 1), backoff(tries));
     } else {
       showError(el.resultsError, `Cannot read the results: ${err.message || err}`);
     }
@@ -194,10 +230,13 @@ function visibleRows() {
     });
 }
 
-function cellText(column, v) {
+// A cell's text: a dash for no value; a whole number without decimals; other numbers
+// to 3 decimals, or to 3 significant digits below 0.001.
+function cellText(v) {
   if (v == null) return "–";
-  if (typeof v === "number") return INTEGER_COLUMNS.has(column) ? String(v) : v.toFixed(3);
-  return String(v);
+  if (typeof v !== "number") return String(v);
+  if (Number.isInteger(v)) return String(v);
+  return Math.abs(v) < 0.001 ? v.toPrecision(3) : v.toFixed(3);
 }
 
 function sortBy(column) {
@@ -205,9 +244,10 @@ function sortBy(column) {
   renderTable();
 }
 
-// The whole table: header, the visible rows, and min / mean / max over the
-// visible `ok` rows. The bag column is not shown; a row that was flown and has
-// a bag links to its replay.
+// The table: the header is rebuilt only when its columns or sort change; one row per
+// run is patched in place; rows move only when the visible order changes; the footer
+// is rebuilt only when the results or the filter change. The bag column is not shown;
+// a row that was flown and has a bag links to its replay.
 function renderTable() {
   if (!state.results) return;
   const { columns, rows } = state.results;
@@ -216,41 +256,110 @@ function renderTable() {
   const bagAt = columns.indexOf("bag");
   const runAt = columns.indexOf("run");
   const visible = visibleRows();
-  const okRows = visible.filter((row) => statusOf(row, statusAt) === "ok");
 
-  const head = h("tr", {},
+  const columnsKey = columns.join("\u0000");
+  if (columnsKey !== state.columnsKey) {
+    state.columnsKey = columnsKey;
+    state.headKey = null;
+    state.rows.clear();
+    tbody.replaceChildren();
+  }
+  const headKey = `${state.sort.col}\u0000${state.sort.dir}`;
+  if (headKey !== state.headKey) {
+    state.headKey = headKey;
+    renderHead(columns, shown);
+  }
+
+  const keep = new Set(visible.map((row) => row[runAt]));
+  for (const row of visible) {
+    const run = row[runAt];
+    let entry = state.rows.get(run);
+    if (!entry) {
+      entry = newRow(run, shown.length);
+      state.rows.set(run, entry);
+    }
+    patchRow(entry, row, shown, statusAt, bagAt, run);
+  }
+  for (const [run, entry] of state.rows) if (!keep.has(run)) entry.tr.remove();
+  visible.forEach((row, i) => {
+    const tr = state.rows.get(row[runAt]).tr;
+    if (tbody.children[i] !== tr) tbody.insertBefore(tr, tbody.children[i] ?? null);
+  });
+
+  const footKey = `${state.version}\u0000${state.filter}`;
+  if (footKey !== state.footKey) {
+    state.footKey = footKey;
+    renderFoot(columns, rows, visible, shown);
+  }
+  el.resultsWrap.hidden = false;
+  el.resultsCount.textContent = `${visible.length} of ${rows.length} runs`;
+}
+
+// The header: a sort button per shown column, and the Replay column. Focus stays on
+// the sort button it was on across the rebuild.
+function renderHead(columns, shown) {
+  const focused = thead.contains(document.activeElement) ? document.activeElement.dataset.column : null;
+  thead.replaceChildren(h("tr", {},
     ...shown.map((i) => {
       const name = columns[i];
-      const button = h("button", { type: "button", class: "sort", text: name });
+      const button = h("button", { type: "button", class: "sort", text: name, "data-column": name });
       button.addEventListener("click", () => sortBy(name));
       const aria = state.sort.col !== name ? "none" : state.sort.dir > 0 ? "ascending" : "descending";
       return h("th", { scope: "col", "aria-sort": aria }, button);
     }),
-    h("th", { scope: "col", text: "Replay" }));
+    h("th", { scope: "col", text: "Replay" })));
+  if (focused != null) [...thead.querySelectorAll("button")].find((b) => b.dataset.column === focused)?.focus();
+}
 
-  const body = visible.map((row) => {
-    const run = row[runAt];
-    const status = statusOf(row, statusAt);
-    const bag = bagAt >= 0 ? row[bagAt] : null;
-    const replayable = (status.startsWith("ok") || status.startsWith("stopped")) && bag != null && String(bag) !== "";
-    const cells = shown.map((i) => {
-      const v = row[i];
-      const cls = i === statusAt ? "status" : typeof v === "number" ? "num" : "";
-      return h("td", { class: cls, title: i === statusAt ? status : null, text: cellText(columns[i], v) });
-    });
-    cells.push(h("td", {}, replayable
-      ? h("a", { href: `./view.html?sweep=${encodeURIComponent(state.id)}&run=${run}`, text: "Replay" })
-      : null));
-    return h("tr", { "data-run": String(run) }, ...cells);
+// The cells of a new row for run `run`, patched by patchRow from then on.
+function newRow(run, count) {
+  const tr = h("tr", { "data-run": String(run) });
+  const cells = Array.from({ length: count }, () => h("td"));
+  const replay = h("td");
+  tr.append(...cells, replay);
+  if (run === state.selected) tr.classList.add("selected");
+  return { tr, cells, replay, texts: [], classes: [], href: "" };
+}
+
+// Set a row's cells from its values: only a cell whose text or class changed is touched.
+function patchRow(entry, row, shown, statusAt, bagAt, run) {
+  const status = statusOf(row, statusAt);
+  shown.forEach((i, j) => {
+    const v = row[i];
+    const text = cellText(v);
+    const cls = i === statusAt ? "status" : typeof v === "number" ? "num" : "";
+    const td = entry.cells[j];
+    if (entry.classes[j] !== cls) {
+      td.className = cls;
+      entry.classes[j] = cls;
+    }
+    if (entry.texts[j] !== text) {
+      td.textContent = text;
+      entry.texts[j] = text;
+      if (i === statusAt) td.title = status;
+    }
   });
+  const bag = bagAt >= 0 ? row[bagAt] : null;
+  const replayable = (status.startsWith("ok") || status.startsWith("stopped")) && bag != null && String(bag) !== "";
+  const href = replayable ? `./view.html?sweep=${encodeURIComponent(state.id)}&run=${encodeURIComponent(String(run))}` : "";
+  if (entry.href !== href) {
+    entry.href = href;
+    entry.replay.replaceChildren(...(href ? [h("a", { href, text: "Replay" })] : []));
+  }
+}
 
+// The footer: min, mean and max over the visible ok rows, for each numeric column
+// the stats do not skip (NO_STATS).
+function renderFoot(columns, rows, visible, shown) {
+  const statusAt = columns.indexOf("status");
+  const okRows = visible.filter((row) => statusOf(row, statusAt) === "ok");
   const stat = (i, pick) => {
     const column = columns[i];
     if (NO_STATS.has(column)) return "";
     const numeric = rows.some((row) => typeof row[i] === "number");
     if (!numeric) return "";
     const values = okRows.map((row) => row[i]).filter((v) => typeof v === "number");
-    return values.length ? cellText(column, pick(values)) : "–";
+    return values.length ? cellText(pick(values)) : "–";
   };
   const min = (vs) => vs.reduce((a, b) => Math.min(a, b));
   const max = (vs) => vs.reduce((a, b) => Math.max(a, b));
@@ -259,14 +368,7 @@ function renderTable() {
     ...shown.map((i, k) => (k === 0
       ? h("th", { scope: "row", text: label })
       : h("td", { class: "num", text: stat(i, pick) }))));
-
-  el.results.replaceChildren(
-    h("thead", {}, head),
-    h("tbody", {}, ...body),
-    h("tfoot", {}, foot("min", min), foot("mean", mean), foot("max", max)));
-  el.resultsWrap.hidden = false;
-  el.resultsCount.textContent = `${visible.length} of ${rows.length} runs`;
-  markSelected();
+  tfoot.replaceChildren(foot("min", min), foot("mean", mean), foot("max", max));
 }
 
 // ---- compare runs ----
@@ -367,7 +469,7 @@ function drawPlot() {
       return typeof v === "number" ? ramp(hi > lo ? (v - lo) / (hi - lo) : 0) : muted;
     };
     legend = numbers.length
-      ? [{ label: `min ${cellText(shown.colour, lo)}`, color: ramp(0) }, { label: `max ${cellText(shown.colour, hi)}`, color: ramp(1) }]
+      ? [{ label: `min ${cellText(lo)}`, color: ramp(0) }, { label: `max ${cellText(hi)}`, color: ramp(1) }]
       : [];
   }
 
@@ -396,8 +498,8 @@ function showTip(data, at) {
   const { x, y } = state.shown;
   el.scatterTip.replaceChildren(
     h("div", { text: `run ${data.run} · ${data.status}` }),
-    h("div", { text: `${x} = ${cellText(x, data.x)}` }),
-    h("div", { text: `${y} = ${cellText(y, data.y)}` }));
+    h("div", { text: `${x} = ${cellText(data.x)}` }),
+    h("div", { text: `${y} = ${cellText(data.y)}` }));
   el.scatterTip.classList.toggle("left", at.x > el.compareWrap.clientWidth / 2);
   el.scatterTip.style.left = `${at.x}px`;
   el.scatterTip.style.top = `${at.y}px`;
@@ -431,24 +533,49 @@ el.colourBy.addEventListener("change", () => { state.plot.colour = el.colourBy.v
 
 // ---- polling ----
 
+// The wait before retry `n` (1-based) after a failed read: 1 s, 2 s, 4 s, capped.
+const backoff = (n) => Math.min(POLL_MS * 2 ** (n - 1), RETRY_MAX_MS);
+
 async function poll() {
   clearTimeout(state.timer);
-  if (document.hidden) return; // resumed by visibilitychange
+  state.timer = 0;
+  if (document.hidden || state.polling || state.gone) return; // a hidden tab resumes on visibilitychange
+  state.polling = true;
+  let view;
   try {
-    render(await getSweep(state.id));
-    showError(el.pollError, "");
+    view = await getSweep(state.id);
   } catch (err) {
-    showError(el.pollError, `Cannot read the sweep: ${err.message || err}`);
+    state.polling = false;
+    if (err instanceof ApiError && err.status === 404) {
+      state.gone = true;
+      showError(el.pollError, `Cannot read the sweep: ${err.message || err}`);
+      return;
+    }
+    state.pollFails++;
+    showError(el.pollNote, "Connection problem — retrying…");
+    keepPolling(backoff(state.pollFails));
+    return;
   }
-  keepPolling();
+  state.polling = false;
+  state.pollFails = 0;
+  showError(el.pollNote, "");
+  render(view);
+  keepPolling(POLL_MS);
 }
 
-function keepPolling() {
-  if (state.view?.state === "running") state.timer = setTimeout(poll, POLL_MS);
+function keepPolling(delay) {
+  if (state.view?.state === "running") state.timer = setTimeout(poll, delay);
 }
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.view?.state === "running") poll();
+});
+
+// The page is leaving: stop the poll and the canvases' loops and observers.
+window.addEventListener("pagehide", () => {
+  clearTimeout(state.timer);
+  allRuns.destroy();
+  scatter.destroy();
 });
 
 // ---- boot ----
@@ -472,7 +599,7 @@ async function boot() {
     return;
   }
   el.content.hidden = false;
-  keepPolling();
+  keepPolling(POLL_MS);
 }
 
 boot();

@@ -54,6 +54,9 @@ function axis(values) {
 // Decimals a tick label needs at this step.
 const decimals = (step) => Math.max(0, Math.ceil(-Math.log10(step) - 1e-9));
 
+// A tick's label: a whole number without decimals, else the step's decimals.
+const tickLabel = (t, step) => (Number.isInteger(t) ? String(t) : t.toFixed(decimals(step)));
+
 export class Scatter {
   #canvas;
   #ctx;
@@ -160,7 +163,7 @@ export class Scatter {
       ctx.moveTo(x, plot.top);
       ctx.lineTo(x, plot.bottom);
       ctx.stroke();
-      ctx.fillText(t.toFixed(decimals(xStep)), x, plot.bottom + 6);
+      ctx.fillText(tickLabel(t, xStep), x, plot.bottom + 6);
     }
     ctx.textBaseline = "middle";
     ctx.textAlign = "right";
@@ -170,7 +173,7 @@ export class Scatter {
       ctx.moveTo(plot.left, y);
       ctx.lineTo(plot.right, y);
       ctx.stroke();
-      ctx.fillText(t.toFixed(decimals(yStep)), plot.left - 6, y);
+      ctx.fillText(tickLabel(t, yStep), plot.left - 6, y);
     }
 
     // The axes' frame and titles.

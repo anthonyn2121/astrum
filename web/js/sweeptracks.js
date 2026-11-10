@@ -8,7 +8,8 @@
 // The tracks come from GET /api/sweeps/<id>/tracks, one request at a time, for
 // the finished runs not asked for yet (up to CHUNK in a row). While the sweep
 // runs, the page's polls say which runs finished and a request goes out at most
-// every REFETCH_MS; a finished sweep is asked at once. A run is asked for once.
+// every REFETCH_MS; a finished sweep is asked at once. A run is asked for once,
+// unless its chunk failed: a failed chunk is asked again up to RETRIES times.
 // Text from the server reaches the DOM as textContent only.
 
 import { getSweepTracks } from "./api.js";
@@ -18,6 +19,7 @@ import { TopDown } from "./topdown.js";
 const CHUNK = 100; // runs per request
 const MAX_RUNS = 2000; // the first runs drawn
 const REFETCH_MS = 3000; // while the sweep runs, at most one request this often
+const RETRIES = 3; // the times a failed chunk is asked again
 const FINISHED = new Set(["ok", "failed", "stopped"]);
 const PATH_ALPHA = 0.35;
 const SELECTED_WIDTH_PX = 3;
@@ -74,6 +76,9 @@ export class SweepTracks {
   #playing = false;
   #frame = 0;
   #frameAt = 0;
+  #tries = new Map(); // a chunk's first run -> its failed tries
+  #retrying = false; // a chunk failed and is to be asked again
+  #given = false; // a chunk was given up: its error stays
 
   constructor({ onSelect }) {
     this.#onSelect = onSelect;
@@ -85,7 +90,6 @@ export class SweepTracks {
     el.play.addEventListener("click", () => (this.#playing ? this.#pause() : this.#play()));
     el.paths.addEventListener("change", () => this.#show());
     el.positions.addEventListener("change", () => this.#show());
-    window.addEventListener("pagehide", () => this.#halt());
   }
 
   // The page's latest view of the sweep: fetch what it has finished, and draw.
@@ -103,11 +107,20 @@ export class SweepTracks {
     this.#show();
   }
 
+  // The page is leaving: stop the play and the wait, and the canvas's loop and observer.
+  destroy() {
+    this.#halt();
+    this.#view.destroy();
+  }
+
   #reset(id) {
     this.#halt();
     this.#id = id;
     this.#runs.clear();
     this.#seen.clear();
+    this.#tries.clear();
+    this.#given = false;
+    this.#retrying = false;
     this.#framed = false;
     this.#t = 0;
     this.#changed();
@@ -136,7 +149,7 @@ export class SweepTracks {
   // Ask for the next group when the sweep allows it: now, or after the wait.
   #schedule() {
     if (this.#busy || this.#timer || this.#group().length === 0) return;
-    const wait = this.#last.state === "running" ? this.#lastFetch + REFETCH_MS - Date.now() : 0;
+    const wait = this.#last.state === "running" || this.#retrying ? this.#lastFetch + REFETCH_MS - Date.now() : 0;
     if (wait > 0) {
       this.#timer = setTimeout(() => {
         this.#timer = 0;
@@ -159,15 +172,30 @@ export class SweepTracks {
       const reply = await getSweepTracks(id, group[0], group.length);
       if (id === this.#id) {
         for (const run of reply.runs) this.#runs.set(run.run, run);
-        showError(el.error, "");
+        this.#retrying = false;
+        if (!this.#given) showError(el.error, "");
         this.#changed();
       }
     } catch (err) {
-      if (id === this.#id) showError(el.error, `Cannot read the tracks: ${err.message || err}`);
+      if (id === this.#id) this.#failed(group, err);
     } finally {
       this.#busy = false;
     }
     this.#schedule();
+  }
+
+  // A failed chunk is asked again (on the next poll, or after the wait) up to RETRIES
+  // times; then it is given up and its error stays.
+  #failed(group, err) {
+    const tries = (this.#tries.get(group[0]) ?? 0) + 1;
+    this.#tries.set(group[0], tries);
+    showError(el.error, `Cannot read the tracks: ${err.message || err}`);
+    if (tries > RETRIES) {
+      this.#given = true;
+      return;
+    }
+    for (const n of group) this.#seen.delete(n);
+    this.#retrying = true;
   }
 
   // Redraw from the runs fetched so far: the slider's span, the empty state, the
