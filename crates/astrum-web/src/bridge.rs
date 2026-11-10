@@ -355,7 +355,11 @@ impl Feed {
                 }
                 Err(e) => {
                     if !reported {
-                        eprintln!("[astrum-web] waiting for a sim on {endpoint} ({e})");
+                        eprintln!(
+                            "[astrum-web] no live sim on {endpoint} yet: the studio is up, and the \
+                             viewer's live source stays idle until one starts (studio runs bring \
+                             their own); retrying in the background ({e})"
+                        );
                         reported = true;
                     }
                     std::thread::sleep(CONNECT_RETRY.saturating_sub(started.elapsed()));

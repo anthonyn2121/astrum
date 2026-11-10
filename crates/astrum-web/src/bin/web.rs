@@ -185,6 +185,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         runs.config().sim.display(),
         runs.config().dir.display()
     );
+    let host =
+        if addr.ip().is_unspecified() { "localhost".to_owned() } else { addr.ip().to_string() };
+    println!("[astrum-web] studio ready: open http://{host}:{}/ (Ctrl-C to stop)", addr.port());
 
     let closing = runs.clone();
     let closing_sweeps = sweeps.clone();
