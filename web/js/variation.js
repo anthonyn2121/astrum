@@ -46,12 +46,12 @@ function whole(text, min) {
   return t !== "" && Number.isInteger(x) && x >= min ? x : undefined;
 }
 
-// An optional number of at least 0: null when empty, NaN when refused.
+// An optional number: null when empty, NaN when it is not a finite number.
 function optionalNumber(text) {
   const t = text.trim();
   if (t === "") return null;
   const x = Number(t);
-  return Number.isFinite(x) && x >= 0 ? x : NaN;
+  return Number.isFinite(x) ? x : NaN;
 }
 
 // The numbers in a grid row's Values text (commas or spaces), or why not.
@@ -128,7 +128,7 @@ export class VariationForm {
     const seed = numeric("varSeed", "Seed", { min: "0", step: "1", inputmode: "numeric", value: "0" });
     const minSep = numeric("varMinSep", "Min separation (m)", { min: "0", placeholder: "none" },
       "a draw that brings two aircraft closer is redrawn");
-    const minAlt = numeric("varMinAlt", "Min altitude (m HAE)", { min: "0", placeholder: "none" },
+    const minAlt = numeric("varMinAlt", "Min altitude (m HAE)", { placeholder: "none" },
       "a draw that brings an aircraft lower is redrawn");
     for (const f of [samples, seed, minSep, minAlt]) f.input.addEventListener("input", () => this.#changed());
     this.#samples = samples.input;
@@ -210,8 +210,9 @@ export class VariationForm {
     const err = this.#shared.error;
     ok = mark(err.samples, this.#samples, hasDraws && samples === undefined ? "Enter a whole number, at least 1." : "") && ok;
     ok = mark(err.seed, this.#seed, hasDraws && seed === undefined ? "Enter a whole number, at least 0." : "") && ok;
-    ok = mark(err.minSep, this.#minSep, hasDraws && Number.isNaN(minSep) ? "Enter a number of at least 0, or leave it empty." : "") && ok;
-    ok = mark(err.minAlt, this.#minAlt, hasDraws && Number.isNaN(minAlt) ? "Enter a number of at least 0, or leave it empty." : "") && ok;
+    const minSepMsg = Number.isNaN(minSep) ? "must be a number" : minSep !== null && minSep <= 0 ? "must be above 0" : "";
+    ok = mark(err.minSep, this.#minSep, hasDraws ? minSepMsg : "") && ok;
+    ok = mark(err.minAlt, this.#minAlt, hasDraws && Number.isNaN(minAlt) ? "must be a number" : "") && ok;
 
     const vary = {};
     const seen = new Set();
@@ -291,6 +292,13 @@ export class VariationForm {
     this.#gridList.replaceChildren(...this.#grid.map((r, i) => this.#rowCard(r, i + 1)));
   }
 
+  // After a row is removed: focus the next row's first control, else the previous
+  // one's, else the subsection's add button.
+  #focusAfterRemove(list, at, add) {
+    const next = list.children[at] ?? list.children[at - 1];
+    (next?.querySelector("input, select") ?? add).focus();
+  }
+
   #drawCard(g, n) {
     const id = `vd${g.key}`;
     const boxes = this.#fleet.map((a) => {
@@ -341,8 +349,10 @@ export class VariationForm {
 
     const remove = h("button", { type: "button", class: "mini", text: "Remove", "aria-label": `Remove draw ${n}` });
     remove.addEventListener("click", () => {
+      const at = this.#draws.indexOf(g);
       this.#draws = this.#draws.filter((d) => d !== g);
       this.#render();
+      this.#focusAfterRemove(this.#drawList, at, this.#addDraw);
       this.#changed();
     });
 
@@ -385,8 +395,10 @@ export class VariationForm {
 
     const remove = h("button", { type: "button", class: "mini", text: "Remove", "aria-label": `Remove grid row ${n}` });
     remove.addEventListener("click", () => {
+      const at = this.#grid.indexOf(r);
       this.#grid = this.#grid.filter((x) => x !== r);
       this.#render();
+      this.#focusAfterRemove(this.#gridList, at, this.#addRow);
       this.#changed();
     });
 
