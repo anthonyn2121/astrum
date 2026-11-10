@@ -64,3 +64,25 @@
 .var-fields .field { flex: 1 1 170px; }
 .var-fields .var-values { flex-basis: 280px; }
 .var-shared { margin: 0; }
+
+/* The starting-positions picture (startcloud.js on topdown.js), in the Plan step. */
+.start-panel { display: flex; flex-direction: column; gap: 8px; margin: 0 0 12px; min-width: 0; }
+.start-panel h3 { margin: 0; font-size: 14px; }
+.start-panel > .muted { margin: 0; }
+.start-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.start-legend { flex: 1; display: flex; flex-wrap: wrap; gap: 4px 16px; min-width: 0; }
+.start-legend-row { display: inline-flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+.start-wrap { position: relative; min-width: 0; }
+.start-canvas {
+  display: block; width: 100%; height: 340px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel-solid);
+}
+.start-canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (max-width: 800px) { .start-canvas { height: 260px; } }
+.start-tip {
+  position: absolute; top: 0; left: 0; max-width: 260px; padding: 6px 9px; pointer-events: none;
+  background: var(--panel-raised); border: 1px solid var(--line); border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums;
+}
+.start-tip div { white-space: nowrap; }
+.start-tip-head { font-weight: 600; }

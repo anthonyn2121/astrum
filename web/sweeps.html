@@ -110,6 +110,18 @@
           <p id="planError" class="form-error" role="alert" hidden></p>
           <p id="planSummary" class="plan-summary"></p>
           <p id="planTrim" class="plan-trim small" role="status" hidden></p>
+          <section id="startPanel" class="start-panel" aria-labelledby="startHead" hidden>
+            <h3 id="startHead">Starting positions</h3>
+            <p class="muted small">Arrows are the scenario's aircraft; dots are each planned run's start for the aircraft the sweep moves. Drag to pan, wheel or + / − to zoom, double-click or Fit to frame.</p>
+            <div class="start-head">
+              <div id="startLegend" class="start-legend small"></div>
+              <button id="startFit" type="button">Fit</button>
+            </div>
+            <div class="start-wrap">
+              <canvas id="startCanvas" class="start-canvas" aria-label="Starting positions, top-down: the scenario's aircraft as arrows, each planned start as a dot. Arrow keys pan, plus and minus zoom, 0 fits."></canvas>
+              <div id="startTip" class="start-tip small" hidden></div>
+            </div>
+          </section>
           <div class="plan-wrap" hidden id="planWrap">
             <table id="planTable" class="plan-table"></table>
           </div>
