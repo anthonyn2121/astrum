@@ -300,6 +300,13 @@ impl Session {
         q.unwrap_or(Ok(()))
     }
 
+    /// Whether every link of the session reaches a hub right now (a client's
+    /// stream link and its query link; a hub or in-process session has one).
+    pub fn linked(&self) -> bool {
+        let up = |z: &zenoh::Session| z.info().routers_zid().wait().next().is_some();
+        up(&self.z) && self.q.as_ref().is_none_or(up)
+    }
+
     /// The underlying Zenoh session (raw recording / replay, advanced use).
     pub fn raw(&self) -> &zenoh::Session {
         &self.z
@@ -491,18 +498,23 @@ impl Trail {
         }
         self.pending.push_back(t);
         if self.pending.len() > cap {
-            return self.halve();
+            return self.halve(cap);
         }
         0
     }
 
     /// Keep every other pending sample, counting back from the newest (which
     /// stays), and double the period; returns how many went. Kept samples are
-    /// two old periods apart, so they still satisfy the doubled one.
-    fn halve(&mut self) -> u64 {
+    /// two old periods apart, so they still satisfy the doubled one. The oldest
+    /// sample stays too (when there is room under the cap), so a batch starts
+    /// where the stretch since the last take starts.
+    fn halve(&mut self, cap: usize) -> u64 {
         let before = self.pending.len();
         let mut kept: Vec<Telemetry> = self.pending.iter().rev().step_by(2).copied().collect();
         kept.reverse();
+        if kept.len() < cap && kept.first() != self.pending.front() {
+            kept.insert(0, self.pending[0]);
+        }
         self.pending = kept.into();
         self.halvings = self.halvings.saturating_add(1);
         (before - self.pending.len()) as u64
@@ -533,11 +545,12 @@ struct SampledState {
 /// * **capped by halving** — at most `cap` samples per aircraft wait to be
 ///   taken. A sim far faster than real time would pass the cap within one
 ///   batch; rather than drop the oldest (a batch that covers only its newest
-///   seconds), the trail keeps every other pending sample and doubles its
-///   period, again each time the cap is passed, so a batch always spans the
-///   whole stretch since the last take at the finest resolution `cap` allows.
-///   A take resets the period. ([`capped`](Self::capped) counts the samples
-///   halving dropped.)
+///   seconds), the trail keeps every other pending sample (the newest always,
+///   the oldest when there is room) and doubles its period, again each time
+///   the cap is passed, so a batch spans the whole stretch since the last take
+///   with between about `cap / 2` and `cap` samples, at a power-of-two
+///   multiple of the sample period. A take resets the period.
+///   ([`capped`](Self::capped) counts the samples halving dropped.)
 /// * **time-ordered** — a sample older than the aircraft's newest (a restarted
 ///   sim or replay) discards that aircraft's pending samples first.
 ///
@@ -986,10 +999,11 @@ pub fn fetch_scenario(session: &Session, timeout: Duration) -> Result<Option<Str
         if left.is_zero() {
             return Ok(None);
         }
-        let attempt = left.min(SCENARIO_RETRY);
         let started = Instant::now();
-        let replies =
-            session.queries().get(keys::SCENARIO).timeout(attempt).wait().map_err(zerr)?;
+        // A query waits out the whole of `left` for its reply — a large
+        // scenario on a slow link takes longer than one retry period — but one
+        // nobody answers finishes at once, and the retry sleep below paces it.
+        let replies = session.queries().get(keys::SCENARIO).timeout(left).wait().map_err(zerr)?;
         while let Ok(reply) = replies.recv() {
             if let Ok(sample) = reply.result() {
                 let text = String::from_utf8(sample.payload().to_bytes().into_owned())
@@ -998,7 +1012,7 @@ pub fn fetch_scenario(session: &Session, timeout: Duration) -> Result<Option<Str
             }
         }
         // No queryable yet: the query finished early; wait out the attempt.
-        std::thread::sleep(attempt.saturating_sub(started.elapsed()));
+        std::thread::sleep(SCENARIO_RETRY.saturating_sub(started.elapsed()).min(left));
     }
 }
 

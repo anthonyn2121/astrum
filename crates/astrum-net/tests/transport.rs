@@ -224,6 +224,43 @@ fn sampled_telemetry_halves_its_trail_at_the_cap_instead_of_dropping_the_oldest(
 }
 
 #[test]
+fn halving_keeps_the_first_and_newest_samples_for_every_cap() {
+    // 400 ticks thinned to every 4th: 100 samples, far more than any cap here.
+    for cap in 1..=7usize {
+        let session = Session::in_process().unwrap();
+        let mut publisher = TelemetryPublisher::new(&session);
+        let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, cap);
+        for tick in 1..=400 {
+            publisher.publish(&sample(1, tick)).unwrap();
+        }
+        settle(&mut sub);
+        let batch: Vec<u64> = sub.take().iter().map(|t| t.tick).collect();
+        assert!(batch.len() <= cap, "cap {cap}: {batch:?}");
+        assert_eq!(batch.last(), Some(&400), "cap {cap}: {batch:?}");
+        // One sample can only be the newest; with room for two, the batch
+        // starts where the stretch did.
+        if cap >= 2 {
+            assert_eq!(batch.first(), Some(&0), "cap {cap}: {batch:?}");
+        }
+        assert!(batch.windows(2).all(|w| w[0] < w[1]), "cap {cap}: {batch:?}");
+    }
+}
+
+#[test]
+fn a_backwards_clock_starts_the_trail_over_at_the_base_period() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    // Cap 3: 60 ticks halve the trail several times; the new run's first 8
+    // ticks then thin at the base period again (every 4th), not the doubled one.
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 3);
+    for tick in (1..=60).chain(0..=8) {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [0, 4, 8].map(|t| (1, t)));
+}
+
+#[test]
 fn sampled_telemetry_drops_an_aircrafts_old_run_when_its_clock_goes_back() {
     let session = Session::in_process().unwrap();
     let mut publisher = TelemetryPublisher::new(&session);

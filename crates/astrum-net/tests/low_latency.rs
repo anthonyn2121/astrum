@@ -120,3 +120,21 @@ fn control_replies_reach_a_client() {
     let refused = send_control(&client, ControlRequest::Step(0), Duration::from_secs(5));
     assert!(matches!(refused, Err(NetError::Refused(_))), "{refused:?}");
 }
+
+#[test]
+fn a_slow_scenario_reply_is_waited_for() {
+    // The reply comes 0.5 s after the query, five retry periods: a fetch that
+    // gave each query only one retry period would drop every reply as late.
+    let (hub, client) = hub_and_client(3);
+    let _queryable = hub
+        .raw()
+        .declare_queryable(keys::SCENARIO)
+        .callback(|query| {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = query.reply(keys::SCENARIO, "[sim]\nrate_hz = 120.0\n").wait();
+        })
+        .wait()
+        .unwrap();
+    let got = fetch_scenario(&client, Duration::from_secs(10)).unwrap();
+    assert_eq!(got.as_deref(), Some("[sim]\nrate_hz = 120.0\n"));
+}

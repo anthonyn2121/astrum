@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use astrum_bag::aircraft_models;
-use astrum_net::zenoh::Wait;
 use astrum_net::{fetch_scenario, EventReceiver, NetError, SampledTelemetry, Selection, Session};
 use axum::extract::ws::Utf8Bytes;
 use serde::Serialize;
@@ -411,7 +410,7 @@ impl Feed {
                     .expect("spawning the models thread"),
             ];
             while !stop.stopped() {
-                let linked = session.raw().info().routers_zid().wait().next().is_some();
+                let linked = session.linked();
                 self.with_attachment(|a| a.connected = linked);
                 std::thread::sleep(LINK_POLL);
             }
