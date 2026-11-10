@@ -40,9 +40,9 @@ export class ControllerForm {
   }
 
   // Render a row per aircraft of a scenario doc (the reply of
-  // GET /api/scenarios/<name>, its aircraft's kind filled in); null clears it.
+  // GET /api/scenarios/<name>; its `fleet` carries each aircraft's resolved
+  // kind, which the controllers fly by); null clears it.
   setScenario(doc) {
-    // The doc's `fleet` carries each aircraft's resolved kind (the controllers fly by it).
     const kinds = new Map((doc?.fleet ?? []).map((a) => [a.id, a.kind]));
     this.#fleet = doc
       ? doc.scenario.aircraft.map((a) => ({ ...a, kind: kinds.get(a.id) ?? a.kind })).sort((a, b) => a.id - b.id)
