@@ -880,7 +880,7 @@ function checkResult(reply) {
   if (!trims.length) return { summary: "No fixed-wing aircraft to trim-check.", items: [], failed: false };
   const items = trims.map((t) => (t.ok
     ? { text: `aircraft ${t.aircraft} (${t.model}): trim ok`, ok: true }
-    : { text: `aircraft ${t.aircraft} (${t.model}): trim FAILED — ${t.error}`, ok: false }));
+    : { text: `trim FAILED — ${t.error}`, ok: false }));
   const failed = trims.filter((t) => !t.ok).length;
   return failed
     ? { summary: `${failed} of ${trims.length} aircraft will not trim — the sim would refuse to start`, items, failed: true }
