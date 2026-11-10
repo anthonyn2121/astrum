@@ -402,65 +402,142 @@ astrum play recordings/session.mcap                   # replay it (run `astrum w
 astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (v3) JSON
 ```
 
-The renderer is static files under `web/` (Three.js and uPlot vendored in `web/vendor/`; the
-modules live in `web/js/`: `main.js` owns playback and selection state, `store.js` the timeline,
-`scene.js`/`meshes.js` the 3-D view, `environment.js` the sky / map, `geo.js` WGS84 geodetic ⇄
-ECEF ⇄ ENU (the same math as `crates/astrum-geo`, to ~1e-8 m), `ui.js` the shell and transport,
-`fleet.js`, `inspector.js`, `eventlog.js` and `plots.js` the docks, `geometry.js` the relative
-geometry, `simcontrol.js` the live sim's control bar and `runpanel.js` a studio run's panel); the
-viewer page is `view.html`. The studio's other pages are `index.html` (home, `home.js`),
-`interactive.html` (`interactive.js`) and the scenario editor `sandbox.html` (`sandbox.js` +
-`editstore.js`), styled by `css/studio.css` / `css/sandbox.css` over `style.css`; every page
-reaches `/api` only through `js/api.js`. The bridge and
-exporter are the two binaries in `crates/astrum-web/`, both projecting telemetry through the one
-`astrum_web::FrameJson` shape. The bridge thins every aircraft's telemetry by sim time
-(`astrum_net::SampledTelemetry`: at most `--sample-hz`, default 30, samples per sim second plus
-the newest; at most `BATCH_SAMPLES` = 120 pending per aircraft, past which the trail is halved —
-every other sample, the newest always, and the period doubled — so a batch always spans the whole
-stretch since the last one) and sends what arrived as one
-`frames` batch at most `--max-hz` (default 30) times per second, so trails stay smooth faster
-than real time; `store.js` appends each aircraft's samples in order and keeps 20 min of sim time
-at 30 Hz (`LIVE_CAPACITY`). Telemetry carries only the vehicle class, so the bridge
-also polls `astrum/scenario` every 5 s and sends each aircraft's JSBSim model
-(`{"type":"models","models":[{"id","model"}…]}`) on connect and whenever it changes, and
-`{"type":"run","run":N,"endpoint"}` on connect and on every `Bridge::attach`/`detach`
-(`crates/astrum-web/src/bridge.rs`); exports carry the same models list as `meta.models`. The
-bridge owns the browser feeds for the server's lifetime; each run gets a fresh session and
-`SampledTelemetry`, and pumps publish only while their run is current, so nothing from an old run
-follows the new run's message. `/api` lives in `src/api.rs`; its guard (`api::guard`) wraps the
-whole nested API service, so new routes inherit the Host, Origin and JSON-body checks. Control
-values are checked by `astrum_net::ControlRequest::validate` against `astrum_net::MIN_SPEED`, the
-one limit the sim and the API share.
+### The web studio and renderer
 
-**Studio runs** (`crates/astrum-web/src/runs.rs`): `Runs` owns the one live interactive run. A
-start is checked by `assign.rs` (the scenario, the assignments, then each controller program
-exists — so "not built" names the
-aircraft instead of failing in `LiveRun::start`) and launched on the blocking pool
-(`LiveRun::start` with `Log::Channel`), so a client that goes away mid-request cannot leave a
-half-started run. The log and monitor threads exist before the run's record is installed and act
-only once it is (a failed install drops the run and its lines); the monitor `wait`s for the run,
-drains its log, writes `metrics.json`, sends the bridge back to `--connect` if it still carries
-the run, and only then marks it finished — so `finished` means the metrics are on disk and the
-bridge is home. Each `LiveSpec` controller is a `launch::ControllerCmd` carrying its name and log
-source: `astrum run` and sweeps use `launch::numbered` (`controller k` / `ctlk`), studio runs
-name them by aircraft (`aircraft N's controller` / `aircraft N`). Stop requests flip the run's own stop
-handle and await the monitor's `watch` channel; nothing holds a lock across an await. The log
-ring's `seq` is monotonic over the server's lifetime (a reader's stale `since` never hides a new
-run's lines). `astrum-web` stops the active run when it is told to shut down (`Runs::close`) and
-waits for it after serving (`Runs::shutdown`). Its tests (`tests/runs.rs`) fly a shell-script
-stand-in sim and the real one, which must be built first (`cargo build -p astrum-sim`; or set
-`ASTRUM_SKIP_REAL_SIM=1`).
+**`web/`** is the browser app: static files that `astrum web` serves from `--root` (default `web`). The viewer and the studio pages are plain ES modules; the table lists every file except `web/vendor/` (Three.js and uPlot, vendored) and `web/img/`.
 
-**Web sweeps** (`crates/astrum-web/src/sweepruns.rs`): `SweepRuns` owns the one web sweep, as `Runs`
-owns the live run, and is independent of it. A start resolves the request (`sweeps::resolve`), plans it
-with `Sweep::plan_scenario`, refuses what `astrum sweep` refuses (no `astrum-sim`, too few ports, a
-failed `check_trim`) and only then creates `<runs-dir>/sweeps/<id>/`. A supervisor thread runs
-`sweep::execute` with `run_in_process` or `launch::run_processes`, exactly as the CLI does, and its
-`on_event` updates the in-memory run states; `meta.json` is rewritten atomically when it ends, before
-the record says so. A sweep that the disk says is `running` but no server owns reads back as
-`interrupted`. Tests (`tests/sweepruns.rs`) fly the `pair` scenario in-process, and one process-mode
-sweep on the real sim with the Python controller (same build requirement as `tests/runs.rs`). A stop request that the processes do not answer within `STOP_GRACE` (5 s, `SweepRunsConfig::stop_grace` in tests) is escalated to a kill, repeated every second until the supervisor ends; `GET /api/sweeps` reads each finished sweep's `meta.json` (its `ok`/`failed` counts) only, and skips a sweep whose meta or summary cannot be read.
-The flight tracks (`GET /api/sweeps/<id>/tracks`) read each finished run's bag through `astrum_bag::tracks`, thinned to `points`, and cache the result as `run-NNNN.tracks-<points>.json` beside the bag; a cache older than its bag, or one that does not read, is rebuilt (`tests/sweepruns.rs`).
+| File | Owns |
+|---|---|
+| `index.html` | the studio home page: cards for Interactive, Sandbox, Sweeps and the viewer; `home.js` announces a live run or sweep |
+| `view.html` | the 3-D replay viewer (`?run=<id>` adds a studio run's panel; `?sweep=<id>&run=<n>` a sweep run) |
+| `interactive.html` | the Interactive setup page, `interactive.js` |
+| `sandbox.html` | the scenario editor, `sandbox.js` with `editstore.js` |
+| `sweeps.html` | the Sweeps builder, `sweeps.js` |
+| `sweep.html` | the sweep page: state, progress, results, All runs, Compare runs |
+| `style.css` | the theme tokens and shared controls for every page |
+| `css/studio.css` | the studio pages' scrolling layout (index, interactive) |
+| `css/sandbox.css` | the scenario editor's layout, over `style.css` |
+| `css/sweeps.css` | the Sweeps builder's form |
+| `css/sweepview.css` | the sweep page, over `studio.css` |
+| `js/api.js` | the `/api` client: every studio call, and `ApiError` (status and message) |
+| `js/ctlform.js` | the per-aircraft controller form (Interactive and Sweeps) |
+| `js/dom.js` | DOM helpers: `$`, `h()`, `showError` |
+| `js/editstore.js` | a scenario's initial conditions as a store the scene reads (the editor's fleet) |
+| `js/environment.js` | background, fog, lights, the ENU grid, and the sky and map looks (`setMode`) |
+| `js/eventlog.js` | the aircraft dock's event log: a virtual list, click to seek |
+| `js/fleet.js` | the fleet dock: aircraft grouped by team, one status row each, pin to target |
+| `js/format.js` | number and time formatting for the HUD |
+| `js/geo.js` | WGS84 geodetic ⇄ ECEF ⇄ ENU, the same math as `crates/astrum-geo` |
+| `js/geometry.js` | relative geometry (range, ATA, aspect, …) with the dogfight env's definitions |
+| `js/home.js` | the home page's announcement of a live studio run and a running sweep |
+| `js/inspector.js` | the aircraft dock's readout: flight state, attitude, combat state, geometry to the target |
+| `js/interactive.js` | the Interactive page: environment, scenario, controllers, speed and time, then `POST /api/runs` |
+| `js/main.js` | the entry point: wires the store, scene, sources and HUD; owns playback and selection state |
+| `js/meshes.js` | procedural F-16-style jet and F450 quad meshes, their colours and placement |
+| `js/net.js` | the telemetry sources: the bridge's WebSocket, or an export file |
+| `js/plots.js` | the plots dock: stacked, time-synced uPlot charts for the selection |
+| `js/prefs.js` | viewer preferences persisted in `localStorage` (`astrum.viewer.v1`) |
+| `js/runpanel.js` | a studio run's panel on `view.html?run=<id>`: state, Stop, log, metrics, Open full replay |
+| `js/sandbox.js` | the scenario editor: map, edits, spawn, undo and redo, world origin, the JSON panel |
+| `js/scatter.js` | the canvas scatter plot behind Compare runs |
+| `js/scenariopicker.js` | the environment and scenario steps; only flyable scenarios can be picked |
+| `js/scene.js` | the 3-D view: camera, sizing, one object per aircraft, and edit mode (the Scene edit API) |
+| `js/simcontrol.js` | the live sim's control bar (`GET /api/bridge`, `POST /api/bridge/control`) |
+| `js/startcloud.js` | a sweep's starting positions on a top-down canvas |
+| `js/store.js` | the timeline store: per-aircraft tracks and `sampleAt(id, t)` |
+| `js/sweeps.js` | the Sweeps builder: base scenario, controllers, run settings, plan, Save, `?sweep=<name>` |
+| `js/sweeptracks.js` | the All runs panel of the sweep page: every run's flight on a top-down canvas |
+| `js/sweepview.js` | the sweep page: state, counts, runs, results table, Stop |
+| `js/topdown.js` | the top-down canvas picture (north up, metres) with arrow, dot and path layers |
+| `js/ui.js` | the HUD shell: top bar, transport, overlays, drag-and-drop, keyboard shortcuts |
+| `js/variation.js` | a sweep's variation: its random draws, its grid and the draw settings |
+
+**Every page** (`index.html` and the studio pages, `view.html` included) links `style.css`; the studio pages add `css/studio.css` or their own sheet. Every page reaches `/api` only through `js/api.js`.
+
+**Crate `astrum-web`** (`crates/astrum-web/`): the live bridge and the MCAP exporter (`astrum-web-export`) both project telemetry through the one `astrum_web::FrameJson` shape, and the server adds the studio's API.
+
+| Module | Owns |
+|---|---|
+| `src/api.rs` | the `/api` router and its guard (Host, Origin, JSON body) and the bridge, catalog, scenario and sweep handlers |
+| `src/assign.rs` | the controllers a run flies: scenario, assignments, command lines, lockstep flags |
+| `src/bridge.rs` | `Bridge`: the browser-facing feeds of whichever sim is attached |
+| `src/bin/web.rs` | the `astrum-web` binary: CLI flags, server wiring, the sweep base port 27500 |
+| `src/bin/export.rs` | the `astrum-web-export` binary: a bag to an `astrum-replay` JSON |
+| `src/catalogs.rs` | the environments, model profiles, controller catalog and scenario listing |
+| `src/export.rs` | `ExportDoc`: decodes a bag's telemetry and events into the renderer's shapes |
+| `src/lib.rs` | the shared JSON shapes (`FrameJson`, `EventJson`) and message builders |
+| `src/runs.rs` | `Runs`: the one live interactive run (`/api/runs`) and its monitor |
+| `src/scenarios.rs` | `PUT /api/scenarios/<name>` and `POST /api/scenario-check` |
+| `src/server.rs` | the HTTP service: telemetry WebSocket, `/api`, tile proxy, static files |
+| `src/sweepruns.rs` | `SweepRuns`: the one web sweep, flown from the browser (results, tracks, replays) |
+| `src/sweeps.rs` | sweep planning and saving (`/api/sweeps/plan`, `/api/sweeps/saved`) |
+
+**The bridge** (`crates/astrum-web/src/bridge.rs`) thins telemetry and feeds the browsers.
+
+- Telemetry is thinned by `astrum_net::SampledTelemetry`: at most `--sample-hz` (default 30) samples per sim second per aircraft, plus the newest.
+- At most `BATCH_SAMPLES` = 120 pending samples per aircraft. Past that the trail is halved (every other sample, the newest always, and the period doubled), so a batch always spans the whole stretch since the last one.
+- One `frames` batch goes out at most `--max-hz` (default 30) times per second, so trails stay smooth faster than real time.
+- `store.js` appends each aircraft's samples in order and keeps 20 min of sim time at 30 Hz (`LIVE_CAPACITY`).
+- Telemetry carries only the vehicle class, so the bridge polls `astrum/scenario` every 5 s and sends each aircraft's JSBSim model (`{"type":"models","models":[{"id","model"}…]}`) on connect and whenever it changes.
+- Exports carry the same list as `meta.models`.
+- `{"type":"run","run":N,"endpoint"}` goes out on connect and on every `Bridge::attach` and `detach`.
+- The bridge owns the browser feeds for the server's lifetime. Each run gets a fresh session and `SampledTelemetry`, and pumps publish only while their run is current, so nothing from an old run follows the new run's messages.
+- `/api` lives in `src/api.rs`. Its guard (`api::guard`) wraps the whole nested API service, so new routes inherit the Host, Origin and JSON-body checks.
+- Control values are checked by `astrum_net::ControlRequest::validate` against `astrum_net::MIN_SPEED`, the one limit the sim and the API share.
+
+
+**Studio runs** (`crates/astrum-web/src/runs.rs`): `Runs` owns the one live interactive run.
+
+- A start is checked by `assign.rs`: the scenario, then the assignments, then whether each controller program exists. So "not built" names the aircraft instead of failing in `LiveRun::start`.
+- The start is launched on the blocking pool (`LiveRun::start` with `Log::Channel`), so a client that goes away mid-request cannot leave a half-started run.
+- The log and monitor threads exist before the run's record is installed, and act only once it is. A failed install drops the run and its lines.
+- The monitor `wait`s for the run, drains its log, writes `metrics.json`, sends the bridge back to `--connect` if it still carries the run, and only then marks it finished. So `finished` means the metrics are on disk and the bridge is home.
+- Each `LiveSpec` controller is a `launch::ControllerCmd` carrying its name and log source. `astrum run` and sweeps use `launch::numbered` (`controller k` / `ctlk`); studio runs name them by aircraft (`aircraft N's controller` / `aircraft N`).
+- Stop requests flip the run's own stop handle and await the monitor's `watch` channel. Nothing holds a lock across an await.
+- The log ring's `seq` is monotonic over the server's lifetime, so a reader's stale `since` never hides a new run's lines.
+- `astrum-web` stops the active run when told to shut down (`Runs::close`), and waits for it after serving (`Runs::shutdown`).
+- Tests (`tests/runs.rs`) fly a shell-script stand-in sim and the real one, which must be built first (`cargo build -p astrum-sim`; or set `ASTRUM_SKIP_REAL_SIM=1`).
+
+**Web sweeps** (`crates/astrum-web/src/sweepruns.rs`): `SweepRuns` owns the one web sweep, as `Runs` owns the live run, and is independent of it.
+
+- A start resolves the request (`sweeps::resolve`), plans it with `Sweep::plan_scenario`, refuses what `astrum sweep` refuses (no `astrum-sim`, too few ports, a failed `check_trim`), and only then creates `<runs-dir>/sweeps/<id>/`.
+- A supervisor thread runs `sweep::execute` with `run_in_process` or `launch::run_processes`, exactly as the CLI does. Its `on_event` updates the in-memory run states.
+- `meta.json` is rewritten atomically when the sweep ends, before the record says so.
+- A sweep that the disk says is `running` but no server owns reads back as `interrupted`.
+- `GET /api/sweeps` reads each finished sweep's `meta.json` (its `ok`/`failed` counts) only, and skips a sweep whose meta or summary cannot be read.
+- A stop request that the processes do not answer within `STOP_GRACE` (5 s, `SweepRunsConfig::stop_grace` in tests) is escalated to a kill, repeated every second until the supervisor ends.
+- The flight tracks (`GET /api/sweeps/<id>/tracks`) read each finished run's bag through `astrum_bag::tracks`, thinned to `points`. They are cached as `run-NNNN.tracks-<points>.json` beside the bag; a cache older than its bag, or one that does not read, is rebuilt.
+- Tests (`tests/sweepruns.rs`) fly the `pair` scenario in-process, and one process-mode sweep on the real sim with the Python controller (same build requirement as `tests/runs.rs`).
+
+**Tests.** The real-sim tests in `tests/runs.rs` and `tests/sweepruns.rs` need `cargo build -p astrum-sim` first (they fly that binary; `ASTRUM_SIM_BIN` points them elsewhere):
+
+```bash
+cargo build -p astrum-sim                                    # once, before the astrum-web tests
+cargo test -p astrum-web --locked                            # every astrum-web test
+ASTRUM_SKIP_REAL_SIM=1 cargo test -p astrum-web --locked     # skip the real-sim tests
+```
+
+**Running the studio from the dev container.**
+
+- `make dev` builds the image if it is missing or out of date, starts the `dev` container (the checkout is bind-mounted at `/workspace`) and opens a shell in it. Each further `make dev` opens another shell in the same container.
+- Inside it, `astrum web` serves the studio (`/` is the home page) and the viewer on one port. `astrum run config/scenario.example.toml --watch` starts a sim, its bridge and the viewer as well.
+- `docker-compose.yml` sets `ASTRUM_WEB_BIND=0.0.0.0:8080` and `ASTRUM_WEB_ROOT=/workspace/web` in the container, and publishes `127.0.0.1:7447` (Zenoh) and `127.0.0.1:8080` (HTTP and WebSocket) on the host.
+- Zenoh has no authentication here: anyone who can reach 7447 can command aircraft.
+
+**Ports.**
+
+| Port | Used by |
+|---|---|
+| `7447` | Zenoh. The sim's router listens on it (`--listen`, default `tcp/0.0.0.0:7447`); the bridge's `--connect` default is `tcp/127.0.0.1:7447`. |
+| `8080` | `astrum web`: the studio, `/api`, static files, `/tiles/`, and the WebSocket `/telemetry`. Default bind `127.0.0.1:8080`. |
+| `27500 + N - 1` | Run N of a process-mode web sweep (loopback in the container; not published). |
+| a free loopback port | Each studio live run's sim. |
+
+**Conventions for studio pages.**
+
+- Every `/api` call goes through `web/js/api.js`; no other module calls `/api` itself. (`environment.js` fetches map tiles, not `/api`.)
+- Text from files, servers or URLs reaches the DOM only through `textContent`: `h()`'s string children and `text:` attributes in `dom.js`. `web/` uses no `innerHTML`.
+- No build step: plain ES modules and CSS served as they are, with no package manifest. Three.js and uPlot are vendored under `web/vendor/`.
 
 **Scene edit API** (the sandbox; sweep previews build on it). `Scene.setEditing({onSelect, onEdit,
 onPoint})` turns on edit mode (and the `"map"` environment: imagery for any fleet); the scene only
