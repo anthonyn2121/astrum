@@ -173,7 +173,7 @@ crates/            # Rust workspace (one crate per responsibility)
   astrum-geo/       #   WGS84 geodetic ↔ ECEF ↔ ENU math, local-level ↔ grid rotations
   astrum-proto/     #   the Cap'n Proto schema v3 + encode/decode + wire fixtures
   astrum-net/       #   Zenoh transport (keys, QoS, LatestTelemetry, CommandSender, events, tick ends, presence, control, scenario)
-  astrum-bag/       #   MCAP record (telemetry + commands + events) / replay (telemetry + events) / run metrics (astrum-bag-metrics)
+  astrum-bag/       #   MCAP record (telemetry + commands + events) / replay (telemetry + events) / run metrics (astrum-bag-metrics) / per-run flight tracks for sweep overviews (`tracks`)
   astrum-web/       #   axum bridge + tile proxy (astrum-web) + MCAP→JSON exporter (astrum-web-export)
   astrum-sim/       #   the Bevy ECS app — the sim binary + the embedded env seam (env.rs) + run supervision (launch.rs), sweeps (sweep.rs, IC offsets perturb.rs), file/environment catalog (catalog.rs), controller catalog (controllers.rs), the astrum CLI
   astrum-env/       #   PyO3 module `astrum_env` + the dogfight Gym adapter (python/)

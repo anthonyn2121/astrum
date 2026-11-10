@@ -22,6 +22,7 @@
 //! metrics (the `astrum-bag-metrics` binary).
 
 pub mod metrics;
+pub mod tracks;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
