@@ -43,6 +43,27 @@
 //!   scenario's errors (then no trims), or whether each aircraft whose class
 //!   trims does so at its initial conditions. 400 for a bad body or more than
 //!   512 aircraft.
+//! * **`POST /api/sweeps/plan`** — what a sweep would run ([`crate::sweeps`]):
+//!   `{"scenario": "<name>", "assignments": [...], "perturb": [...], "vary":
+//!   {"aircraft.<id>.offset.<axis>": [...]}, "samples", "sample_seed",
+//!   "min_separation_m", "min_alt_hae_m", "repeats", "max_time_s",
+//!   "run_timeout_s", "jobs", "check_trim"}` → 200 with its runs, their values
+//!   and the moving aircraft's starting positions; 400 for a bad request (the
+//!   message names the key), 422 for a sweep the planner refuses, 400 for more
+//!   than 2000 runs.
+//! * **`PUT /api/sweeps/saved/<name>`** — save a sweep as
+//!   `config/sweep.<name>.toml`, runnable with `astrum sweep`: `{"request":
+//!   {…}, "summary": "…", "overwrite": false}` → 201 (created) or 200
+//!   (replaced) with `{name, path, summary}`; 400 for a bad name, summary or
+//!   request, 409 when the file exists and `overwrite` is not set, 422 for a
+//!   sweep that cannot be planned (nothing is written), 500 when it cannot be
+//!   written.
+//! * **`GET /api/sweeps/saved`** — every `config/sweep.<name>.toml`
+//!   ([`SavedEntry`](crate::sweeps::SavedEntry)): name, path, summary, base,
+//!   error (invalid files are listed too).
+//! * **`GET /api/sweeps/saved/<name>`** — one saved sweep as a request:
+//!   `{name, summary, request}`; 400 for a bad name, 404 when there is none,
+//!   422 when the file is not a sweep the studio can read back.
 //! * **`POST /api/runs`** — start the live interactive run
 //!   ([`crate::runs`]): `{"scenario": "<name>" | {…}, "assignments":
 //!   [{"aircraft", "controller", "params"}], "speed", "max_time_s"}` → 201
@@ -104,6 +125,9 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/scenarios", get(scenarios))
         .route("/scenario-check", post(crate::scenarios::check))
         .route("/scenarios/{name}", get(scenario).put(crate::scenarios::save))
+        .route("/sweeps/plan", post(crate::sweeps::plan))
+        .route("/sweeps/saved", get(crate::sweeps::list))
+        .route("/sweeps/saved/{name}", get(crate::sweeps::load).put(crate::sweeps::save))
         .route("/runs", post(runs::start))
         .route("/runs/current", get(runs::current).delete(runs::stop))
         .route("/runs/current/log", get(runs::log))

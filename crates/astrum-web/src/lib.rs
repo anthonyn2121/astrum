@@ -27,6 +27,7 @@ pub mod export;
 pub mod runs;
 pub mod scenarios;
 pub mod server;
+pub mod sweeps;
 
 use astrum_bag::{aircraft_models, AircraftModel};
 use astrum_proto::{Enu, Event, EventKind, Telemetry, VehicleKind};
