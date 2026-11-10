@@ -42,7 +42,11 @@ export class ControllerForm {
   // Render a row per aircraft of a scenario doc (the reply of
   // GET /api/scenarios/<name>, its aircraft's kind filled in); null clears it.
   setScenario(doc) {
-    this.#fleet = doc ? [...doc.scenario.aircraft].sort((a, b) => a.id - b.id) : [];
+    // The doc's `fleet` carries each aircraft's resolved kind (the controllers fly by it).
+    const kinds = new Map((doc?.fleet ?? []).map((a) => [a.id, a.kind]));
+    this.#fleet = doc
+      ? doc.scenario.aircraft.map((a) => ({ ...a, kind: kinds.get(a.id) ?? a.kind })).sort((a, b) => a.id - b.id)
+      : [];
     this.#rows = new Map();
     this.#host.replaceChildren();
     for (const a of this.#fleet) this.#addRow(a);
@@ -66,6 +70,44 @@ export class ControllerForm {
       assignments.push({ aircraft: row.aircraft.id, controller: row.controller.id, params });
     }
     return { ok, assignments };
+  }
+
+  // Set the rows from saved assignments ([{aircraft, controller, params}], as
+  // assignments() returns them): each row's controller, then its parameters; a
+  // parameter the list leaves out keeps its default. Returns the entries it
+  // cannot place (an aircraft or controller this form does not have).
+  setAssignments(list) {
+    const problems = [];
+    for (const row of this.#rows.values()) {
+      row.select.value = "";
+      row.select.dispatchEvent(new Event("change"));
+    }
+    for (const a of list) {
+      const row = this.#rows.get(a.aircraft);
+      if (!row) {
+        problems.push(`aircraft ${a.aircraft} is not in the scenario`);
+        continue;
+      }
+      row.select.value = a.controller;
+      if (row.select.value !== a.controller) {
+        problems.push(`aircraft ${a.aircraft}: no controller ${a.controller} flies its kind`);
+        continue;
+      }
+      row.select.dispatchEvent(new Event("change"));
+      for (const [name, value] of Object.entries(a.params || {})) {
+        const f = row.fields.get(name);
+        if (!f) {
+          problems.push(`aircraft ${a.aircraft}: controller ${a.controller} has no param ${name}`);
+          continue;
+        }
+        f.input.value = String(value);
+        f.edited = true;
+        f.from.textContent = "";
+        this.#check(row, f.spec);
+      }
+      this.#prefillTargets(row);
+    }
+    return problems;
   }
 
   // Show the server's verdict next to what it names ("aircraft 2: controller
@@ -196,9 +238,7 @@ export class ControllerForm {
           const reset = h("button", { type: "button", class: "mini", title: "Set it to the catalog default", text: "reset" });
           reset.addEventListener("click", () => {
             input.value = String(p.default);
-            f.edited = true;
-            from.textContent = "";
-            this.#check(row, p);
+            input.dispatchEvent(new Event("change", { bubbles: true })); // the change handler marks it edited and checks it
           });
           hint.append(` default ${p.default} `, reset);
         }

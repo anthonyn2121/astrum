@@ -683,6 +683,8 @@ A live panel shows the scenario as JSON in `Scenario`'s own serde shape (copyabl
 problems `Scenario::validate` would report (unique ids, |climb|, |bank| < 90, control rates that
 divide `rate_hz`, lockstep consistency, finite numbers, …) inline.
 
+**Sweeps** (`/sweeps.html`) builds a sweep of a saved scenario: the same environment and scenario choice as Interactive, optional catalog controllers per aircraft (none: the sweep flies in-process; some: each run launches them), and the run settings (max sim time, repeats, parallel runs, a per-run wall timeout). Its plan (runs, seeds, values, in-process or with controllers) is re-planned as the form changes, and **Check trims** builds every run's aircraft trims. **Save sweep** writes `config/sweep.<name>.toml`, which `astrum sweep config/sweep.<name>.toml` runs; **Saved sweeps** lists those files and opens one (`?sweep=<name>`).
+
 Both data paths feed one JSON frame shape (`astrum_web::FrameJson`) and one event shape
 (`astrum_web::EventJson`, see [Events](#events)), so the live stream and an offline export can't
 drift:

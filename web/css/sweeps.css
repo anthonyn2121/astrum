@@ -1,0 +1,34 @@
+/* The form's fieldset: no browser frame (as Interactive's #setupFields). */
+#sweepFields { border: 0; margin: 0; padding: 0; min-width: 0; }
+
+/* The Sweeps builder (sweeps.html): on top of studio.css. */
+
+.saved-sweeps { margin: 0 0 22px; }
+.saved-sweeps > summary { cursor: pointer; font-weight: 600; font-size: 15px; }
+.saved-sweeps[open] > summary { margin-bottom: 12px; }
+.saved-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.saved-item {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 10px 12px;
+  background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.saved-text { flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.saved-name { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.saved-item .field-error { font-size: 12px; }
+
+.plan-summary { font-weight: 600; font-size: 15px; margin: 0 0 10px; }
+.plan-summary:empty { display: none; }
+.plan-trim { color: var(--ok); margin: 0 0 10px; }
+.plan-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+.plan-table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+.plan-table th, .plan-table td {
+  padding: 5px 12px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line);
+}
+.plan-table th { color: var(--muted); font-weight: 600; background: var(--panel-raised); }
+.plan-table tbody tr:last-child td { border-bottom: 0; }
+.plan-actions { margin-top: 12px; display: flex; gap: 12px; align-items: center; }
+
+.save-step .run-options { margin-bottom: 12px; }
+.run-options .save-summary { flex: 1; min-width: 280px; max-width: none; }
+.save-result { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
+.save-result:empty { display: none; }
+.save-result code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }

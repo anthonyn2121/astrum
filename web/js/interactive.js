@@ -9,28 +9,25 @@
 // the DOM as text only.
 
 import {
-  getEnvironments, getScenarios, getScenario, getControllers, getCurrentRun, startRun, stopRun, ApiError,
+  getControllers, getCurrentRun, startRun, stopRun, ApiError,
 } from "./api.js";
-import { $, h, showError } from "./dom.js";
+import { $, showError } from "./dom.js";
 import { ControllerForm } from "./ctlform.js";
+import { ScenarioPicker } from "./scenariopicker.js";
 
 const ACTIVE_POLL_MS = 2000;
 
 const el = {
   active: $("activeRun"), activeId: $("activeId"), activeMeta: $("activeMeta"), activeOpen: $("activeOpen"),
   activeStop: $("activeStop"), activeError: $("activeError"), loadError: $("loadError"),
-  form: $("setup"), fields: $("setupFields"), envList: $("envList"), scenarioError: $("scenarioError"),
-  scenarioList: $("scenarioList"), scenarioEmpty: $("scenarioEmpty"), fleet: $("fleet"), fleetEmpty: $("fleetEmpty"),
+  form: $("setup"), fields: $("setupFields"), fleet: $("fleet"), fleetEmpty: $("fleetEmpty"),
   speedSeg: $("speedSeg"), maxTime: $("maxTime"), maxTimeHint: $("maxTimeHint"), maxTimeError: $("maxTimeError"),
   formError: $("formError"), runBtn: $("runBtn"), runNote: $("runNote"),
 };
 
 const state = {
-  environments: [],
-  scenarios: [],
   controllers: [],
-  envId: null,
-  scenario: null,  // the chosen ScenarioEntry
+  scenario: null,  // the picked ScenarioEntry
   doc: null,       // its ScenarioDoc (initial conditions, sim settings)
   speed: 1,
   activeRun: null, // the active RunView, if any
@@ -39,90 +36,27 @@ const state = {
 
 let form = null; // the controller form; made once the catalogs are loaded
 
-// ---- catalog lists ----
+const picker = new ScenarioPicker({
+  envList: $("envList"), scenarioList: $("scenarioList"), scenarioEmpty: $("scenarioEmpty"),
+  scenarioError: $("scenarioError"), onChange: onPick,
+});
 
-function renderEnvironments() {
-  el.envList.replaceChildren();
-  for (const env of state.environments) {
-    const input = h("input", { type: "radio", name: "env", value: env.id });
-    input.checked = env.id === state.envId;
-    input.addEventListener("change", () => { state.envId = env.id; renderScenarios(); selectScenario(null); });
-    el.envList.append(h("label", { class: "choice" },
-      input,
-      h("span", { class: "choice-body" },
-        h("span", { class: "choice-title", text: env.name }),
-        h("span", { class: "choice-text muted", text: env.description }))));
-  }
-}
+// ---- the scenario ----
 
-function fleetSummary(aircraft) {
-  const counts = new Map();
-  for (const a of aircraft) counts.set(a.model, (counts.get(a.model) || 0) + 1);
-  const models = [...counts].map(([m, n]) => (n > 1 ? `${m} ×${n}` : m)).join(", ");
-  return `${aircraft.length} aircraft${models ? `: ${models}` : ""}`;
-}
-
-function renderScenarios() {
-  el.scenarioList.replaceChildren();
-  const list = state.scenarios.filter((s) => s.environment === state.envId);
-  el.scenarioEmpty.hidden = list.length > 0;
-  for (const s of list) {
-    const invalid = typeof s.error === "string";
-    const input = h("input", { type: "radio", name: "scenario", value: s.name, disabled: invalid });
-    input.checked = state.scenario?.name === s.name;
-    input.addEventListener("change", () => selectScenario(s));
-    const body = h("span", { class: "choice-body" },
-      h("span", { class: "choice-title", text: s.name }),
-      s.summary ? h("span", { class: "choice-text", text: s.summary }) : null,
-      invalid
-        ? h("span", { class: "choice-text field-error", text: s.error })
-        : h("span", { class: "choice-text muted", text: fleetSummary(s.aircraft) }));
-    el.scenarioList.append(h("label", { class: invalid ? "choice disabled" : "choice", title: s.path }, input, body));
-  }
-}
-
-async function selectScenario(entry) {
+// The picker's report of each pick (scenariopicker.js): the scenario, and its
+// doc, which is null while it is read and when nothing is picked.
+function onPick(entry, doc, error) {
   state.scenario = entry;
-  state.doc = null;
-  form.setScenario(null);
-  el.fleetEmpty.hidden = !!entry;
-  el.fleetEmpty.textContent = "Pick a scenario first.";
-  el.maxTimeHint.textContent = "";
-  showError(el.formError, "");
-  if (entry) showError(el.scenarioError, "");
-  syncRunButton();
-  if (!entry) return;
-  try {
-    const doc = await getScenario(entry.name);
-    if (state.scenario !== entry) return; // another one was picked meanwhile
-    state.doc = doc;
-  } catch (e) {
-    if (state.scenario !== entry) return;
-    el.fleetEmpty.hidden = false;
-    el.fleetEmpty.textContent = `Cannot read scenario ${entry.name}: ${e.message || e}`;
-    return;
-  }
-  const max = state.doc.scenario?.sim?.max_time_s;
-  el.maxTimeHint.textContent = Number.isFinite(max)
-    ? `empty: the scenario's ${max > 0 ? `${max} s` : "no limit"}; 0 = until stopped`
+  state.doc = doc;
+  form.setScenario(doc);
+  el.fleetEmpty.hidden = !!entry && !error;
+  el.fleetEmpty.textContent = error ? `Cannot read scenario ${entry.name}: ${error}` : "Pick a scenario first.";
+  const max = doc?.scenario?.sim?.max_time_s;
+  el.maxTimeHint.textContent = !doc ? ""
+    : Number.isFinite(max) ? `empty: the scenario's ${max > 0 ? `${max} s` : "no limit"}; 0 = until stopped`
     : "empty: the scenario's limit; 0 = until stopped";
-  form.setScenario(state.doc);
+  showError(el.formError, "");
   syncRunButton();
-}
-
-// `?scenario=<name>`: pick that scenario as a click would; when it is not
-// listed or not valid, say why and pick nothing.
-function selectFromUrl(name) {
-  const s = state.scenarios.find((x) => x.name === name);
-  if (!s || typeof s.error === "string") {
-    const reason = s ? s.error : "no such scenario in the config directory";
-    showError(el.scenarioError, `Scenario "${name}" is not available: ${reason}`);
-    return;
-  }
-  state.envId = s.environment;
-  renderEnvironments();
-  selectScenario(s);
-  renderScenarios();
 }
 
 // ---- run ----
@@ -243,22 +177,15 @@ el.form.addEventListener("submit", submit);
 async function boot() {
   pollActive();
   try {
-    const [environments, scenarios, controllers] = await Promise.all([
-      getEnvironments(), getScenarios(), getControllers(),
-    ]);
-    state.environments = Array.isArray(environments) ? environments : [];
-    state.scenarios = Array.isArray(scenarios) ? scenarios : [];
+    const [controllers] = await Promise.all([getControllers(), picker.load()]);
     state.controllers = Array.isArray(controllers) ? controllers : [];
   } catch (e) {
     showError(el.loadError, `Cannot load the studio catalogs: ${e.message || e}`);
     return;
   }
-  state.envId = state.environments[0]?.id ?? null;
   form = new ControllerForm({ host: el.fleet, controllers: state.controllers });
-  renderEnvironments();
-  renderScenarios();
   const want = new URLSearchParams(location.search).get("scenario");
-  if (want !== null) selectFromUrl(want);
+  if (want !== null) picker.pick(want);
 }
 
 boot();

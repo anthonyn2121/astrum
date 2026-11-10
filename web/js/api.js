@@ -57,3 +57,10 @@ export const stopRun = () => apiDelete("/runs/current");
 export const getRunLog = (since) => apiGet(`/runs/current/log?since=${encodeURIComponent(since)}`);
 export const getRunReplay = (id) => apiGet(`/runs/${encodeURIComponent(id)}/replay`);
 export const getRunMetrics = (id) => apiGet(`/runs/${encodeURIComponent(id)}/metrics`);
+
+// Sweeps (crates/astrum-web/src/sweeps.rs): plan one without flying it, and
+// save / list / read the sweep files `astrum sweep` runs.
+export const planSweep = (request) => apiPost("/sweeps/plan", request);
+export const getSavedSweeps = () => apiGet("/sweeps/saved");
+export const getSavedSweep = (name) => apiGet(`/sweeps/saved/${encodeURIComponent(name)}`);
+export const saveSweep = (name, body) => apiPut("/sweeps/saved/" + encodeURIComponent(name), body);
