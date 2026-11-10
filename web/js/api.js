@@ -42,6 +42,9 @@ export const getModels = () => apiGet("/models");
 export const getControllers = () => apiGet("/controllers").then((c) => c.entries);
 export const getScenarios = () => apiGet("/scenarios");
 export const getScenario = (name) => apiGet(`/scenarios/${encodeURIComponent(name)}`);
+// Scenario writes and checks (crates/astrum-web/src/scenarios.rs).
+export const saveScenario = (name, body) => apiPut("/scenarios/" + encodeURIComponent(name), body);
+export const checkScenario = (scenario) => apiPost("/scenario-check", { scenario });
 
 // The bridge: which sim the telemetry stream carries, and that sim's run control.
 export const getBridge = () => apiGet("/bridge");
