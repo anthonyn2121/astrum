@@ -678,7 +678,7 @@ the view centre (the lowest free ids, TAS 0 for multirotors, previewed as transl
 duplicate, delete, undo / redo (Ctrl+Z / Ctrl+Shift+Z) and the world origin (fields, a location,
 or pick on the map; optionally moving the fleet with it; the view stays on the same ground, undo
 and redo included) round it off.
-**Save…** (Ctrl+S) names the scenario and writes `config/scenario.<name>.toml` (an existing file is replaced only on confirmation); **Check** validates it and flies each fixed-wing aircraft's trim, listing any that would stop the sim from starting; **Run** saves first when the scenario is unsaved or edited, then opens Interactive on it.
+**Save…** (Ctrl+S) names the scenario and writes `config/scenario.<name>.toml` (an existing file is replaced only on confirmation); **Check** validates it and flies each fixed-wing aircraft's trim, listing any that would stop the sim from starting; **Run** saves first when the scenario is unsaved or edited, then opens Interactive on it; **Sweep** saves the same way and opens the Sweeps builder on the saved scenario.
 A live panel shows the scenario as JSON in `Scenario`'s own serde shape (copyable), with the
 problems `Scenario::validate` would report (unique ids, |climb|, |bank| < 90, control rates that
 divide `rate_hz`, lockstep consistency, finite numbers, …) inline.
