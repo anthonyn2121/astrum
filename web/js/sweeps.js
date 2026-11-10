@@ -4,11 +4,16 @@
 // POST /api/sweeps/plan says it, re-planned as the form changes. Save writes
 // config/sweep.<name>.toml for `astrum sweep`; `?sweep=<name>` (or the Saved
 // sweeps list) opens one. The variation (variation.js) joins the request.
+// Run sweep flies the plan on screen (POST /api/sweeps) and opens its page
+// (sweep.html); a sweep that is running is shown above the form.
 //
 // Names, summaries, plans and errors from the server and catalogs are
 // untrusted: they reach the DOM as text only.
 
-import { ApiError, getControllers, getSavedSweep, getSavedSweeps, planSweep, saveSweep } from "./api.js";
+import {
+  ApiError, getControllers, getCurrentSweep, getSavedSweep, getSavedSweeps, getSweeps, planSweep, saveSweep,
+  startSweep, stopSweep,
+} from "./api.js";
 import { $, h, showError } from "./dom.js";
 import { ControllerForm } from "./ctlform.js";
 import { ScenarioPicker } from "./scenariopicker.js";
@@ -28,6 +33,10 @@ const el = {
   checkTrims: $("checkTrims"), saveForm: $("saveForm"), saveName: $("saveName"), saveSummary: $("saveSummary"),
   saveError: $("saveError"), saveSubmit: $("saveSubmit"), saveReplace: $("saveReplace"), saveResult: $("saveResult"),
   variation: $("variation"),
+  runSweep: $("runSweep"), activeSweep: $("activeSweep"), activeSweepId: $("activeSweepId"),
+  activeSweepProgress: $("activeSweepProgress"), activeSweepOpen: $("activeSweepOpen"),
+  activeSweepStop: $("activeSweepStop"), activeSweepError: $("activeSweepError"),
+  recentError: $("recentError"), recentEmpty: $("recentEmpty"), recentList: $("recentList"),
 };
 
 const state = {
@@ -36,6 +45,10 @@ const state = {
   seq: 0,            // bumped by every change and every plan: a reply to an older one is ignored
   timer: 0,          // the debounced plan
   savedJson: "null", // the request last saved or opened (the unsaved-changes guard compares it)
+  plannedJson: null, // the request the plan on screen is for (null: none, or out of date)
+  starting: false,   // a sweep start is in flight
+  activeSweep: null, // the running sweep, if any
+  leaving: false,    // a sweep was started: leaving the page is not an unsaved change
 };
 
 let form = null; // the controller form; made once the catalogs are loaded
@@ -116,6 +129,7 @@ const snapshot = () => JSON.stringify(buildRequest() ?? null);
 
 // Forget the plan on screen: it is out of date, or the request was refused.
 function clearPlan() {
+  state.plannedJson = null;
   el.planBusy.hidden = true;
   showError(el.planError, "");
   el.planSummary.textContent = "";
@@ -133,6 +147,7 @@ function changed() {
   clearPlan();
   const request = buildRequest();
   showError(el.planNote, request ? "" : state.doc ? "Fix the marked fields to see the plan." : "Pick a scenario to see its plan.");
+  syncRunSweep();
   if (!request) return;
   el.planBusy.hidden = false;
   state.timer = setTimeout(() => send(request, false), PLAN_DEBOUNCE_MS);
@@ -145,14 +160,20 @@ async function send(request, check) {
   el.planBusy.hidden = false;
   try {
     const reply = await planSweep(check ? { ...request, check_trim: true } : request);
-    if (seq === state.seq) renderPlan(reply);
+    if (seq === state.seq) {
+      renderPlan(reply);
+      state.plannedJson = JSON.stringify(request);
+    }
   } catch (err) {
     if (seq === state.seq) {
       clearPlan();
       showError(el.planError, err.message || String(err));
     }
   } finally {
-    if (seq === state.seq) el.planBusy.hidden = true;
+    if (seq === state.seq) {
+      el.planBusy.hidden = true;
+      syncRunSweep();
+    }
   }
 }
 
@@ -273,6 +294,124 @@ async function openSweep(name) {
   state.savedJson = snapshot();
 }
 
+// ---- running sweeps ----
+
+const ACTIVE_POLL_MS = 2000;
+let activeTimer = 0;
+
+// Why the plan on screen cannot be flown, or "" when it can: a sweep is
+// running, the form is not a valid request, or the plan is not for it.
+function runBlocker(request) {
+  if (state.activeSweep) return "A sweep is already running: stop it or open it first.";
+  if (!request) return whyNot();
+  if (state.plannedJson !== JSON.stringify(request)) return "The plan on screen is not for this request.";
+  return "";
+}
+
+// Run sweep: enabled for the plan on screen, and not while a sweep runs or a
+// start is in flight.
+function syncRunSweep() {
+  const why = runBlocker(buildRequest());
+  el.runSweep.disabled = !!why || state.starting;
+  el.runSweep.title = why;
+}
+
+// Start the sweep the form asks for and open its page. A refusal shows its
+// message in the plan; a 409 also links to the sweep that runs.
+async function runSweep() {
+  const request = buildRequest();
+  const why = runBlocker(request);
+  if (why) {
+    showError(el.planError, why);
+    return;
+  }
+  state.starting = true;
+  syncRunSweep();
+  try {
+    const sweep = await startSweep(request);
+    state.leaving = true;
+    location.href = `./sweep.html?id=${encodeURIComponent(sweep.id)}`;
+    return;
+  } catch (err) {
+    showError(el.planError, err.message || String(err));
+    if (err instanceof ApiError && err.status === 409) linkRunning();
+  }
+  state.starting = false;
+  syncRunSweep();
+}
+
+async function linkRunning() {
+  const sweep = await getCurrentSweep().catch(() => null);
+  if (!sweep || sweep.state !== "running") return;
+  el.planError.append(" ", h("a", { href: `./sweep.html?id=${encodeURIComponent(sweep.id)}`, text: "Open the running sweep" }));
+}
+
+// The running sweep (if any) is shown with links to open or stop it.
+async function pollActive() {
+  clearTimeout(activeTimer);
+  if (document.hidden) return; // resumed by visibilitychange
+  try {
+    const sweep = await getCurrentSweep();
+    state.activeSweep = sweep?.state === "running" ? sweep : null;
+  } catch {
+    state.activeSweep = null;
+  }
+  renderActive();
+  syncRunSweep();
+  activeTimer = setTimeout(pollActive, ACTIVE_POLL_MS);
+}
+
+function renderActive() {
+  const sweep = state.activeSweep;
+  el.activeSweep.hidden = !sweep;
+  if (!sweep) return;
+  el.activeSweepId.textContent = sweep.id;
+  el.activeSweepProgress.textContent = `${sweep.ok + sweep.failed + sweep.stopped}/${sweep.total}`;
+  el.activeSweepOpen.href = `./sweep.html?id=${encodeURIComponent(sweep.id)}`;
+}
+
+async function stopActive() {
+  el.activeSweepStop.disabled = true;
+  el.activeSweepStop.textContent = "Stopping…";
+  try {
+    await stopSweep();
+    showError(el.activeSweepError, "");
+  } catch (err) {
+    showError(el.activeSweepError, `stop: ${err.message || err}`);
+  }
+  el.activeSweepStop.disabled = false;
+  el.activeSweepStop.textContent = "Stop it";
+  pollActive();
+}
+
+// ---- recent sweeps ----
+
+const startedText = (at) => {
+  const when = new Date(at);
+  return Number.isNaN(when.getTime()) ? at : when.toLocaleString();
+};
+
+// Every sweep under the sweeps dir, newest first.
+async function refreshRecent() {
+  try {
+    const sweeps = await getSweeps();
+    showError(el.recentError, "");
+    el.recentEmpty.hidden = sweeps.length > 0;
+    el.recentList.replaceChildren(...sweeps.map(recentItem));
+  } catch (err) {
+    showError(el.recentError, `Cannot list the sweeps: ${err.message || err}`);
+  }
+}
+
+function recentItem(sweep) {
+  return h("li", { class: "saved-item" },
+    h("div", { class: "saved-text" },
+      h("a", { class: "saved-name", href: `./sweep.html?id=${encodeURIComponent(sweep.id)}`, text: sweep.id }),
+      h("span", { class: "small", text: `${sweep.scenario} · ${sweep.state}` }),
+      h("span", { class: "muted small", text: `${sweep.ok} ok · ${sweep.failed} failed of ${sweep.total}` }),
+      h("span", { class: "muted small", text: startedText(sweep.started_at) })));
+}
+
 // ---- wiring ----
 
 el.form.addEventListener("change", changed); // any edit: the scenario, controllers, parameters, settings
@@ -285,6 +424,9 @@ el.checkTrims.addEventListener("click", () => {
   }
   send(request, true);
 });
+el.runSweep.addEventListener("click", runSweep);
+el.activeSweepStop.addEventListener("click", stopActive);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pollActive(); });
 el.saveForm.addEventListener("submit", (e) => {
   e.preventDefault();
   save(false);
@@ -293,7 +435,7 @@ el.saveReplace.addEventListener("click", () => save(true));
 
 // Unsaved changes: the request differs from the one last saved or opened.
 window.addEventListener("beforeunload", (e) => {
-  if (snapshot() === state.savedJson) return;
+  if (state.leaving || snapshot() === state.savedJson) return;
   e.preventDefault();
   e.returnValue = "";
 });
@@ -302,6 +444,8 @@ window.addEventListener("beforeunload", (e) => {
 
 async function boot() {
   refreshSaved();
+  refreshRecent();
+  pollActive();
   try {
     const [controllers] = await Promise.all([getControllers(), picker.load()]);
     form = new ControllerForm({ host: el.fleet, controllers: Array.isArray(controllers) ? controllers : [] });

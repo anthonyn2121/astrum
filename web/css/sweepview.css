@@ -1,0 +1,77 @@
+/* The sweep page (sweep.html): on top of studio.css. */
+
+.sweep-id { margin: 0 0 4px; font-size: 12px; overflow-wrap: anywhere; }
+.sweep-summary h1 { overflow-wrap: anywhere; }
+.state-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin: 0 0 14px; }
+.state-badge {
+  font-weight: 600; font-size: 12px; padding: 2px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel-raised); color: var(--text);
+}
+.state-badge.running { color: var(--accent); border-color: var(--accent); }
+.state-badge.finished { color: var(--ok); border-color: #46d38a88; }
+.state-badge.stopped, .state-badge.interrupted { color: var(--warn); border-color: #ffb54788; }
+.state-badge.failed { color: var(--live); border-color: #ff5a4d88; }
+
+.progress-line { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; margin: 0 0 12px; }
+.progress-line progress { width: min(420px, 100%); height: 10px; accent-color: var(--accent); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+.chip {
+  padding: 1px 9px; border-radius: 999px; border: 1px solid var(--line);
+  font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.chip.ok { color: var(--ok); border-color: #46d38a88; }
+.chip.failed { color: var(--live); border-color: #ff5a4d88; }
+.chip.running { color: var(--accent); border-color: var(--accent); }
+.chip.stopped { color: var(--warn); border-color: #ffb54788; }
+.chip.queued { color: var(--muted); }
+
+.sweep-facts { max-width: 560px; margin: 0 0 14px; }
+.sweep-facts code { overflow-wrap: anywhere; }
+.sweep-actions { display: flex; gap: 12px; align-items: center; margin: 0 0 12px; }
+.sweep-summary .form-error { margin-bottom: 10px; }
+
+.sweep-section { margin: 0 0 30px; }
+.sweep-section > h2 { font-size: 16px; margin: 0 0 12px; }
+
+/* The run strip: one square per run, coloured by status. */
+.run-strip { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 10px; }
+.run-cell {
+  width: 16px; height: 16px; padding: 0; border: 0; border-radius: 3px;
+  background: var(--muted); opacity: 0.35;
+}
+.run-cell.running { background: var(--accent); opacity: 1; }
+.run-cell.ok { background: var(--ok); opacity: 1; }
+.run-cell.failed { background: var(--live); opacity: 1; }
+.run-cell.stopped { background: var(--warn); opacity: 1; }
+.run-cell.selected { outline: 2px solid var(--text); outline-offset: 2px; }
+
+/* The results table. */
+.results-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 10px; }
+.results-head h2 { margin: 0; font-size: 16px; }
+.filter-label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.results-wrap {
+  max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius);
+}
+.results-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+.results-table th, .results-table td {
+  padding: 5px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line);
+}
+.results-table td.num { text-align: right; }
+.results-table td.status { white-space: normal; min-width: 180px; overflow-wrap: anywhere; }
+.results-table thead th {
+  position: sticky; top: 0; z-index: 1; background: var(--panel-raised); color: var(--muted); font-weight: 600;
+}
+.results-table tbody tr { cursor: pointer; }
+.results-table tbody tr:hover td { background: rgba(74,163,255,0.06); }
+.results-table tbody tr.selected td { background: rgba(74,163,255,0.16); }
+.results-table tfoot th, .results-table tfoot td {
+  position: sticky; bottom: 0; background: var(--panel-raised); border-bottom: 0; border-top: 1px solid var(--line);
+  color: var(--muted);
+}
+.results-table tfoot td { color: var(--text); }
+button.sort {
+  background: none; border: 0; padding: 0; color: inherit; font: inherit; font-weight: 600; cursor: pointer;
+}
+button.sort:hover { color: var(--accent); }
+th[aria-sort="ascending"] button.sort::after { content: " ▲"; color: var(--accent); }
+th[aria-sort="descending"] button.sort::after { content: " ▼"; color: var(--accent); }

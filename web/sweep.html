@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ASTRUM · Sweep</title>
+  <link rel="icon" type="image/png" href="./img/favicon.png" />
+  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/studio.css" />
+  <link rel="stylesheet" href="./css/sweepview.css" />
+</head>
+<body class="studio">
+  <header class="studio-top">
+    <a class="brand" href="./"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Studio</em></a>
+    <a class="crumb" href="./sweeps.html">Sweeps</a>
+    <a class="top-link" href="./view.html">Replay viewer</a>
+  </header>
+
+  <main class="studio-main">
+    <p id="loadError" class="form-error" role="alert" hidden></p>
+
+    <section id="content" hidden>
+      <section class="sweep-summary" aria-labelledby="scenario">
+        <p id="sweepId" class="sweep-id mono muted"></p>
+        <h1 id="scenario"></h1>
+        <div class="state-line">
+          <span id="stateBadge" class="state-badge">running</span>
+          <span id="stateReason" class="muted small"></span>
+        </div>
+        <div class="progress-line">
+          <progress id="progress" value="0" max="1"></progress>
+          <span id="progressText" class="mono"></span>
+        </div>
+        <p class="chips">
+          <span id="chipOk" class="chip ok">ok 0</span>
+          <span id="chipFailed" class="chip failed">failed 0</span>
+          <span id="chipRunning" class="chip running">running 0</span>
+          <span id="chipQueued" class="chip queued">queued 0</span>
+          <span id="chipStopped" class="chip stopped">stopped 0</span>
+        </p>
+        <dl class="kv sweep-facts">
+          <dt>mode</dt><dd id="mode"></dd>
+          <dt>jobs</dt><dd id="jobs"></dd>
+          <dt>wall time</dt><dd id="wall" class="mono"></dd>
+          <dt>out</dt><dd><code id="out"></code></dd>
+        </dl>
+        <div class="sweep-actions">
+          <button id="stopBtn" type="button" hidden>Stop sweep</button>
+        </div>
+        <p id="actionError" class="form-error" role="alert" hidden></p>
+        <p id="pollError" class="form-error" role="alert" hidden></p>
+      </section>
+
+      <section class="sweep-section" aria-labelledby="runsHead">
+        <h2 id="runsHead">Runs</h2>
+        <div id="strip" class="run-strip"></div>
+        <p class="muted small">Each square is a run; click one to select its row in the results.</p>
+      </section>
+
+      <section class="sweep-section" aria-labelledby="resultsHead">
+        <div class="results-head">
+          <h2 id="resultsHead">Results</h2>
+          <label class="filter-label">Status
+            <select id="statusFilter">
+              <option value="all">All</option>
+              <option value="ok">ok</option>
+              <option value="failed">failed</option>
+              <option value="other">other</option>
+            </select>
+          </label>
+          <span id="resultsCount" class="muted small"></span>
+        </div>
+        <p id="resultsNote" class="muted" hidden></p>
+        <p id="resultsError" class="form-error" role="alert" hidden></p>
+        <div id="resultsWrap" class="results-wrap" hidden>
+          <table id="results" class="results-table"></table>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script type="module" src="./js/sweepview.js"></script>
+</body>
+</html>

@@ -11,6 +11,7 @@
 import { Store } from "./store.js";
 import { Scene } from "./scene.js";
 import { Net, defaultWsUrl, loadExportFile } from "./net.js";
+import { getSweepReplay } from "./api.js";
 import { UI } from "./ui.js";
 import { FleetList } from "./fleet.js";
 import { Inspector } from "./inspector.js";
@@ -163,8 +164,11 @@ const plots = new Plots({
 });
 plots.setVisible(ui.plotsVisible);
 
-// The studio run this page was opened for (view.html?run=<id>), if any.
-const runId = new URLSearchParams(location.search).get("run");
+// The page's address: one run of a sweep (view.html?sweep=<id>&run=<n>, its bag), or
+// a studio run this page was opened for (view.html?run=<id>, its panel).
+const params = new URLSearchParams(location.search);
+const sweepId = params.get("sweep");
+const runId = sweepId === null ? params.get("run") : null;
 const simControl = new SimControl({ enabled: () => state.mode === "live" });
 const runPanel = runId ? new RunPanel({ runId, onReplay: (doc, label) => openFile(doc, label) }) : null;
 
@@ -279,10 +283,33 @@ async function openFile(source, name) {
       + (store.events.length ? ` · ${store.events.length} events` : "")
       + (meta?.rejected ? ` · ${Number(meta.rejected)} rejected` : ""));
   } catch (e) {
-    state.fileError = String(e.message || e);
-    state.status = "error";
-    ui.setStatus("error", state.fileError);
+    fileFailed(String(e.message || e));
   }
+}
+
+// A recording that cannot be opened: the viewer's status says why.
+function fileFailed(msg) {
+  state.fileError = msg;
+  state.status = "error";
+  ui.setStatus("error", msg);
+}
+
+// view.html?sweep=<id>&run=<n>: the header names the run, and its bag opens as a
+// studio run's replay does. A refusal (no such run, no bag) is the viewer's error.
+async function openSweepRun(id, n) {
+  document.getElementById("sweepNote").textContent = `Sweep ${id} · run ${n}`;
+  document.getElementById("sweepLink").href = `./sweep.html?id=${encodeURIComponent(id)}`;
+  document.getElementById("sweepRef").hidden = false;
+  let doc;
+  try {
+    doc = await getSweepReplay(id, n);
+  } catch (e) {
+    net.disconnect();
+    state.connected = false;
+    fileFailed(String(e.message || e));
+    return;
+  }
+  await openFile(doc, `sweep ${id} · run ${n}`);
 }
 
 // ---- selection & target ----
@@ -550,4 +577,5 @@ ui.setWsUrl(initialUrl);
 connect(initialUrl); // auto-attach to the local bridge; the user can open a file instead
 simControl.start();
 runPanel?.start();
+if (sweepId !== null) openSweepRun(sweepId, params.get("run") ?? "");
 requestAnimationFrame(tick);
