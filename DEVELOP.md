@@ -433,7 +433,8 @@ values are checked by `astrum_net::ControlRequest::validate` against `astrum_net
 one limit the sim and the API share.
 
 **Studio runs** (`crates/astrum-web/src/runs.rs`): `Runs` owns the one live interactive run. A
-start is checked (assignments, then each controller program exists — so "not built" names the
+start is checked by `assign.rs` (the scenario, the assignments, then each controller program
+exists — so "not built" names the
 aircraft instead of failing in `LiveRun::start`) and launched on the blocking pool
 (`LiveRun::start` with `Log::Channel`), so a client that goes away mid-request cannot leave a
 half-started run. The log and monitor threads exist before the run's record is installed and act

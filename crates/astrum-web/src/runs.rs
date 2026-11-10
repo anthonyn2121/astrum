@@ -17,7 +17,7 @@
 //! serves its replay export and metrics; the active run's only once it has
 //! finished.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,7 +28,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use astrum_bag::BagReader;
 use astrum_net::{speed_ok, MIN_SPEED};
-use astrum_sim::controllers::ControllerCatalog;
 use astrum_sim::launch::{Children, ControllerCmd, LiveRun, LiveSpec, Log, LogLine, LogStream};
 use astrum_sim::scenario::Scenario;
 use astrum_sim::sweep::Outcome;
@@ -43,8 +42,11 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::api::{error, json, safe_name, NAME_MAX_LEN};
+use crate::assign::{
+    assign, check_programs, scenario_input, Assignment, AssignmentBody, InputError,
+};
 use crate::bridge::Bridge;
-use crate::catalogs::{Catalogs, ScenarioError};
+use crate::catalogs::Catalogs;
 use crate::export::export_bag;
 use crate::server::AppState;
 
@@ -82,15 +84,6 @@ pub enum RunState {
     Running,
     /// Every process is reaped; [`RunView::outcome`] says how it ended.
     Finished,
-}
-
-/// One aircraft's controller as the run flies it: every catalog parameter,
-/// defaults filled in.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Assignment {
-    pub aircraft: u32,
-    pub controller: String,
-    pub params: BTreeMap<String, Value>,
 }
 
 /// A run as the API reports it.
@@ -266,15 +259,6 @@ struct StartBody {
     speed: Option<f64>,
     /// Sim-time limit override (s, 0 = until stopped); default: the scenario's.
     max_time_s: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AssignmentBody {
-    aircraft: u32,
-    controller: String,
-    #[serde(default)]
-    params: BTreeMap<String, Value>,
 }
 
 /// What a checked request flies.
@@ -608,35 +592,11 @@ fn write_metrics(dir: &Path) -> Result<(), String> {
 
 /// Resolve the scenario, apply the overrides and check the assignments.
 fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
-    let (name, mut scenario) = match body.scenario {
-        Value::String(name) => match catalogs.scenario(&name) {
-            Ok(doc) => (Some(doc.name), doc.scenario),
-            Err(e @ (ScenarioError::BadName(_) | ScenarioError::NotFound(_))) => {
-                return Err(RunError::BadRequest(format!("scenario: {e}")))
-            }
-            Err(e @ ScenarioError::Invalid(_)) => {
-                return Err(RunError::InvalidScenario(e.to_string()))
-            }
-            Err(e @ ScenarioError::Io(_)) => return Err(RunError::Failed(e.to_string())),
-        },
-        doc @ Value::Object(_) => {
-            let invalid = |e: String| RunError::InvalidScenario(format!("inline scenario: {e}"));
-            let scenario: Scenario =
-                serde_json::from_value(doc).map_err(|e| invalid(e.to_string()))?;
-            scenario.validate().map_err(|e| invalid(e.to_string()))?;
-            // The model names a directory under the JSBSim root: no paths.
-            for a in &scenario.aircraft {
-                safe_name(&a.model)
-                    .map_err(|e| invalid(format!("aircraft {}: model: {e}", a.id)))?;
-            }
-            (None, scenario)
-        }
-        _ => {
-            return Err(RunError::BadRequest(
-                "scenario must be a saved scenario's name or a scenario object".into(),
-            ))
-        }
-    };
+    let (name, mut scenario) = scenario_input(body.scenario, catalogs).map_err(|e| match e {
+        InputError::Bad(why) => RunError::BadRequest(why),
+        InputError::Invalid(why) => RunError::InvalidScenario(why),
+        InputError::Io(why) => RunError::Failed(why),
+    })?;
     if let Some(speed) = body.speed {
         if !speed_ok(speed, MIN_SPEED) {
             return Err(RunError::BadRequest(format!(
@@ -659,17 +619,7 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
     let (controllers, assignments) =
         assign(&mut scenario, &body.assignments, catalogs.controllers())
             .map_err(RunError::BadRequest)?;
-    for a in &assignments {
-        // Rendered, so the catalog has it.
-        if let Some(spec) = catalogs.controllers().get(&a.controller) {
-            find_program(&spec.command[0]).map_err(|why| {
-                RunError::Failed(format!(
-                    "aircraft {}: controller `{}`: {why}",
-                    a.aircraft, a.controller
-                ))
-            })?;
-        }
-    }
+    check_programs(&assignments, catalogs.controllers()).map_err(RunError::Failed)?;
     let controllers = controllers
         .into_iter()
         .zip(&assignments)
@@ -680,117 +630,6 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
         })
         .collect();
     Ok(Plan { name, scenario, controllers, assignments })
-}
-
-/// Check that a controller's program can start: a path (relative to the
-/// server's working directory) to an executable file, or a name on `PATH`.
-fn find_program(program: &str) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let executable = |path: &Path| {
-        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    };
-    if program.contains('/') {
-        if executable(Path::new(program)) {
-            return Ok(());
-        }
-        let hint = if program.starts_with("build/controllers/") {
-            " (build the C++ controllers: cmake -S controllers -B build/controllers \
-             -DCMAKE_BUILD_TYPE=Release && cmake --build build/controllers -j)"
-        } else {
-            ""
-        };
-        return Err(format!("`{program}` not found or not executable{hint}"));
-    }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    if std::env::split_paths(&path).any(|dir| executable(&dir.join(program))) {
-        Ok(())
-    } else {
-        Err(format!("`{program}` not found on PATH"))
-    }
-}
-
-/// Check every assignment against the scenario and the catalog, render the
-/// controllers' command lines, and fly exactly the controlled aircraft in
-/// lockstep. Errors name the aircraft (and the parameter).
-fn assign(
-    scenario: &mut Scenario,
-    assignments: &[AssignmentBody],
-    catalog: &ControllerCatalog,
-) -> Result<(Vec<String>, Vec<Assignment>), String> {
-    let fleet_ids: Vec<u32> = scenario.aircraft.iter().map(|a| a.id).collect();
-    let mut controlled = BTreeSet::new();
-    let mut commands = Vec::with_capacity(assignments.len());
-    let mut views = Vec::with_capacity(assignments.len());
-    for a in assignments {
-        let id = a.aircraft;
-        let Some(spec) = scenario.aircraft.iter().find(|s| s.id == id) else {
-            return Err(format!("aircraft {id}: not in the scenario (its fleet is {fleet_ids:?})"));
-        };
-        if !controlled.insert(id) {
-            return Err(format!("aircraft {id}: assigned more than one controller"));
-        }
-        let Some(controller) = catalog.get(&a.controller) else {
-            return Err(format!("aircraft {id}: no controller {:?} in the catalog", a.controller));
-        };
-        let kind = spec.class().map_err(|e| format!("aircraft {id}: {e}"))?.kind;
-        if !controller.flies(kind) {
-            let kinds: Vec<&str> =
-                controller.kinds.iter().map(|&k| crate::kind_str(k.into())).collect();
-            return Err(format!(
-                "aircraft {id}: controller {:?} does not fly {} aircraft (it flies {})",
-                controller.id,
-                crate::kind_str(kind.into()),
-                kinds.join(", ")
-            ));
-        }
-        let mut params = BTreeMap::new();
-        for (name, value) in &a.params {
-            let value = toml_value(value)
-                .map_err(|why| format!("aircraft {id}: controller param `{name}`: {why}"))?;
-            params.insert(name.clone(), value);
-        }
-        commands.push(
-            controller
-                .render(id, &params, &fleet_ids)
-                .map_err(|e| format!("aircraft {id}: {e}"))?,
-        );
-        // Rendered, so every parameter has a value: given or default.
-        let effective = controller
-            .params
-            .iter()
-            .filter_map(|p| {
-                let value =
-                    a.params.get(&p.name).cloned().or_else(|| {
-                        p.default.as_ref().and_then(|d| serde_json::to_value(d).ok())
-                    })?;
-                Some((p.name.clone(), value))
-            })
-            .collect();
-        views.push(Assignment {
-            aircraft: id,
-            controller: controller.id.clone(),
-            params: effective,
-        });
-    }
-    scenario.sim.lockstep = !controlled.is_empty();
-    for aircraft in &mut scenario.aircraft {
-        aircraft.lockstep = controlled.contains(&aircraft.id);
-    }
-    Ok((commands, views))
-}
-
-/// A JSON parameter value as the catalog's TOML value.
-fn toml_value(value: &Value) -> Result<toml::Value, String> {
-    match value {
-        Value::Number(n) => n
-            .as_i64()
-            .map(toml::Value::Integer)
-            .or_else(|| n.as_f64().map(toml::Value::Float))
-            .ok_or_else(|| format!("{n} is not representable")),
-        Value::String(s) => Ok(toml::Value::String(s.clone())),
-        Value::Bool(b) => Ok(toml::Value::Boolean(*b)),
-        other => Err(format!("{other} is not a number or a string")),
-    }
 }
 
 /// Create `<root>/<stamp>-<name>` (or `…-2`, `…-3`, … if taken), cut to a
