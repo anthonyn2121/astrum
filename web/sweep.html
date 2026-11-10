@@ -76,6 +76,27 @@
           <table id="results" class="results-table"></table>
         </div>
       </section>
+
+      <section class="sweep-section" aria-labelledby="compareHead">
+        <div class="results-head">
+          <h2 id="compareHead">Compare runs</h2>
+          <label class="filter-label">X axis
+            <select id="xAxis"></select>
+          </label>
+          <label class="filter-label">Y axis
+            <select id="yAxis"></select>
+          </label>
+          <label class="filter-label">Colour by
+            <select id="colourBy"></select>
+          </label>
+        </div>
+        <p class="muted small">Each point is a run; click one (or step with the left and right arrows) to select it.</p>
+        <p id="compareEmpty" class="muted" hidden>Nothing to plot yet.</p>
+        <div id="compareWrap" class="compare-wrap" hidden>
+          <canvas id="scatter" class="scatter" aria-label="Scatter plot of the runs"></canvas>
+          <div id="scatterTip" class="scatter-tip" hidden></div>
+        </div>
+      </section>
     </section>
   </main>
 
