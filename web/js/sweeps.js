@@ -23,39 +23,47 @@ import { StartCloud } from "./startcloud.js";
 const PLAN_DEBOUNCE_MS = 400;
 const PLAN_ROWS = 20;        // the plan table's rows; the rest is counted
 const DEFAULT_MAX_TIME_S = 60;
+const ACTIVE_POLL_MS = 2000;
 
 const el = {
-  savedSweeps: $("savedSweeps"), savedError: $("savedError"), savedEmpty: $("savedEmpty"), savedList: $("savedList"),
+  savedError: $("savedError"), savedEmpty: $("savedEmpty"), savedList: $("savedList"),
   loadError: $("loadError"), form: $("sweep"), fleet: $("fleet"), fleetEmpty: $("fleetEmpty"), fleetError: $("fleetError"),
   maxTime: $("maxTime"), maxTimeError: $("maxTimeError"), repeats: $("repeats"), repeatsError: $("repeatsError"),
   jobs: $("jobs"), jobsError: $("jobsError"), runTimeout: $("runTimeout"), runTimeoutError: $("runTimeoutError"),
-  planNote: $("planNote"), planBusy: $("planBusy"), planError: $("planError"), planSummary: $("planSummary"),
-  planTrim: $("planTrim"), planWrap: $("planWrap"), planTable: $("planTable"), planMore: $("planMore"),
-  checkTrims: $("checkTrims"), saveForm: $("saveForm"), saveName: $("saveName"), saveSummary: $("saveSummary"),
-  saveError: $("saveError"), saveSubmit: $("saveSubmit"), saveReplace: $("saveReplace"), saveResult: $("saveResult"),
-  variation: $("variation"),
+  planNote: $("planNote"), planBusy: $("planBusy"), planError: $("planError"), planBody: $("planBody"),
+  planSummary: $("planSummary"), planTrim: $("planTrim"), planWrap: $("planWrap"), planTable: $("planTable"),
+  planMore: $("planMore"), checkTrims: $("checkTrims"), saveForm: $("saveForm"), saveName: $("saveName"),
+  saveSummary: $("saveSummary"), saveError: $("saveError"), saveSubmit: $("saveSubmit"),
+  saveReplace: $("saveReplace"), saveResult: $("saveResult"), variation: $("variation"),
   startPanel: $("startPanel"), startLegend: $("startLegend"), startTip: $("startTip"),
   startCanvas: $("startCanvas"), startFit: $("startFit"),
   runSweep: $("runSweep"), activeSweep: $("activeSweep"), activeSweepId: $("activeSweepId"),
   activeSweepProgress: $("activeSweepProgress"), activeSweepOpen: $("activeSweepOpen"),
   activeSweepStop: $("activeSweepStop"), activeSweepError: $("activeSweepError"),
+  activeSweepStatus: $("activeSweepStatus"),
   recentError: $("recentError"), recentEmpty: $("recentEmpty"), recentList: $("recentList"),
 };
 
 const state = {
   scenario: null,    // the picked ScenarioEntry
   doc: null,         // its ScenarioDoc
+  loading: false,    // the picked scenario's doc is being read
   seq: 0,            // bumped by every change and every plan: a reply to an older one is ignored
   timer: 0,          // the debounced plan
-  savedJson: "null", // the request last saved or opened (the unsaved-changes guard compares it)
+  handledJson: null, // the request the last change handled (null: none, or the plan was cleared)
+  savedJson: null,   // the request last saved or opened; null until a pick's first plan (the guard's baseline)
   plannedJson: null, // the request the plan on screen is for (null: none, or out of date)
+  openTok: 0,        // bumped by each openSweep: an older open or save that finishes returns
+  pickTok: 0,        // bumped by each pick that is not openSweep's own: an open in flight is stale
   starting: false,   // a sweep start is in flight
   activeSweep: null, // the running sweep, if any
+  activeMisses: 0,   // polls in a row that failed
   leaving: false,    // a sweep was started: leaving the page is not an unsaved change
 };
 
-let form = null; // the controller form; made once the catalogs are loaded
+let form = null; // the controller form; made before the picker loads
 let variation = null; // the variation form; made with the controller form
+let opening = null; // the scenario name openSweep is picking (its own pick is not a user's)
 
 const picker = new ScenarioPicker({
   envList: $("envList"), scenarioList: $("scenarioList"), scenarioEmpty: $("scenarioEmpty"),
@@ -66,18 +74,22 @@ const cloud = new StartCloud({ canvas: el.startCanvas, legend: el.startLegend, t
 // ---- the scenario ----
 
 // The picker's report of each pick: the scenario, and its doc (null while it
-// is read, and when nothing is picked).
+// is read, and when nothing is picked). The plan is cleared; the first plan
+// for the pick is the baseline of the unsaved-changes guard.
 function onPick(entry, doc, error) {
+  if (!entry || entry.name !== opening) state.pickTok += 1;
+  if (entry) state.savedJson = null;
   state.scenario = entry;
   state.doc = doc;
+  state.loading = !!entry && !doc && !error;
   form.setScenario(doc);
   variation.setScenario(doc);
   el.fleetEmpty.hidden = !!entry && !error;
   el.fleetEmpty.textContent = error ? `Cannot read scenario ${entry.name}: ${error}` : "Pick a scenario first.";
   showError(el.fleetError, "");
   el.startPanel.hidden = !doc;
-  cloud.set(doc, null);
   if (doc) el.maxTime.value = String(defaultMaxTime(doc));
+  clearPlan();
   changed();
 }
 
@@ -133,9 +145,18 @@ const snapshot = () => JSON.stringify(buildRequest() ?? null);
 
 // ---- the plan ----
 
-// Forget the plan on screen: it is out of date, or the request was refused.
+// The plan on screen is out of date (dimmed) until its reply arrives.
+function setStale(stale) {
+  el.planBody.classList.toggle("is-stale", stale);
+  el.planBody.setAttribute("aria-busy", String(stale));
+}
+
+// Forget the plan on screen: the scenario changed, or the request was refused
+// or failed. The next change is always handled.
 function clearPlan() {
   state.plannedJson = null;
+  state.handledJson = null;
+  setStale(false);
   el.planBusy.hidden = true;
   showError(el.planError, "");
   el.planSummary.textContent = "";
@@ -146,18 +167,30 @@ function clearPlan() {
   cloud.set(state.doc, null);
 }
 
-// The form changed: the plan is out of date. Plan again once the form has
-// settled, or say what is missing.
+// The form changed. A request that differs from the last one marks the plan on
+// screen stale and plans again once the form has settled; no request (a field
+// is invalid, or no scenario) clears the plan and says why. An unchanged
+// request (a field blurred, say) changes nothing.
 function changed() {
-  state.seq += 1;
-  clearTimeout(state.timer);
-  clearPlan();
   const request = buildRequest();
-  showError(el.planNote, request ? "" : state.doc ? "Fix the marked fields to see the plan." : "Pick a scenario to see its plan.");
+  const json = JSON.stringify(request ?? null);
+  if (json === state.handledJson) return;
+  clearTimeout(state.timer);
+  state.seq += 1;
+  state.plannedJson = null;
+  if (request) {
+    showError(el.planNote, "");
+    setStale(true);
+    el.planBusy.hidden = false;
+    state.timer = setTimeout(() => send(request, false), PLAN_DEBOUNCE_MS);
+  } else {
+    clearPlan();
+    showError(el.planNote, state.doc
+      ? "Fix the marked fields to see the plan."
+      : state.loading ? "Loading the scenario…" : "Pick a scenario to see its plan.");
+  }
+  state.handledJson = json;
   syncRunSweep();
-  if (!request) return;
-  el.planBusy.hidden = false;
-  state.timer = setTimeout(() => send(request, false), PLAN_DEBOUNCE_MS);
 }
 
 // Plan `request`; with `check`, the runs' aircraft trims are built and checked too.
@@ -165,11 +198,13 @@ async function send(request, check) {
   clearTimeout(state.timer);
   const seq = ++state.seq;
   el.planBusy.hidden = false;
+  if (check) el.checkTrims.disabled = true;
   try {
     const reply = await planSweep(check ? { ...request, check_trim: true } : request);
     if (seq === state.seq) {
       renderPlan(reply);
       state.plannedJson = JSON.stringify(request);
+      if (state.savedJson === null) state.savedJson = JSON.stringify(request);
     }
   } catch (err) {
     if (seq === state.seq) {
@@ -177,6 +212,7 @@ async function send(request, check) {
       showError(el.planError, err.message || String(err));
     }
   } finally {
+    if (check) el.checkTrims.disabled = false;
     if (seq === state.seq) {
       el.planBusy.hidden = true;
       syncRunSweep();
@@ -184,11 +220,16 @@ async function send(request, check) {
   }
 }
 
-const formatValue = (v) => (typeof v === "number" ? v.toFixed(3) : String(v));
+const formatValue = (v) => {
+  if (typeof v !== "number") return String(v);
+  return v !== 0 && Math.abs(v) < 0.001 ? v.toPrecision(3) : v.toFixed(3);
+};
 
 // A POST /api/sweeps/plan reply: the summary line, the first rows, the rest
-// counted, and the trim check when it was asked for.
+// counted, and the trim check when it was asked for. It replaces the plan on
+// screen and clears its stale marking.
 function renderPlan(plan) {
+  setStale(false);
   showError(el.planError, "");
   cloud.set(state.doc, plan);
   el.planSummary.textContent = `${plan.runs} runs · ${plan.in_process ? "in-process" : "with controllers (processes)"}`;
@@ -216,6 +257,7 @@ function renderPlan(plan) {
 // ---- save ----
 
 // Save the request as `name`; `overwrite` replaces the sweep file that exists.
+// A save that finishes after an open started leaves the form's result alone.
 async function save(overwrite) {
   showError(el.saveError, "");
   const request = buildRequest();
@@ -223,6 +265,7 @@ async function save(overwrite) {
     showError(el.saveError, whyNot());
     return;
   }
+  const token = state.openTok;
   el.saveSubmit.disabled = true;
   el.saveReplace.disabled = true;
   try {
@@ -231,16 +274,20 @@ async function save(overwrite) {
       summary: el.saveSummary.value.trim(),
       overwrite,
     });
-    state.savedJson = JSON.stringify(request);
-    el.saveReplace.hidden = true;
-    el.saveResult.replaceChildren(
-      h("p", {}, "Saved as ", h("code", { text: saved.path })),
-      h("p", {}, "Run it with ", h("code", { text: `astrum sweep ${saved.path}` })));
-    history.replaceState(null, "", `?sweep=${encodeURIComponent(saved.name)}`);
+    if (token === state.openTok) {
+      state.savedJson = JSON.stringify(request);
+      el.saveReplace.hidden = true;
+      el.saveResult.replaceChildren(
+        h("p", {}, "Saved as ", h("code", { text: saved.path })),
+        h("p", {}, "Run it with ", h("code", { text: `astrum sweep ${saved.path}` })));
+      history.replaceState(null, "", `?sweep=${encodeURIComponent(saved.name)}`);
+    }
     refreshSaved();
   } catch (err) {
-    showError(el.saveError, err.message || String(err));
-    el.saveReplace.hidden = !(err instanceof ApiError && err.status === 409);
+    if (token === state.openTok) {
+      showError(el.saveError, err.message || String(err));
+      el.saveReplace.hidden = !(err instanceof ApiError && err.status === 409);
+    }
   } finally {
     el.saveSubmit.disabled = false;
     el.saveReplace.disabled = false;
@@ -274,18 +321,29 @@ function savedItem(entry) {
 }
 
 // Open the saved sweep `name`: its scenario, controllers, run settings and the
-// name and summary it was saved under.
+// name and summary it was saved under. An open is stale (and returns without
+// touching the form) when another open or a user's pick started meanwhile.
 async function openSweep(name) {
   showError(el.savedError, "");
+  const token = ++state.openTok;
+  const picks = state.pickTok;
   let saved;
   try {
     saved = await getSavedSweep(name);
   } catch (err) {
-    showError(el.savedError, err.message || String(err));
+    if (token === state.openTok) showError(el.savedError, err.message || String(err));
     return;
   }
+  if (token !== state.openTok || picks !== state.pickTok) return;
   const { request } = saved;
-  if (!(await picker.pick(request.scenario))) return; // the picker says why
+  opening = request.scenario;
+  let picked;
+  try {
+    picked = await picker.pick(request.scenario);
+  } finally {
+    opening = null;
+  }
+  if (!picked || token !== state.openTok) return; // the picker says why
   showError(el.fleetError, form.setAssignments(request.assignments).join("; "));
   variation.setFields(request);
   el.maxTime.value = String(request.max_time_s);
@@ -304,7 +362,6 @@ async function openSweep(name) {
 
 // ---- running sweeps ----
 
-const ACTIVE_POLL_MS = 2000;
 let activeTimer = 0;
 
 // Why the plan on screen cannot be flown, or "" when it can: a sweep is
@@ -354,28 +411,43 @@ async function linkRunning() {
   el.planError.append(" ", h("a", { href: `./sweep.html?id=${encodeURIComponent(sweep.id)}`, text: "Open the running sweep" }));
 }
 
-// The running sweep (if any) is shown with links to open or stop it.
+// The running sweep (if any) is shown with links to open or stop it. One
+// failed poll keeps the last known sweep; two in a row hide it.
 async function pollActive() {
   clearTimeout(activeTimer);
   if (document.hidden) return; // resumed by visibilitychange
   try {
     const sweep = await getCurrentSweep();
-    state.activeSweep = sweep?.state === "running" ? sweep : null;
+    state.activeMisses = 0;
+    setActive(sweep?.state === "running" ? sweep : null);
   } catch {
-    state.activeSweep = null;
+    state.activeMisses += 1;
+    if (state.activeMisses >= 2) setActive(null);
   }
-  renderActive();
   syncRunSweep();
+  clearTimeout(activeTimer);
   activeTimer = setTimeout(pollActive, ACTIVE_POLL_MS);
 }
 
-function renderActive() {
-  const sweep = state.activeSweep;
+// Show `sweep` (null: none) above the form. The banner is announced when a
+// sweep appears and when it goes, not on each progress update. A sweep that
+// ends refreshes the recent list.
+function setActive(sweep) {
+  const was = state.activeSweep;
+  state.activeSweep = sweep;
   el.activeSweep.hidden = !sweep;
-  if (!sweep) return;
+  if (!sweep) {
+    showError(el.activeSweepError, "");
+    if (was) {
+      el.activeSweepStatus.textContent = "";
+      refreshRecent();
+    }
+    return;
+  }
   el.activeSweepId.textContent = sweep.id;
   el.activeSweepProgress.textContent = `${sweep.ok + sweep.failed + sweep.stopped}/${sweep.total}`;
   el.activeSweepOpen.href = `./sweep.html?id=${encodeURIComponent(sweep.id)}`;
+  if (!was) el.activeSweepStatus.textContent = "A sweep is running";
 }
 
 async function stopActive() {
@@ -439,13 +511,27 @@ el.saveForm.addEventListener("submit", (e) => {
   e.preventDefault();
   save(false);
 });
+el.saveName.addEventListener("input", () => {
+  el.saveReplace.hidden = true; // replacing applies to the name that got the 409 only
+  showError(el.saveError, "");
+});
 el.saveReplace.addEventListener("click", () => save(true));
 
-// Unsaved changes: the request differs from the one last saved or opened.
+// Unsaved changes: the request differs from the one last saved or opened (or,
+// for a fresh pick, from its first plan).
 window.addEventListener("beforeunload", (e) => {
-  if (state.leaving || snapshot() === state.savedJson) return;
+  if (state.leaving || state.savedJson === null || snapshot() === state.savedJson) return;
   e.preventDefault();
   e.returnValue = "";
+});
+
+// Back/forward cache: a page restored from it keeps the script's state, so a
+// finished start (or a leave) must not carry over.
+window.addEventListener("pageshow", (e) => {
+  if (!e.persisted) return;
+  state.leaving = false;
+  state.starting = false;
+  syncRunSweep();
 });
 
 // ---- boot ----
@@ -455,9 +541,11 @@ async function boot() {
   refreshRecent();
   pollActive();
   try {
-    const [controllers] = await Promise.all([getControllers(), picker.load()]);
+    // The forms exist before the picker loads, so no pick can arrive without them.
+    const controllers = await getControllers();
     form = new ControllerForm({ host: el.fleet, controllers: Array.isArray(controllers) ? controllers : [] });
     variation = new VariationForm({ host: el.variation, onChange: changed });
+    await picker.load();
   } catch (e) {
     showError(el.loadError, `Cannot load the studio catalogs: ${e.message || e}`);
     return;

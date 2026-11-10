@@ -20,7 +20,8 @@
     <h1>Sweeps</h1>
     <p class="muted lede">Build a sweep of a saved scenario: the runs it would fly are planned as you set it up, and a saved sweep runs from the command line with <code>astrum sweep</code>.</p>
 
-    <section id="activeSweep" class="banner" aria-live="polite" hidden>
+    <p id="activeSweepStatus" class="visually-hidden" role="status"></p>
+    <section id="activeSweep" class="banner" hidden>
       <div class="banner-text">
         <strong>A sweep is running:</strong> <span id="activeSweepId" class="mono"></span> · <span id="activeSweepProgress" class="mono"></span>
       </div>
@@ -108,7 +109,8 @@
           <p id="planNote" class="muted small"></p>
           <p id="planBusy" class="muted small" role="status" hidden>Planning…</p>
           <p id="planError" class="form-error" role="alert" hidden></p>
-          <p id="planSummary" class="plan-summary"></p>
+          <div id="planBody" class="plan-body" aria-busy="false">
+          <p id="planSummary" class="plan-summary" role="status"></p>
           <p id="planTrim" class="plan-trim small" role="status" hidden></p>
           <section id="startPanel" class="start-panel" aria-labelledby="startHead" hidden>
             <h3 id="startHead">Starting positions</h3>
@@ -126,6 +128,7 @@
             <table id="planTable" class="plan-table"></table>
           </div>
           <p id="planMore" class="muted small" hidden></p>
+          </div>
           <div class="plan-actions">
             <button id="runSweep" type="button" class="primary" disabled>Run sweep</button>
             <button id="checkTrims" type="button">Check trims</button>
