@@ -106,6 +106,14 @@ async fn a_scenario_comes_back_whole_or_with_the_reason_it_cannot() {
         .collect();
     assert_eq!(ids, [7, 2]);
     assert_eq!(doc["scenario"]["aircraft"][1]["health"], 100.0);
+    // The resolved kinds (neither aircraft's file entry names one), by id.
+    assert_eq!(
+        doc["fleet"],
+        json!([
+            {"id": 2, "model": "f16", "kind": "fixed-wing", "team": 0},
+            {"id": 7, "model": "F450", "kind": "multirotor", "team": 1},
+        ])
+    );
 
     for (uri, status, needle) in [
         ("/api/scenarios/missing", StatusCode::NOT_FOUND, "no scenario named \"missing\""),

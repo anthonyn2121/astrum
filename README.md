@@ -729,7 +729,7 @@ refused), 503 (no sim). The studio's catalog and scenario routes work on `--conf
 ids), `GET /api/models` (model, kind, autopilot profile), `GET /api/controllers` (the controller
 catalog, `{"entries":[…]}`), `GET /api/scenarios` (every `scenario.<name>.toml` there — name,
 summary, environment, fleet, or the error that makes it unflyable) and `GET
-/api/scenarios/<name>` (one scenario in full; 404 when missing, 422 when invalid), `PUT
+/api/scenarios/<name>` (one scenario in full, plus `fleet`: each aircraft's resolved vehicle kind; 404 when missing, 422 when invalid), `PUT
 /api/scenarios/<name>` with `{"scenario": {…}, "summary": "…", "overwrite": false}` saves it as
 `config/scenario.<name>.toml` (201 created, 200 replaced; 409 when it exists and `overwrite` is not
 true; 400 for a bad name or summary; 422 for an invalid scenario or a model that is not a plain

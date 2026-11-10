@@ -81,14 +81,6 @@ function renderScenarios() {
   }
 }
 
-// The listing resolves each aircraft's kind (a known model may leave it out of
-// the file); the controller form filters on it, so the doc carries it too.
-function withKinds(doc, entry) {
-  const kinds = new Map(entry.aircraft.map((a) => [a.id, a.kind]));
-  const aircraft = doc.scenario.aircraft.map((a) => ({ ...a, kind: kinds.get(a.id) }));
-  return { ...doc, scenario: { ...doc.scenario, aircraft } };
-}
-
 async function selectScenario(entry) {
   state.scenario = entry;
   state.doc = null;
@@ -102,7 +94,7 @@ async function selectScenario(entry) {
   try {
     const doc = await getScenario(entry.name);
     if (state.scenario !== entry) return; // another one was picked meanwhile
-    state.doc = withKinds(doc, entry);
+    state.doc = doc;
   } catch (e) {
     if (state.scenario !== entry) return;
     el.fleetEmpty.hidden = false;

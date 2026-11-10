@@ -76,6 +76,9 @@ pub struct ScenarioDoc {
     pub path: String,
     pub summary: String,
     pub environment: &'static str,
+    /// The fleet with each aircraft's resolved vehicle kind (a known model may
+    /// leave it out of the file), sorted by id.
+    pub fleet: Vec<AircraftEntry>,
     pub scenario: Scenario,
 }
 
@@ -188,6 +191,7 @@ impl Catalogs {
             path: path.display().to_string(),
             summary: summary(&text),
             environment: DEFAULT_ENVIRONMENT,
+            fleet: fleet(&scenario),
             scenario,
         })
     }
