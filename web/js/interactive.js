@@ -89,6 +89,7 @@ async function selectScenario(entry) {
   el.fleetEmpty.textContent = "Pick a scenario first.";
   el.maxTimeHint.textContent = "";
   showError(el.formError, "");
+  if (entry) showError(el.scenarioError, "");
   syncRunButton();
   if (!entry) return;
   try {
