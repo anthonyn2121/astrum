@@ -93,4 +93,5 @@
 #saveDialog .sb-h { margin: 0 0 4px; }
 .sb-dialog-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 #checkResult { margin: 0 0 8px; font-size: 12px; }
+#checkResult:empty { display: none; }
 #checkResult p { margin: 0 0 4px; }

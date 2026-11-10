@@ -59,7 +59,10 @@ const state = {
   savedJson: null,      // scenarioDoc() as JSON at load / save; isDirty() compares to it
   checked: null,        // scenarioDoc() as JSON that the check result is for
   runAfterSave: false,  // Run is waiting for its save
+  busy: true,           // a request is in flight, or the page is still loading
 };
+
+const SUMMARY_MAX = 200; // the server's limit on a saved summary (characters)
 
 const store = new EditStore();
 const scene = new Scene($("view"));
@@ -839,7 +842,8 @@ function syncSwatches() {
 const isDirty = () => JSON.stringify(scenarioDoc()) !== state.savedJson;
 
 function setBusy(busy) {
-  for (const id of ["saveBtn", "checkBtn", "runBtn", "saveSubmitBtn", "saveReplaceBtn"]) $(id).disabled = busy;
+  state.busy = busy;
+  for (const id of ["saveBtn", "checkBtn", "runBtn", "saveSubmitBtn", "saveReplaceBtn", "saveCancelBtn"]) $(id).disabled = busy;
 }
 
 // Show a check result (or a pending note) for the scenario JSON `json`: a
@@ -858,13 +862,11 @@ function showResult(json, { summary, items, failed }) {
     return li;
   }));
   $("checkResult").replaceChildren(head, ul);
-  $("checkResult").hidden = false;
 }
 
 function clearCheck() {
   state.checked = null;
   $("checkResult").replaceChildren();
-  $("checkResult").hidden = true;
 }
 
 // The check's reply as a result: the scenario's problems, else each trim.
@@ -903,6 +905,7 @@ async function check() {
 }
 
 function openSaveDialog(note = "") {
+  if (!state.scenario || state.busy) return;
   $("saveName").value = state.savedName ?? "";
   $("saveSummary").value = state.savedSummary;
   $("saveNote").textContent = note;
@@ -921,6 +924,7 @@ function showSaveError(msg = "") {
 // Save the scenario as `name`; `overwrite` replaces an existing file.
 async function saveAs(name, summary, overwrite) {
   const doc = scenarioDoc();
+  showSaveError();
   setBusy(true);
   try {
     const entry = await saveScenario(name, { scenario: doc, summary, overwrite });
@@ -943,11 +947,17 @@ async function saveAs(name, summary, overwrite) {
 }
 
 function submitSave() {
+  const name = $("saveName").value.trim();
+  const summary = $("saveSummary").value.trim();
   if (validate(state.scenario).length) {
     showSaveError("Fix the problems listed in the Scenario JSON panel first.");
     return;
   }
-  saveAs($("saveName").value.trim(), $("saveSummary").value.trim(), false);
+  if ([...summary].length > SUMMARY_MAX) {
+    showSaveError(`The summary is ${[...summary].length} characters; at most ${SUMMARY_MAX}.`);
+    return;
+  }
+  saveAs(name, summary, false);
 }
 
 function replaceSave() {
@@ -990,6 +1000,7 @@ function wire() {
   $("saveCancelBtn").addEventListener("click", () => $("saveDialog").close());
   $("saveName").addEventListener("input", () => { $("saveReplaceBtn").hidden = true; });
   $("saveDialog").addEventListener("close", () => { state.runAfterSave = false; });
+  $("saveDialog").addEventListener("cancel", (e) => { if (state.busy) e.preventDefault(); });
   window.addEventListener("beforeunload", (e) => {
     if (state.scenario && isDirty() && (state.scenario.aircraft.length || state.savedName)) e.returnValue = "";
   });
@@ -1117,6 +1128,7 @@ async function load() {
   scene.update(store, 0, { showTrails: false, spinRotors: false });
   scene.frameFleet();
   requestAnimationFrame(frame);
+  setBusy(false);
 }
 
 load();
