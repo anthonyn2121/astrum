@@ -434,3 +434,149 @@ async fn the_saved_list_shows_each_sweeps_base_and_the_files_it_cannot_read() {
         ["controllers.toml", "scenario.pair.toml", "sweep.broken.toml", "sweep.grid.toml"]
     );
 }
+
+/// The `[set]` table the Sweeps page writes for `pair` with no assignments.
+const PAGE_SET: &str = "[set]\n\"sim.max_time_s\" = 60.0\n\"sim.lockstep\" = false\n\"aircraft.1.lockstep\" = false\n\"aircraft.2.lockstep\" = false\n";
+
+/// Write `config/sweep.<name>.toml` as `base = <base>` then `text`.
+fn write_sweep(dir: &Path, name: &str, text: &str, base: &Path) {
+    let base = serde_json::to_string(&base.display().to_string()).unwrap();
+    std::fs::write(dir.join(format!("sweep.{name}.toml")), format!("base = {base}\n{text}"))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_summary_with_a_control_character_is_refused_and_nothing_is_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = config_dir(tmp.path());
+    let app =
+        common::app_with_catalogs(tmp.path(), Bridge::new(config()), Catalogs::load(&dir).unwrap());
+    for summary in ["a\tb", "two\rlines", "bell\u{7}", "vt\u{b}", "ff\u{c}", "del\u{7f}"] {
+        let (status, reply) =
+            send(&app, Method::PUT, "/api/sweeps/saved/ctl", &save_body(&grid(), summary, None))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{summary:?}: {reply}");
+        assert_eq!(reply["error"], json!("summary: control characters are not allowed"));
+    }
+    assert_eq!(files(&dir), ["controllers.toml", "scenario.pair.toml"]);
+}
+
+#[tokio::test]
+async fn a_summary_that_would_read_back_as_the_assignments_line_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = config_dir(tmp.path());
+    let app =
+        common::app_with_catalogs(tmp.path(), Bridge::new(config()), Catalogs::load(&dir).unwrap());
+    for summary in ["astrum-studio: []", "  astrum-studio: [{}]"] {
+        let (status, reply) =
+            send(&app, Method::PUT, "/api/sweeps/saved/tag", &save_body(&grid(), summary, None))
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{summary:?}: {reply}");
+        assert!(reply["error"].as_str().unwrap().contains("astrum-studio:"), "{reply}");
+    }
+    assert_eq!(files(&dir), ["controllers.toml", "scenario.pair.toml"]);
+}
+
+#[tokio::test]
+async fn a_hand_written_sweep_is_read_back_only_when_the_page_would_write_the_same_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = config_dir(tmp.path());
+    let app =
+        common::app_with_catalogs(tmp.path(), Bridge::new(config()), Catalogs::load(&dir).unwrap());
+    let base = dir.join("scenario.pair.toml");
+    // (name, the file after its base line, the refusal's field or "" for 200)
+    let cases = [
+        ("page", PAGE_SET.to_owned(), ""),
+        (
+            "controllers",
+            format!("controllers = [\"python3 hold.py\"]\n{PAGE_SET}"),
+            "`controllers`",
+        ),
+        ("extra_set", format!("{PAGE_SET}\"sim.rate_hz\" = 60.0\n"), "`set`"),
+        ("vary", format!("{PAGE_SET}\n[vary]\n\"aircraft.2.forward_m\" = [1.0]\n"), "vary key"),
+        ("out", format!("out = \"runs/x\"\n{PAGE_SET}"), "`out`"),
+    ];
+    for (name, text, field) in cases {
+        write_sweep(&dir, name, &text, &base);
+        let (status, reply) =
+            send(&app, Method::GET, &format!("/api/sweeps/saved/{name}"), "").await;
+        if field.is_empty() {
+            assert_eq!(status, StatusCode::OK, "{name}: {reply}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}: {reply}");
+        let error = reply["error"].as_str().unwrap();
+        assert!(
+            error
+                .starts_with(&format!("sweep \"{name}\" has settings the Sweeps page cannot edit")),
+            "{error}"
+        );
+        assert!(error.contains(field), "{name}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn a_base_that_is_not_this_config_directorys_saved_scenario_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = config_dir(tmp.path());
+    let app =
+        common::app_with_catalogs(tmp.path(), Bridge::new(config()), Catalogs::load(&dir).unwrap());
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::copy(dir.join("scenario.pair.toml"), elsewhere.join("scenario.pair.toml")).unwrap();
+    write_sweep(&dir, "away", PAGE_SET, &elsewhere.join("scenario.pair.toml"));
+
+    let (status, reply) = send(&app, Method::GET, "/api/sweeps/saved/away", "").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reply}");
+    assert_eq!(reply["error"], json!("base is not a saved scenario of this config directory"));
+    let (status, list) = send(&app, Method::GET, "/api/sweeps/saved", "").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list[0]["name"], "away");
+    assert_eq!(list[0]["base"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_base_saved_with_lockstep_plans_and_saves_without_controllers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("config");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(common::repo_config().join("controllers.toml"), dir.join("controllers.toml"))
+        .unwrap();
+    let mut doc = pair();
+    doc["sim"]["lockstep"] = json!(true);
+    for a in doc["aircraft"].as_array_mut().unwrap() {
+        a["lockstep"] = json!(true);
+    }
+    let scenario: Scenario = serde_json::from_value(doc).unwrap();
+    std::fs::write(dir.join("scenario.lock.toml"), scenario.to_toml()).unwrap();
+    let app =
+        common::app_with_catalogs(tmp.path(), Bridge::new(config()), Catalogs::load(&dir).unwrap());
+    let req = json!({"scenario": "lock", "max_time_s": 60.0});
+
+    let (status, plan) = send(&app, Method::POST, PLAN, &req.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["runs"], 1);
+    let (status, saved) =
+        send(&app, Method::PUT, "/api/sweeps/saved/locked", &save_body(&req, "", None)).await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+}
+
+#[tokio::test]
+async fn an_unreadable_saved_sweep_is_listed_with_its_error_and_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = config_dir(tmp.path());
+    let app =
+        common::app_with_catalogs(tmp.path(), Bridge::new(config()), Catalogs::load(&dir).unwrap());
+    std::fs::write(dir.join("sweep.binary.toml"), [0xff, 0xfe, b'\n']).unwrap();
+
+    let (status, list) = send(&app, Method::GET, "/api/sweeps/saved", "").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list[0]["name"], "binary");
+    assert_eq!(list[0]["base"], Value::Null);
+    let error = list[0]["error"].as_str().unwrap();
+    assert!(error.starts_with("cannot read: "), "{error}");
+
+    let (status, reply) = send(&app, Method::GET, "/api/sweeps/saved/binary", "").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reply}");
+    assert_eq!(reply["error"], json!(error));
+}

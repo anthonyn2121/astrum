@@ -165,17 +165,18 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         .map_err(SweepInputError::BadRequest)?;
     check_programs(&assignments, catalogs.controllers()).map_err(SweepInputError::BadRequest)?;
 
-    let mut set =
-        BTreeMap::from([("sim.max_time_s".to_owned(), toml::Value::Float(req.max_time_s))]);
-    if !req.assignments.is_empty() {
-        let controlled: BTreeSet<u32> = req.assignments.iter().map(|a| a.aircraft).collect();
-        set.insert("sim.lockstep".to_owned(), toml::Value::Boolean(true));
-        for a in &doc.scenario.aircraft {
-            set.insert(
-                format!("aircraft.{}.lockstep", a.id),
-                toml::Value::Boolean(controlled.contains(&a.id)),
-            );
-        }
+    // As `assign` sets them: the lockstep flags are always the sweep's, so a
+    // base saved with lockstep on plans without controllers too.
+    let controlled: BTreeSet<u32> = req.assignments.iter().map(|a| a.aircraft).collect();
+    let mut set = BTreeMap::from([
+        ("sim.max_time_s".to_owned(), toml::Value::Float(req.max_time_s)),
+        ("sim.lockstep".to_owned(), toml::Value::Boolean(!controlled.is_empty())),
+    ]);
+    for a in &doc.scenario.aircraft {
+        set.insert(
+            format!("aircraft.{}.lockstep", a.id),
+            toml::Value::Boolean(controlled.contains(&a.id)),
+        );
     }
     let vary = req
         .vary
@@ -453,11 +454,15 @@ fn sweep_name(path: &Path) -> Option<String> {
     safe_name(name).ok().map(str::to_owned)
 }
 
-/// `<name>` of a `scenario.<name>.toml` base path.
-fn base_name(base: &Path) -> Option<String> {
+/// `<name>` of `base` when it is this config directory's saved scenario
+/// `scenario.<name>.toml`: the same file, by canonical path.
+fn base_name(catalogs: &Catalogs, base: &Path) -> Option<String> {
     let file = base.file_name()?.to_str()?;
     let name = file.strip_prefix("scenario.")?.strip_suffix(".toml")?;
-    safe_name(name).ok().map(str::to_owned)
+    let name = safe_name(name).ok()?;
+    let saved = catalogs.scenario_path(name).ok()?;
+    let same = std::fs::canonicalize(base).ok()? == std::fs::canonicalize(&saved).ok()?;
+    same.then(|| name.to_owned())
 }
 
 /// The comment lines at the top of `text`, each without its `#` and trimmed.
@@ -487,27 +492,28 @@ fn number(v: &toml::Value) -> Option<f64> {
     v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
 }
 
-/// Every `sweep.<name>.toml` in `dir` whose name passes [`safe_name`], sorted by name.
-fn saved_entries(dir: &Path) -> io::Result<Vec<SavedEntry>> {
+/// Every `sweep.<name>.toml` in the config directory whose name passes
+/// [`safe_name`], sorted by name. A file that cannot be read is listed with
+/// its error.
+fn saved_entries(catalogs: &Catalogs) -> io::Result<Vec<SavedEntry>> {
     let mut entries = Vec::new();
-    for dirent in std::fs::read_dir(dir)? {
+    for dirent in std::fs::read_dir(catalogs.config_dir())? {
         let path = dirent?.path();
         let Some(name) = sweep_name(&path) else { continue };
         if !path.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(&path)?;
-        let (base, error) = match toml::from_str::<SweepFile>(&text) {
-            Ok(file) => (base_name(&file.base), None),
-            Err(e) => (None, Some(e.to_string())),
+        let (summary, base, error) = match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let (base, error) = match toml::from_str::<SweepFile>(&text) {
+                    Ok(file) => (base_name(catalogs, &file.base), None),
+                    Err(e) => (None, Some(e.to_string())),
+                };
+                (header_summary(&text), base, error)
+            }
+            Err(e) => (String::new(), None, Some(format!("cannot read: {e}"))),
         };
-        entries.push(SavedEntry {
-            name,
-            path: path.display().to_string(),
-            summary: header_summary(&text),
-            base,
-            error,
-        });
+        entries.push(SavedEntry { name, path: path.display().to_string(), summary, base, error });
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
@@ -516,7 +522,7 @@ fn saved_entries(dir: &Path) -> io::Result<Vec<SavedEntry>> {
 /// `GET /api/sweeps/saved`: every saved sweep, invalid ones too.
 pub(crate) async fn list(State(state): State<AppState>) -> Response {
     let catalogs = state.catalogs.clone();
-    match tokio::task::spawn_blocking(move || saved_entries(catalogs.config_dir())).await {
+    match tokio::task::spawn_blocking(move || saved_entries(&catalogs)).await {
         Ok(Ok(entries)) => json(StatusCode::OK, &entries),
         Ok(Err(e)) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -526,27 +532,59 @@ pub(crate) async fn list(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Read the saved sweep `name` back as a request.
+/// `file` with its integers as floats: the form the page reads and writes
+/// numbers in.
+fn floats(mut file: SweepFile) -> SweepFile {
+    for v in file.vary.values_mut().flatten().chain(file.set.values_mut()) {
+        if let toml::Value::Integer(i) = *v {
+            *v = toml::Value::Float(i as f64);
+        }
+    }
+    file
+}
+
+/// The first setting of `disk` that differs from `planned` (`base` is not one).
+fn first_difference(disk: &SweepFile, planned: &SweepFile) -> Option<&'static str> {
+    [
+        ("controllers", disk.controllers == planned.controllers),
+        ("set", disk.set == planned.set),
+        ("vary", disk.vary == planned.vary),
+        ("speed", disk.speed == planned.speed),
+        ("out", disk.out == planned.out),
+        ("repeats", disk.repeats == planned.repeats),
+        ("jobs", disk.jobs == planned.jobs),
+        ("run_timeout_s", disk.run_timeout_s == planned.run_timeout_s),
+        ("samples", disk.samples == planned.samples),
+        ("sample_seed", disk.sample_seed == planned.sample_seed),
+        ("min_separation_m", disk.min_separation_m == planned.min_separation_m),
+        ("min_alt_hae_m", disk.min_alt_hae_m == planned.min_alt_hae_m),
+        ("perturb", disk.perturb == planned.perturb),
+    ]
+    .into_iter()
+    .find(|(_, same)| !same)
+    .map(|(field, _)| field)
+}
+
+/// Read the saved sweep `name` back as a request. It is refused (422) unless
+/// the request plans the same sweep file the file holds: a sweep the Sweeps
+/// page cannot edit is not handed back.
 fn read_saved(catalogs: &Catalogs, name: &str) -> Result<SavedSweep, Refusal> {
     let name = safe_name(name).map_err(bad)?;
     let path = sweep_path(catalogs, name);
+    let unprocessable = |msg: String| Refusal(StatusCode::UNPROCESSABLE_ENTITY, msg);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(Refusal(StatusCode::NOT_FOUND, format!("no sweep named {name:?}")))
         }
-        Err(e) => {
-            return Err(Refusal(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reading {}: {e}", path.display()),
-            ))
-        }
+        Err(e) => return Err(unprocessable(format!("cannot read: {e}"))),
     };
-    let unprocessable = |msg: String| Refusal(StatusCode::UNPROCESSABLE_ENTITY, msg);
     let file: SweepFile =
         toml::from_str(&text).map_err(|e| unprocessable(format!("{}: {e}", path.display())))?;
-    let scenario = base_name(&file.base)
-        .ok_or_else(|| unprocessable("base is not a saved scenario".to_owned()))?;
+    let mut disk = floats(file.clone());
+    let scenario = base_name(catalogs, &file.base).ok_or_else(|| {
+        unprocessable("base is not a saved scenario of this config directory".to_owned())
+    })?;
     let max_time_s = file
         .set
         .get("sim.max_time_s")
@@ -583,6 +621,24 @@ fn read_saved(catalogs: &Catalogs, name: &str) -> Result<SavedSweep, Refusal> {
         jobs: file.jobs,
         check_trim: false,
     };
+    let cannot_edit = |why: &str| {
+        unprocessable(format!(
+            "sweep \"{name}\" has settings the Sweeps page cannot edit (run it with `astrum sweep {}`){why}",
+            path.display()
+        ))
+    };
+    let planned = resolve(&request, catalogs)
+        .map_err(|e| match e {
+            SweepInputError::BadRequest(msg) => cannot_edit(&format!(": {msg}")),
+            other => Refusal::from(other),
+        })?
+        .file;
+    // The base is checked above, so it is not compared.
+    disk.base = planned.base.clone();
+    if disk != planned {
+        let field = first_difference(&disk, &planned).unwrap_or("settings");
+        return Err(cannot_edit(&format!(": first differing field is `{field}`")));
+    }
     Ok(SavedSweep { name: name.to_owned(), summary: header_summary(&text), request })
 }
 
@@ -599,10 +655,16 @@ pub(crate) async fn load(
     }
 }
 
-/// Refuse a summary that is not one line of at most [`SUMMARY_MAX_CHARS`].
+/// Refuse a summary that is not printable single-line text of at most
+/// [`SUMMARY_MAX_CHARS`], or one that would read back as the assignments line.
 fn check_summary(summary: &str) -> Result<(), Refusal> {
-    if summary.contains(['\n', '\r']) {
-        return Err(bad("summary must be a single line".to_owned()));
+    if summary.chars().any(char::is_control) {
+        return Err(bad("summary: control characters are not allowed".to_owned()));
+    }
+    if summary.trim().starts_with(STUDIO_TAG) {
+        return Err(bad(format!(
+            "summary: must not start with {STUDIO_TAG:?}, the tag of the assignments line"
+        )));
     }
     let chars = summary.chars().count();
     if chars > SUMMARY_MAX_CHARS {
@@ -614,7 +676,8 @@ fn check_summary(summary: &str) -> Result<(), Refusal> {
 }
 
 /// The file's text: the summary line, the assignments line (when there are
-/// assignments) and the sweep. It must read back as the file it came from.
+/// assignments) and the sweep. The whole text must read back as the file it
+/// came from.
 fn sweep_text(file: &SweepFile, request: &SweepRequest, summary: &str) -> Result<String, Refusal> {
     let internal = |msg: String| Refusal(StatusCode::INTERNAL_SERVER_ERROR, msg);
     let mut text = String::new();
@@ -626,13 +689,13 @@ fn sweep_text(file: &SweepFile, request: &SweepRequest, summary: &str) -> Result
             .map_err(|e| internal(format!("writing the assignments: {e}")))?;
         text += &format!("# {STUDIO_TAG} {assignments}\n");
     }
-    let body = file.to_toml().map_err(|e| internal(e.to_string()))?;
-    let read_back: SweepFile = toml::from_str(&body)
-        .map_err(|e| internal(format!("the sweep does not read back: {e}")))?;
+    text += &file.to_toml().map_err(|e| internal(e.to_string()))?;
+    let read_back: SweepFile = toml::from_str(&text).map_err(|e| {
+        Refusal(StatusCode::UNPROCESSABLE_ENTITY, format!("the sweep does not read back: {e}"))
+    })?;
     if read_back != *file {
         return Err(internal("the sweep does not read back as it was planned".to_owned()));
     }
-    text += &body;
     Ok(text)
 }
 

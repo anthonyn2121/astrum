@@ -747,10 +747,13 @@ Sweeps (planned and saved, never flown here): `POST /api/sweeps/plan` with `{"sc
 → 200 with the runs, each run's values and the moving aircraft's starting positions (400 for a bad
 request or more than 2000 runs, 422 for a sweep the planner refuses). `PUT /api/sweeps/saved/<name>`
 with `{"request": {…}, "summary": "…", "overwrite": false}` writes `config/sweep.<name>.toml`, runnable
-with `astrum sweep` (201 created, 200 replaced; 409 when it exists and `overwrite` is not true; 422
-with nothing written when the sweep cannot be planned). `GET /api/sweeps/saved` lists them with their
-base scenario (or the error that makes the file unreadable) and `GET /api/sweeps/saved/<name>` reads
-one back as a request.
+with `astrum sweep` (201 created, 200 replaced; 409 when it exists and `overwrite` is not true; 400 for
+a summary with a control character, or one starting `astrum-studio:`; 422 with nothing written when the
+sweep cannot be planned). `GET /api/sweeps/saved` lists them with their base scenario (`null` unless it
+is this config directory's `scenario.<name>.toml`, or the error that makes the file unreadable) and
+`GET /api/sweeps/saved/<name>` reads one back as a request; 422 for a sweep the Sweeps page cannot edit
+(settings its request would not write back, such as `speed`, `out` or hand-written `controllers`); run
+such a file with `astrum sweep` instead.
 
 Live interactive runs — one at a time, owned by the server: `POST /api/runs` with
 `{"scenario": "<name>" | {…scenario…}, "assignments": [{"aircraft": 1, "controller": "cpp-hold",
