@@ -64,6 +64,31 @@
 //! * **`GET /api/sweeps/saved/<name>`** — one saved sweep as a request:
 //!   `{name, summary, request}`; 400 for a bad name, 404 when there is none,
 //!   422 when the file is not a sweep the studio can read back.
+//! * **`POST /api/sweeps`** — start a sweep flown in the background
+//!   ([`crate::sweepruns`]): the body is a sweep request, as for
+//!   `POST /api/sweeps/plan`; it is written to `<runs-dir>/sweeps/<id>/` →
+//!   201 with its [`SweepView`](crate::sweepruns::SweepView); 400 for a bad
+//!   request, 409 while another sweep runs (the message names it), 422 for a
+//!   sweep that cannot fly (no `astrum-sim` for a process-mode sweep, too few
+//!   ports, a failed trim check; nothing is written), 500 when it cannot be
+//!   written.
+//! * **`GET /api/sweeps/current`** — `{"sweep": SweepView | null}`: the latest
+//!   sweep since the server started. **`DELETE`** stops the running one (200,
+//!   its final view, its unfinished runs stay `queued`; 404 when none runs).
+//! * **`GET /api/sweeps`** — `[{"id", "scenario", "state", "total", "ok",
+//!   "failed", "started_at", "wall_s"}]`, every sweep under the sweeps dir,
+//!   newest first. A sweep whose `meta.json` says `running` but which no server
+//!   owns is `interrupted`.
+//! * **`GET /api/sweeps/<id>`** — a [`SweepView`](crate::sweepruns::SweepView):
+//!   its state, counts and each run's status; 400 for an unsafe id, 404 for an
+//!   unknown one.
+//! * **`GET /api/sweeps/<id>/results`** — `summary.csv` as `{"columns": […],
+//!   "rows": [[…]]}` (numbers as numbers, empty cells as null); 404 until the
+//!   sweep has written it.
+//! * **`GET /api/sweeps/<id>/runs/<n>/replay`** — run `n` (1-based) of the
+//!   sweep as an export document, as `GET /api/runs/<id>/replay` gives one; 400
+//!   for a number outside the plan, 404 when the run has no bag, 409 while the
+//!   run is still running.
 //! * **`POST /api/runs`** — start the live interactive run
 //!   ([`crate::runs`]): `{"scenario": "<name>" | {…}, "assignments":
 //!   [{"aircraft", "controller", "params"}], "speed", "max_time_s"}` → 201
@@ -128,6 +153,11 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/sweeps/plan", post(crate::sweeps::plan))
         .route("/sweeps/saved", get(crate::sweeps::list))
         .route("/sweeps/saved/{name}", get(crate::sweeps::load).put(crate::sweeps::save))
+        .route("/sweeps", get(crate::sweepruns::list).post(crate::sweepruns::start))
+        .route("/sweeps/current", get(crate::sweepruns::current).delete(crate::sweepruns::stop))
+        .route("/sweeps/{id}", get(crate::sweepruns::view))
+        .route("/sweeps/{id}/results", get(crate::sweepruns::results))
+        .route("/sweeps/{id}/runs/{n}/replay", get(crate::sweepruns::replay))
         .route("/runs", post(runs::start))
         .route("/runs/current", get(runs::current).delete(runs::stop))
         .route("/runs/current/log", get(runs::log))

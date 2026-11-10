@@ -17,15 +17,15 @@
 //!    origin, or naming a `Host` other than `localhost`, an IP address or one
 //!    of `--allowed-hosts`, are refused.
 //!  * **`/api/…`** — the JSON API (`astrum_web::api`): bridge status and run
-//!    control, the studio's catalogs and its live interactive runs (one at a
-//!    time, under `--runs-dir`), behind the same `Host` check.
+//!    control, the studio's catalogs, its live interactive runs and its sweeps
+//!    (one of each at a time, under `--runs-dir`), behind the same `Host` check.
 //!  * **`GET /tiles/<z>/<x>/<y>.jpg`** — slippy-map tile proxy with a disk cache.
 //!  * **`GET /…`** — static files from `--root`.
 //!
 //! The bridge attaches to `--connect` at startup and keeps retrying in the
 //! background until a sim answers there; the server runs whether or not one
 //! ever does. Starting a run (`POST /api/runs`) re-attaches it to that run's
-//! sim. Shutting the server down stops the active run first.
+//! sim. Shutting the server down stops the active run and sweep first.
 //!
 //! Config (CLI arg > env > default): see `--help`.
 
@@ -38,11 +38,16 @@ use astrum_web::bridge::{Bridge, BridgeConfig};
 use astrum_web::catalogs::Catalogs;
 use astrum_web::runs::{Runs, RunsConfig};
 use astrum_web::server::{self, Config};
+use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig};
 use clap::Parser;
 
 /// How often the scenario is re-fetched, so a restarted sim or replay with
 /// another fleet reaches the browsers within a few seconds.
 const MODELS_POLL: Duration = Duration::from_secs(5);
+
+/// The first loopback port a process-mode web sweep's run listens on (run N
+/// on `SWEEP_BASE_PORT + N - 1`).
+const SWEEP_BASE_PORT: u16 = 27500;
 
 /// Stream live/replayed telemetry to browsers over WebSocket and serve the
 /// static 3-D renderer, both on one port.
@@ -140,6 +145,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         RunsConfig { dir: cli.runs_dir, sim, connect: cli.connect.clone() },
         bridge.clone(),
     );
+    let sweeps = SweepRuns::new(SweepRunsConfig {
+        dir: runs.config().dir.join("sweeps"),
+        sim: runs.config().sim.clone(),
+        base_port: SWEEP_BASE_PORT,
+    });
 
     let cfg = Config {
         root: cli.root,
@@ -148,6 +158,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         allowed_hosts,
         catalogs,
         runs: runs.clone(),
+        sweeps: sweeps.clone(),
     };
     let tiles = if cfg.tile_url.is_empty() {
         format!("cache-only ({})", cfg.tile_cache.display())
@@ -175,14 +186,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let closing = runs.clone();
+    let closing_sweeps = sweeps.clone();
     let shutdown = async move {
         shutdown_signal().await;
         // Stop the active run now: open WebSockets hold the graceful shutdown.
         closing.close();
+        closing_sweeps.close();
     };
     let served = axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
     // Wait for the run's processes to be reaped (and its metrics written).
-    tokio::task::spawn_blocking(move || runs.shutdown()).await?;
+    tokio::task::spawn_blocking(move || {
+        runs.shutdown();
+        sweeps.shutdown();
+    })
+    .await?;
     served?;
     Ok(())
 }

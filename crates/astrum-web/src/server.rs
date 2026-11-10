@@ -42,6 +42,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use crate::bridge::{Bridge, EventBatch, RunNote, Snapshot};
 use crate::catalogs::Catalogs;
 use crate::runs::Runs;
+use crate::sweepruns::SweepRuns;
 
 /// Highest slippy-map zoom the tile proxy accepts.
 pub const MAX_ZOOM: u32 = 22;
@@ -66,6 +67,8 @@ pub struct Config {
     pub catalogs: Catalogs,
     /// The live interactive runs (`/api/runs`); its bridge is the server's.
     pub runs: Runs,
+    /// The web sweeps (`/api/sweeps`): one at a time, under `<runs-dir>/sweeps`.
+    pub sweeps: SweepRuns,
 }
 
 #[derive(Clone)]
@@ -74,6 +77,7 @@ pub(crate) struct AppState {
     pub(crate) allowed_hosts: Arc<[String]>,
     pub(crate) catalogs: Arc<Catalogs>,
     pub(crate) runs: Runs,
+    pub(crate) sweeps: SweepRuns,
     tiles: Arc<TileProxy>,
 }
 
@@ -106,6 +110,7 @@ pub fn router(cfg: Config, bridge: Bridge) -> reqwest::Result<Router> {
         allowed_hosts: cfg.allowed_hosts.into(),
         catalogs: Arc::new(cfg.catalogs),
         runs: cfg.runs,
+        sweeps: cfg.sweeps,
         tiles,
     };
     // The guard wraps the whole API, fallbacks included, so no route added

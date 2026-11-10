@@ -634,7 +634,11 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
 
 /// Create `<root>/<stamp>-<name>` (or `…-2`, `…-3`, … if taken), cut to a
 /// [`safe_name`]'s length.
-fn new_run_dir(root: &Path, stamp: &str, name: &str) -> Result<(String, PathBuf), RunError> {
+pub(crate) fn new_run_dir(
+    root: &Path,
+    stamp: &str,
+    name: &str,
+) -> Result<(String, PathBuf), RunError> {
     let base = format!("{stamp}-{name}");
     for n in 1..1000u32 {
         let suffix = if n == 1 { String::new() } else { format!("-{n}") };
@@ -655,12 +659,12 @@ fn free_port() -> io::Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 /// `yyyymmdd-hhmmss` (UTC) of a Unix time in ms.
-fn utc_stamp(ms: u64) -> String {
+pub(crate) fn utc_stamp(ms: u64) -> String {
     let secs = ms / 1000;
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
