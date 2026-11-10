@@ -10,6 +10,7 @@
 import { ApiError, getSweep, getSweepResults, stopSweep } from "./api.js";
 import { $, h, showError } from "./dom.js";
 import { fmtTime } from "./format.js";
+import { Scatter, themeColour } from "./scatter.js";
 
 const POLL_MS = 1000;
 const RUN_STATES = ["queued", "running", "ok", "failed", "stopped"];
@@ -27,6 +28,8 @@ const el = {
   stopBtn: $("stopBtn"), actionError: $("actionError"), pollError: $("pollError"), strip: $("strip"),
   statusFilter: $("statusFilter"), resultsCount: $("resultsCount"), resultsNote: $("resultsNote"),
   resultsError: $("resultsError"), resultsWrap: $("resultsWrap"), results: $("results"),
+  xAxis: $("xAxis"), yAxis: $("yAxis"), colourBy: $("colourBy"), compareEmpty: $("compareEmpty"),
+  compareWrap: $("compareWrap"), scatter: $("scatter"), scatterTip: $("scatterTip"),
 };
 
 const state = {
@@ -41,6 +44,8 @@ const state = {
   resultsSeq: 0,
   sort: { col: "run", dir: 1 },
   filter: "all",
+  plot: { x: null, y: null, colour: null }, // the user's picks (null: the default)
+  shown: null,       // the axes and colour plotted, after defaults
   timer: 0,
 };
 
@@ -115,6 +120,7 @@ function markSelected() {
   for (const row of el.results.querySelectorAll("tbody tr")) {
     row.classList.toggle("selected", Number(row.dataset.run) === state.selected);
   }
+  drawPlot();
 }
 
 // Select run `n` (from the strip or the table): its row is brought into view.
@@ -144,6 +150,7 @@ async function loadResults() {
     state.results = results;
     showError(el.resultsError, "");
     showError(el.resultsNote, "");
+    renderCompare();
     renderTable();
   } catch (err) {
     if (seq !== state.resultsSeq) return;
@@ -257,6 +264,140 @@ function renderTable() {
   markSelected();
 }
 
+// ---- compare runs ----
+
+// Numeric columns no plot uses as an axis or colour: the seed and sample, the
+// bag, the wall time and the speed.
+const NOT_PLOTTED = new Set(["seed", "sample", "bag", "wall_s", "speed_x", "status"]);
+// The y axis and the colour leave out `run` too: an index, not a result.
+const NOT_Y = new Set([...NOT_PLOTTED, "run"]);
+// The numeric fleet metrics in catalog order (sim_time_s aside): the y axis
+// defaults to the first of them with a number, else to sim_time_s.
+const METRIC_COLUMNS = [
+  "min_separation_m", "min_alt_hae_m", "max_bank_deg", "max_nz_g", "failsafe_entries",
+  "controller_losses", "command_refusals", "hits", "kills",
+];
+
+const scatter = new Scatter(el.scatter, { onHover: showTip, onPick: (data) => select(data.run) });
+
+// The columns with a number in at least one row, minus `skip`.
+function numericColumns(columns, rows, skip) {
+  return columns.filter((name, i) => !skip.has(name) && rows.some((row) => typeof row[i] === "number"));
+}
+
+// Refill the three selects (rebuilt only when their options change, so an open
+// popup survives a refresh), keeping the user's picks that still exist, then plot.
+function renderCompare() {
+  const { columns, rows } = state.results;
+  const xs = numericColumns(columns, rows, NOT_PLOTTED);
+  const ys = numericColumns(columns, rows, NOT_Y);
+  const colours = ["status", ...ys];
+  const choose = (kind, options, fallback) => (options.includes(state.plot[kind]) ? state.plot[kind] : fallback);
+  state.shown = {
+    x: choose("x", xs, xs.find((c) => c.startsWith("aircraft.")) ?? (xs.includes("run") ? "run" : xs[0])),
+    y: choose("y", ys, METRIC_COLUMNS.find((c) => ys.includes(c)) ?? (ys.includes("sim_time_s") ? "sim_time_s" : ys[0])),
+    colour: choose("colour", colours, "status"),
+  };
+  fillSelect(el.xAxis, xs, state.shown.x);
+  fillSelect(el.yAxis, ys, state.shown.y);
+  fillSelect(el.colourBy, colours, state.shown.colour);
+  drawPlot();
+}
+
+function fillSelect(select, options, value) {
+  const key = options.join("\n");
+  if (select.dataset.options !== key) {
+    select.replaceChildren(...options.map((o) => h("option", { value: o, text: o })));
+    select.dataset.options = key;
+  }
+  select.value = value ?? "";
+  select.disabled = options.length === 0;
+}
+
+const hexRgb = (hex) => {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+
+// The colour at t in [0, 1] on the ramp from `from` to `to` (both "#rrggbb").
+function rampColour(from, to) {
+  const a = hexRgb(from);
+  const b = hexRgb(to);
+  return (t) => `rgb(${a.map((c, i) => Math.round(c + (b[i] - c) * t)).join(", ")})`;
+}
+
+// The points of the shown axes: every run with a number for both, coloured by
+// status (ok, failed, other) or along the ramp of a numeric colour column; the
+// selected run is flagged.
+function drawPlot() {
+  const shown = state.shown;
+  if (!shown) return;
+  const { columns, rows } = state.results;
+  const xi = columns.indexOf(shown.x);
+  const yi = columns.indexOf(shown.y);
+  const ci = shown.colour === "status" ? -1 : columns.indexOf(shown.colour);
+  const runAt = columns.indexOf("run");
+  const statusAt = columns.indexOf("status");
+  const placed = rows.filter((row) => typeof row[xi] === "number" && typeof row[yi] === "number");
+
+  let colourOf;
+  let legend;
+  if (ci < 0) {
+    const ok = themeColour("--ok");
+    const failed = themeColour("--live");
+    const other = themeColour("--warn");
+    colourOf = (row) => {
+      const status = statusOf(row, statusAt);
+      return status.startsWith("ok") ? ok : status.startsWith("failed") ? failed : other;
+    };
+    legend = [{ label: "ok", color: ok }, { label: "failed", color: failed }, { label: "other", color: other }];
+  } else {
+    const numbers = placed.map((row) => row[ci]).filter((v) => typeof v === "number");
+    const lo = numbers.length ? Math.min(...numbers) : 0;
+    const hi = numbers.length ? Math.max(...numbers) : 0;
+    const ramp = rampColour(themeColour("--accent"), themeColour("--warn"));
+    const muted = themeColour("--muted");
+    colourOf = (row) => {
+      const v = row[ci];
+      return typeof v === "number" ? ramp(hi > lo ? (v - lo) / (hi - lo) : 0) : muted;
+    };
+    legend = numbers.length
+      ? [{ label: `min ${cellText(shown.colour, lo)}`, color: ramp(0) }, { label: `max ${cellText(shown.colour, hi)}`, color: ramp(1) }]
+      : [];
+  }
+
+  const points = placed.map((row) => ({
+    x: row[xi],
+    y: row[yi],
+    color: colourOf(row),
+    selected: row[runAt] === state.selected,
+    data: { run: row[runAt], status: statusOf(row, statusAt), x: row[xi], y: row[yi] },
+  }));
+  scatter.setData({ xLabel: shown.x ?? "", yLabel: shown.y ?? "", points, legend });
+
+  const chosen = points.find((p) => p.selected);
+  el.scatter.setAttribute("aria-label", points.length
+    ? `${shown.y} against ${shown.x}, ${points.length} runs${chosen ? `, run ${chosen.data.run} selected` : ""}`
+    : "Scatter plot of the runs");
+  el.compareEmpty.hidden = points.length > 0;
+  el.compareWrap.hidden = points.length === 0;
+  if (!points.length) showTip(null, null);
+}
+
+// The hover text, beside the pointer: text only.
+function showTip(data, at) {
+  el.scatterTip.hidden = !data;
+  if (!data) return;
+  const { x, y } = state.shown;
+  el.scatterTip.replaceChildren(
+    h("div", { text: `run ${data.run} · ${data.status}` }),
+    h("div", { text: `${x} = ${cellText(x, data.x)}` }),
+    h("div", { text: `${y} = ${cellText(y, data.y)}` }));
+  el.scatterTip.classList.toggle("left", at.x > el.compareWrap.clientWidth / 2);
+  el.scatterTip.style.left = `${at.x}px`;
+  el.scatterTip.style.top = `${at.y}px`;
+}
+
 // ---- stop ----
 
 el.stopBtn.addEventListener("click", async () => {
@@ -278,6 +419,10 @@ el.results.addEventListener("click", (e) => {
   const row = e.target.closest("tbody tr[data-run]");
   if (row) select(Number(row.dataset.run));
 });
+
+el.xAxis.addEventListener("change", () => { state.plot.x = el.xAxis.value; renderCompare(); });
+el.yAxis.addEventListener("change", () => { state.plot.y = el.yAxis.value; renderCompare(); });
+el.colourBy.addEventListener("change", () => { state.plot.colour = el.colourBy.value; renderCompare(); });
 
 // ---- polling ----
 

@@ -75,3 +75,17 @@ button.sort {
 button.sort:hover { color: var(--accent); }
 th[aria-sort="ascending"] button.sort::after { content: " ▲"; color: var(--accent); }
 th[aria-sort="descending"] button.sort::after { content: " ▼"; color: var(--accent); }
+
+/* Compare runs: the scatter plot (scatter.js) on a canvas, the hover text over it. */
+.compare-wrap {
+  position: relative; height: min(52vh, 440px); min-height: 280px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-solid); overflow: hidden;
+}
+.scatter { position: absolute; inset: 0; width: 100%; height: 100%; display: block; border-radius: var(--radius); }
+.scatter:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.scatter-tip {
+  position: absolute; z-index: 2; margin: 0; max-width: 320px; padding: 5px 8px; pointer-events: none;
+  transform: translate(12px, 12px); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
+  background: var(--panel-raised); border: 1px solid var(--line); border-radius: 6px;
+}
+.scatter-tip.left { transform: translate(calc(-100% - 12px), 12px); }
