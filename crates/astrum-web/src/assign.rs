@@ -19,7 +19,7 @@ use crate::api::safe_name;
 use crate::catalogs::{Catalogs, ScenarioError};
 
 /// One requested assignment: an aircraft, a catalog controller and its parameters.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentBody {
     pub aircraft: u32,

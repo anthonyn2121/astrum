@@ -740,6 +740,18 @@ trims does so at its initial conditions. All `/api`
 requests are subject to the `Host` check (403); non-GET ones must also be `Content-Type:
 application/json` (415) and, from a browser, same-origin (403).
 
+Sweeps (planned and saved, never flown here): `POST /api/sweeps/plan` with `{"scenario": "<name>",
+"assignments": [{"aircraft", "controller", "params"}], "perturb": [{"aircraft": [2], "forward_m":
+{"uniform": 300}}], "vary": {"aircraft.2.offset.forward_m": [-200, 0, 200]}, "samples", "sample_seed",
+"min_separation_m", "min_alt_hae_m", "repeats", "max_time_s", "run_timeout_s", "jobs", "check_trim"}`
+→ 200 with the runs, each run's values and the moving aircraft's starting positions (400 for a bad
+request or more than 2000 runs, 422 for a sweep the planner refuses). `PUT /api/sweeps/saved/<name>`
+with `{"request": {…}, "summary": "…", "overwrite": false}` writes `config/sweep.<name>.toml`, runnable
+with `astrum sweep` (201 created, 200 replaced; 409 when it exists and `overwrite` is not true; 422
+with nothing written when the sweep cannot be planned). `GET /api/sweeps/saved` lists them with their
+base scenario (or the error that makes the file unreadable) and `GET /api/sweeps/saved/<name>` reads
+one back as a request.
+
 Live interactive runs — one at a time, owned by the server: `POST /api/runs` with
 `{"scenario": "<name>" | {…scenario…}, "assignments": [{"aircraft": 1, "controller": "cpp-hold",
 "params": {"alt": 1500}}], "speed": 0, "max_time_s": 60}` (`speed` 0 = as fast as possible;
