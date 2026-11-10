@@ -32,3 +32,35 @@
 .save-result { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
 .save-result:empty { display: none; }
 .save-result code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+
+/* The variation (variation.js), in the Variation step. */
+.variation { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+.var-part { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.var-part h3 { margin: 0; font-size: 14px; }
+.var-help { margin: 0; }
+.var-list { display: flex; flex-direction: column; gap: 10px; }
+.var-list:empty { display: none; }
+.var-card {
+  display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 12px 14px;
+  background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.var-card-head { display: flex; align-items: center; gap: 10px; }
+.var-card-title { font-weight: 600; margin-right: auto; }
+.var-card > .field-error { margin: 0; }
+.var-aircraft { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.var-aircraft > .field-label { flex-basis: 100%; }
+.var-check {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 6px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
+}
+.var-check:hover { border-color: var(--accent); }
+.var-check:has(input:checked) { border-color: var(--accent); background: var(--accent-dim); }
+.var-check input { margin: 0; accent-color: var(--accent); }
+.var-axes { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px 16px; min-width: 0; }
+.var-axis { display: grid; grid-template-columns: 96px minmax(0, 1fr) minmax(0, 96px); gap: 4px 8px; align-items: center; min-width: 0; }
+.var-axis select, .var-axis input { width: 100%; min-width: 0; }
+.var-axis .field-error { grid-column: 1 / -1; }
+.var-fields { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px 16px; min-width: 0; }
+.var-fields .field { flex: 1 1 170px; }
+.var-fields .var-values { flex-basis: 280px; }
+.var-shared { margin: 0; }

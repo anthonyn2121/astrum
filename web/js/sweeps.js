@@ -3,8 +3,7 @@
 // in-process), the run settings, and the plan: what the sweep would fly, as
 // POST /api/sweeps/plan says it, re-planned as the form changes. Save writes
 // config/sweep.<name>.toml for `astrum sweep`; `?sweep=<name>` (or the Saved
-// sweeps list) opens one. The variation joins the request through
-// variationFields().
+// sweeps list) opens one. The variation (variation.js) joins the request.
 //
 // Names, summaries, plans and errors from the server and catalogs are
 // untrusted: they reach the DOM as text only.
@@ -13,6 +12,7 @@ import { ApiError, getControllers, getSavedSweep, getSavedSweeps, planSweep, sav
 import { $, h, showError } from "./dom.js";
 import { ControllerForm } from "./ctlform.js";
 import { ScenarioPicker } from "./scenariopicker.js";
+import { VariationForm } from "./variation.js";
 
 const PLAN_DEBOUNCE_MS = 400;
 const PLAN_ROWS = 20;        // the plan table's rows; the rest is counted
@@ -27,6 +27,7 @@ const el = {
   planTrim: $("planTrim"), planWrap: $("planWrap"), planTable: $("planTable"), planMore: $("planMore"),
   checkTrims: $("checkTrims"), saveForm: $("saveForm"), saveName: $("saveName"), saveSummary: $("saveSummary"),
   saveError: $("saveError"), saveSubmit: $("saveSubmit"), saveReplace: $("saveReplace"), saveResult: $("saveResult"),
+  variation: $("variation"),
 };
 
 const state = {
@@ -38,6 +39,7 @@ const state = {
 };
 
 let form = null; // the controller form; made once the catalogs are loaded
+let variation = null; // the variation form; made with the controller form
 
 const picker = new ScenarioPicker({
   envList: $("envList"), scenarioList: $("scenarioList"), scenarioEmpty: $("scenarioEmpty"),
@@ -52,6 +54,7 @@ function onPick(entry, doc, error) {
   state.scenario = entry;
   state.doc = doc;
   form.setScenario(doc);
+  variation.setScenario(doc);
   el.fleetEmpty.hidden = !!entry && !error;
   el.fleetEmpty.textContent = error ? `Cannot read scenario ${entry.name}: ${error}` : "Pick a scenario first.";
   showError(el.fleetError, "");
@@ -80,12 +83,6 @@ function numberOf(input, errorNode, { integer = false, min = 0, exclusive = fals
   return msg ? undefined : x;
 }
 
-// The variation's request fields (perturb, vary, samples, sample_seed,
-// min_separation_m, min_alt_hae_m); there is no variation yet.
-function variationFields() {
-  return {};
-}
-
 // The POST /api/sweeps/plan body for the form: the picked scenario, its
 // controllers and the run settings, plus the variation's fields. Null while no
 // scenario is picked or a field is not valid; every problem is marked.
@@ -96,7 +93,8 @@ function buildRequest() {
   const repeats = numberOf(el.repeats, el.repeatsError, { integer: true, min: 1 });
   const jobs = numberOf(el.jobs, el.jobsError, { integer: true, min: 0 });
   const runTimeout = numberOf(el.runTimeout, el.runTimeoutError, { min: 0 });
-  if (!ok || [maxTime, repeats, jobs, runTimeout].includes(undefined)) return null;
+  const fields = variation.fields();
+  if (!ok || !fields || [maxTime, repeats, jobs, runTimeout].includes(undefined)) return null;
   return {
     scenario: state.scenario.name,
     assignments,
@@ -104,7 +102,7 @@ function buildRequest() {
     repeats,
     jobs,
     run_timeout_s: runTimeout,
-    ...variationFields(),
+    ...fields,
   };
 }
 
@@ -260,6 +258,7 @@ async function openSweep(name) {
   const { request } = saved;
   if (!(await picker.pick(request.scenario))) return; // the picker says why
   showError(el.fleetError, form.setAssignments(request.assignments).join("; "));
+  variation.setFields(request);
   el.maxTime.value = String(request.max_time_s);
   el.repeats.value = String(request.repeats);
   el.jobs.value = String(request.jobs);
@@ -306,6 +305,7 @@ async function boot() {
   try {
     const [controllers] = await Promise.all([getControllers(), picker.load()]);
     form = new ControllerForm({ host: el.fleet, controllers: Array.isArray(controllers) ? controllers : [] });
+    variation = new VariationForm({ host: el.variation, onChange: changed });
   } catch (e) {
     showError(el.loadError, `Cannot load the studio catalogs: ${e.message || e}`);
     return;
