@@ -1,46 +1,63 @@
 //! `astrum-web` — stream live/replayed telemetry to the browser and serve the
 //! static 3-D renderer, on one port.
 //!
-//!  * **`GET /telemetry`** (WebSocket) — one JSON message per fleet snapshot,
-//!    `{"type":"frames","frames":[FrameJson…]}`, at most `--max-hz` per second,
+//!  * **`GET /telemetry`** (WebSocket) — every aircraft's telemetry thinned to
+//!    at most `--sample-hz` samples per SIM second (plus each aircraft's
+//!    newest), batched as `{"type":"frames","frames":[FrameJson…]}` at most
+//!    `--max-hz` times per wall second (several samples per aircraft each,
+//!    time-ordered per aircraft),
 //!    plus every `astrum/events` event as `{"type":"events","events":[EventJson…]}`
 //!    (in order, never throttled; a browser that connects mid-run gets only the
 //!    events from then on), plus the scenario's aircraft models as
 //!    `{"type":"models","models":[{"id":1,"model":"f16"}…]}` (on connect and
-//!    whenever they change). The upstream is the Zenoh stream, so the source is
-//!    either the live sim or `astrum-bag-play`. Upgrades from another origin are
-//!    refused.
+//!    whenever they change), plus `{"type":"run","run":N,"endpoint":"…"}` on
+//!    connect and whenever the bridge is attached elsewhere (everything after
+//!    it belongs to the new run). The upstream is the Zenoh stream, so the
+//!    source is either the live sim or `astrum-bag-play`. Upgrades from another
+//!    origin, or naming a `Host` other than `localhost`, an IP address or one
+//!    of `--allowed-hosts`, are refused.
+//!  * **`/api/…`** — the JSON API (`astrum_web::api`): bridge status and run
+//!    control, the studio's catalogs, its live interactive runs and its sweeps
+//!    (one of each at a time, under `--runs-dir`), behind the same `Host` check.
 //!  * **`GET /tiles/<z>/<x>/<y>.jpg`** — slippy-map tile proxy with a disk cache.
 //!  * **`GET /…`** — static files from `--root`.
+//!
+//! The bridge attaches to `--connect` at startup and keeps retrying in the
+//! background until a sim answers there; the server runs whether or not one
+//! ever does. Starting a run (`POST /api/runs`) re-attaches it to that run's
+//! sim. Shutting the server down stops the active run and sweep first.
 //!
 //! Config (CLI arg > env > default): see `--help`.
 
 use std::error::Error;
-use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use astrum_net::{EventReceiver, LatestTelemetry, Selection, Session};
-use astrum_web::server::{self, Config, EVENT_BACKLOG};
+use astrum_sim::launch::sibling;
+use astrum_web::bridge::{Bridge, BridgeConfig};
+use astrum_web::catalogs::Catalogs;
+use astrum_web::runs::{Runs, RunsConfig};
+use astrum_web::server::{self, Config};
+use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig, STOP_GRACE};
 use clap::Parser;
-use tokio::sync::{broadcast, mpsc, watch};
 
 /// How often the scenario is re-fetched, so a restarted sim or replay with
 /// another fleet reaches the browsers within a few seconds.
 const MODELS_POLL: Duration = Duration::from_secs(5);
+
+/// The first loopback port a process-mode web sweep's run listens on (run N
+/// on `SWEEP_BASE_PORT + N - 1`).
+const SWEEP_BASE_PORT: u16 = 27500;
 
 /// Stream live/replayed telemetry to browsers over WebSocket and serve the
 /// static 3-D renderer, both on one port.
 #[derive(Parser)]
 #[command(name = "astrum-web", version, about)]
 struct Cli {
-    /// Zenoh endpoint to connect to (the sim or a replay).
+    /// Zenoh endpoint of the sim (or replay) to attach to at startup; the
+    /// bridge waits for one to answer there.
     #[arg(long, env = "ASTRUM_ZENOH_CONNECT", default_value = astrum_net::DEFAULT_CONNECT_ENDPOINT)]
     connect: String,
-
-    /// Seconds to wait for the sim (or replay) to accept the connection.
-    #[arg(long, env = "ASTRUM_CONNECT_TIMEOUT_S", default_value_t = 60.0)]
-    connect_timeout: f64,
 
     /// HTTP/WebSocket listen address (loopback by default; pass 0.0.0.0:8080 to
     /// expose it, e.g. inside a container).
@@ -51,9 +68,15 @@ struct Cli {
     #[arg(long, env = "ASTRUM_WEB_ROOT", default_value = "web")]
     root: PathBuf,
 
-    /// Most fleet snapshots per second sent to each browser.
+    /// Most sample batches per (wall) second sent to each browser.
     #[arg(long, env = "ASTRUM_WEB_MAX_HZ", default_value_t = 30.0)]
     max_hz: f64,
+
+    /// Most telemetry samples per aircraft per SIM second sent to each browser
+    /// (each batch also carries every aircraft's newest sample), so trails stay
+    /// smooth when the sim runs faster than real time.
+    #[arg(long, env = "ASTRUM_WEB_SAMPLE_HZ", default_value_t = 30.0)]
+    sample_hz: f64,
 
     /// Upstream slippy-map tile template (`{z}`/`{x}`/`{y}` placeholders); the
     /// renderer's ground map is proxied + cached through `/tiles/`. Default: Esri
@@ -69,66 +92,82 @@ struct Cli {
     /// tile fetched once while online is served from here afterwards (offline).
     #[arg(long, env = "ASTRUM_TILE_CACHE", default_value = "tilecache")]
     tile_cache: PathBuf,
+
+    /// Extra host names (comma-separated, no port) the telemetry WebSocket and
+    /// `/api` answer for, besides `localhost` and IP addresses — e.g. the
+    /// machine's DNS name when browsing to it from elsewhere. Any other `Host`
+    /// is refused, so a rebound attacker domain cannot reach them.
+    #[arg(long, env = "ASTRUM_WEB_ALLOWED_HOSTS", value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
+
+    /// Config directory: the controller catalog (`controllers.toml`, read at
+    /// startup) and the scenarios (`scenario.<name>.toml`) the studio offers.
+    #[arg(long, env = "ASTRUM_CONFIG_DIR", default_value = "config")]
+    config_dir: PathBuf,
+
+    /// Where live interactive runs go: one directory per run (its
+    /// `scenario.toml`, `run.mcap` and `metrics.json`).
+    #[arg(long, env = "ASTRUM_RUNS_DIR", default_value = "runs/web")]
+    runs_dir: PathBuf,
+
+    /// The `astrum-sim` binary live runs fly on (default: next to this one).
+    #[arg(long, env = "ASTRUM_SIM_BIN")]
+    sim: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    if !(cli.max_hz.is_finite() && cli.max_hz > 0.0) {
-        return Err(format!("--max-hz must be a positive number, got {}", cli.max_hz).into());
+    let period = |flag: &str, hz: f64| -> Result<Duration, String> {
+        Some(hz)
+            .filter(|hz| hz.is_finite() && *hz > 0.0)
+            .and_then(|hz| Duration::try_from_secs_f64(1.0 / hz).ok())
+            .ok_or_else(|| format!("{flag} must be a positive number, got {hz}"))
+    };
+    let min_period = period("--max-hz", cli.max_hz)?;
+    let sample_period = period("--sample-hz", cli.sample_hz)?;
+    let mut allowed_hosts = Vec::new();
+    for host in cli.allowed_hosts.iter().map(|h| h.trim()).filter(|h| !h.is_empty()) {
+        if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+            return Err(format!(
+                "--allowed-hosts: {host:?} is not a bare host name (letters, digits, '.', '-'; \
+                 no port)"
+            )
+            .into());
+        }
+        allowed_hosts.push(host.to_owned());
     }
-    let min_period = Duration::from_secs_f64(1.0 / cli.max_hz);
-    let wait = Duration::try_from_secs_f64(cli.connect_timeout)
-        .map_err(|e| format!("--connect-timeout {}: {e}", cli.connect_timeout))?;
+    let catalogs = Catalogs::load(&cli.config_dir).map_err(|e| e.to_string())?;
+    let bridge = Bridge::new(BridgeConfig { min_period, sample_period, models_poll: MODELS_POLL });
+    bridge.attach(&cli.connect);
+    let sim = cli.sim.unwrap_or_else(|| sibling("astrum-sim"));
+    let runs = Runs::new(
+        RunsConfig { dir: cli.runs_dir, sim, connect: cli.connect.clone() },
+        bridge.clone(),
+    );
+    let sweeps = SweepRuns::new(SweepRunsConfig {
+        dir: runs.config().dir.join("sweeps"),
+        sim: runs.config().sim.clone(),
+        base_port: SWEEP_BASE_PORT,
+        stop_grace: STOP_GRACE,
+    });
 
-    // Zenoh's blocking API runs on its own runtime: drive it from plain threads,
-    // outside this one. Each pump reports why it stopped through `stopped`.
-    let (tx, rx) = watch::channel(None);
-    let (events_tx, _) = broadcast::channel(EVENT_BACKLOG);
-    let (models_tx, models_rx) = watch::channel(None);
-    let (stopped_tx, mut stopped) = mpsc::unbounded_channel::<String>();
-    let connect = cli.connect.clone();
-    let pump_events_tx = events_tx.clone();
-    std::thread::Builder::new().name("telemetry".into()).spawn(move || {
-        let result = Session::connect(&connect, wait).and_then(|session| {
-            let mut latest = LatestTelemetry::subscribe(&session, Selection::Fleet)?;
-            let events = EventReceiver::subscribe(&session)?;
-            let (models_stopped, models_from) = (stopped_tx.clone(), connect.clone());
-            let models_session = session.clone();
-            std::thread::Builder::new()
-                .name("models".into())
-                .spawn(move || {
-                    let e = server::pump_models(&models_session, &models_tx, MODELS_POLL);
-                    let _ = models_stopped.send(format!("scenario from {models_from}: {e}"));
-                })
-                .expect("spawning the models thread");
-            let (events_stopped, events_from) = (stopped_tx.clone(), connect.clone());
-            let session = session.clone(); // keeps the event subscription's session open
-            std::thread::Builder::new()
-                .name("events".into())
-                .spawn(move || {
-                    let _session = session;
-                    let e = server::pump_events(&events, &pump_events_tx);
-                    let _ = events_stopped.send(format!("events from {events_from}: {e}"));
-                })
-                .expect("spawning the events thread");
-            server::pump_snapshots(&mut latest, &tx, min_period)
-        });
-        let why = match result {
-            Ok(()) => "telemetry pump stopped".to_owned(),
-            Err(e) => format!("telemetry from {connect}: {e}"),
-        };
-        let _ = stopped_tx.send(why);
-    })?;
-
-    let cfg = Config { root: cli.root, tile_url: cli.tile_url, tile_cache: cli.tile_cache };
+    let cfg = Config {
+        root: cli.root,
+        tile_url: cli.tile_url,
+        tile_cache: cli.tile_cache,
+        allowed_hosts,
+        catalogs,
+        runs: runs.clone(),
+        sweeps: sweeps.clone(),
+    };
     let tiles = if cfg.tile_url.is_empty() {
         format!("cache-only ({})", cfg.tile_cache.display())
     } else {
         format!("{} → cache {}", cfg.tile_url, cfg.tile_cache.display())
     };
     let root = cfg.root.display().to_string();
-    let app = server::router(cfg, rx, events_tx, models_rx)?;
+    let app = server::router(cfg, bridge)?;
 
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await
@@ -136,16 +175,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr = listener.local_addr()?;
     println!("[astrum-web] serving {root} on http://{addr}");
     println!(
-        "[astrum-web] telemetry WebSocket at ws://{addr}/telemetry (upstream {}, ≤{} Hz)",
-        cli.connect, cli.max_hz
+        "[astrum-web] telemetry WebSocket at ws://{addr}/telemetry (attached to {}, ≤{} \
+         samples per sim second in ≤{} batches per second)",
+        cli.connect, cli.sample_hz, cli.max_hz
     );
     println!("[astrum-web] map tiles: {tiles}");
+    println!(
+        "[astrum-web] live runs: {} into {}",
+        runs.config().sim.display(),
+        runs.config().dir.display()
+    );
+    let host =
+        if addr.ip().is_unspecified() { "localhost".to_owned() } else { addr.ip().to_string() };
+    println!("[astrum-web] studio ready: open http://{host}:{}/ (Ctrl-C to stop)", addr.port());
 
-    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-    tokio::select! {
-        served = serve.into_future() => Ok(served?),
-        why = stopped.recv() => Err(why.unwrap_or_else(|| "telemetry thread panicked".to_owned()).into()),
-    }
+    let closing = runs.clone();
+    let closing_sweeps = sweeps.clone();
+    let shutdown = async move {
+        shutdown_signal().await;
+        // Stop the active run now: open WebSockets hold the graceful shutdown.
+        closing.close();
+        closing_sweeps.close();
+    };
+    let served = axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+    // Wait for the run's processes to be reaped (and its metrics written).
+    tokio::task::spawn_blocking(move || {
+        runs.shutdown();
+        sweeps.shutdown();
+    })
+    .await?;
+    served?;
+    Ok(())
 }
 
 /// Resolves on Ctrl-C or SIGTERM (`docker stop`).

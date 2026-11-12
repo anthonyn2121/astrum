@@ -3,11 +3,14 @@
 //  * WebSocket — the `astrum-web` bridge streams fleet snapshots,
 //    `{"type":"frames","frames":[FrameJson…]}`, run events,
 //    `{"type":"events","events":[EventJson…]}`, from the live sim or
-//    `astrum-bag-play`, and each aircraft's JSBSim model from the scenario,
-//    `{"type":"models","models":[{"id","model"}…]}` (on connect and on change).
+//    `astrum-bag-play`, each aircraft's JSBSim model from the scenario,
+//    `{"type":"models","models":[{"id","model"}…]}` (on connect and on change),
+//    and which run it carries, `{"type":"run","run":N,"endpoint"}` (on connect
+//    and whenever the bridge is attached elsewhere: a new run starts there).
 //    The store buffers frames and events so you can scrub back through what's
 //    been received (events only from when this page connected).
-//  * File — an `astrum-web-export` document (a whole bag baked to JSON). Loaded
+//  * File — an `astrum-web-export` document (a whole bag baked to JSON), from a
+//    file or a finished studio run (`GET /api/runs/<id>/replay`). Loaded
 //    whole, giving a fully seekable timeline with no running services; its
 //    `meta.models` names the models.
 
@@ -32,10 +35,11 @@ export function parseModels(list) {
 }
 
 export class Net {
-  constructor({ onFrames, onEvents, onModels, onStatus }) {
+  constructor({ onFrames, onEvents, onModels, onRun, onStatus }) {
     this.onFrames = onFrames;
     this.onEvents = onEvents || (() => {});
     this.onModels = onModels || (() => {});
+    this.onRun = onRun || (() => {});
     this.onStatus = onStatus || (() => {});
     this.ws = null;
   }
@@ -68,6 +72,7 @@ export class Net {
       if (msg.type === "frames" && Array.isArray(msg.frames)) this.onFrames(msg.frames);
       else if (msg.type === "events" && Array.isArray(msg.events)) this.onEvents(msg.events);
       else if (msg.type === "models") this.onModels(parseModels(msg.models));
+      else if (msg.type === "run" && Number.isInteger(msg.run)) this.onRun(msg.run);
     };
   }
 
@@ -91,14 +96,18 @@ export function defaultWsUrl() {
   return `${proto}//${host}/telemetry`;
 }
 
-// Parse an astrum-web-export document. Returns { frames, events, meta, models }
-// (models: Map id -> JSBSim model, empty for exports without them) or throws.
-export async function loadExportFile(file) {
-  let doc;
-  try {
-    doc = JSON.parse(await file.text());
-  } catch {
-    throw new Error("not JSON (expected an astrum-web-export document)");
+// Parse an astrum-web-export document — a File/Blob of JSON, or the document
+// already parsed (untrusted either way). Returns { frames, events, meta,
+// models } (models: Map id -> JSBSim model, empty for exports without them)
+// or throws.
+export async function loadExportFile(source) {
+  let doc = source;
+  if (source instanceof Blob) {
+    try {
+      doc = JSON.parse(await source.text());
+    } catch {
+      throw new Error("not JSON (expected an astrum-web-export document)");
+    }
   }
   if (!doc || doc.kind !== EXPORT_KIND || !Array.isArray(doc.frames)) {
     throw new Error("not an ASTRUM replay export (expected an astrum-web-export document)");

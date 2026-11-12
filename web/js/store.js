@@ -6,7 +6,9 @@
 // playback, scrubbing and slow-motion all read from the same history.
 //
 //  * Live tracks are fixed-capacity ring buffers: O(1) append, the oldest
-//    sample is overwritten once a track is full.
+//    sample is overwritten once a track is full. The bridge sends batches of
+//    samples thinned by sim time (several per aircraft, time-ordered per
+//    aircraft); they are appended in order.
 //  * File tracks keep every frame of the opened export.
 //
 // Run events (hits, kills, …) sit in one list sorted by sim time beside the
@@ -17,8 +19,13 @@
 // the id, kind and clock and coerce every other field to a finite number /
 // known string.
 
-// Live history per aircraft: 20 min at the bridge's default 30 Hz.
-const LIVE_CAPACITY = 36000;
+// Live history per aircraft: 20 min of SIM time at the bridge's default
+// `--sample-hz` of 30 (whatever the sim's speed: the bridge thins by sim
+// time). A higher `--sample-hz` shortens the window in proportion, and so does
+// slow motion below 1×, where each batch's newest sample comes on top.
+const LIVE_WINDOW_S = 20 * 60;
+const LIVE_SAMPLE_HZ = 30;
+const LIVE_CAPACITY = LIVE_WINDOW_S * LIVE_SAMPLE_HZ;
 
 // Continuous fields, linearly interpolated between samples.
 const LERP_FIELDS = [
@@ -158,10 +165,16 @@ export class Store {
 
   get frameCount() { return this._frameCount; }
 
-  // Live: append one snapshot of frames. Returns false — having stopped — if an
-  // aircraft's clock went backwards (a new run started); the caller resets the
-  // store and appends the snapshot again.
+  // Live: append one batch of frames — several samples per aircraft, each
+  // aircraft's in time order. Within a batch, a sample no newer than the
+  // aircraft's previous one in the batch is a duplicate and ignored; one at
+  // the same time as the newest buffered sample replaces it (a re-sent
+  // newest). Returns false — having stopped — if an aircraft's first sample
+  // in the batch is older than its newest buffered one (its clock went
+  // backwards: a new run started); the caller resets the store and appends
+  // the batch again.
   appendLive(frames) {
+    const seen = new Set(); // aircraft already appended to from this batch
     for (const f of frames) {
       const p = parseFrame(f);
       if (!p) continue;
@@ -173,9 +186,15 @@ export class Store {
       }
       const ring = track.samples;
       const last = ring.last();
-      if (last && p.s.t < last.t) return false;
+      const first = !seen.has(p.id);
+      seen.add(p.id);
+      if (last && p.s.t < last.t) {
+        if (first) return false;
+        continue;
+      }
       if (last && p.s.t === last.t) {
-        ring.setLast(p.s); // same tick re-published: replace
+        if (!first) continue;
+        ring.setLast(p.s); // the newest re-sent: replace
       } else {
         if (ring.push(p.s)) this._minStale = true;
         else if (ring.length === 1 && p.s.t < this._min) this._min = p.s.t;

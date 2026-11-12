@@ -2,26 +2,37 @@
 //! browser-based 3-D replay renderer (`web/`).
 //!
 //! It defines ONE JSON shape per message kind — [`FrameJson`] for telemetry,
-//! [`EventJson`] for `astrum/events`, [`AircraftModel`] for the fleet's JSBSim
-//! models — used by both delivery paths:
+//! [`EventJson`] for `astrum/events`, [`astrum_bag::AircraftModel`] for the
+//! fleet's JSBSim models — used by both delivery paths:
 //!
-//! * **live / replay stream** — the `astrum-web` binary ([`server`]) tracks the
-//!   newest telemetry of every aircraft (the live sim *or* `astrum-bag-play`) and
-//!   pushes rate-limited fleet snapshots ([`snapshot_message`]), every event
-//!   ([`events_message`]) and the scenario's aircraft models
-//!   ([`models_message`]) to every connected browser over WebSocket, while also
-//!   serving the static renderer.
+//! * **live / replay stream** — the `astrum-web` binary ([`server`]) attaches a
+//!   [`bridge::Bridge`] to the live sim *or* `astrum-bag-play`, thins every
+//!   aircraft's telemetry by sim time and pushes rate-limited batches of it
+//!   ([`frames_message`]), every event ([`events_message`]), the scenario's
+//!   aircraft models ([`models_message`]) and each change of attachment
+//!   ([`run_message`]) to every connected browser over WebSocket, while also
+//!   serving the static renderer and the JSON [`api`] (including the studio's
+//!   live interactive runs, [`runs`]).
 //! * **offline export** — the `astrum-web-export` binary ([`export`]) reads an
 //!   MCAP bag and bakes it into a single [`ExportDoc`] the renderer can open with
 //!   no running services.
 //!
 //! Keeping the shapes here means the live stream and the exporter cannot drift.
 
+pub mod api;
+pub mod assign;
+pub mod bridge;
+pub mod catalogs;
 pub mod export;
+pub mod runs;
+pub mod scenarios;
 pub mod server;
+pub mod sweepruns;
+pub mod sweeps;
 
+use astrum_bag::{aircraft_models, AircraftModel};
 use astrum_proto::{Enu, Event, EventKind, Telemetry, VehicleKind};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// The renderer's name for a vehicle class (matches the scenario `kind` field
 /// and the browser's mesh factory).
@@ -116,7 +127,7 @@ impl FrameJson {
     }
 }
 
-/// One live WebSocket message: the newest state of every tracked aircraft.
+/// One live WebSocket message: a batch of telemetry samples.
 #[derive(Serialize)]
 struct FramesMessage<'a> {
     #[serde(rename = "type")]
@@ -124,10 +135,11 @@ struct FramesMessage<'a> {
     frames: &'a [FrameJson],
 }
 
-/// Encode a fleet snapshot as the live stream's message,
-/// `{"type":"frames","frames":[FrameJson…]}`.
-pub fn snapshot_message(snapshot: &[Telemetry]) -> String {
-    let frames: Vec<FrameJson> = snapshot.iter().map(FrameJson::from_telemetry).collect();
+/// Encode a batch of samples as the live stream's message,
+/// `{"type":"frames","frames":[FrameJson…]}`, in the batch's order (the bridge
+/// sends several samples per aircraft, time-ordered per aircraft).
+pub fn frames_message(samples: &[Telemetry]) -> String {
+    let frames: Vec<FrameJson> = samples.iter().map(FrameJson::from_telemetry).collect();
     // Serialising plain structs of numbers / static strings into a String
     // cannot fail (non-finite floats become `null`).
     serde_json::to_string(&FramesMessage { kind: "frames", frames: &frames })
@@ -252,44 +264,6 @@ pub fn events_message(events: &[Event]) -> String {
         .unwrap_or_else(|e| unreachable!("EventJson serialisation failed: {e}"))
 }
 
-/// One aircraft's JSBSim model as the scenario declares it. Telemetry carries
-/// only the vehicle class, so this is how the renderer learns that, say,
-/// aircraft 1 is an F-16 (and draws the daytime environment for it).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct AircraftModel {
-    pub id: u32,
-    /// The scenario's `model` string, e.g. `"f16"` or `"c172x"`.
-    pub model: String,
-}
-
-/// The part of a scenario TOML [`aircraft_models`] reads; every other key is
-/// ignored, so scenario schema changes elsewhere cannot break it.
-#[derive(Deserialize)]
-struct ScenarioFleet {
-    #[serde(default)]
-    aircraft: Vec<ScenarioAircraft>,
-}
-
-#[derive(Deserialize)]
-struct ScenarioAircraft {
-    id: Option<u32>,
-    model: Option<String>,
-}
-
-/// The `[[aircraft]]` ids and models of a scenario TOML, sorted by id. Entries
-/// missing either field are skipped; TOML that does not parse (or whose fleet
-/// has the wrong shape) yields none — the renderer then keeps its default look.
-pub fn aircraft_models(scenario_toml: &str) -> Vec<AircraftModel> {
-    let Ok(fleet) = toml::from_str::<ScenarioFleet>(scenario_toml) else { return Vec::new() };
-    let mut models: Vec<AircraftModel> = fleet
-        .aircraft
-        .into_iter()
-        .filter_map(|a| Some(AircraftModel { id: a.id?, model: a.model? }))
-        .collect();
-    models.sort_by_key(|m| m.id);
-    models
-}
-
 /// One live WebSocket message: the fleet's aircraft models.
 #[derive(Serialize)]
 struct ModelsMessage<'a> {
@@ -303,6 +277,24 @@ struct ModelsMessage<'a> {
 pub fn models_message(models: &[AircraftModel]) -> String {
     serde_json::to_string(&ModelsMessage { kind: "models", models })
         .unwrap_or_else(|e| unreachable!("AircraftModel serialisation failed: {e}"))
+}
+
+/// One live WebSocket message: which attachment the stream now carries.
+#[derive(Serialize)]
+struct RunMessage<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    run: u64,
+    endpoint: Option<&'a str>,
+}
+
+/// Encode a run change as the live stream's message,
+/// `{"type":"run","run":N,"endpoint":"tcp/…"}` (`endpoint` is `null` while
+/// nothing is attached). A new `run` means everything sent before it belongs
+/// to another sim or run: the browser starts a fresh timeline.
+pub fn run_message(run: u64, endpoint: Option<&str>) -> String {
+    serde_json::to_string(&RunMessage { kind: "run", run, endpoint })
+        .unwrap_or_else(|e| unreachable!("run message serialisation failed: {e}"))
 }
 
 /// One exported telemetry sample plus the recorder's receive time.

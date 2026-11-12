@@ -1,6 +1,7 @@
 // Entry point: wire the timeline store, the 3-D scene, the telemetry sources and
-// the HUD (shell, fleet list, inspector, event log, plots) together, then run
-// the animation / playback loop.
+// the HUD (shell, fleet list, inspector, event log, plots, the live sim's
+// control bar and — with ?run=<id> — the studio run's panel) together, then
+// run the animation / playback loop.
 //
 // main.js is the single source of truth for playback and selection state. The
 // store buffers telemetry keyed on sim time; the scene is a pure function of
@@ -10,6 +11,7 @@
 import { Store } from "./store.js";
 import { Scene } from "./scene.js";
 import { Net, defaultWsUrl, loadExportFile } from "./net.js";
+import { getSweepReplay } from "./api.js";
 import { UI } from "./ui.js";
 import { FleetList } from "./fleet.js";
 import { Inspector } from "./inspector.js";
@@ -17,6 +19,8 @@ import { EventLog, EVENT_GROUPS } from "./eventlog.js";
 import { Plots, CHANNELS } from "./plots.js";
 import { relativeGeometry } from "./geometry.js";
 import { loadPrefs, savePrefs } from "./prefs.js";
+import { SimControl } from "./simcontrol.js";
+import { RunPanel } from "./runpanel.js";
 
 // A playhead move longer than this (sim s) in one frame is a seek: the events
 // it skips over are not flashed.
@@ -54,6 +58,7 @@ const state = {
   prevPlayhead: NaN, // last frame's playhead; events crossed since get flashed
   fleetDirty: true,
   models: new Map(), // aircraft id -> JSBSim model (scenario), when known
+  liveRun: null,     // the bridge's run id on this connection, once announced
 };
 
 // ---- colours ----
@@ -94,7 +99,7 @@ const ui = new UI({
   onSpeed: (v) => { state.speed = v; },
   onConnect: (url) => connect(url || defaultWsUrl()),
   onRetry: () => connect(state.wsUrl || defaultWsUrl()),
-  onFile: (file) => openFile(file),
+  onFile: (file) => openFile(file, file.name),
   onCamera: (mode) => { scene.setCameraMode(mode); ui.setCameraMode(scene.cameraMode); },
   onFit: () => { scene.frameFleet(); ui.setCameraMode(scene.cameraMode); },
   onToggle: (key, val) => {
@@ -159,6 +164,14 @@ const plots = new Plots({
 });
 plots.setVisible(ui.plotsVisible);
 
+// The page's address: one run of a sweep (view.html?sweep=<id>&run=<n>, its bag), or
+// a studio run this page was opened for (view.html?run=<id>, its panel).
+const params = new URLSearchParams(location.search);
+const sweepId = params.get("sweep");
+const runId = sweepId === null ? params.get("run") : null;
+const simControl = new SimControl({ enabled: () => state.mode === "live" });
+const runPanel = runId ? new RunPanel({ runId, onReplay: (doc, label) => openFile(doc, label) }) : null;
+
 ui.setToggles(state);
 ui.setModelScale(state.modelScale);
 scene.setModelScale(state.modelScale);
@@ -190,6 +203,17 @@ const net = new Net({
     }
   },
   onModels: (models) => { state.models = models; },
+  onRun: (run) => {
+    // The bridge was attached to another sim or run: start a fresh timeline
+    // (its models follow), following it live like a fresh connection.
+    if (state.liveRun !== null && run !== state.liveRun) {
+      startLiveRun();
+      state.models = new Map();
+      state.followLive = true;
+      state.playing = true;
+    }
+    state.liveRun = run;
+  },
   onStatus: (st, label) => {
     state.status = st;
     ui.setStatus(st, label);
@@ -226,6 +250,7 @@ function startLiveRun() {
 function connect(url) {
   startLiveRun();
   state.models = new Map(); // the bridge sends the scenario's models on connect
+  state.liveRun = null; // ...and its run, which this connection starts on
   state.mode = "live";
   state.wsUrl = url;
   state.fileError = "";
@@ -235,11 +260,13 @@ function connect(url) {
   net.connect(url);
 }
 
-async function openFile(file) {
+// Open an export document: a File/Blob, or one already parsed (a studio run's
+// replay); `name` labels it.
+async function openFile(source, name) {
   net.disconnect();
   state.connected = false;
   try {
-    const { meta, frames, events, models } = await loadExportFile(file);
+    const { meta, frames, events, models } = await loadExportFile(source);
     store.loadFile(frames, events);
     state.models = models;
     scene.clearFleet();
@@ -251,15 +278,40 @@ async function openFile(file) {
     state.playhead = b.min;
     resetSelection();
     state.status = "file";
-    ui.setStatus("file", `${file.name} · ${store.frameCount} frames`
+    ui.setStatus("file", `${name} · ${store.frameCount} frames`
       + ` · ${store.ids().length} aircraft`
       + (store.events.length ? ` · ${store.events.length} events` : "")
       + (meta?.rejected ? ` · ${Number(meta.rejected)} rejected` : ""));
   } catch (e) {
-    state.fileError = String(e.message || e);
-    state.status = "error";
-    ui.setStatus("error", state.fileError);
+    fileFailed(String(e.message || e));
   }
+}
+
+// A recording that cannot be opened: the viewer's status says why.
+function fileFailed(msg) {
+  state.fileError = msg;
+  state.status = "error";
+  ui.setStatus("error", msg);
+}
+
+// view.html?sweep=<id>&run=<n>: the header names the run, and its bag opens as a
+// studio run's replay does. A refusal (no such run, no bag) is the viewer's error.
+async function openSweepRun(id, n) {
+  const ref = document.getElementById("sweepRef");
+  ref.textContent = `← Sweep (run ${n})`;
+  ref.title = `Back to sweep ${id}`;
+  ref.href = `./sweep.html?id=${encodeURIComponent(id)}`;
+  ref.hidden = false;
+  let doc;
+  try {
+    doc = await getSweepReplay(id, n);
+  } catch (e) {
+    net.disconnect();
+    state.connected = false;
+    fileFailed(String(e.message || e));
+    return;
+  }
+  await openFile(doc, `sweep ${id} · run ${n}`);
 }
 
 // ---- selection & target ----
@@ -403,7 +455,12 @@ function emptyText() {
   if (state.mode === "file" || state.fileError) return state.fileError || "The recording has no telemetry.";
   const url = state.wsUrl || defaultWsUrl();
   if (state.status === "connecting") return `Connecting to ${url}…`;
-  if (state.connected) return `Connected to ${url}. Waiting for the first frame.`;
+  if (runPanel?.replayable) return `Run ${runId} has ended; open its full replay from the run panel.`;
+  if (runPanel?.missing) return `This server has no recorded run ${runId}. Start one from Interactive, or open a recording.`;
+  if (state.connected) {
+    return runId ? `Connected to ${url}. Waiting for run ${runId}'s first frame.`
+      : `Connected to ${url}. Waiting for the first frame.`;
+  }
   return `No live stream at ${url}. Start one with astrum run <scenario> --watch, or open a recording.`;
 }
 
@@ -520,4 +577,11 @@ function tick(now) {
 const initialUrl = defaultWsUrl();
 ui.setWsUrl(initialUrl);
 connect(initialUrl); // auto-attach to the local bridge; the user can open a file instead
+simControl.start();
+runPanel?.start();
+if (sweepId !== null) {
+  const n = params.get("run") ?? "";
+  if (sweepId !== "" && /^\d+$/.test(n)) openSweepRun(sweepId, n);
+  else fileFailed("The address needs ?sweep=<id>&run=<number>.");
+}
 requestAnimationFrame(tick);

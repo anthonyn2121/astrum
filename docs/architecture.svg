@@ -204,7 +204,7 @@
   <rect class="box" x="844" y="798" width="692" height="66" rx="8"/>
   <rect x="844" y="798" width="5" height="66" rx="2.5" fill="#38BDF8"/>
   <text class="cName" x="862" y="820">astrum-web   ·   bridge</text>
-  <text class="cDesc" x="862" y="840">axum · latest-value SUB → snapshot ≤ --max-hz · every event → WS 127.0.0.1:8080</text>
+  <text class="cDesc" x="862" y="840">axum · sampled SUB → batches ≤ --max-hz · every event → WS 127.0.0.1:8080</text>
   <text class="cDesc" x="862" y="857">static web/ · /tiles proxy · Origin check · export ▸ MCAP → astrum-replay v3</text>
 
   <line x1="1190" y1="864" x2="1190" y2="882" stroke="#38BDF8" stroke-width="3" marker-end="url(#mBlue)"/>

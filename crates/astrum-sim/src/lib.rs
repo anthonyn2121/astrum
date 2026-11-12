@@ -19,18 +19,24 @@
 //! `exit_on_signal` → `exit_on_fatal` → `publish_events` → `publish_tick_end`.
 //! Startup spawns the fleet and publishes tick 0 (telemetry, then its tick end).
 
+pub mod catalog;
 pub mod combat;
 pub mod components;
 pub mod control;
+pub mod controllers;
 pub mod env;
 pub mod events;
+pub mod launch;
 pub mod net;
+pub mod perturb;
 pub mod pilot;
 pub mod record;
+pub mod rng;
 pub mod scenario;
 pub mod step_pool;
 pub mod sweep;
 pub mod systems;
+pub mod trim;
 
 use bevy::prelude::*;
 

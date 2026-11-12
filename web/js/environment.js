@@ -1,29 +1,35 @@
 // The world around the fleet — background, fog, lights and the ENU grid — in
-// one of two looks the parent picks from the fleet's models (setMode):
+// one of three looks (setMode):
 //
 //   * "plain": the dark, map-less look every platform gets by default: a
 //     near-black background, a short fog, cool hemisphere + key lights and
 //     the grid;
 //   * "sky": a daytime look for the F-16 scenarios: a shader sky dome with a
 //     sun, a sun light, a long haze, two procedural cloud layers and a ground
-//     map streamed in LOD rings under wherever the camera is looking.
+//     map streamed in LOD rings under wherever the camera is looking;
+//   * "map": the editor's look (scene edit mode): the sky's daylight, dome
+//     and ground map for any fleet, without clouds or near haze, so the
+//     imagery stays clear from straight above; or, with setChart(true), a
+//     dark star chart instead of the dome and imagery (navy, a grid that
+//     keeps its spacing on screen at any zoom, faint fixed stars).
 //
 // The plain objects (lights, grid, fog, background) always exist and are
 // retuned per mode; everything the sky adds is built on entering it and freed
 // on leaving, so a plain session holds no sky GPU resources.
 //
-// The map needs the scenario's geodetic origin, which telemetry doesn't carry.
-// Every sample has both its geodetic and its ENU position, though, and the
-// sim's ENU is the WGS84 tangent plane at the origin (crates/astrum-geo), so
+// The map needs the scenario's geodetic origin. An editor knows it from the
+// scenario's `[world]` (setOrigin); telemetry doesn't carry it, but every
+// sample has both its geodetic and its ENU position, and the sim's ENU is the
+// WGS84 tangent plane at the origin (geo.js, = crates/astrum-geo), so
 // observe() solves the origin exactly from the first geolocated sample. Tile
 // vertices then sit at their exact ENU position on the ellipsoid (h = 0): the
 // map curves away with the Earth just as the aircraft positions do (~120 m
 // below the tangent plane at 40 km out, ~1.8 km at 150 km).
 
 import * as THREE from "three";
+import { Datum, DEG2RAD, WGS84_A } from "./geo.js";
 
-const MODES = new Set(["plain", "sky"]);
-const DEG2RAD = Math.PI / 180;
+const MODES = new Set(["plain", "sky", "map"]);
 
 // Today's dark look, restored exactly whenever the sky is left.
 const PLAIN = {
@@ -50,6 +56,34 @@ const SKY = {
   gridOpacity: 0.1, // a scale cue over the imagery, not a floor
   zenith: 0x2b64c4,
   sunDisc: 0xfff4e0,
+};
+
+// The editor's daylight: the sky's lights, no clouds, and fog only past the
+// map's reach, so a top-down camera ~100 km up sees the imagery unfogged.
+const MAP_LOOK = {
+  ...SKY,
+  fog: { color: HAZE, near: 120000, far: 300000 },
+  gridOpacity: 0.16,
+};
+
+// The editor's star chart (map mode with setChart): the sky's lights over a
+// deep navy ground, no fog, and the chart grid in place of the faint ENU grid.
+const CHART_BG = 0x050a18;
+const CHART_LOOK = {
+  ...MAP_LOOK,
+  background: CHART_BG,
+  fog: { color: CHART_BG, near: 1e7, far: 2e7 },
+  gridOpacity: 0,
+};
+// The chart grid: a plane following the view's focus, fading out toward its
+// edge. Its finest lines are ≥ minPx apart on screen; each tenth one is a
+// brighter major line, and the finest level fades out as the view zooms out.
+const CHART = {
+  half: 2000000,   // m
+  minPx: 20,       // device px
+  minor: 0x14304f,
+  major: 0x5a9ae6,
+  star: 0xcfe2ff,
 };
 
 // The sun: elevation above the horizon and compass azimuth (0 = north,
@@ -111,108 +145,12 @@ const MAP = {
 const ORDER_DOME = -1000;
 const ORDER_MAP = -900;     // + zoom
 const ORDER_CLOUDS = 1;     // + 0.5 for whichever layer is nearer the camera
-
-// WGS84 (crates/astrum-geo).
-const WGS84_A = 6378137;
-const WGS84_F = 1 / 298.257223563;
-const WGS84_E2 = WGS84_F * (2 - WGS84_F);
+const ORDER_CHART = -900;   // the chart grid takes the map's place
 
 // Scratch values for the per-frame paths (never retained).
-const _ecef = { x: 0, y: 0, z: 0 };
-const _ecef2 = { x: 0, y: 0, z: 0 };
 const _enu = { e: 0, n: 0, u: 0 };
 const _centre = { e: 0, n: 0, u: 0 };
 const _geo = { lat: 0, lon: 0, h: 0 };
-
-function geodeticToEcef(lat, lon, h, out) {
-  const sl = Math.sin(lat), cl = Math.cos(lat);
-  const n = WGS84_A / Math.sqrt(1 - WGS84_E2 * sl * sl);
-  out.x = (n + h) * cl * Math.cos(lon);
-  out.y = (n + h) * cl * Math.sin(lon);
-  out.z = (n * (1 - WGS84_E2) + h) * sl;
-  return out;
-}
-
-// Iterates the latitude with a height formula that stays well-conditioned at
-// the poles (the same scheme as astrum-geo).
-function ecefToGeodetic(e, out) {
-  const p = Math.hypot(e.x, e.y);
-  let lat = Math.atan2(e.z, p * (1 - WGS84_E2));
-  let h = 0;
-  for (let i = 0; i < 10; i++) {
-    const s = Math.sin(lat), c = Math.cos(lat);
-    const n = WGS84_A / Math.sqrt(1 - WGS84_E2 * s * s);
-    h = p * c + e.z * s - (WGS84_A * WGS84_A) / n;
-    const next = Math.atan2(e.z, p * (1 - (WGS84_E2 * n) / (n + h)));
-    const done = Math.abs(next - lat) < 1e-14;
-    lat = next;
-    if (done) break;
-  }
-  out.lat = lat;
-  out.lon = Math.atan2(e.y, e.x);
-  out.h = h;
-  return out;
-}
-
-// The scenario's ENU frame: the WGS84 tangent plane at a geodetic origin
-// (radians, metres HAE), as in astrum-geo's LocalFrame.
-class Datum {
-  constructor(lat, lon, h) {
-    this.lat = lat;
-    this.lon = lon;
-    this.h = h;
-    this._o = geodeticToEcef(lat, lon, h, { x: 0, y: 0, z: 0 });
-    const sl = Math.sin(lat), cl = Math.cos(lat), so = Math.sin(lon), co = Math.cos(lon);
-    // Rows of the ECEF → ENU rotation: E, N, U.
-    this._r = new Float64Array([-so, co, 0, -sl * co, -sl * so, cl, cl * co, cl * so, sl]);
-  }
-
-  // Solve the origin from one sample with both a geodetic and an ENU position.
-  // Moving the origin by δ (local metres) moves the sample's ENU by ≈ −δ (up
-  // to a tilt of distance / R), so stepping the origin against the residual
-  // converges to sub-centimetre in a few iterations. Null for an inconsistent
-  // sample.
-  static solve(s) {
-    const lat = s.lat_deg * DEG2RAD, lon = s.lon_deg * DEG2RAD, h = s.alt_hae_m;
-    let lat0 = lat - s.enu_n / WGS84_A;
-    let lon0 = lon - s.enu_e / (WGS84_A * Math.cos(lat));
-    let h0 = h - s.enu_u;
-    for (let i = 0; i < 20; i++) {
-      const d = new Datum(lat0, lon0, h0);
-      d.toEnu(lat, lon, h, _enu);
-      const re = s.enu_e - _enu.e, rn = s.enu_n - _enu.n, ru = s.enu_u - _enu.u;
-      if (Math.hypot(re, rn, ru) < 0.005) return d;
-      const sl = Math.sin(lat0);
-      const w = 1 - WGS84_E2 * sl * sl;
-      const nRad = WGS84_A / Math.sqrt(w);         // prime-vertical radius
-      const mRad = (nRad * (1 - WGS84_E2)) / w;    // meridian radius
-      lat0 -= rn / (mRad + h0);
-      lon0 -= re / ((nRad + h0) * Math.cos(lat0));
-      h0 -= ru;
-    }
-    return null;
-  }
-
-  // Geodetic (radians, m HAE) → ENU metres into `out` { e, n, u }.
-  toEnu(lat, lon, h, out) {
-    const p = geodeticToEcef(lat, lon, h, _ecef);
-    const dx = p.x - this._o.x, dy = p.y - this._o.y, dz = p.z - this._o.z;
-    const r = this._r;
-    out.e = r[0] * dx + r[1] * dy + r[2] * dz;
-    out.n = r[3] * dx + r[4] * dy + r[5] * dz;
-    out.u = r[6] * dx + r[7] * dy + r[8] * dz;
-    return out;
-  }
-
-  // ENU metres → geodetic into `out` { lat, lon, h }.
-  toGeodetic(e, n, u, out) {
-    const r = this._r;
-    _ecef2.x = r[0] * e + r[3] * n + r[6] * u + this._o.x;
-    _ecef2.y = r[1] * e + r[4] * n + r[7] * u + this._o.y;
-    _ecef2.z = r[2] * e + r[5] * n + r[8] * u + this._o.z;
-    return ecefToGeodetic(_ecef2, out);
-  }
-}
 
 // Web-Mercator tile coordinates (fractional) ⇄ geodetic radians; `n` is the
 // tiles per axis (2 ** zoom).
@@ -275,16 +213,23 @@ class GroundMap {
   }
 
   // Throttled: at most every planMs, find the focus tile and finest zoom, and
-  // re-plan only if either changed.
+  // re-plan only if either changed. An orthographic (top-down map) camera has
+  // one scale everywhere; a perspective one is measured at the ground point
+  // below the focus.
   frame(camera, focus, viewH, now) {
     if (now - this._planAt < MAP.planMs) return;
     this._planAt = now;
     const d = this._datum;
     const g = d.toGeodetic(focus.x, -focus.z, focus.y, _geo);
-    const ground = d.toEnu(g.lat, g.lon, 0, _centre);
-    const cam = camera.position;
-    const dist = Math.max(1, Math.hypot(cam.x - ground.e, cam.y - ground.u, cam.z + ground.n));
-    const mPerPx = (dist * 2 * Math.tan((camera.fov * DEG2RAD) / 2)) / Math.max(1, viewH);
+    let mPerPx;
+    if (camera.isOrthographicCamera) {
+      mPerPx = (camera.top - camera.bottom) / camera.zoom / Math.max(1, viewH);
+    } else {
+      const ground = d.toEnu(g.lat, g.lon, 0, _centre);
+      const cam = camera.position;
+      const dist = Math.max(1, Math.hypot(cam.x - ground.e, cam.y - ground.u, cam.z + ground.n));
+      mPerPx = (dist * 2 * Math.tan((camera.fov * DEG2RAD) / 2)) / Math.max(1, viewH);
+    }
     const circ = 2 * Math.PI * WGS84_A * Math.cos(g.lat);
     const z = Math.min(MAP.maxZoom, Math.max(MAP.minZoom, Math.round(Math.log2(circ / (256 * mPerPx)))));
     const n = 2 ** z;
@@ -416,6 +361,11 @@ class GroundMap {
     mesh.position.set(c.e, c.u, -c.n);
     mesh.renderOrder = ORDER_MAP + z;
     return mesh;
+  }
+
+  // Hidden under the editor's chart look; its tiles stay loaded.
+  set visible(v) {
+    this._group.visible = v;
   }
 
   _dropTile(t) {
@@ -575,6 +525,74 @@ function cloudLayer(spec, frag, uniforms) {
   return mesh;
 }
 
+// The chart grid. Spacing comes from the ground metres per pixel at each
+// fragment (fwidth), so it holds on screen in the top-down map and recedes in
+// the orbit view. Opaque on the chart's navy (it is the ground, drawn first
+// like the tiles); faint stars hashed per screen cell sit behind the lines.
+const CHART_VERT = /* glsl */ `
+varying vec2 vXZ;
+void main() {
+  vec4 w = modelMatrix * vec4(position, 1.0);
+  vXZ = w.xz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}`;
+const CHART_FRAG = /* glsl */ `
+uniform vec3 uBg, uMinor, uMajor, uStar;
+uniform vec2 uCentre;
+uniform float uHalf, uMinPx;
+varying vec2 vXZ;
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+// Coverage of lines every \`s\` metres, \`w\` px wide.
+float lines(vec2 p, float s, float w) {
+  vec2 c = p / s;
+  vec2 g = abs(fract(c - 0.5) - 0.5) / fwidth(c);
+  return 1.0 - clamp(min(g.x, g.y) - w + 1.0, 0.0, 1.0);
+}
+void main() {
+  vec2 dp = fwidth(vXZ);
+  float lod = log2(max(max(dp.x, dp.y) * uMinPx, 1e-3)) / log2(10.0);
+  float s0 = pow(10.0, floor(lod)), f = fract(lod);
+  float fine = lines(vXZ, s0, 1.0) * (1.0 - f);
+  float mid = lines(vXZ, s0 * 10.0, 1.0);
+  float major = lines(vXZ, s0 * 100.0, 1.5);
+  vec2 cell = floor(gl_FragCoord.xy / 3.0);
+  float h = hash12(cell);
+  vec3 col = uBg + uStar * step(0.996, h) * (h - 0.996) * 120.0;
+  col = mix(col, uMinor, max(fine * 0.55, mid * mix(0.85, 1.0, f)));
+  col = mix(col, uMajor, max(mid * f * 0.35, major * 0.8));
+  float edge = 1.0 - smoothstep(0.6 * uHalf, uHalf, length(vXZ - uCentre));
+  gl_FragColor = vec4(mix(uBg, col, edge), 1.0);
+  #include <colorspace_fragment>
+}`;
+
+function chartGrid() {
+  const geom = new THREE.PlaneGeometry(2 * CHART.half, 2 * CHART.half);
+  geom.rotateX(-Math.PI / 2); // XY → XZ
+  const mesh = new THREE.Mesh(geom, new THREE.ShaderMaterial({
+    vertexShader: CHART_VERT,
+    fragmentShader: CHART_FRAG,
+    uniforms: {
+      uBg: { value: new THREE.Color(CHART_BG) },
+      uMinor: { value: new THREE.Color(CHART.minor) },
+      uMajor: { value: new THREE.Color(CHART.major) },
+      uStar: { value: new THREE.Color(CHART.star) },
+      uCentre: { value: new THREE.Vector2() },
+      uHalf: { value: CHART.half },
+      uMinPx: { value: CHART.minPx },
+    },
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  }));
+  mesh.frustumCulled = false;
+  mesh.renderOrder = ORDER_CHART;
+  return mesh;
+}
+
 export class Environment {
   constructor(scene, { maxAnisotropy = 1 } = {}) {
     this._scene = scene;
@@ -583,8 +601,10 @@ export class Environment {
     this._t = 0;
     this._datum = null;
     this._failed = new Set(); // tile keys not to request again this source
-    this._sky = null;         // { dome, cumulus, cirrus } while in sky mode
-    this._map = null;         // GroundMap while in sky mode with a datum
+    this._sky = null;         // { dome, clouds: { cumulus, cirrus } | null } in sky / map mode
+    this._map = null;         // GroundMap in sky / map mode with a datum
+    this._chart = false;      // setChart: the map mode's star-chart look
+    this._chartGrid = null;   // its grid, built on first use
 
     // One background colour and one fog, retuned per mode (same fog type, so
     // a mode switch recompiles no material).
@@ -619,31 +639,64 @@ export class Environment {
     return this._mode;
   }
 
-  // "plain" | "sky"; idempotent.
+  // "plain" | "sky" | "map"; idempotent. Sky ⇄ map keeps the dome and the
+  // loaded map tiles and only adds or drops the clouds.
   setMode(mode) {
     if (!MODES.has(mode)) throw new Error(`unknown environment: ${mode}`);
     if (mode === this._mode) return;
     this._mode = mode;
-    if (mode === "sky") {
-      this._applyLook(SKY);
-      this._sun.position.copy(SUN_DIR);
-      this._buildSky();
-    } else {
+    if (mode === "plain") {
       this._disposeSky();
       this._applyLook(PLAIN);
       this._sun.position.copy(PLAIN_SUN_POS);
+      return;
     }
+    this._applyLook(mode === "sky" ? SKY : this._chart ? CHART_LOOK : MAP_LOOK);
+    this._sun.position.copy(SUN_DIR);
+    if (!this._sky) this._buildDome();
+    if (mode === "sky") this._buildClouds();
+    else this._disposeClouds();
+  }
+
+  // The map mode's look: imagery (false, the default) or the star chart. Kept
+  // across modes; only map mode shows it.
+  setChart(on) {
+    if (!!on === this._chart) return;
+    this._chart = !!on;
+    if (this._mode === "map") this._applyLook(this._chart ? CHART_LOOK : MAP_LOOK);
+  }
+
+  // Whether the star chart is showing (chart look in map mode).
+  get chart() {
+    return this._chart && this._mode === "map";
   }
 
   get hasDatum() {
     return this._datum !== null;
   }
 
+  // The scenario's ENU frame (geo.js Datum), null until observed or set.
+  get datum() {
+    return this._datum;
+  }
+
   // Solve the scenario origin from a sample, if it is geolocated (0, 0 is a
-  // sim without geodetic output). Call until hasDatum.
+  // sim without geodetic output). Call until hasDatum; a no-op once an origin
+  // is known (observed or set).
   observe(s) {
     if (this._datum || !Number.isFinite(s.lat_deg) || (s.lat_deg === 0 && s.lon_deg === 0)) return;
     this._datum = Datum.solve(s);
+  }
+
+  // Place the ENU origin explicitly, from a scenario's `[world]` (degrees, m
+  // HAE) — an editor has no telemetry to observe. A different origin drops
+  // the loaded tiles (they sit at their old ENU); the same one is a no-op.
+  setOrigin(latDeg, lonDeg, altHaeM) {
+    if (![latDeg, lonDeg, altHaeM].every(Number.isFinite)) throw new Error("origin must be finite");
+    if (this._datum?.isAt(latDeg, lonDeg, altHaeM)) return;
+    this._map?.dispose();
+    this._map = null;
+    this._datum = Datum.fromDegrees(latDeg, lonDeg, altHaeM);
   }
 
   // The playhead's sim time, which drives the cloud drift.
@@ -661,26 +714,44 @@ export class Environment {
 
   // Per render, after the camera is posed: keep the dome and clouds on the
   // camera, drift the clouds, and stream the map around `focus` (the orbit
-  // target / tracked point). `viewH` is the view height in CSS px.
+  // target / tracked point / map centre). `viewH` is the view height in CSS px.
   frame(camera, focus, viewH) {
+    const chart = this.chart;
+    if (chart && !this._chartGrid) {
+      this._chartGrid = chartGrid();
+      this._scene.add(this._chartGrid);
+    }
+    if (this._chartGrid) {
+      this._chartGrid.visible = chart;
+      this._chartGrid.position.set(focus.x, 0, focus.z);
+      this._chartGrid.material.uniforms.uCentre.value.set(focus.x, focus.z);
+    }
     const sky = this._sky;
     if (!sky) return;
     const cam = camera.position;
+    sky.dome.visible = !chart;
     sky.dome.position.copy(cam);
-    // Drift with the wind: the pattern at x now is the one at x − wind·t at t = 0.
-    const de = WIND_EN[0] * this._t, dn = WIND_EN[1] * this._t;
-    sky.cumulus.position.set(cam.x, 0, cam.z);
-    sky.cumulus.material.uniforms.uOffset.value.set(de, -dn);
-    sky.cirrus.position.set(cam.x, 0, cam.z);
-    sky.cirrus.material.uniforms.uOffset.value.set(de, -dn);
-    // The layer farther from the camera's height draws first, so the nearer
-    // one blends over it.
-    const nearerCumulus = Math.abs(cam.y - CUMULUS.height) < Math.abs(cam.y - CIRRUS.height);
-    sky.cumulus.renderOrder = ORDER_CLOUDS + (nearerCumulus ? 0.5 : 0);
-    sky.cirrus.renderOrder = ORDER_CLOUDS + (nearerCumulus ? 0 : 0.5);
-
+    const clouds = sky.clouds;
+    if (clouds) {
+      // Drift with the wind: the pattern at x now is the one at x − wind·t at t = 0.
+      const de = WIND_EN[0] * this._t, dn = WIND_EN[1] * this._t;
+      clouds.cumulus.position.set(cam.x, 0, cam.z);
+      clouds.cumulus.material.uniforms.uOffset.value.set(de, -dn);
+      clouds.cirrus.position.set(cam.x, 0, cam.z);
+      clouds.cirrus.material.uniforms.uOffset.value.set(de, -dn);
+      // The layer farther from the camera's height draws first, so the nearer
+      // one blends over it.
+      const nearerCumulus = Math.abs(cam.y - CUMULUS.height) < Math.abs(cam.y - CIRRUS.height);
+      clouds.cumulus.renderOrder = ORDER_CLOUDS + (nearerCumulus ? 0.5 : 0);
+      clouds.cirrus.renderOrder = ORDER_CLOUDS + (nearerCumulus ? 0 : 0.5);
+    }
     if (!this._datum) return;
+    if (chart) {
+      if (this._map) this._map.visible = false;
+      return;
+    }
     if (!this._map) this._map = new GroundMap(this._scene, this._datum, this._failed, this._aniso);
+    this._map.visible = true;
     this._map.frame(camera, focus, viewH, performance.now());
   }
 
@@ -700,7 +771,7 @@ export class Environment {
     this._grid.material.opacity = look.gridOpacity;
   }
 
-  _buildSky() {
+  _buildDome() {
     const dome = new THREE.Mesh(
       new THREE.SphereGeometry(DOME_RADIUS, 48, 24),
       new THREE.ShaderMaterial({
@@ -720,7 +791,12 @@ export class Environment {
     );
     dome.frustumCulled = false;
     dome.renderOrder = ORDER_DOME;
+    this._sky = { dome, clouds: null };
+    this._scene.add(dome);
+  }
 
+  _buildClouds() {
+    if (this._sky.clouds) return;
     const sunXZ = new THREE.Vector2(SUN_DIR.x, SUN_DIR.z).normalize();
     const cumulus = cloudLayer(CUMULUS, CUMULUS_FRAG, {
       uScale: { value: CUMULUS.scale },
@@ -735,20 +811,30 @@ export class Environment {
       uAlong: { value: new THREE.Vector2(WIND_EN[0], -WIND_EN[1]).normalize() }, // wind in three XZ
       uStreak: { value: new THREE.Vector2(CIRRUS.streak[0], CIRRUS.streak[1]) },
     });
+    this._sky.clouds = { cumulus, cirrus };
+    this._scene.add(cumulus, cirrus);
+  }
 
-    this._sky = { dome, cumulus, cirrus };
-    this._scene.add(dome, cumulus, cirrus);
+  _disposeClouds() {
+    const clouds = this._sky?.clouds;
+    if (!clouds) return;
+    for (const o of [clouds.cumulus, clouds.cirrus]) {
+      this._scene.remove(o);
+      o.geometry.dispose();
+      o.material.dispose();
+    }
+    this._sky.clouds = null;
   }
 
   _disposeSky() {
     this._map?.dispose();
     this._map = null;
     if (!this._sky) return;
-    for (const o of Object.values(this._sky)) {
-      this._scene.remove(o);
-      o.geometry.dispose();
-      o.material.dispose();
-    }
+    this._disposeClouds();
+    const { dome } = this._sky;
+    this._scene.remove(dome);
+    dome.geometry.dispose();
+    dome.material.dispose();
     this._sky = null;
   }
 
@@ -760,5 +846,11 @@ export class Environment {
     this._grid.material.dispose();
     this._disc.geometry.dispose();
     this._disc.material.dispose();
+    if (this._chartGrid) {
+      this._scene.remove(this._chartGrid);
+      this._chartGrid.geometry.dispose();
+      this._chartGrid.material.dispose();
+      this._chartGrid = null;
+    }
   }
 }

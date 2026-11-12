@@ -4,6 +4,7 @@
 #include <FGFDMExec.h>
 #include <FGJSBBase.h>
 #include <initialization/FGInitialCondition.h>
+#include <input_output/FGLog.h>
 #include <input_output/FGPropertyManager.h>
 #include <math/FGLocation.h>
 #include <models/FGInertial.h>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <simgear/misc/sg_path.hxx>
 #include <string>
 
@@ -84,6 +86,29 @@ void resolve_nodes(FdmHandle* h) {
   h->rud = need("fcs/rudder-cmd-norm");
   h->thr = need("fcs/throttle-cmd-norm[0]");
 }
+
+// JSBSim logs some messages at INFO regardless of debug_lvl (the turn trim's
+// "<nlf>, <psidot>"). While debug output is silenced, route them through a
+// console logger that drops anything below WARN, restoring the previous logger
+// on scope exit — also when DoTrim throws. The logger is per thread.
+class QuietLog {
+ public:
+  explicit QuietLog(bool quiet) {
+    if (!quiet) return;
+    prev_ = JSBSim::GetLogger();
+    auto console = std::make_shared<JSBSim::FGLogConsole>();
+    console->SetMinLevel(JSBSim::LogLevel::WARN);
+    JSBSim::SetLogger(console);
+  }
+  ~QuietLog() {
+    if (prev_) JSBSim::SetLogger(prev_);
+  }
+  QuietLog(const QuietLog&) = delete;
+  QuietLog& operator=(const QuietLog&) = delete;
+
+ private:
+  JSBSim::FGLogger_ptr prev_;
+};
 
 }  // namespace
 
@@ -216,6 +241,7 @@ int fdm_run_ic(FdmHandle* h) {
 int fdm_trim(FdmHandle* h, int mode) {
   // DoTrim throws TrimFailureException when the trim does not converge.
   FDM_GUARD(h, {
+    QuietLog quiet(h->exec.GetDebugLevel() == 0);
     h->exec.DoTrim(mode);
     return FDM_OK;
   })

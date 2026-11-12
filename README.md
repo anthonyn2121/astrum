@@ -21,7 +21,8 @@ fixed-wing aircraft and sUAS quadrotors, each with its own high-fidelity flight 
 Telemetry and commands can be recorded to an **MCAP** bag and the telemetry replayed to any
 subscriber with the recorded payload bytes, and a browser-based **3-D replay renderer**
 (Three.js, procedural meshes) visualises the fleet live or from an exported bag — `astrum run
-config/scenario.example.toml --watch`, then open http://localhost:8080.
+config/scenario.example.toml --watch`, then open http://localhost:8080/view.html. The same server
+hosts a small web **studio** (http://localhost:8080) that sets up and flies interactive runs.
 
 ## Status
 
@@ -46,8 +47,9 @@ to a commanded heading/altitude over Zenoh (`config/demos/python.toml` runs the 
 controller). `config/demos/quad.toml` flies ASTRUM's second vehicle class — an **F450 quadrotor**
 that climbs and yaws under the built-in multirotor hover-hold autopilot.
 `config/demos/formation.toml` flies a figure-eight leader with three decentralized MPC followers.
-`make smoke` flies every `config/demos/*.toml` in lockstep, as fast as possible, and fails on the
-first failure. `--watch` adds the 3-D renderer to any run.
+`make smoke` flies every `config/demos/*.toml`, then every controller-catalog entry once with its
+defaults, in lockstep, as fast as possible, and fails on the first failure. `--watch` adds the 3-D
+renderer to any run.
 
 ## Architecture & data flow
 
@@ -120,7 +122,7 @@ Inside the dev container (`/workspace`):
 ```bash
 astrum list                                    # every scenario / run / sweep file under config/
 astrum run config/demos/cpp.toml               # C++ controller flies aircraft 1, then tears down
-astrum run config/demos/formation.toml --watch # figure-eight leader + 3 MPC followers, live at http://localhost:8080
+astrum run config/demos/formation.toml --watch # figure-eight leader + 3 MPC followers, live at http://localhost:8080/view.html
 make verify                                    # confirm the toolchain (pinned versions agree, JSBSim/zenoh link + run)
 make test                                      # all tests
 make ci                                        # the full gate: fmt-check + lint + all tests + cargo deny
@@ -179,6 +181,8 @@ lon_deg = -122.3756
 alt_hae_m = 4572.0
 heading_deg = 90.0
 tas_mps = 250.0
+# climb_deg = 0.0         # flight-path angle at spawn, + = climbing; strictly within ±90
+# bank_deg = 0.0          # roll at spawn, + = right wing down; strictly within ±90
 # trim = true             # default: true for fixed-wing, false for multirotor; failure is fatal
 # lockstep = false        # in a lockstep scenario, wait for this aircraft's commands
 # control_rate_hz = 30.0  # telemetry + lockstep commands at this rate (divides rate_hz)
@@ -186,6 +190,12 @@ team = 0
 health = 100.0
 # ammo = 511              # armed (fixed-wing) aircraft only
 ```
+
+A trimmed fixed-wing starts in steady flight at `climb_deg`: wings level, or a coordinated turn
+at `bank_deg` (JSBSim's turn trim). The trim is exact at spawn, but the F-16's own flight
+controls roll an uncommanded aircraft out of the turn (≈ 30° → 13° in 20 s while climbing), and
+steep banks may not trim at all (60° on the F-16 does not) — fatal, like any failed trim. An
+untrimmed aircraft (multirotor, `trim = false`) just starts with that velocity direction and roll.
 
 Bundled scenarios: `scenario.example.toml` (2-ship fleet), `scenario.demo.toml` (bounded single
 fixed-wing), `scenario.quad.toml` (single F450), `scenario.formation.toml` (4-ship formation),
@@ -343,13 +353,46 @@ and collects every run.
 ```bash
 astrum sweep config/sweep.demo.toml             # 12 runs: C++ controller, 4 headings × 3 speeds
 astrum sweep config/sweep.trim.toml --jobs 8
+astrum sweep config/sweep.offsets.toml          # 60 runs: random wingman start offsets
 astrum sweep config/sweep.demo.toml --dry-run   # list the planned runs, fly nothing
 ```
 
 A sweep file names a `base` scenario, fixed overrides (`[set]`) and a grid (`[vary]`: every
-combination is a run, × `repeats`, repeat `r` with seed `sim.seed + r`). Keys are
-`sim.<field>`, `world.<field>`, `aircraft.<id>.<field>`, or `param.<name>` (a free value for
-controller commands). Every run's scenario is built and validated before anything flies.
+combination is a grid point; each flies × `samples` (if any) × `repeats`, repeat `r` with seed
+`sim.seed + r`). Keys are `sim.<field>`, `world.<field>`, `aircraft.<id>.<field>`,
+`aircraft.<id>.offset.<axis>` or `param.<name>` (a free value for controller commands). Every
+run's scenario is built and validated, and every aircraft that trims is trimmed at its run's
+initial conditions exactly as the sim will (`--dry-run` too), before anything flies: a run that
+cannot trim is invalid, named with its values. The check builds each distinct aircraft once,
+about 8 ms per F-16 (200 runs × 4 F-16s: 6.7 s); JSBSim loads models one at a time.
+
+**Offsets** move or turn an aircraft relative to its initial conditions once every absolute key of
+the run is applied, in the frame of those initial conditions: `forward_m` (horizontal, along its
+heading), `right_m` (90° clockwise of it), `up_m` (local vertical), and `heading_deg` (wraps to
+[0, 360)), `climb_deg`, `bank_deg` (the results must stay strictly within ±90). Offsets stack, and
+a heading offset never turns the frame of another, so a draw shifts an aircraft alike at every grid
+point — except that a rigid group's drawn turn swings its members about wherever the grid put the
+lead. **Random offsets**: `samples = N` draws every `[[perturb]]` table N times; sample `k` is the
+same at every grid point (common random numbers) and reproducible from the file. A draw that puts
+two aircraft closer than `min_separation_m` (3-D) or one below `min_alt_hae_m` at any grid point is
+redrawn (1000 attempts, then the sweep is invalid). Without those limits sample `k` depends only on
+`sample_seed` (default 0) and `k`; a redrawn sample also depends on every grid point.
+
+```toml
+samples = 20
+sample_seed = 7
+min_separation_m = 300.0
+
+[[perturb]]
+aircraft = [2, 3]                  # each its own draw per axis…
+forward_m = { uniform = 300.0 }    # ±300 m
+up_m = { normal = 50.0 }           # σ = 50 m, truncated at 3σ
+
+[[perturb]]
+aircraft = [4, 5]
+rigid = true                       # …or one draw for the group, in aircraft 4's frame:
+heading_deg = { uniform = 20.0 }   # turns the pair about 4, keeping their spacing
+```
 
 - **Without `controllers`** the runs fly in-process, one thread each (for scenarios that need no
   external control — trim, initial-condition and physics studies).
@@ -359,19 +402,23 @@ controller commands). Every run's scenario is built and validated before anythin
   `{endpoint}`, `{run}`, `{seed}` and `{param.<name>}` are filled in. Unpaced runs with controllers
   must be lockstep, so they are reproducible.
 
-Results land in `runs/<file stem>/`: per run its scenario, bag and logs, and `summary.csv` (run,
-status, seed, the varied values, sim time, wall time, speed, bag). Ctrl-C stops starting runs and
-ends the running ones cleanly; the summary marks them. Exit status 0 means every run was ok.
-Bundled sweeps: `sweep.trim.toml` (in-process), `sweep.demo.toml` (C++ controller),
-`sweep.formation.toml` (four Python controllers at a 30 Hz control rate). Other flags:
-`--out DIR`, `--overwrite`, `--base-port P`, `--sim PATH`.
+Results land in `runs/<file stem>/`: per run its scenario, bag, logs and `<run>.metrics.json`
+(`astrum metrics` of its bag), and `summary.csv` — run, status, seed, the sample (when sampling),
+the varied values and drawn offsets (one column per `aircraft.<id>.offset.<axis>`; a rigid group's
+under its first aircraft), sim time, wall time, speed, bag, then the fleet metrics (`end_reason`,
+`min_separation_m`, … `kills`; empty without a bag). The summary is rewritten whenever a run starts
+or finishes (`running`, `not run` for the rest), so it shows progress. Ctrl-C stops starting runs
+and ends the running ones cleanly; the summary marks the rest. Exit status 0 means every run was
+ok. Bundled sweeps: `sweep.trim.toml` (in-process), `sweep.offsets.toml` (in-process, random
+offsets), `sweep.demo.toml` (C++ controller), `sweep.formation.toml` (four Python controllers at a
+30 Hz control rate). Other flags: `--out DIR`, `--overwrite`, `--base-port P`, `--sim PATH`.
 
 A **run file** is a sweep file without a grid: `base`, `controllers`, `[set]` and an optional
 `speed` — one run. The demos under `config/demos/` are run files. `astrum run` flies one (or a
 bare scenario TOML) in the foreground and refuses files that plan more than one run:
 
 ```bash
-astrum run config/demos/formation.toml --watch               # + the viewer at http://localhost:8080
+astrum run config/demos/formation.toml --watch               # + the viewer at http://localhost:8080/view.html
 astrum run config/scenario.demo.toml --speed 0 --set aircraft.1.tas_mps=60
 astrum run config/demos/cpp.toml --record recordings/session.mcap
 astrum run config/demos/quad.toml --dry-run                  # print the resolved scenario TOML
@@ -441,6 +488,20 @@ For developing real control laws there's [`controllers/optimal/`](controllers/op
 (C++ and Python laws on the same runtime): **LQR** and **MPC** (`--law lqr|mpc`), and in Python
 also `figure8` and `formation` (a follower that reads its leader from the fleet snapshot).
 
+**Controller catalog.** `config/controllers.toml` lists every launchable (program, law) pair —
+the ten above — with its vehicle kinds, whether it reads the fleet, and typed, bounded
+parameters (`number`, `integer`, `choice`, or another `aircraft` of the scenario; heading,
+altitude and speed parameters say which state they command). It is what the web studio launches
+from: `astrum_sim::controllers::ControllerSpec::render` turns an entry, an aircraft id and
+parameter values into one `controllers` command line, refusing unknown, out-of-range or
+wrongly-typed values, so a browser never supplies a command. The C++ entries need the programs
+built (`cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release && cmake --build
+build/controllers -j`, which `astrum` does for you); the Python ones run with `python3`.
+`astrum controllers [--config-dir DIR]` lists the entries (id, kinds, name); `astrum controllers
+render ID --id N [--param NAME=VALUE]... [--fleet IDS]` prints the command line `render` makes
+(values parse as TOML; unset ones take their defaults; `--fleet` lists the scenario's aircraft
+for `aircraft` parameters, default just `N`) and exits 2 with the catalog's message on a bad one.
+
 ## Wire protocol, telemetry & commands
 
 One Cap'n Proto schema (`crates/astrum-proto/schema/astrum.capnp`, **v3**) is shared by Rust, C++
@@ -485,10 +546,15 @@ Events and `TickEnd` are the exception: published with `Block` at priority `Data
 with a FIFO (`astrum_net::EventReceiver`, the SDKs' `EventSubscriber`). Per tick the sim sends the
 due telemetry (aircraft id ascending), then the events, then `TickEnd`.
 The sim also offers Zenoh's **low-latency transport** (no batching, no fragmentation, and a single
-lane per link — priorities reorder nothing on it) and the C++ and Python clients ask for it
-(`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 % more lockstep throughput for
-the C++ demo sweep (~2 % with Python controllers). A client that doesn't ask, or a sim that
-doesn't offer it, falls back to the default transport.
+lane per link — priorities reorder nothing on it) and every client asks for it for its streams —
+the C++ and Python SDKs and the Rust tools (`astrum_net::Session::connect`: recorder, web bridge,
+`astrum ctl`) (`transport/unicast/lowlatency = true`, `qos/enabled = false`): ~14 % more lockstep
+throughput for the C++ demo sweep (~2 % with Python controllers), and it sidesteps a Zenoh 1.10 bug
+that, on the default transport, stopped all telemetry to a client after its first dropped sample
+(DEVELOP §1). Nothing is dropped on it, so a client that falls behind paces the sim and **one that
+stops reading — a suspended recorder, viewer bridge or controller — freezes it, control plane
+included, until it reads again**. A Rust client's queries (scenario, status, control) use a second,
+default-transport link, so a scenario of any size reaches it.
 
 **Topology.** The sim (or `astrum play`) **listens as a Zenoh router** on
 `tcp/0.0.0.0:7447`; every other process — recorder, web bridge, C++ and Python controllers —
@@ -496,8 +562,9 @@ opens one `mode=client` session (multicast scouting off) connecting to it: `tcp/
 default (host-side tools reach the dev container's published port on the same address). The router routes between its clients, so e.g. the
 recorder sees the commands a controller sends (Zenoh 1.10 routers do not forward between two
 *peers*). A client's open waits for a sim that is still starting, up to its connect timeout, then
-fails with a clear message: controllers exit 1 after `--startup-timeout`; `astrum record` and
-`astrum web` take `--connect-timeout` (`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s). Endpoints are
+fails with a clear message: controllers exit 1 after `--startup-timeout`; `astrum record` takes
+`--connect-timeout` (`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s); `astrum web` never gives up: it
+keeps retrying in the background and serves pages meanwhile. Endpoints are
 overridable via `$ASTRUM_ZENOH_LISTEN` (sim / replay) and `$ASTRUM_ZENOH_CONNECT` (everyone else);
 the endpoint syntax is `proto/host:port`.
 
@@ -538,6 +605,21 @@ path (`ASTRUM_BAG`), `--rate` (sim-time speed multiplier, default `1.0`; ≤ 0 =
 gap is capped at 5 s; `ASTRUM_REPLAY_RATE`), `--listen` (`ASTRUM_ZENOH_LISTEN`), `--warmup-ms`
 (default 300; `ASTRUM_REPLAY_WARMUP_MS`). Legacy pre-MCAP `.bag` files are not readable — re-record.
 
+```bash
+# run metrics as JSON: end reason, closest approach, extremes, failsafe/refusal/hit/kill counts, final states
+astrum metrics recordings/session.mcap [--out metrics.json]
+```
+
+`astrum metrics` (`astrum_bag::metrics::compute`) reduces a bag to `end_reason`, `end_message`,
+`sim_time_s`, `min_separation_m` (with `min_separation_pair` and `min_separation_t_s`),
+`min_alt_hae_m`, `max_bank_deg`, `max_nz_g`, `failsafe_entries`, `controller_losses`,
+`command_refusals` (running totals since the sim started), `hits`, `kills`, and per aircraft its
+model, extremes and final state. Only living aircraft count. Separation compares samples of the
+same tick, never interpolated: exact on `--record` bags (every tick), limited to the ticks both
+aircraft share on control-rate or `astrum record` bags. One bag is one run: a bag recorded across
+a sim restart is not split. Flags: positional bag path (`ASTRUM_BAG`), `--out`
+(`ASTRUM_METRICS_OUT`; default stdout).
+
 ## 3-D replay renderer (`astrum web` + `web/`)
 
 A browser-based renderer visualises the fleet on the ENU grid — procedurally-generated F-16-style
@@ -568,7 +650,7 @@ Both data paths feed one JSON frame shape (`astrum_web::FrameJson`) and one even
 drift:
 
 ```bash
-# LIVE — start the fleet + the bridge, then open http://localhost:8080
+# LIVE — start the fleet + the bridge, then open http://localhost:8080/view.html
 astrum run config/scenario.example.toml --watch
 # (the bridge equally serves a bag being replayed: `astrum play b.mcap` in one shell, `astrum web` in another)
 
@@ -576,24 +658,227 @@ astrum run config/scenario.example.toml --watch
 astrum export recordings/session.mcap --out recordings/session.json
 ```
 
-`astrum web` is an axum/tokio server. A latest-value Zenoh subscriber feeds one batched JSON
-snapshot of the whole fleet at most `--max-hz` times per second (default 30), fanned out to every
-browser over the WebSocket `GET /telemetry` (a slow browser skips to the newest snapshot). Events
+`astrum web` is an axum/tokio server. A sampling Zenoh subscriber (`astrum_net::SampledTelemetry`)
+thins every aircraft's telemetry to at most `--sample-hz` samples per SIM second (default 30) plus
+its newest, and the bridge sends what arrived as one `{"type":"frames","frames":[…]}` batch at
+most `--max-hz` times per wall second (default 30) — several samples per aircraft, time-ordered
+per aircraft, at most 120 per aircraft (past that the trail is halved: every other sample, the
+newest always, so a 400× sim shows its whole flight at ~0.15–0.3 s resolution rather than the
+last few seconds) — fanned out to every browser over the
+WebSocket `GET /telemetry`. So a sim at 100× real time still draws smooth trails and plots (at
+1× each batch is the aircraft's newest sample, as before). A slow browser skips to the newest
+batch: it loses the skipped batches' samples (a gap in its timeline), never falls behind. Events
 are never dropped or throttled: each batch goes to every browser as `{"type":"events","events":[…]}`
 on the same socket, from the moment it connected. The fleet's JSBSim models, which telemetry does
 not carry, come from the sim's (or `astrum play`'s) `astrum/scenario` reply, polled every 5 s:
 each browser gets `{"type":"models","models":[{"id":1,"model":"f16"},…]}` (sorted by id) on
-connect once known, and again whenever the fleet changes. WebSocket
-upgrades whose `Origin` does not match the request's `Host` are rejected. The same port serves the static `web/` app and
-the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags: `--connect` (default `tcp/127.0.0.1:7447`),
-`--bind` (default `127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`,
-published on host loopback), `--root` (default `web`), `--max-hz`, `--tile-url`, `--tile-cache` — each with an
-`ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback. `astrum export` takes
-the bag as a positional argument and writes an `astrum-replay` document (version 3: `frames`,
+connect once known, and again whenever the fleet changes. Each browser also gets
+`{"type":"run","run":N,"endpoint":"tcp/…"}` on connect and whenever the bridge is attached
+elsewhere (or detached: `"endpoint":null`); everything after it belongs to the new run, and the
+viewer starts a fresh timeline. The bridge attaches to `--connect` at startup and retries in the
+background until a sim answers there; the server stays up with or without one, and each
+attachment starts with an empty fleet (no aircraft carried over from an earlier sim).
+
+The same port serves the static `web/` app and the tile proxy `/tiles/{z}/{x}/{y}.jpg`. Flags:
+`--connect` (default `tcp/127.0.0.1:7447`, attached at startup), `--bind` (default
+`127.0.0.1:8080`; the dev container presets `ASTRUM_WEB_BIND=0.0.0.0:8080`, published on host
+loopback), `--root` (default `web`), `--max-hz`, `--sample-hz`, `--tile-url`, `--tile-cache`,
+`--allowed-hosts`, `--config-dir` (its `controllers.toml` is read at startup; a broken one stops
+the server), `--runs-dir` (default `runs/web`) and `--sim` (default: the `astrum-sim` next to
+`astrum-web`) — each with an `ASTRUM_WEB_*` / `ASTRUM_TILE_*` / `ASTRUM_ZENOH_CONNECT` env fallback
+(`ASTRUM_WEB_ALLOWED_HOSTS`, `ASTRUM_CONFIG_DIR`, `ASTRUM_RUNS_DIR` and `ASTRUM_SIM_BIN` for the
+last four). Paths are relative to the server's working directory: run it from the repo root, so
+the catalog's controller commands (`build/controllers/…`, `controllers/…`) resolve.
+
+`astrum export` takes the bag as a positional argument and writes an `astrum-replay` document
+(version 3: `frames`,
 `events`, and `meta` with their counts, the embedded `scenario` TOML and its aircraft `models`
 as `[{"id","model"},…]`, `[]` without a scenario) to `--out` (env fallbacks `ASTRUM_BAG` /
 `ASTRUM_WEB_EXPORT`). Version 2 exports still open (without events); v1 JSON exports are not
 readable by the current renderer.
+
+## Web studio
+
+`astrum web` also serves the studio at `/` (the home page), with cards for **Interactive**, **Sandbox**, **Sweeps** and the **Replay viewer** (`/view.html`, above).
+Runs need the sim binary: `astrum-sim`, next to `astrum-web` by default (`--sim`).
+The controller catalog is `config/controllers.toml`, read at startup (a broken one stops the server). Scenarios are `config/scenario.<name>.toml` and sweeps `config/sweep.<name>.toml` (`--config-dir`, default `config`).
+Interactive runs are written to `<runs-dir>/<id>/` and sweeps to `<runs-dir>/sweeps/<id>/` (`--runs-dir`, default `runs/web`).
+The server binds `127.0.0.1:8080` by default (`--bind`). Every `/api` route and the WebSocket answer only a `Host` of `localhost`, an IP address or a name in `--allowed-hosts`; every non-GET `/api` request must be same-origin JSON (see [HTTP API](#http-api)).
+
+### A typical workflow
+
+1. In **Sandbox**, spawn the fleet, drag and edit it on the map, click **Check**, then **Save…** to write `config/scenario.<name>.toml`.
+2. For a live run, click **Run** (it saves first) and pick a controller per aircraft in **Interactive**; set the speed and click **Run**, and the viewer opens on the run.
+3. For a sweep, click **Sweep** (it saves first) or open **Sweeps**; set the variation as draws or a grid, check the starting-positions preview and the plan, then click **Run sweep**.
+4. On the sweep page, follow the progress and the results table; **Compare runs** plots two columns and **All runs** draws every flight.
+5. Click **Replay** on a run to open it in the viewer (`view.html?sweep=<id>&run=<n>`).
+
+### Interactive
+
+- `/interactive.html` sets up one live run. **Run** starts it and opens `/view.html?run=<id>`.
+- Environment: only `empty` for now.
+- Scenario: from `--config-dir`. Invalid ones are listed, disabled, with their error.
+- Controllers: one catalog controller per aircraft, or none (uncommanded). Only controllers that fly the aircraft's vehicle kind are offered.
+- Parameters: a form with the catalog's bounds.
+- Heading, altitude and airspeed targets start from the aircraft's initial conditions; a follower's altitude starts from its leader's.
+- The catalog default is one click away.
+- Speed: 1×, 2×, 10× or Max. Optionally a max sim time.
+- While a run is active, the page shows it (open / stop) instead of a new start.
+- Viewer sim-control bar: it appears whenever the stream comes from a live sim. It pauses, resumes, steps N ticks and paces the *sim* (1×, 2×, 10×, Max).
+- The bar shows the sim's state, tick, sim time, achieved vs target pace, and the lockstep aircraft it is waiting for.
+- The transport only replays what the page has received.
+- With `?run=<id>`, a run panel shows the run's state, **Stop**, its log and, once it ends, its outcome, key metrics and **Open full replay** (the run's bag as an export, loaded like a file).
+
+### Sandbox
+
+- `/sandbox.html?scenario=<name>` edits a saved scenario. `/sandbox.html` starts a new one from the empty environment's sim defaults and a chosen location.
+- The fleet is shown at its initial conditions on a top-down, north-up map over aerial imagery (any platform). An orbit view is also available.
+- Select: click, Shift+click or Shift+drag.
+- Move: drag the selection on the horizontal plane at its altitude. Each aircraft keeps its `alt_hae_m`; its grid height is recomputed.
+- Far from the origin, the aircraft settles below the drag plane by the Earth's curvature: ~18 m at 15 km.
+- Rotate and climb: the yellow knobs rotate the true heading (Shift snaps it to 5°) and raise or lower it (or Alt+drag).
+- Map: wheel zooms; drag on empty map pans (any button).
+- Inspector: edits every `[[aircraft]]` field: id, model, kind and autopilot profile overrides, team, lat/lon or ENU about the origin, altitude HAE, heading, climb, bank, TAS, trim, lockstep, control rate, health, and ammo for fixed-wing.
+- `[world]` and `[sim]` are editable too.
+- Web-launched runs set `lockstep` themselves for the aircraft they attach controllers to, so a scenario authored for the studio leaves it off.
+- **Spawn** places N aircraft of a model in line abreast, trail, a grid, or at random in a box around the view centre. Ids are the lowest free ones; TAS is 0 for multirotors; the spawn preview shows translucent ghosts.
+- Duplicate, delete, and undo / redo (Ctrl+Z / Ctrl+Shift+Z).
+- World origin: set in fields, from a location, or by picking on the map; optionally moving the fleet with it. The view stays on the same ground, undo and redo included.
+- **Save…** (Ctrl+S) names the scenario and writes `config/scenario.<name>.toml`. An existing file is replaced only on confirmation.
+- **Check** validates the scenario and flies each fixed-wing aircraft's trim, listing any that would stop the sim from starting.
+- **Run** saves first when the scenario is unsaved or edited, then opens Interactive on it.
+- **Sweep** saves the same way and opens the Sweeps builder on the saved scenario.
+- A live panel shows the scenario as JSON in `Scenario`'s own serde shape (copyable).
+- The panel shows inline the problems `Scenario::validate` would report: unique ids, |climb|, |bank| < 90, control rates that divide `rate_hz`, lockstep consistency, finite numbers, and so on.
+
+### Sweeps
+
+- **Building**
+  - `/sweeps.html` builds a sweep of a saved scenario, with the same environment and scenario choice as Interactive.
+  - Optional catalog controllers per aircraft: none means the sweep flies in-process; some means each run launches them.
+  - Run settings: max sim time, repeats, parallel runs (`jobs`, at most 256; 0 = one per core) and a per-run wall timeout.
+  - The plan (runs, seeds, values, in-process or with controllers) is re-planned as the form changes. **Check trims** builds every run's aircraft trims.
+  - **Starting positions** picture above the plan table: the scenario's aircraft as arrows and, for each aircraft the sweep moves, one dot per planned run (with a heading tick where the run turns it).
+  - **Variation** (optional) sets the offsets:
+    - **Random draws** move or turn chosen aircraft by a random offset in each one's own frame (forward along its heading, right of it, up; heading, climb and bank turn it).
+    - Draws are uniform (± a) or normal (σ, truncated at 3σ). A rigid group moves as one body on one draw.
+    - A **grid** varies one aircraft's axis over listed values. The grid is the product of its rows.
+    - Samples, seed, min separation and min altitude govern the draws.
+  - **Save sweep** writes `config/sweep.<name>.toml`; `astrum sweep config/sweep.<name>.toml` runs it.
+  - **Saved sweeps** lists those files and opens one (`?sweep=<name>`).
+- **Running**
+  - **Run sweep** flies the plan in the background (`POST /api/sweeps`; one sweep at a time) and opens its page.
+  - A running sweep is shown above the form, with links to open or stop it.
+  - **Recent sweeps** lists every sweep under `<runs-dir>/sweeps/<id>/`.
+  - The sweep page (`/sweep.html?id=<id>`) shows the state, a progress bar and the counts, and a square per run coloured by status (click one to select its row).
+  - **Stop sweep** ends a running sweep; its runs not yet started stay queued.
+- **Results**
+  - The results table (`summary.csv`) sorts by any column and filters by status (all, ok, failed, other). It shows min, mean and max over the visible ok runs.
+  - **Replay** on a run with a bag opens it in the viewer (`view.html?sweep=<id>&run=<n>`).
+  - **Compare runs** plots any two numeric result columns against each other. The axes default to a varied key and to `min_separation_m`.
+  - Points are coloured by status or by a numeric column; clicking a point selects its run in the table and the strip.
+  - **All runs** draws every finished run's flight at once: each aircraft's path is coloured by the run's status (the selected run's in the accent colour).
+  - A time slider with Play at 1×, 4× or 16× moves a dot per aircraft along its track. **Paths** and **Positions at t** toggle.
+
+### HTTP API
+
+- Every response is JSON. A failure is `{"error": "…"}` with a fitting status.
+- Host check: every `/api` route answers only a `Host` of `localhost`, an IP address or a name in `--allowed-hosts` (comma-separated host names, no port). Any other `Host` gets 403, so DNS rebinding is refused.
+- Every non-GET request must also be `Content-Type: application/json` (415) and, from a browser, same-origin (403).
+- Static files and tiles are not restricted by `Host`. To use the viewer by name from another machine, add the machine's DNS name to `--allowed-hosts` (`ASTRUM_WEB_ALLOWED_HOSTS`).
+- WebSocket upgrades whose `Origin` does not match the request's `Host` are rejected.
+- Sweep ids are checked as path segments: 1–128 characters of ASCII letters, digits, `.`, `_` or `-`, not starting with `.` (so no `..`). Run ids must be plain names. Either way, a bad id gets 400.
+
+| method path | what | statuses |
+|---|---|---|
+| `GET /api/bridge` | bridge state: `{endpoint, run, connected, status}` | 200 |
+| `POST /api/bridge/control` | pause, resume, step N ticks or set the sim's speed | 200, 400, 409, 503 |
+| `GET /api/environments` | every environment: locations, sim defaults, models, metric ids | 200 |
+| `GET /api/models` | models ASTRUM has profiles for: model, kind, autopilot profile | 200 |
+| `GET /api/controllers` | the controller catalog, `{"entries": […]}` | 200 |
+| `GET /api/scenarios` | every `config/scenario.<name>.toml`, invalid ones included | 200 |
+| `GET /api/scenarios/<name>` | one scenario in full, plus its `fleet` | 200, 400, 404, 422 |
+| `PUT /api/scenarios/<name>` | save `config/scenario.<name>.toml` | 201, 200, 400, 409, 422, 500 |
+| `POST /api/scenario-check` | validate a scenario and trim-check it; writes nothing | 200, 400 |
+| `GET /api/sweeps/saved` | every `config/sweep.<name>.toml`, invalid ones included | 200, 500 |
+| `GET /api/sweeps/saved/<name>` | one saved sweep read back as a request | 200, 400, 404, 422 |
+| `PUT /api/sweeps/saved/<name>` | save `config/sweep.<name>.toml` (runnable with `astrum sweep`) | 201, 200, 400, 409, 422, 500 |
+| `POST /api/sweeps/plan` | what a sweep would fly; nothing is flown | 200, 400, 422, 500 |
+| `GET /api/sweeps` | every sweep under the sweeps dir, newest first | 200 |
+| `POST /api/sweeps` | start a sweep in the background | 201, 400, 409, 422, 500 |
+| `GET /api/sweeps/current` | the latest sweep since the server started | 200 |
+| `DELETE /api/sweeps/current` | stop the running sweep; its final view | 200, 404 |
+| `GET /api/sweeps/<id>` | a sweep's view: state, counts, each run's status | 200, 400, 404 |
+| `GET /api/sweeps/<id>/results` | `summary.csv` as `{"columns", "rows"}` | 200, 400, 404 |
+| `GET /api/sweeps/<id>/tracks` | flight tracks of the runs in `[from, from + count)` | 200, 400, 404 |
+| `GET /api/sweeps/<id>/runs/<n>/replay` | run `n` (1-based) of a sweep as a replay document | 200, 400, 404, 409 |
+| `POST /api/runs` | start the live interactive run | 201, 400, 409, 422, 500 |
+| `GET /api/runs/current` | the latest run since the server started | 200 |
+| `DELETE /api/runs/current` | stop the active run; its final state | 200, 409 |
+| `GET /api/runs/current/log` | the current run's output lines from `since` on | 200 |
+| `GET /api/runs/<id>/replay` | a run's `astrum-replay` export | 200, 400, 404, 409 |
+| `GET /api/runs/<id>/metrics` | a run's metrics (`astrum metrics` JSON) | 200, 400, 404, 409 |
+| `GET /telemetry` (not `/api`) | WebSocket: frames, events, models and run notes | 403 when the upgrade is refused |
+| `GET /tiles/<z>/<x>/<y>.jpg` (not `/api`) | slippy-map tile proxy with a disk cache | 400 for a bad tile path |
+
+Request and response details:
+
+- `GET /api/bridge`: `status` is the sim's `astrum ctl status` JSON (the sim's `astrum/status`), or null when no sim answers.
+- `POST /api/bridge/control` takes `{"action":"pause"}`, `{"action":"resume"}`, `{"action":"step","ticks":N}` (N ≥ 1) or `{"action":"speed","value":X}` (X = 0 for unpaced, or at least `MIN_SPEED`), and replies `{"ok":true}`.
+- `POST /api/bridge/control` errors: 400 for a bad body; 409 with the sim's reason when it refuses; 503 when no sim is reachable.
+- `GET /api/environments`: each environment's locations, sim defaults, models and metric ids. `GET /api/models`: each model's model, kind and autopilot profile.
+- `GET /api/scenarios`: every `config/scenario.<name>.toml`: name, summary, environment, fleet, or the error that makes it unflyable.
+- `GET /api/scenarios/<name>`: `fleet` gives each aircraft's resolved vehicle kind. 400 for a name that cannot be a file name, 404 when there is none, 422 when the file is not a valid scenario.
+- `PUT /api/scenarios/<name>` takes `{"scenario": {…}, "summary": "…", "overwrite": false}` and replies with its `ScenarioEntry`: 201 created, 200 replaced.
+- `PUT /api/scenarios/<name>` errors: 409 when the file exists and `overwrite` is not true; 400 for a bad name, summary or body; 422 for an invalid scenario or a model that is not a plain name; 500 when it cannot be written.
+- `POST /api/scenario-check` takes `{"scenario": {…}}` and replies 200 `{"errors": […], "trim": [{"aircraft", "model", "ok", "error"}]}`: the scenario's errors (then no trims), or whether each aircraft whose class trims does so at its initial conditions.
+- `POST /api/scenario-check` errors: 400 for a bad body or more than 512 aircraft.
+- `GET /api/sweeps/saved`: each file's name, path, summary, base and error. `base` is `null` unless it is this config directory's `scenario.<name>.toml`, or the error that makes the file unreadable.
+- `GET /api/sweeps/saved/<name>` replies `{name, summary, request}`. 422 is for a sweep the Sweeps page cannot edit (settings its request would not write back, such as `speed`, `out` or hand-written `controllers`); run such a file with `astrum sweep` instead.
+- `PUT /api/sweeps/saved/<name>` takes `{"request": {…}, "summary": "…", "overwrite": false}` and replies `{name, path, summary}`: 201 created, 200 replaced.
+- `PUT /api/sweeps/saved/<name>` errors: 409 when the file exists and `overwrite` is not true; 400 for a bad name, a summary with a control character, one starting `astrum-studio:`, or a bad request; 422 with nothing written when the sweep cannot be planned; 500 when it cannot be written.
+- The summary is at most 200 characters. The request's assignments ride along in a header comment, so `GET /api/sweeps/saved/<name>` reads the file back as a request.
+- A sweep request, as `POST /api/sweeps/plan`, `POST /api/sweeps` and a saved sweep's `request`, has this shape:
+
+```json
+{"scenario": "<name>", "assignments": [{"aircraft", "controller", "params"}],
+ "perturb": [{"aircraft": [2], "forward_m": {"uniform": 300}}],
+ "vary": {"aircraft.2.offset.forward_m": [-200, 0, 200]},
+ "samples", "sample_seed", "min_separation_m", "min_alt_hae_m", "repeats",
+ "max_time_s", "run_timeout_s", "jobs", "check_trim"}
+```
+
+- `POST /api/sweeps/plan` replies 200 with the runs, each run's values and the moving aircraft's starting positions. Nothing is flown.
+- `POST /api/sweeps/plan` errors: 400 for a bad request (the message names the key) or for more than 2000 runs; 422 for a sweep the planner refuses; 500 when planning fails.
+- `jobs` is at most 256 (0 = one per core).
+- `POST /api/sweeps` takes the same body and starts the sweep in the background, as `astrum sweep` flies it: in-process, or in process mode with the request's assignments as controllers.
+- It writes `<--runs-dir>/sweeps/<id>/` (`<id>` = UTC `yyyymmdd-hhmmss-<scenario>`, with `-2`, `-3`, … when taken): `request.json`, `sweep.toml`, `meta.json` (the state, rewritten when the sweep ends), `summary.csv`, and per run `run-NNNN.mcap` and `run-NNNN.metrics.json`.
+- Run N of a process-mode sweep listens on `27500 + N - 1`.
+- `POST /api/sweeps` is refused before anything is written: 400 for a bad request; 409 while another sweep runs (the message names it); 422 for a sweep that cannot fly (no `astrum-sim` for process mode, too few ports, a failed trim check). 500 when it cannot be written.
+- Otherwise it replies 201 with its view. One sweep runs at a time, independent of the live run.
+- `GET /api/sweeps/current` → `{"sweep": …|null}`: the latest sweep since the server started.
+- `DELETE /api/sweeps/current` stops it: 200 with its final view, the runs not yet started stay `queued`; 404 when none runs.
+- `GET /api/sweeps` → `[{id, scenario, state, total, ok, failed, started_at, wall_s}]`, newest first. A sweep whose `meta.json` says running but which no server owns is `interrupted`.
+- `GET /api/sweeps/<id>` → the sweep's view: `state` (`running`, `finished`, `stopped`, `failed`, or `interrupted` for a sweep whose server went away), its counts, and each run's `status` (`queued`, `running`, `ok`, `failed`, `stopped`) with its reason, sim time and wall time.
+- `GET /api/sweeps/<id>/results` → `summary.csv` as `{"columns": […], "rows": [[…]]}`. Numbers come as numbers and empty cells as null; 404 until the file is written.
+- `GET /api/sweeps/<id>/runs/<n>/replay` (`n` is 1-based) replies as `GET /api/runs/<id>/replay` does. 400 for a number outside the plan, 404 when the run has no bag, 409 while it runs.
+- `GET /api/sweeps/<id>/tracks?from=&count=&points=` covers the runs in `[from, from + count)`. Defaults are 1, 100 and 80; `count` is 1–500 and `points` 2–400. 400 for a value out of range (the message names it).
+- For each finished run with a readable bag, the tracks give its `status`, `sim_time_s`, each aircraft's `t`, `e`, `n`, `u` samples thinned to `points`, and `died_at_s`.
+- A track cache is written beside the bag as `run-NNNN.tracks-<points>.json`. A cache older than its bag, or one that does not read, is rebuilt.
+- Live interactive runs: one at a time, owned by the server.
+- `POST /api/runs` takes `{"scenario": "<name>" | {…scenario…}, "assignments": [{"aircraft": 1, "controller": "cpp-hold", "params": {"alt": 1500}}], "speed": 0, "max_time_s": 60}`.
+- `speed` 0 = as fast as possible. `speed` and `max_time_s` default to the scenario's. `max_time_s` 0 = until stopped.
+- `POST /api/runs` replies 201 with the run: `{id, scenario, state: "starting"|"running"|"finished", endpoint, speed, max_time_s, lockstep, assignments (every parameter, defaults filled in), started_at_ms, finished_at_ms, outcome, dir, bag}`.
+- `POST /api/runs` errors: 400 for bad input (the message names the aircraft and parameter); 409 while a run is active or being started; 422 for an invalid scenario (an inline one's aircraft `model` must be a plain name); 500 when it cannot start.
+- A 500 for a controller program that is not built reads "aircraft 1: controller `cpp-hold`: `build/controllers/cpp/astrum-controller` not found …".
+- Exactly the controlled aircraft fly in lockstep; the others fly uncommanded.
+- A run writes `<--runs-dir>/<id>/` (`scenario.toml`, `run.mcap`, and `metrics.json` once it ends; `<id>` = UTC `yyyymmdd-hhmmss-<scenario>`). Its sim listens on a free loopback port and the bridge attaches to it.
+- When the run ends, the bridge goes back to `--connect` (unless something re-attached it meanwhile). That starts a fresh live timeline in every viewer, and the run panel offers the full replay.
+- `GET /api/runs/current` → `{"run": …|null}`: the latest run since the server started.
+- `DELETE /api/runs/current` stops the active run: 200 with its final state; 409 when none is active.
+- `GET /api/runs/current/log?since=<seq>` → `{"lines": [{seq, source, stream, line}], "next"}`: the last 5000 output lines. A controller's `source` is its aircraft (`aircraft 1`).
+- `GET /api/runs/<id>/replay` (the `astrum-replay` export) and `GET /api/runs/<id>/metrics` (`astrum metrics` JSON) serve any run under the runs dir. 400 for an id that is not a plain name, 404 when unknown or unrecorded, 409 while it runs.
+- Stopping the server stops the active run and sweep first.
 
 ## Embedded RL environment (`astrum-env`)
 
@@ -660,7 +945,7 @@ sim's endpoint.
 
 ```
 assets/            logos
-config/            scenarios (example, demo, quad, formation, smoke), sweeps, demos/ run files
+config/            scenarios (example, demo, quad, formation, smoke), sweeps, demos/ run files, controllers.toml (controller catalog)
 controllers/       out-of-sim flight controllers: README.md (the SDK contract), common/ (C++ SDK), cpp/, python/ (Python SDK + example), optimal/, examples/out_of_tree/
 crates/            Rust workspace — astrum-fdm/geo/proto/net/bag/sim/env/web
 docker/            Dockerfile, entrypoint, pinned Python requirements

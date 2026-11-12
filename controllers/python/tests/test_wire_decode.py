@@ -87,6 +87,28 @@ def test_command_round_trip(control):
     assert decode_command(encode_command(cmd)) == cmd
 
 
+@pytest.mark.parametrize(
+    "make",
+    [RawActuators, MultirotorRaw, AutopilotTargets],
+    ids=lambda t: t.__name__,
+)
+def test_command_encodes_numpy_scalars(make):
+    np = pytest.importorskip("numpy")
+    values = (0.25, -0.5, 0.125, 0.75)[: 3 if make is AutopilotTargets else 4]
+    scalars = [np.float64(values[0]), np.float32(values[1])] + [np.float64(v) for v in values[2:]]
+    cmd = Command(
+        target_id=4,
+        seq=11,
+        telemetry_tick=99,
+        trigger=np.bool_(True),
+        epoch=7,
+        control=make(*scalars),
+    )
+    got = decode_command(encode_command(cmd))
+    assert got.trigger is True
+    assert got.control == make(*values)
+
+
 def test_tick_end_round_trip_and_garbage():
     te = TickEnd(2**40 + 1, 1234.5)
     assert decode_tick_end(encode_tick_end(te)) == te

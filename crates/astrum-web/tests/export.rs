@@ -1,14 +1,14 @@
 //! `export_bag` turns an MCAP bag's telemetry and events into the renderer's
 //! document.
 
-use astrum_bag::BagWriter;
+use astrum_bag::{AircraftModel, BagWriter};
 use astrum_net::keys;
 use astrum_proto::{
     encode_command, encode_event, encode_telemetry, Command, Control, ControlMode, EndReason, Enu,
     Event, EventKind, ModeReason, RawActuators, Telemetry, VehicleKind,
 };
 use astrum_web::export::export_bag;
-use astrum_web::{AircraftModel, EventFields, ExportDoc};
+use astrum_web::{EventFields, ExportDoc};
 
 const DT: f64 = 1.0 / 120.0;
 

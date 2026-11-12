@@ -280,8 +280,9 @@ need to subscribe to the new keys to capture them; the web exporter would need t
 (default 100) and `ammo` (armed aircraft only), copied into the components by
 `initial_components`.
 
-Scenario initial conditions are **geodetic (HAE) + heading + true airspeed**; fixed-wing
-aircraft are trimmed for level flight at spawn (`trim = false` skips it; a failed trim is
+Scenario initial conditions are **geodetic (HAE) + heading + true airspeed**, plus an optional
+flight-path angle and bank (`climb_deg`, `bank_deg`, default 0); fixed-wing aircraft are trimmed
+at spawn for steady flight at them (`trim = false` skips it; a failed trim is
 fatal). That is sufficient for a merge setup; the Gym adapter's `scenario.py` builds its
 two-`f16` scenarios this way, and `tests/common/mod.rs` has `two_f16_opposing()`.
 
@@ -610,7 +611,7 @@ observability/polish. Phase 4 is the RL payoff.
 | Run control (pause / step / speed), status; controller presence | `astrum-sim/src/control.rs` (`RunControl`, `serve_control`, `publish_status`); `net.rs` (`connect`, `Controllers`, `track_controllers`, `HeldCommands`); `astrum-net/src/lib.rs` (`ControlServer`, `PresenceWatcher`), `src/bin/ctl.rs` |
 | Event stream (hits, kills, trigger, mode changes, run end) | `astrum-sim/src/events.rs` (`EventLog`, `publish_events`); emitted in `combat/systems.rs` (`fire_guns`, `resolve_hits`, `on_kill`), `pilot.rs` (`log_mode_changes`), `net.rs` (`Controllers`), `systems.rs` (exit systems); `SimEnv::events`; schema `Event` |
 | In-process recording (`--record`) | `astrum-sim/src/record.rs` (`TickRecorder`, `Recording`) |
-| Sweeps (`astrum sweep`) | `astrum-sim/src/sweep.rs` (planning, in-process runs, summary), `src/bin/astrum.rs` (process mode + `astrum run`) |
+| Sweeps (`astrum sweep`), `astrum run`, `astrum list` | `astrum-sim/src/sweep.rs` (planning, in-process runs, summary), `launch.rs` (`LiveRun`, process mode `run_processes`), `catalog.rs` (file listing, environments); `src/bin/astrum.rs` is the CLI over them |
 | Wire schema | `astrum-proto/schema/astrum.capnp` (`Telemetry`, `Command`, `Combat`) |
 | Encode / decode | `astrum-proto/src/lib.rs` |
 | Zenoh keys / transport | `astrum-net/src/lib.rs` (`keys`, `qos`, `LatestTelemetry`, `CommandSender`) |

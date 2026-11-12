@@ -12,12 +12,17 @@
 //!   for commands.
 //!
 //! The scenario TOML served by the sim at record start is stored as the metadata
-//! record `astrum.scenario` (key `toml`).
+//! record `astrum.scenario` (key `toml`); [`aircraft_models`] reads the fleet's
+//! models out of it.
 //!
 //! [`BagWriter`] / [`BagReader`] are the file API; [`Recorder`] and [`replay`]
 //! are the record and replay loops behind the `astrum-bag-record` /
 //! `astrum-bag-play` binaries, written against a [`Session`] so they run on an
-//! in-process session in tests.
+//! in-process session in tests. [`metrics::compute`] reduces a bag to run
+//! metrics (the `astrum-bag-metrics` binary).
+
+pub mod metrics;
+pub mod tracks;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -31,6 +36,7 @@ use astrum_net::zenoh::pubsub::Subscriber;
 use astrum_net::zenoh::Wait;
 use astrum_net::{keys, EventPublisher, NetError, Session, TelemetryPublisher};
 use mcap::records::{MessageHeader, Metadata, Record};
+use serde::{Deserialize, Serialize};
 
 /// Metadata record holding the recorded scenario.
 pub const SCENARIO_METADATA: &str = "astrum.scenario";
@@ -268,6 +274,44 @@ impl BagReader {
         out.sort_by_key(|m| m.log_time_ns);
         Ok(out)
     }
+}
+
+/// One aircraft's JSBSim model as the scenario declares it. Telemetry carries
+/// only the vehicle class, so this is how the renderer learns that, say,
+/// aircraft 1 is an F-16 (and draws the daytime environment for it).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AircraftModel {
+    pub id: u32,
+    /// The scenario's `model` string, e.g. `"f16"` or `"c172x"`.
+    pub model: String,
+}
+
+/// The part of a scenario TOML [`aircraft_models`] reads; every other key is
+/// ignored, so scenario schema changes elsewhere cannot break it.
+#[derive(Deserialize)]
+struct ScenarioFleet {
+    #[serde(default)]
+    aircraft: Vec<ScenarioAircraft>,
+}
+
+#[derive(Deserialize)]
+struct ScenarioAircraft {
+    id: Option<u32>,
+    model: Option<String>,
+}
+
+/// The `[[aircraft]]` ids and models of a scenario TOML, sorted by id. Entries
+/// missing either field are skipped; TOML that does not parse (or whose fleet
+/// has the wrong shape) yields none — the renderer then keeps its default look.
+pub fn aircraft_models(scenario_toml: &str) -> Vec<AircraftModel> {
+    let Ok(fleet) = toml::from_str::<ScenarioFleet>(scenario_toml) else { return Vec::new() };
+    let mut models: Vec<AircraftModel> = fleet
+        .aircraft
+        .into_iter()
+        .filter_map(|a| Some(AircraftModel { id: a.id?, model: a.model? }))
+        .collect();
+    models.sort_by_key(|m| m.id);
+    models
 }
 
 // --- Recording ----------------------------------------------------------------
