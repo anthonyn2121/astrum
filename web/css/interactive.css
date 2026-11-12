@@ -94,6 +94,26 @@
 .flight-plan #runNote { text-align: center; }
 .flight-plan #runNote:empty { display: none; }
 
+/* ---- A race scenario's course: the seed controls and the top-down sketch ---- */
+.course-box { margin-top: 18px; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--glass-line); background: rgba(0, 0, 0, 0.22); }
+.course-box .plan-sub { margin-bottom: 10px; }
+.course-controls { display: flex; flex-wrap: wrap; gap: 14px 28px; align-items: flex-start; }
+.course-random { display: flex; align-items: center; gap: 8px; padding-top: 18px; color: var(--text); cursor: pointer; }
+.course-random input { width: auto; }
+.course-seed { max-width: 260px; }
+.course-gates { max-width: 140px; }
+.course-seed-row { display: flex; gap: 8px; align-items: center; }
+.course-seed-row input { flex: 1; min-width: 0; }
+.course-seed input[readonly] { opacity: 0.7; cursor: default; }
+.course-preview { margin: 14px 0 0; }
+.course-svg { display: block; width: 100%; height: 260px; border-radius: 8px; background: rgba(0, 0, 0, 0.3); border: 1px solid var(--glass-line); }
+.course-svg .path { fill: none; stroke: rgba(143, 180, 224, 0.55); stroke-width: 1; stroke-dasharray: 4 4; }
+.course-svg .gate { stroke: #8fb4e0; stroke-width: 3; stroke-linecap: round; }
+.course-svg .gate.first { stroke: #ffc23d; }
+.course-svg .arrow { fill: #cfe3ff; }
+.course-svg .num { fill: var(--text); font-family: system-ui, sans-serif; font-weight: 600; }
+.course-box .form-error { margin: 10px 0 0; }
+
 /* ---- Locked setup while a run is active: dimmed but legible ---- */
 #setupFields:disabled { opacity: 1; filter: saturate(0.55); }
 #setupFields:disabled .step > :not(h2) { opacity: 0.62; }

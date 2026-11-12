@@ -3,7 +3,10 @@
 // in-process), the run settings, and the plan: what the sweep would fly, as
 // POST /api/sweeps/plan says it, re-planned as the form changes. Save writes
 // config/sweep.<name>.toml for `astrum sweep`; `?sweep=<name>` (or the Saved
-// sweeps list) opens one. The variation (variation.js) joins the request.
+// sweeps list) opens one. The variation (variation.js) joins the request. A
+// race scenario also gets the Course settings: every run flies the scenario's
+// course seed (`fixed`: one environment) or the run's own (`randomize`: repeat r
+// flies the base seed + r), as `course_seed_mode`.
 // Run sweep flies the plan on screen (POST /api/sweeps) and opens its page
 // (sweep.html); a sweep that is running is shown above the form.
 //
@@ -33,6 +36,8 @@ const el = {
   loadError: $("loadError"), form: $("sweep"), fleet: $("fleet"), fleetEmpty: $("fleetEmpty"), fleetError: $("fleetError"),
   maxTime: $("maxTime"), maxTimeError: $("maxTimeError"), repeats: $("repeats"), repeatsError: $("repeatsError"),
   jobs: $("jobs"), jobsError: $("jobsError"), runTimeout: $("runTimeout"), runTimeoutError: $("runTimeoutError"),
+  variationRace: $("variationRace"), courseSection: $("courseSection"), courseMode: $("courseMode"), courseModeHint: $("courseModeHint"),
+  courseGates: $("courseGates"), courseGatesHint: $("courseGatesHint"), courseGatesError: $("courseGatesError"),
   planNote: $("planNote"), planBusy: $("planBusy"), planError: $("planError"), planBody: $("planBody"),
   planSummary: $("planSummary"), planTrim: $("planTrim"), planWrap: $("planWrap"), planTable: $("planTable"),
   planMore: $("planMore"), checkTrims: $("checkTrims"), saveForm: $("saveForm"), saveName: $("saveName"),
@@ -100,10 +105,47 @@ function onPick(entry, doc, error) {
   el.fleetEmpty.hidden = !!entry && !error;
   el.fleetEmpty.textContent = error ? `Cannot read scenario ${entry.name}: ${error}` : "Pick a scenario first.";
   showError(el.fleetError, "");
-  el.startPanel.hidden = !doc;
   if (doc) el.maxTime.value = String(defaultMaxTime(doc));
+  el.courseMode.value = "fixed"; // a pick starts with one environment for every run
+  const own = doc?.course?.gates.length;
+  el.courseGates.value = own ?? ""; // ...and the scenario's own gate count
+  el.courseGatesHint.textContent = own != null ? `the scenario's own count is ${own}` : "";
+  showError(el.courseGatesError, "");
+  syncCourse();
+  el.startPanel.hidden = !doc || isRace(); // a race starts where its course says, not where the scenario's aircraft is
   clearPlan();
   changed();
+}
+
+// Is the picked scenario (its doc read) a race: in the race environment, or
+// carrying a course?
+function isRace() {
+  return !!state.doc && (state.scenario?.environment === "race" || state.doc.course != null);
+}
+
+// The Course setting: shown for a race scenario. Its hint says which seeds the
+// runs fly.
+function syncCourse() {
+  const race = isRace();
+  el.courseSection.hidden = !race;
+  // A race's drone starts from its course (the server refuses start offsets).
+  el.variationRace.hidden = !race;
+  el.variation.hidden = race;
+  const seed = state.doc?.course?.seed;
+  const base = Number.isFinite(seed) ? `the scenario's course seed ${seed}` : "the scenario's course seed";
+  el.courseModeHint.textContent = el.courseMode.value === "randomize"
+    ? `repeat r flies ${base} + r` : `every run flies ${base}`;
+}
+
+// The Gates setting: the whole number in the field (2 to 64), or undefined
+// after showing why it is refused.
+function courseGates() {
+  const raw = el.courseGates.value.trim();
+  const x = Number(raw);
+  const bad = raw === "" || !Number.isInteger(x) || x < 2 || x > 64;
+  showError(el.courseGatesError, bad ? "must be a whole number from 2 to 64" : "");
+  el.courseGates.setAttribute("aria-invalid", String(bad));
+  return bad ? undefined : x;
 }
 
 // The max sim time a new sweep starts from: the scenario's, when it has one.
@@ -145,12 +187,16 @@ function buildRequest() {
   const { ok, assignments } = form.assignments();
   const settings = runSettings();
   const fields = variation.fields();
-  if (!ok || !fields || !settings) return null;
+  const gates = isRace() ? courseGates() : null;
+  if (!ok || !fields || !settings || gates === undefined) return null;
   return {
     scenario: state.scenario.name,
     assignments,
     ...settings,
     ...fields,
+    ...(isRace() ? { course_seed_mode: el.courseMode.value } : {}),
+    // The scenario's own gate count is what a sweep without one flies: send only another.
+    ...(gates != null && gates !== state.doc.course?.gates.length ? { gates } : {}),
   };
 }
 
@@ -280,17 +326,24 @@ function renderPlan(plan) {
     h("span", { class: "plan-count", text: String(plan.runs) }),
     ` ${plan.runs === 1 ? "run" : "runs"} · ${plan.in_process ? "in-process" : "with controllers (processes)"}`);
   const withSample = plan.rows.some((r) => r.sample != null);
+  // A race sweep's rows also say which course (seed) each run flies.
+  const withCourse = plan.rows.some((r) => r.course_seed != null);
+  const withGates = plan.rows.some((r) => r.gates != null);
   const shown = plan.rows.slice(0, PLAN_ROWS);
   el.planTable.replaceChildren(
     h("thead", {}, h("tr", {},
       h("th", { text: "run" }),
       h("th", { text: "seed" }),
       withSample ? h("th", { text: "sample" }) : null,
+      withCourse ? h("th", { text: "course seed" }) : null,
+      withGates ? h("th", { text: "gates" }) : null,
       ...plan.keys.map((k) => h("th", { text: k })))),
     h("tbody", {}, ...shown.map((r) => h("tr", {},
       h("td", { text: String(r.run) }),
       h("td", { text: String(r.seed) }),
       withSample ? h("td", { text: r.sample == null ? "" : String(r.sample) }) : null,
+      withCourse ? h("td", { text: r.course_seed == null ? "" : String(r.course_seed) }) : null,
+      withGates ? h("td", { text: r.gates == null ? "" : String(r.gates) }) : null,
       ...plan.keys.map((k) => h("td", { text: formatValue(r.values[k]) }))))));
   el.planWrap.hidden = false;
   const more = plan.rows.length - shown.length;
@@ -411,6 +464,9 @@ async function openSweep(name) {
   if (!picked || token !== state.openTok) return; // the picker says why
   showError(el.fleetError, form.setAssignments(request.assignments).join("; "));
   variation.setFields(request);
+  el.courseMode.value = request.course_seed_mode ?? "fixed";
+  if (request.gates != null) el.courseGates.value = String(request.gates);
+  syncCourse();
   el.maxTime.value = String(request.max_time_s);
   el.repeats.value = String(request.repeats);
   el.jobs.value = String(request.jobs);
@@ -573,6 +629,7 @@ function recentItem(sweep) {
 el.form.addEventListener("change", changed); // any edit: the scenario, controllers, parameters, settings
 el.form.addEventListener("input", changed); // typing re-plans after the debounce, not only on blur
 el.form.addEventListener("submit", (e) => e.preventDefault());
+el.courseMode.addEventListener("change", syncCourse);
 el.checkTrims.addEventListener("click", () => {
   const request = buildRequest();
   if (!request) {

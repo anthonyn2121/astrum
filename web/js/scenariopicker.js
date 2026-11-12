@@ -90,7 +90,10 @@ export class ScenarioPicker {
         s.summary ? h("span", { class: "choice-text", text: s.summary }) : null,
         invalid
           ? h("span", { class: "choice-text field-error", text: s.error })
-          : h("span", { class: "choice-text muted", text: fleetSummary(s.aircraft) }));
+          : h("span", {
+              class: "choice-text muted",
+              text: `${Number.isInteger(s.gates) ? `${s.gates} gates · ` : ""}${fleetSummary(s.aircraft)}`,
+            }));
       scenarioList.append(h("label", { class: invalid ? "choice disabled" : "choice", title: s.path }, input, body));
     }
   }

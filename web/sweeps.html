@@ -93,6 +93,7 @@
         <section class="step" aria-labelledby="variationHead">
           <h2 id="variationHead"><span class="step-n">4</span> Variation <span class="muted small">optional</span></h2>
           <p class="muted small">Vary where the aircraft start and how they point, around the scenario's own starting conditions. Each offset is in the aircraft's own frame: forward along its heading, right of it, and up.</p>
+          <p id="variationRace" class="muted small" hidden>A race flies from its course's start, so there are no start offsets to vary; use the Course setting under Run settings.</p>
           <div id="variation" class="variation"></div>
         </section>
 
@@ -120,6 +121,23 @@
               <input id="runTimeout" type="number" min="0" step="any" inputmode="decimal" value="0" />
               <span class="muted small">0 = none</span>
               <span id="runTimeoutError" class="field-error" role="alert" hidden></span>
+            </div>
+          </div>
+          <!-- A race scenario's course: the same gates every run, or new ones each run. -->
+          <div id="courseSection" class="run-options" hidden>
+            <div class="field">
+              <label class="field-label" for="courseMode">Course</label>
+              <select id="courseMode">
+                <option value="fixed">Same environment for every run</option>
+                <option value="randomize">Randomize gates each run</option>
+              </select>
+              <span id="courseModeHint" class="muted small"></span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="courseGates">Gates</label>
+              <input id="courseGates" type="number" min="2" max="64" step="1" inputmode="numeric" />
+              <span id="courseGatesHint" class="muted small"></span>
+              <span id="courseGatesError" class="field-error" role="alert" hidden></span>
             </div>
           </div>
         </section>

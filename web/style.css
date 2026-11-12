@@ -409,6 +409,7 @@ a.brand { color: inherit; text-decoration: none; }
 .ev-kind.mode { color: var(--accent); }
 .ev-kind.ctrl { color: var(--ok); }
 .ev-kind.run { color: var(--text); }
+.ev-kind.race { color: var(--ok); }
 
 /* ---- Plots (js/plots.js) ----
    Chips + "+ Channel" in the dock header, one row per channel in the body

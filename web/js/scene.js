@@ -22,6 +22,14 @@
 //   * in the sky, a half-opacity "ghost" redraw of each body after the clouds,
 //     so an aircraft behind a cloud still shows through at about half strength;
 //   * motion trails and hit / kill flashes;
+//   * a race course (setCourse): one frame per gate — drawn at the model scale
+//     about the centre of its opening, as the aircraft are, so a drone and the
+//     gate it flies through stay in proportion — a number tag, a line through
+//     the gate centres, and the pending gate highlighted (setPendingGate).
+//     While a course is on screen multirotors are drawn at true size
+//     (meshes.js F450_UNIT) instead of the sandbox's exaggerated quad mesh;
+//     neither gates nor drone get a minimum on-screen size then, and the chase /
+//     top / side cameras sit metres away, not hundreds;
 //   * viewInfo(), the camera heading and scale the DOM compass / scale bar use;
 //   * edit mode (setEditing), the scenario editor's interaction: click /
 //     Shift+click / Shift+box selection, dragging aircraft on the horizontal
@@ -35,6 +43,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import {
   buildAircraft, buildGhostGeometry, enuToThree, attitudeToQuaternion, aircraftColor, tintAircraft, setTwoTone,
+  buildGate, buildGateLabel, placeGate, setGateState, F450_UNIT,
 } from "./meshes.js";
 import { Environment } from "./environment.js";
 import { DEG2RAD, RAD2DEG } from "./geo.js";
@@ -108,6 +117,12 @@ const TRACKED = new Set(["chase", "top", "side"]);
 const CHASE = { back: 140, rise: 32, ahead: 300 }; // m behind / above, look-ahead
 const TOP_HEIGHT = 900;   // m above the selection (minimum when framing a pair)
 const SIDE_DIST = 420;    // m abeam (minimum when framing a pair)
+// The same views while a race course is on screen: a 0.57 m drone and 1 m gates
+// are seen from metres away, not hundreds.
+const RACE_CHASE = { back: 5, rise: 1.5, ahead: 12 };
+const RACE_TOP_HEIGHT = 25;
+const RACE_SIDE_DIST = 8;
+const RACE_NEAR = 0.1, RACE_FAR = 20000; // the perspective clip planes with a course (else 1, 500000)
 const FIT_MARGIN = 1.3;   // half-extent multiplier when framing a pair
 const FIT_PAD = 40;       // m added to each half-extent (the models themselves)
 const SLOW_MPS = 3;       // below this the flight path is noise: use the heading
@@ -147,6 +162,10 @@ const DRAG_REACH = 4;
 const PREVIEW_OPACITY = 0.6;
 const PREVIEW_MIN_PX = 28;
 const PREVIEW_COLOR = 0x8fe3ff; // a light cyan that reads on imagery and on the dark grid
+
+// Race course: the line through the gate centres is COURSE_LINE_COLOR.
+const COURSE_LINE_COLOR = 0x8fb4e0;
+const FOOT_COURSE_RADIUS = 0.4; // m: a drone's ground ring with a course on screen (0.57 m drone)
 
 const UP = new THREE.Vector3(0, 1, 0);
 const NORTH = new THREE.Vector3(0, 0, -1); // screen-up of the top view
@@ -206,6 +225,8 @@ export class Scene {
     this._flashes = [];      // { sprite, age, life, size }
     this._flashTex = null;   // shared radial glow, built on first use
     this._modelScale = MODEL_SCALE_DEFAULT;
+    this._course = null;     // { gates: [{ index, group, label, center }], line }, see setCourse
+    this._pending = 0;       // index of the gate to highlight (setPendingGate)
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -392,6 +413,72 @@ export class Scene {
     this._tracking = false;
     this._env.reset(); // a new source may sit at a different datum
     this._clearFlashes();
+  }
+
+  // A course is drawn at true size (see _sizeForScreen), so its camera sees
+  // gates from well under a metre: the perspective clip planes follow it.
+  _clipForCourse(on) {
+    this._persp.near = on ? RACE_NEAR : 1;
+    this._persp.far = on ? RACE_FAR : 500000;
+    this._persp.updateProjectionMatrix();
+  }
+
+  // Show a race course — the validated course JSON (race.js parseCourse) — in
+  // place of the current one, or none with null. Gate i is built from the
+  // course's dimensions and stands where its centre / yaw say (meshes.js
+  // describes the placement); the highlighted one follows setPendingGate.
+  setCourse(course) {
+    this._disposeCourse();
+    this._clipForCourse(!!course);
+    if (!course) return;
+    const gates = course.gates.map((g) => {
+      const group = buildGate(course);
+      placeGate(group, g);
+      const label = buildGateLabel(g.index);
+      label.visible = false; // placed by _sizeForScreen
+      this.scene.add(group, label);
+      return { index: g.index, group, label, center: group.position.clone() };
+    });
+    const geom = new THREE.BufferGeometry().setFromPoints(gates.map((g) => g.center));
+    const line = new THREE.Line(geom, new THREE.LineBasicMaterial({
+      color: COURSE_LINE_COLOR, transparent: true, opacity: 0.6, fog: false,
+    }));
+    this.scene.add(line);
+    this._course = { gates, line };
+    this._paintGates();
+  }
+
+  // Highlight gate `index` as the next to fly; the gates before it are passed
+  // (all of them, once it is past the last).
+  setPendingGate(index) {
+    if (index === this._pending) return;
+    this._pending = index;
+    this._paintGates();
+  }
+
+  _paintGates() {
+    if (!this._course) return;
+    for (const g of this._course.gates) {
+      setGateState(g.group, g.index < this._pending ? "passed" : g.index === this._pending ? "pending" : "future", g.label);
+    }
+  }
+
+  // Take the course out of the scene and free its geometries, materials and
+  // number-tag textures.
+  _disposeCourse() {
+    const c = this._course;
+    if (!c) return;
+    this._course = null;
+    for (const { group, label } of c.gates) {
+      this.scene.remove(group, label);
+      group.traverse((o) => o.geometry?.dispose());
+      for (const m of group.userData.mats) m.dispose();
+      label.material.map.dispose();
+      label.material.dispose();
+    }
+    this.scene.remove(c.line);
+    c.line.geometry.dispose();
+    c.line.material.dispose();
   }
 
   // Take one aircraft out of the scene and free its geometries, materials
@@ -899,13 +986,14 @@ export class Scene {
       if (los > 1e-3) _v.divideScalar(los);
       else pathDir(own.sample, own.psi, false, _v);
       smoothDir(this._chaseDir, _v, snap ? 1 : blend(dt, TAU_CHASE_DIR));
-      _wantCam.copy(this._chaseDir).multiplyScalar(-CHASE.back * zoom).addScaledVector(UP, CHASE.rise * zoom);
+      const view = this._course ? RACE_CHASE : CHASE;
+      _wantCam.copy(this._chaseDir).multiplyScalar(-view.back * zoom).addScaledVector(UP, view.rise * zoom);
       if (los > 1e-3) _wantLook.subVectors(tgt.group.position, p);
-      else _wantLook.copy(this._chaseDir).multiplyScalar(CHASE.ahead * zoom);
+      else _wantLook.copy(this._chaseDir).multiplyScalar(view.ahead * zoom);
     } else if (mode === "top") {
       // Straight down, north up; a pinned pair is centred and kept in frame.
       up = NORTH;
-      let h = TOP_HEIGHT;
+      let h = this._course ? RACE_TOP_HEIGHT : TOP_HEIGHT;
       if (tgt) {
         const b = tgt.group.position;
         _want.addVectors(p, b).multiplyScalar(0.5);
@@ -922,7 +1010,7 @@ export class Scene {
     } else {
       // Side: level, abeam the smoothed horizontal track (or, with a target,
       // perpendicular to the horizontal line of sight, framing both).
-      let dist = SIDE_DIST;
+      let dist = this._course ? RACE_SIDE_DIST : SIDE_DIST;
       let haveLos = false;
       if (tgt) {
         const b = tgt.group.position;
@@ -982,6 +1070,10 @@ export class Scene {
     for (const { group } of this.fleet.values()) {
       if (group.visible) { box.expandByPoint(group.position); any = true; }
     }
+    if (this._course) {
+      for (const g of this._course.gates) box.expandByPoint(g.center);
+      any = true;
+    }
     const center = new THREE.Vector3();
     if (this._mode === "map") {
       let mpp = MAP_MPP_DEFAULT;
@@ -997,7 +1089,8 @@ export class Scene {
     let radius;
     if (any) {
       box.getCenter(center);
-      radius = Math.max(box.getBoundingSphere(new THREE.Sphere()).radius, 150);
+      // A race course is metres across: no 150 m floor, or it frames as a speck.
+      radius = Math.max(box.getBoundingSphere(new THREE.Sphere()).radius, this._course ? 8 : 150);
     } else {
       center.set(0, 60, 0);
       radius = 400;
@@ -1114,7 +1207,14 @@ export class Scene {
       const g = a.group;
       if (!g.visible) continue;
       const dist = this._depth(g.position);
-      const s = Math.max(this._modelScale, (MIN_AIRCRAFT_PX * px * dist) / g.userData.span);
+      // A drone is drawn at true size next to a course's gates.
+      const unit = this._course && g.userData.kind === "multirotor" ? F450_UNIT : 1;
+      // With a course on screen nothing is inflated past the Size setting: no
+      // minimum on-screen size (1× is exactly true scale); the selection
+      // brackets and the name tag keep a far drone findable.
+      const s = this._course
+        ? this._modelScale * unit
+        : Math.max(this._modelScale, (MIN_AIRCRAFT_PX * px * dist) / g.userData.span);
       g.scale.setScalar(s);
       if (a.label.visible) {
         // Anchored at the aircraft and lifted in screen space just clear of the
@@ -1129,13 +1229,32 @@ export class Scene {
         a.label.scale.set(labelH * NAME_ASPECT, labelH, 1);
       }
       if (a.foot.visible) {
-        a.foot.scale.setScalar(Math.max(FOOT_RADIUS, FOOT_MIN_PX * px * this._depth(a.foot.position)));
+        a.foot.scale.setScalar(this._course ? FOOT_COURSE_RADIUS
+          : Math.max(FOOT_RADIUS, FOOT_MIN_PX * px * this._depth(a.foot.position)));
       }
     }
+    if (this._course) this._sizeCourse(px, labelH);
     this._updateSelectMarker(px);
     this._updateTargetOverlay(px);
     this._updateHandles(px);
     this._sizeGhosts(px);
+  }
+
+  // Gate sizes and number tags: a gate is drawn at the model scale about the
+  // centre of its opening — exactly true size at 1×, with no minimum on-screen
+  // size — and its tag (a constant screen size) sits just above the frame's top
+  // edge.
+  _sizeCourse(px, labelH) {
+    for (const { group, label } of this._course.gates) {
+      const { top } = group.userData;
+      const dist = this._depth(group.position);
+      const s = this._modelScale;
+      group.scale.setScalar(s);
+      label.visible = true;
+      label.position.copy(group.position);
+      label.center.y = -((top * s) / (dist * px) + LABEL_GAP_PX) / LABEL_PX;
+      label.scale.set(labelH * NAME_ASPECT, labelH, 1);
+    }
   }
 
   // The bracket size (CSS px) around a built aircraft: at least SELECT_PX and
@@ -1246,6 +1365,7 @@ export class Scene {
   dispose() {
     this.cancelEdit();
     this.clearFleet();
+    this._disposeCourse();
     for (const layer of [...this._ghostLayers.keys()]) this._dropGhostLayer(layer);
     this._resizeObserver.disconnect();
     const el = this.renderer.domElement;

@@ -385,3 +385,107 @@ export function buildGhostGeometry(kind) {
   geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
   return { geom, span: 9.5 };
 }
+
+// ---- Race gates ----
+//
+// A gate is a square clear opening in a frame of two uprights and a top bar
+// (the course message's `opening_m` / `bar_m` / `top_bar_m`: the bar stock is
+// `bar_m` square, the uprights flank the opening and are as tall as it is, and
+// the top bar spans the opening plus both uprights). The sim places it by the
+// CENTRE OF THE OPENING (`east_m`, `north_m`, `up_m`, ENU metres) and `yaw_rad`,
+// the heading of the gate's normal — the flight direction through it — with 0 =
+// North and + toward East, the same convention as an aircraft's heading.
+//
+// Placement. The sim's gate frame is (right, up, normal) with right = starboard
+// of the flight direction, i.e. in ENU (psi = yaw_rad):
+//     normal = ( sin psi,  cos psi, 0)      right = (cos psi, -sin psi, 0)
+// Through the grid mapping (three.x = E, three.y = U, three.z = -N) those are
+//     normal = ( sin psi, 0, -cos psi)      right = (cos psi,  0,  sin psi)
+// (right, up, normal) is LEFT-handed, so — exactly as attitudeToQuaternion does
+// for an aircraft — the mesh's local +X is the gate's PORT side (-right), which
+// makes (port, up, normal) a proper rotation: Ry(theta) takes local +Z to
+// (sin theta, 0, cos theta) and local +X to (cos theta, 0, -sin theta), so
+// theta = pi - psi. The frame is mirror-symmetric across x = 0, so using port
+// for local +X changes nothing visible. The gate stands upright: no bank, no tilt.
+
+// Gate colours by progress: ahead of the drone, the one it must fly next, and
+// behind it. `fill` is the opacity of the pane drawn in the opening.
+const GATE_LOOK = {
+  future: { color: 0x8fb4e0, emissive: 0.3, fill: 0.05, opacity: 1 },
+  pending: { color: 0xffc23d, emissive: 0.65, fill: 0.2, opacity: 1 },
+  passed: { color: 0x4fd18b, emissive: 0.25, fill: 0, opacity: 0.55 },
+};
+
+const _gateUp = new THREE.Vector3(0, 1, 0);
+
+// The orientation of a gate whose normal has heading `yawRad` (see above).
+export function gateQuaternion(yawRad, out = new THREE.Quaternion()) {
+  return out.setFromAxisAngle(_gateUp, Math.PI - yawRad);
+}
+
+// Put a gate group (from buildGate) where `gate` — a course message gate
+// { east_m, north_m, up_m, yaw_rad } — stands.
+export function placeGate(group, gate) {
+  enuToThree(gate.east_m, gate.north_m, gate.up_m, group.position);
+  gateQuaternion(gate.yaw_rad, group.quaternion);
+}
+
+// One gate's frame, built about the centre of its opening in the gate's local
+// axes (+X port, +Y up, +Z along the normal). Returns a THREE.Group whose
+// userData carries { span, top, bars, pane, mats }: `span` is the frame's
+// largest dimension (its diagonal) and `top` how far the frame's top edge is
+// above the centre of the opening, in metres at scale 1, which the scene uses
+// to keep a far gate visible and to lift its number tag. Colour it with setGateState.
+export function buildGate({ opening_m: opening, bar_m: bar, top_bar_m: topBar }) {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.6, transparent: true });
+  const half = opening / 2, t = bar / 2;
+  const bars = [
+    box(bar, opening, bar, mat, -(half + t), 0, 0), // port upright
+    box(bar, opening, bar, mat, half + t, 0, 0),    // starboard upright
+    box(topBar, bar, bar, mat, 0, half + t, 0),     // top bar, on both uprights
+  ];
+  g.add(...bars);
+  const paneMat = new THREE.MeshBasicMaterial({
+    transparent: true, depthWrite: false, side: THREE.DoubleSide, fog: false,
+  });
+  const pane = new THREE.Mesh(new THREE.PlaneGeometry(opening, opening), paneMat);
+  g.add(pane);
+  g.userData = {
+    span: Math.hypot(topBar, opening + bar), top: half + bar,
+    bars, pane, mats: [mat, paneMat],
+  };
+  setGateState(g, "future");
+  return g;
+}
+
+// Colour a gate (and, given, its number tag) for its progress: "future",
+// "pending" or "passed".
+export function setGateState(group, state, label = null) {
+  const look = GATE_LOOK[state];
+  const [mat, paneMat] = group.userData.mats;
+  mat.color.setHex(look.color);
+  mat.emissive.setHex(look.color).multiplyScalar(look.emissive);
+  mat.opacity = look.opacity;
+  paneMat.color.setHex(look.color);
+  paneMat.opacity = look.fill;
+  group.userData.pane.visible = look.fill > 0;
+  if (label) {
+    drawLabel(label, new THREE.Color(look.color));
+    label.material.map.needsUpdate = true;
+  }
+}
+
+// A gate's number tag: the course message's `index` + 1, as aircraft tags are
+// drawn (a constant on-screen size the scene sets each frame).
+export function buildGateLabel(index) {
+  return labelSprite(String(index + 1), new THREE.Color(GATE_LOOK.future.color));
+}
+
+// The scale that draws the quad mesh at its true size: model units × this =
+// metres. buildMultirotor's motors sit 4.6 / 2 units out on the arms and carry
+// 1.15-unit rotor discs, so the mesh reaches 3.45 units from the hub; the F450
+// reaches ARM_M + PROP_RADIUS_M = 0.1651 + 0.1194 m (crates/astrum-race
+// airframe.rs HALF_SPAN_M). The scene applies it to multirotors when a race
+// course is on screen, so the drone and a ~1 m gate are in proportion.
+export const F450_UNIT = (0.1651 + 9.4 * 0.0254 / 2) / (4.6 / 2 + 1.15);

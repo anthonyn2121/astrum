@@ -14,6 +14,8 @@
 //    whole, giving a fully seekable timeline with no running services; its
 //    `meta.models` names the models.
 
+import { parseCourse } from "./race.js";
+
 // The export documents this viewer reads (astrum_web::ExportDoc): version 3 has
 // `events`; version 2 predates them (opened with none).
 const EXPORT_KIND = "astrum-replay";
@@ -98,8 +100,9 @@ export function defaultWsUrl() {
 
 // Parse an astrum-web-export document — a File/Blob of JSON, or the document
 // already parsed (untrusted either way). Returns { frames, events, meta,
-// models } (models: Map id -> JSBSim model, empty for exports without them)
-// or throws.
+// models, course } (models: Map id -> JSBSim model, empty for exports without
+// them; course: a race recording's `meta.course`, race.js parseCourse, else null) or
+// throws.
 export async function loadExportFile(source) {
   let doc = source;
   if (source instanceof Blob) {
@@ -122,5 +125,6 @@ export async function loadExportFile(source) {
     events: Array.isArray(doc.events) ? doc.events : [],
     meta,
     models: parseModels(meta?.models),
+    course: parseCourse(meta?.course),
   };
 }

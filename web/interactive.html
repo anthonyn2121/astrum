@@ -70,6 +70,35 @@
           <p id="scenarioError" class="form-error" role="alert" hidden></p>
           <div id="scenarioList" class="choices" role="radiogroup" aria-labelledby="scenarioHead"></div>
           <p id="scenarioEmpty" class="muted" hidden>No scenarios for this environment in the config directory.</p>
+
+          <!-- A race scenario's course: its seed (a fresh random one when the gates are
+               randomized) and a top-down sketch of the gates that seed gives. -->
+          <div id="courseBox" class="course-box" hidden>
+            <h3 class="plan-sub">Course</h3>
+            <div class="course-controls">
+              <label class="course-random"><input id="courseRandom" type="checkbox" /> Randomize gates</label>
+              <div class="field course-seed">
+                <label class="field-label" for="courseSeed">Course seed</label>
+                <div class="course-seed-row">
+                  <input id="courseSeed" type="number" min="0" step="1" inputmode="numeric" aria-describedby="courseSeedHint" />
+                  <button id="courseReroll" type="button" class="mini" title="Pick another random seed" hidden>Reroll</button>
+                </div>
+                <span id="courseSeedHint" class="muted small"></span>
+                <span id="courseSeedError" class="field-error" hidden></span>
+              </div>
+              <div class="field course-gates">
+                <label class="field-label" for="courseGates">Gates</label>
+                <input id="courseGates" type="number" min="2" max="64" step="1" inputmode="numeric" aria-describedby="courseGatesHint" />
+                <span id="courseGatesHint" class="muted small"></span>
+                <span id="courseGatesError" class="field-error" hidden></span>
+              </div>
+            </div>
+            <figure class="course-preview">
+              <svg id="coursePreview" class="course-svg" role="img" aria-label="Top-down sketch of the course" preserveAspectRatio="xMidYMid meet"></svg>
+              <figcaption id="courseCaption" class="muted small"></figcaption>
+            </figure>
+            <p id="courseError" class="form-error" role="alert" hidden></p>
+          </div>
         </section>
 
         <section class="step" aria-labelledby="fleetHead">
@@ -105,6 +134,7 @@
         <dl class="plan-list">
           <div><dt>Environment</dt><dd id="planEnv">—</dd></div>
           <div><dt>Scenario</dt><dd id="planScenario">—</dd></div>
+          <div id="planCourseRow" hidden><dt>Course</dt><dd id="planCourse">—</dd></div>
           <div><dt>Speed</dt><dd id="planSpeed">—</dd></div>
           <div><dt>Max sim time</dt><dd id="planMax">—</dd></div>
         </dl>

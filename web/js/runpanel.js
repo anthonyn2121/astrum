@@ -3,7 +3,9 @@
 // not finished), a Stop button (DELETE /api/runs/current), its log
 // (GET /api/runs/current/log?since=…, appended as it arrives) and, once the
 // run has finished, its outcome, key metrics (GET /api/runs/<id>/metrics) and
-// "Open full replay" (GET /api/runs/<id>/replay, handed to `onReplay`).
+// "Open full replay" (GET /api/runs/<id>/replay, handed to `onReplay`). A race
+// run's course (the run view's `course`) is handed to `onCourse` — validated
+// (race.js), null for any other run — every time it is read.
 //
 // A run that is not the server's current one (an earlier run's link) shows
 // only its metrics and replay. Everything the server sends — ids, reasons,
@@ -11,6 +13,7 @@
 
 import { getCurrentRun, stopRun, getRunLog, getRunMetrics, getRunReplay, ApiError } from "./api.js";
 import { fmtNum, fmtRange } from "./format.js";
+import { parseCourse } from "./race.js";
 
 const RUN_POLL_MS = 1000;
 const LOG_DOM_MAX = 2000; // lines kept on the page (the server keeps its own ring)
@@ -65,6 +68,11 @@ function metricRows(m) {
   add("lowest altitude", unit(m.min_alt_hae_m, 0, "m HAE"));
   add("max bank", unit(m.max_bank_deg, 1, "°"));
   add("max load", unit(m.max_nz_g, 2, "g"));
+  // A race run's score (astrum_bag::metrics, C5).
+  if (Number.isInteger(m.gates_passed)) add("gates passed", String(m.gates_passed));
+  if (Number.isInteger(m.gates_missed)) add("gates missed", String(m.gates_missed));
+  add("race time", unit(m.race_time_s, 2, "s"));
+  if (typeof m.race_outcome === "string") add("race outcome", m.race_outcome);
   for (const [key, label] of [
     ["failsafe_entries", "failsafe entries"], ["controller_losses", "controller losses"],
     ["command_refusals", "command refusals"], ["hits", "hits"], ["kills", "kills"],
@@ -75,9 +83,10 @@ function metricRows(m) {
 }
 
 export class RunPanel {
-  constructor({ runId, onReplay }) {
+  constructor({ runId, onReplay, onCourse }) {
     this.runId = runId;
     this.onReplay = onReplay;
+    this.onCourse = onCourse;
     this.el = {
       panel: $("runPanel"), id: $("runId"), state: $("runState"), stop: $("runStopBtn"),
       collapse: $("runCollapseBtn"), body: $("runBody"), info: $("runInfo"), error: $("runError"),
@@ -135,6 +144,7 @@ export class RunPanel {
       this.current = !!run && run.id === this.runId;
       if (this.current) {
         this.view = run;
+        this.onCourse(parseCourse(run.course));
         await this._pollLog();
         if (this.done) return;
         if (run.state === "finished") this.done = true;
@@ -249,6 +259,7 @@ export class RunPanel {
       const view = await stopRun();
       // Final from here on: a poll in flight must not bring back "running".
       this.view = view;
+      this.onCourse(parseCourse(view.course));
       this.current = true;
       this.done = true;
       await this._pollLog().catch(() => {});

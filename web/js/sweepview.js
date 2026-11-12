@@ -18,7 +18,7 @@ const RETRY_MAX_MS = 15000; // the longest wait before a failed read is retried
 const RESULTS_TRIES = 5; // tries at the results once the sweep has ended
 const RUN_STATES = ["queued", "running", "ok", "failed", "stopped"];
 // Columns left out of the min / mean / max rows.
-const NO_STATS = new Set(["run", "seed", "sample", "wall_s", "speed_x", "status", "bag"]);
+const NO_STATS = new Set(["run", "seed", "course_seed", "gates", "sample", "wall_s", "speed_x", "status", "bag"]);
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
 const el = {
@@ -419,12 +419,14 @@ function renderFoot(columns, rows, visible, shown) {
 // Numeric columns no plot uses as an axis or colour: the seed and sample, the
 // bag, the wall time and the speed.
 const NOT_PLOTTED = new Set(["seed", "sample", "bag", "wall_s", "speed_x", "status"]);
-// The y axis and the colour leave out `run` too: an index, not a result.
-const NOT_Y = new Set([...NOT_PLOTTED, "run"]);
-// The numeric fleet metrics in catalog order (sim_time_s aside): the y axis
-// defaults to the first of them with a number, else to sim_time_s.
+// The y axis and the colour leave out `run` too: an index, not a result; and the
+// course seed and gate count of a race sweep, which name the environment (x axes, not results).
+const NOT_Y = new Set([...NOT_PLOTTED, "run", "course_seed", "gates"]);
+// The numeric fleet metrics in catalog order (sim_time_s aside; the race's
+// first, which only race sweeps have): the y axis defaults to the first of them
+// with a number, else to sim_time_s.
 const METRIC_COLUMNS = [
-  "min_separation_m", "min_alt_hae_m", "max_bank_deg", "max_nz_g", "failsafe_entries",
+  "gates_passed", "gates_missed", "race_time_s", "min_separation_m", "min_alt_hae_m", "max_bank_deg", "max_nz_g", "failsafe_entries",
   "controller_losses", "command_refusals", "hits", "kills",
 ];
 
