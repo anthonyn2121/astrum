@@ -30,7 +30,7 @@ const el = {
   statusFilter: $("statusFilter"), resultsCount: $("resultsCount"), resultsNote: $("resultsNote"),
   resultsError: $("resultsError"), resultsWrap: $("resultsWrap"), results: $("results"),
   xAxis: $("xAxis"), yAxis: $("yAxis"), colourBy: $("colourBy"), compareEmpty: $("compareEmpty"),
-  compareWrap: $("compareWrap"), scatter: $("scatter"), scatterTip: $("scatterTip"),
+  compareWrap: $("compareWrap"), scatter: $("scatter"), scatterTip: $("scatterTip"), ring: $("ring"),
 };
 
 const state = {
@@ -69,6 +69,48 @@ el.results.replaceChildren(thead, tbody, tfoot);
 
 // ---- the summary ----
 
+// The orbit progress ring (decoration: the <progress> beside it carries the value):
+// a track, an arc for the done fraction and a glowing satellite at the arc's head,
+// with done / total in the middle. Built once; render() moves the arc and satellite.
+const SVG_NS = "http://www.w3.org/2000/svg";
+const RING_R = 50;
+const RING_C = 2 * Math.PI * RING_R;
+
+function svg(tag, attrs = {}, ...children) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+  node.append(...children);
+  return node;
+}
+
+const ring = (() => {
+  const arc = svg("circle", {
+    class: "ring-arc", cx: 60, cy: 60, r: RING_R, "stroke-dasharray": RING_C, "stroke-dashoffset": RING_C,
+  });
+  const sat = svg("g", { class: "ring-sat" },
+    svg("circle", { class: "ring-sat-halo", cx: 60, cy: 60 - RING_R, r: 7 }),
+    svg("circle", { class: "ring-sat-core", cx: 60, cy: 60 - RING_R, r: 3.2 }));
+  const done = svg("tspan", { class: "ring-done" });
+  const total = svg("tspan", { class: "ring-total", dx: 2 });
+  el.ring.append(svg("svg", { viewBox: "0 0 120 120", width: 132, height: 132 },
+    svg("circle", { class: "ring-orbit", cx: 60, cy: 60, r: 38 }),
+    svg("circle", { class: "ring-track", cx: 60, cy: 60, r: RING_R }),
+    arc,
+    sat,
+    svg("text", { class: "ring-text", x: 60, y: 60 }, done, total),
+    svg("text", { class: "ring-label", x: 60, y: 76 }, "done")));
+  return { arc, sat, done, total };
+})();
+
+function renderRing(done, total, sweepState) {
+  const f = total > 0 ? Math.min(1, done / total) : 0;
+  ring.arc.setAttribute("stroke-dashoffset", String(RING_C * (1 - f)));
+  ring.sat.style.transform = `rotate(${f * 360}deg)`;
+  ring.done.textContent = String(done);
+  ring.total.textContent = `/${total}`;
+  el.ring.dataset.state = sweepState;
+}
+
 function render(view) {
   state.view = view;
   const running = view.state === "running";
@@ -81,6 +123,7 @@ function render(view) {
   el.progress.max = view.total;
   el.progress.value = done;
   el.progressText.textContent = `${done} of ${view.total} done`;
+  renderRing(done, view.total, view.state);
   el.chipOk.textContent = `ok ${view.ok}`;
   el.chipFailed.textContent = `failed ${view.failed}`;
   el.chipRunning.textContent = `running ${view.running}`;

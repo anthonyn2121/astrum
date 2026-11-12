@@ -1,3 +1,8 @@
+/* The Sweeps builder (sweeps.html): on top of studio.css. The galleries of
+   saved and recent sweeps on top, then the steps on the constellation rail
+   with, from 1200 px, the plan beside them in a sticky glass panel (the
+   starting positions as a star chart, the plan table); the Save step below. */
+
 /* The form's fieldset: no browser frame (as Interactive's #setupFields). */
 #sweepFields { border: 0; margin: 0; padding: 0; min-width: 0; }
 
@@ -7,60 +12,219 @@
   clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
 
-/* The Sweeps builder (sweeps.html): on top of studio.css. */
+/* ---- The page frame ---- */
+.sweeps-main h1 { color: var(--star); text-shadow: 0 0 18px rgba(74, 163, 255, 0.45); }
 
-.saved-sweeps { margin: 0 0 22px; }
-.saved-sweeps > summary { cursor: pointer; font-weight: 600; font-size: 15px; }
-.saved-sweeps[open] > summary { margin-bottom: 12px; }
-.saved-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-.saved-item {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 10px 12px;
-  background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius);
+/* The steps and the plan: one column (the plan is step 6 on the rail, the
+   rail joining it to step 5), two from 1200 px with the plan sticky. */
+.sweeps-layout { min-width: 0; }
+.sweeps-steps { min-width: 0; }
+#sweepFields > .step:last-child::before { display: block; }
+.plan-step { padding-bottom: 30px; }
+.plan-step::before { display: none; }
+@media (min-width: 1200px) {
+  .sweeps-main { max-width: 1440px; }
+  .sweeps-layout {
+    display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(400px, 1fr); gap: 0 36px; align-items: start;
+  }
+  #sweepFields > .step:last-child::before { display: none; }
+  /* The padding keeps the current star's pulse inside the scroll box. */
+  .plan-aside {
+    position: sticky; top: 64px; max-height: calc(100vh - 76px); overflow-y: auto; scrollbar-width: thin;
+    margin: -12px -8px 0 -12px; padding: 12px 8px 12px 12px;
+  }
+  /* Sized by the viewport, so the whole panel (Run sweep too) fits beside the steps. */
+  .plan-aside .start-canvas { height: clamp(220px, 28vh, 320px); }
+  .plan-aside .plan-wrap { max-height: clamp(160px, 22vh, 340px); }
 }
-.saved-text { flex: 1; min-width: 240px; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
-.saved-name { font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.saved-item .field-error { font-size: 12px; }
 
-.plan-summary { font-weight: 600; font-size: 15px; margin: 0 0 10px; }
+/* ---- Galleries: saved and recent sweeps as glass cards ---- */
+.gallery { margin: 0 0 26px; min-width: 0; }
+.gallery-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 0 0 12px; }
+.gallery-head h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 16px; }
+.gallery-head h2::before {
+  content: "✦"; font-size: 13px; color: var(--star); text-shadow: 0 0 8px var(--accent), 0 0 16px var(--accent);
+}
+.gallery-count {
+  padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: var(--accent); background: rgba(74, 163, 255, 0.14); border: 1px solid rgba(74, 163, 255, 0.35);
+}
+.gallery-count:empty { display: none; }
+.gallery-more { margin-left: auto; }
+.gallery > .form-error, .gallery > .muted { margin: 0 0 10px; }
+
+.saved-list { list-style: none; margin: 0; padding: 0; }
+.gallery-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.saved-item {
+  position: relative; display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 14px 16px;
+  background: radial-gradient(120% 90% at 100% 0%, var(--nebula-a), transparent 60%), var(--glass);
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+/* A faint star in each card's corner, bright while the card is pointed at. */
+.saved-item::after {
+  content: "✧"; position: absolute; top: 10px; right: 13px; font-size: 13px; color: rgba(234, 243, 255, 0.3);
+  transition: color 0.15s, text-shadow 0.15s;
+}
+.saved-item:hover, .saved-item:focus-within {
+  border-color: rgba(74, 163, 255, 0.6); box-shadow: var(--glow); transform: translateY(-1px);
+}
+.saved-item:hover::after, .saved-item:focus-within::after { color: var(--star); text-shadow: 0 0 8px var(--accent); }
+.saved-item.is-invalid { border-color: rgba(255, 90, 77, 0.4); }
+.saved-text { flex: 1; display: flex; flex-direction: column; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.saved-name {
+  padding-right: 18px; font-weight: 600; font-size: 14px; color: var(--star);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+a.saved-name { color: var(--accent); }
+.saved-summary {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; line-height: 1.45;
+}
+.saved-base {
+  align-self: flex-start; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--glass-line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.saved-item .field-error { font-size: 12px; }
+.saved-actions { display: flex; gap: 8px; }
+
+/* A recent sweep's state, and its ok / failed runs out of the total. */
+.sweep-state {
+  display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 11px; font-weight: 600;
+  color: var(--accent); background: rgba(74, 163, 255, 0.12); border: 1px solid rgba(74, 163, 255, 0.35);
+}
+.sweep-state[data-state="running"] {
+  color: var(--ok); background: rgba(70, 211, 138, 0.12); border-color: rgba(70, 211, 138, 0.45);
+  box-shadow: 0 0 10px rgba(70, 211, 138, 0.3);
+}
+.sweep-state[data-state="failed"] { color: var(--live); background: rgba(255, 90, 77, 0.1); border-color: rgba(255, 90, 77, 0.4); }
+.sweep-state[data-state="stopped"] { color: var(--warn); background: rgba(255, 181, 71, 0.1); border-color: rgba(255, 181, 71, 0.4); }
+.run-bar { display: flex; height: 4px; margin: 2px 0; border-radius: 2px; overflow: hidden; background: rgba(120, 170, 225, 0.14); }
+.run-bar-ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.run-bar-failed { background: var(--live); box-shadow: 0 0 6px var(--live); }
+
+/* ---- The plan panel ---- */
+.plan-card {
+  display: flex; flex-direction: column; min-width: 0; padding: 16px 18px 18px;
+  background:
+    radial-gradient(120% 70% at 100% 0%, var(--nebula-b), transparent 60%),
+    radial-gradient(120% 80% at 0% 0%, var(--nebula-a), transparent 55%),
+    var(--glass);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.plan-card > p { margin: 0 0 10px; }
+.plan-card > p:empty { margin: 0; }
+.plan-busy::before {
+  content: "✦"; display: inline-block; margin-right: 6px; color: var(--accent);
+  animation: plan-twinkle 0.9s ease-in-out infinite alternate;
+}
+@keyframes plan-twinkle {
+  from { opacity: 0.35; text-shadow: none; }
+  to { opacity: 1; text-shadow: 0 0 8px var(--accent); }
+}
+
+.plan-summary { margin: 0 0 14px; font-weight: 600; font-size: 14px; color: var(--muted); }
 .plan-summary:empty { margin: 0; }
+/* The run count: large and glowing. */
+.plan-count {
+  margin-right: 2px; font-size: 44px; font-weight: 700; line-height: 1; vertical-align: -5px;
+  font-variant-numeric: tabular-nums; color: var(--star);
+  text-shadow: 0 0 12px rgba(74, 163, 255, 0.85), 0 0 32px rgba(74, 163, 255, 0.45);
+}
 .plan-body.is-stale { opacity: 0.55; transition: opacity 0.15s; }
 .plan-trim { color: var(--ok); margin: 0 0 10px; }
-.plan-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
-.plan-table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
-.plan-table th, .plan-table td {
-  padding: 5px 12px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line);
+.plan-actions { margin-top: 14px; display: flex; gap: 12px; align-items: center; }
+
+/* The plan table: glass, a solid header that stays while the rows scroll,
+   and a glow on the row pointed at. */
+.plan-wrap {
+  max-height: 340px; overflow: auto; scrollbar-width: thin;
+  background: var(--glass); border: 1px solid var(--glass-line); border-radius: 10px;
 }
-.plan-table th { color: var(--muted); font-weight: 600; background: var(--panel-raised); }
+.plan-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+.plan-table th, .plan-table td {
+  padding: 6px 12px; text-align: right; white-space: nowrap; border-bottom: 1px solid rgba(120, 170, 225, 0.08);
+}
+.plan-table th {
+  position: sticky; top: 0; z-index: 1; color: var(--muted); font-weight: 600;
+  background: var(--panel-solid); border-bottom: 0; box-shadow: inset 0 -1px 0 var(--glass-line);
+}
+.plan-table td:first-child { color: var(--accent); }
+.plan-table td { transition: background 0.12s, color 0.12s; }
 .plan-table tbody tr:last-child td { border-bottom: 0; }
-.plan-actions { margin-top: 12px; display: flex; gap: 12px; align-items: center; }
+.plan-table tbody tr:hover td {
+  background: rgba(74, 163, 255, 0.12); color: var(--star); text-shadow: 0 0 8px rgba(74, 163, 255, 0.6);
+}
+.plan-table tbody tr:hover td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+.plan-body > #planMore { margin: 8px 0 0; }
 
-.run-options .save-summary { flex: 1; min-width: 280px; max-width: none; }
-.save-result { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
-.save-result:empty { display: none; }
-.save-result code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+/* The starting-positions picture (startcloud.js on topdown.js): a star chart. */
+.start-panel { display: flex; flex-direction: column; gap: 8px; margin: 0 0 14px; min-width: 0; }
+.start-panel h3 { margin: 0; font-size: 14px; }
+.start-panel > .muted { margin: 0; }
+.start-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.start-legend { flex: 1; display: flex; flex-wrap: wrap; gap: 4px 16px; min-width: 0; }
+.start-legend-row { display: inline-flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+.start-wrap { position: relative; min-width: 0; }
+.start-canvas {
+  --chart-halo: #050a14;
+  --chart-grid: rgba(120, 170, 225, 0.11);
+  --chart-label: rgba(160, 190, 228, 0.62);
+  display: block; width: 100%; height: 320px; border: 1px solid var(--glass-line); border-radius: 10px;
+  background:
+    radial-gradient(ellipse 70% 60% at 50% 45%, rgba(40, 80, 140, 0.3), transparent 70%),
+    radial-gradient(circle at 85% 12%, var(--nebula-b), transparent 40%),
+    radial-gradient(circle at 10% 90%, var(--nebula-a), transparent 45%),
+    var(--chart-halo);
+  box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.6), 0 0 22px rgba(74, 163, 255, 0.08);
+}
+.start-canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (max-width: 800px) { .start-canvas { height: 260px; } }
+.start-tip {
+  position: absolute; top: 0; left: 0; max-width: 260px; padding: 6px 9px; pointer-events: none;
+  background: var(--glass-strong); backdrop-filter: blur(8px);
+  border: 1px solid rgba(74, 163, 255, 0.45); border-radius: 8px; box-shadow: var(--glow);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums;
+}
+.start-tip div { white-space: nowrap; }
+.start-tip-head { font-weight: 600; color: var(--star); }
 
-/* The variation (variation.js), in the Variation step. */
+/* ---- The variation (variation.js), in the Variation step ---- */
 .variation { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
 .var-part { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-.var-part h3 { margin: 0; font-size: 14px; }
+.var-part h3 { margin: 0; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 .var-help { margin: 0; }
+/* Add random draw / Add grid row: a dashed "add" chip, not a full-width bar. */
+.var-part > button {
+  align-self: flex-start; padding: 5px 14px; color: var(--accent);
+  background: rgba(74, 163, 255, 0.06); border: 1px dashed rgba(74, 163, 255, 0.45); border-radius: 999px;
+}
+.var-part > button::before { content: "+ "; font-weight: 700; }
+.var-part > button:hover:not(:disabled) { background: rgba(74, 163, 255, 0.14); box-shadow: var(--glow); }
 .var-list { display: flex; flex-direction: column; gap: 10px; }
 .var-list:empty { display: none; }
 .var-card {
-  display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 12px 14px;
-  background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius);
+  display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 14px 16px;
+  background: radial-gradient(100% 80% at 100% 0%, var(--nebula-a), transparent 60%), var(--glass);
+  border: 1px solid var(--glass-line); border-radius: 12px; backdrop-filter: blur(8px);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
+.var-card:focus-within { border-color: rgba(74, 163, 255, 0.5); box-shadow: var(--glow); }
 .var-card-head { display: flex; align-items: center; gap: 10px; }
 .var-card-title { font-weight: 600; margin-right: auto; }
+.var-card-title::before { content: "✦"; margin-right: 7px; color: var(--accent); text-shadow: 0 0 6px var(--accent); }
 .var-card > .field-error { margin: 0; }
 .var-aircraft { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .var-aircraft > .field-label { flex-basis: 100%; }
 .var-check {
-  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; cursor: pointer;
-  border: 1px solid var(--line); border-radius: 6px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; cursor: pointer; align-self: flex-start;
+  background: rgba(0, 0, 0, 0.2); border: 1px solid var(--glass-line); border-radius: 999px;
+  font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
-.var-check:hover { border-color: var(--accent); }
-.var-check:has(input:checked) { border-color: var(--accent); background: var(--accent-dim); }
+.var-check:hover { border-color: rgba(74, 163, 255, 0.6); }
+.var-check:has(input:checked) {
+  border-color: var(--accent); background: rgba(74, 163, 255, 0.16); box-shadow: 0 0 10px rgba(74, 163, 255, 0.25);
+}
+.var-check:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
 .var-check input { margin: 0; accent-color: var(--accent); }
 .var-axes { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px 16px; min-width: 0; }
 .var-axis { display: grid; grid-template-columns: 96px minmax(0, 1fr) minmax(0, 96px); gap: 4px 8px; align-items: center; min-width: 0; }
@@ -71,24 +235,19 @@
 .var-fields .var-values { flex-basis: 280px; }
 .var-shared { margin: 0; }
 
-/* The starting-positions picture (startcloud.js on topdown.js), in the Plan step. */
-.start-panel { display: flex; flex-direction: column; gap: 8px; margin: 0 0 12px; min-width: 0; }
-.start-panel h3 { margin: 0; font-size: 14px; }
-.start-panel > .muted { margin: 0; }
-.start-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
-.start-legend { flex: 1; display: flex; flex-wrap: wrap; gap: 4px 16px; min-width: 0; }
-.start-legend-row { display: inline-flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
-.start-wrap { position: relative; min-width: 0; }
-.start-canvas {
-  display: block; width: 100%; height: 340px; border: 1px solid var(--line); border-radius: var(--radius);
-  background: var(--panel-solid);
+/* ---- Save ---- */
+.save-form {
+  padding: 16px 18px; background: var(--glass); border: 1px solid var(--glass-line); border-radius: 12px;
+  backdrop-filter: blur(8px);
 }
-.start-canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-@media (max-width: 800px) { .start-canvas { height: 260px; } }
-.start-tip {
-  position: absolute; top: 0; left: 0; max-width: 260px; padding: 6px 9px; pointer-events: none;
-  background: var(--panel-raised); border: 1px solid var(--line); border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums;
+.run-options .save-summary { flex: 1; min-width: 280px; max-width: none; }
+.save-result { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
+.save-result:empty { display: none; }
+.save-result p { margin: 0; }
+.save-result code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .plan-busy::before { animation: none; }
+  .saved-item, .saved-item::after, .var-card, .var-check, .plan-table td, .plan-body.is-stale { transition: none; }
+  .saved-item:hover, .saved-item:focus-within { transform: none; }
 }
-.start-tip div { white-space: nowrap; }
-.start-tip-head { font-weight: 600; }

@@ -6,23 +6,44 @@
   <title>ASTRUM · Interactive</title>
   <link rel="icon" type="image/png" href="./img/favicon.png" />
   <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/cosmos.css" />
   <link rel="stylesheet" href="./css/studio.css" />
+  <link rel="stylesheet" href="./css/interactive.css" />
 </head>
 <body class="studio">
+  <div class="sky" aria-hidden="true"><i></i><i></i><i></i></div>
   <header class="studio-top">
-    <a class="brand" href="./"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Studio</em></a>
-    <span class="crumb">Interactive</span>
-    <a class="top-link" href="./view.html">Replay viewer</a>
+    <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM</a>
+    <nav class="nav-tabs" aria-label="Studio pages">
+      <a href="./interactive.html" aria-current="page">Interactive</a>
+      <a href="./sandbox.html">Sandbox</a>
+      <a href="./sweeps.html">Sweeps</a>
+      <a href="./view.html">Replay</a>
+    </nav>
   </header>
 
-  <main class="studio-main">
-    <h1>Interactive run</h1>
-    <p class="muted lede">Fly one scenario live: every aircraft you give a controller flies it in lockstep with the sim; the others fly uncommanded (trimmed controls).</p>
+  <main class="studio-main ia-main">
+    <!-- Hero: the title and lede over a soft glow and a small constellation. -->
+    <div class="ia-hero">
+      <svg class="ia-hero-art" viewBox="0 0 160 90" aria-hidden="true" focusable="false">
+        <polyline points="12,62 46,30 82,44 118,16 148,38" />
+        <polyline points="82,44 104,74" />
+        <circle cx="12" cy="62" r="1.8" />
+        <circle cx="46" cy="30" r="2.4" />
+        <circle cx="82" cy="44" r="1.9" />
+        <circle class="bright" cx="118" cy="16" r="3" />
+        <circle cx="148" cy="38" r="1.7" />
+        <circle cx="104" cy="74" r="2.1" />
+      </svg>
+      <h1>Interactive run</h1>
+      <p class="muted lede">Fly one scenario live: every aircraft you give a controller flies it in lockstep with the sim; the others fly uncommanded (trimmed controls).</p>
+    </div>
 
     <!-- One live run at a time: while one is active, it is shown here instead
          of a new start. -->
-    <section id="activeRun" class="banner" aria-live="polite" hidden>
+    <section id="activeRun" class="banner ia-live" aria-live="polite" hidden>
       <div class="banner-text">
+        <span class="live-dot" aria-hidden="true"></span>
         <strong>A run is active:</strong> <span id="activeId" class="mono"></span>
         <div id="activeMeta" class="muted small"></div>
       </div>
@@ -35,7 +56,9 @@
 
     <p id="loadError" class="form-error" role="alert" hidden></p>
 
-    <form id="setup" novalidate>
+    <!-- Two columns (>= 1100px): the steps on the constellation rail, and the
+         sticky flight plan card holding the Launch button. -->
+    <form id="setup" class="ia-layout" novalidate>
       <fieldset id="setupFields">
         <section class="step" aria-labelledby="envHead">
           <h2 id="envHead"><span class="step-n">1</span> Environment</h2>
@@ -74,13 +97,26 @@
               <span id="maxTimeError" class="field-error" hidden></span>
             </div>
           </div>
-          <div id="formError" class="form-error" role="alert" hidden></div>
-          <div class="run-actions">
-            <button id="runBtn" type="submit" class="primary big" disabled>Run</button>
-            <span id="runNote" class="muted small"></span>
-          </div>
         </section>
       </fieldset>
+
+      <aside class="flight-plan glass" aria-labelledby="planHead">
+        <h2 id="planHead">Flight plan</h2>
+        <dl class="plan-list">
+          <div><dt>Environment</dt><dd id="planEnv">—</dd></div>
+          <div><dt>Scenario</dt><dd id="planScenario">—</dd></div>
+          <div><dt>Speed</dt><dd id="planSpeed">—</dd></div>
+          <div><dt>Max sim time</dt><dd id="planMax">—</dd></div>
+        </dl>
+        <h3 class="plan-sub">Aircraft</h3>
+        <ul id="planFleet" class="plan-fleet"></ul>
+        <p id="planLocked" class="plan-locked small" hidden>Setup is locked while a run is in flight.</p>
+        <div id="formError" class="form-error" role="alert" hidden></div>
+        <div class="run-actions">
+          <button id="runBtn" type="submit" class="primary big" disabled>Launch</button>
+          <span id="runNote" class="muted small"></span>
+        </div>
+      </aside>
     </form>
   </main>
 

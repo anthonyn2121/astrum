@@ -1,8 +1,10 @@
 // A scatter plot on a canvas (the sweep page's Compare runs). The caller owns
 // the data and what a point's `data` means: this draws the points, reports the
 // point under the pointer (onHover) and the point picked by a click or by the
-// arrow keys (onPick). Colours are plain CSS colour strings; the axis, grid and
-// text colours come from the theme (style.css variables).
+// arrow keys (onPick). Colours are plain CSS colour strings; the grid, label and
+// legend colours come from the canvas's --chart-grid, --chart-label and
+// --chart-halo (else the page's --line, --muted and --panel-solid). Points are
+// drawn as small stars: a soft glow in their colour and a brighter core.
 
 const MARGIN = { left: 60, right: 14, top: 12, bottom: 44 };
 const POINT_R = 5;
@@ -10,8 +12,15 @@ const SELECTED_R = 8;
 const HIT_PX = 10;
 const TARGET_TICKS = 6;
 const FONT_PX = 11;
+const GLOW_PX = 9;
+const CORE_R = 1.8;
 
 let probe = null;
+
+// The canvas colour of `name` read on `el`, or of `fallback` when `name` is unset there.
+function chartColour(el, name, fallback) {
+  return getComputedStyle(el).getPropertyValue(name).trim() ? themeColour(name, el) : themeColour(fallback, el);
+}
 
 // A theme colour (a CSS custom property) as a canvas colour string.
 export function themeColour(name, el = document.documentElement) {
@@ -141,10 +150,11 @@ export class Scatter {
     const style = getComputedStyle(canvas);
     const colour = {
       text: themeColour("--text", canvas),
-      muted: themeColour("--muted", canvas),
-      line: themeColour("--line", canvas),
+      muted: chartColour(canvas, "--chart-label", "--muted"),
+      line: chartColour(canvas, "--chart-grid", "--line"),
       accent: themeColour("--accent", canvas),
-      panel: themeColour("--panel-solid", canvas),
+      panel: chartColour(canvas, "--chart-halo", "--panel-solid"),
+      star: chartColour(canvas, "--star", "--text"),
     };
     const font = style.fontFamily;
     ctx.font = `${FONT_PX}px ${font}`;
@@ -203,31 +213,50 @@ export class Scatter {
         selected.push(p);
         continue;
       }
-      this.#dot(p, sx(p.x), sy(p.y));
+      this.#dot(p, sx(p.x), sy(p.y), colour);
     }
     for (const p of selected) {
       const x = sx(p.x);
       const y = sy(p.y);
-      this.#dot(p, x, y);
+      this.#dot(p, x, y, colour);
+      ctx.save();
+      ctx.shadowColor = colour.accent;
+      ctx.shadowBlur = 12;
       ctx.beginPath();
       ctx.arc(x, y, SELECTED_R, 0, 2 * Math.PI);
       ctx.strokeStyle = colour.accent;
       ctx.lineWidth = 2;
       ctx.stroke();
-      ctx.lineWidth = 1;
+      ctx.restore();
+      ctx.beginPath();
+      ctx.arc(x, y, SELECTED_R + 4, 0, 2 * Math.PI);
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = colour.accent;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
     }
 
     this.#drawLegend(plot, colour);
   }
 
-  #dot(p, x, y) {
+  // A point as a small star: its colour with a soft glow, then a brighter core.
+  #dot(p, x, y, colour) {
     const ctx = this.#ctx;
+    ctx.save();
+    ctx.shadowColor = p.color;
+    ctx.shadowBlur = GLOW_PX;
     ctx.beginPath();
     ctx.arc(x, y, POINT_R, 0, 2 * Math.PI);
     ctx.fillStyle = p.color;
+    ctx.globalAlpha = 0.9;
     ctx.fill();
-    ctx.strokeStyle = "rgba(10, 14, 20, 0.7)";
-    ctx.stroke();
+    ctx.restore();
+    ctx.beginPath();
+    ctx.arc(x, y, CORE_R, 0, 2 * Math.PI);
+    ctx.fillStyle = colour.star;
+    ctx.globalAlpha = 0.85;
+    ctx.fill();
+    ctx.globalAlpha = 1;
   }
 
   #drawLegend(plot, colour) {
@@ -241,8 +270,10 @@ export class Scatter {
     const boxH = pad * 2 + legend.length * row - (row - 10);
     const x0 = plot.right - boxW - 6;
     const y0 = plot.top + 6;
+    ctx.globalAlpha = 0.85;
     ctx.fillStyle = colour.panel;
     ctx.fillRect(x0, y0, boxW, boxH);
+    ctx.globalAlpha = 1;
     ctx.strokeStyle = colour.line;
     ctx.strokeRect(x0 + 0.5, y0 + 0.5, boxW - 1, boxH - 1);
     ctx.textAlign = "left";

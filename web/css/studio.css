@@ -1,7 +1,14 @@
-/* The studio's pages (index.html, interactive.html): ordinary scrolling
-   documents on top of style.css's tokens and controls. */
+/* The studio's scrolling pages (index, interactive, sweeps, sweep): ordinary
+   documents over the starfield, on top of style.css's tokens and controls and
+   cosmos.css's shell. Also the components Interactive and Sweeps share: the
+   constellation stepper (.step, lit by the page with .is-done / .is-current),
+   the .choice tiles and the .fleet-row cards. */
 
-html, body { height: auto; min-height: 100%; overflow: auto; }
+/* The document scrolls (html), not body: a scrolling body would hold every
+   position: sticky element (the top bar, side panels) in place. */
+html, body { height: auto; min-height: 100%; }
+html { overflow: auto; }
+body { overflow: visible; }
 body.studio { font-size: 14px; }
 
 a { color: var(--accent); }
@@ -9,18 +16,18 @@ a.button {
   display: inline-block; font: inherit; color: var(--text); background: var(--accent-dim);
   border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; text-decoration: none;
 }
-a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+a.button.primary { font-weight: 600; }
 a.button:hover { border-color: var(--accent); }
 a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
 
 .studio-top {
-  position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 14px;
-  height: 52px; padding: 0 20px; background: var(--panel-solid); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 22px;
+  height: 52px; padding: 0 20px;
+  background: var(--glass-strong); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--glass-line);
+  box-shadow: 0 1px 0 rgba(74, 163, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.25);
 }
-.crumb { color: var(--muted); }
-.crumb::before { content: "/"; margin-right: 14px; opacity: 0.5; }
-.top-link { margin-left: auto; }
 
 .studio-main { max-width: 1080px; margin: 0 auto; padding: 28px 20px 64px; }
 .studio-main h1 { font-size: 24px; margin: 0 0 6px; }
@@ -34,10 +41,11 @@ a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
 .card {
   display: flex; flex-direction: column; gap: 10px; padding: 22px; border-radius: 12px;
-  background: var(--panel-raised); border: 1px solid var(--line); color: inherit; text-decoration: none;
-  transition: border-color 0.15s, transform 0.15s;
+  background: var(--glass); border: 1px solid var(--glass-line); color: inherit; text-decoration: none;
+  backdrop-filter: blur(8px);
+  transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
 }
-.card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.card:hover { border-color: rgba(74, 163, 255, 0.6); transform: translateY(-2px); box-shadow: var(--glow); }
 .card h2 { margin: 0; font-size: 19px; }
 .card p { margin: 0; color: var(--muted); line-height: 1.5; }
 .card-cta { margin-top: auto; color: var(--accent); font-weight: 600; }
@@ -45,20 +53,60 @@ a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* ---- Interactive ---- */
 #setupFields { border: 0; margin: 0; padding: 0; min-width: 0; }
 #setupFields:disabled { opacity: 0.45; }
-.step { margin: 0 0 26px; }
-.step h2 { display: flex; align-items: center; gap: 10px; font-size: 16px; margin: 0 0 12px; }
+
+/* Constellation stepper: each .step's number is a star on a rail down the
+   left; the rail joins it to the next step. The page lights a finished step
+   with .is-done (its star glows, its rail segment lights) and marks the next
+   one to do with .is-current (a slow pulsing ring). */
+.step { position: relative; margin: 0; padding: 0 0 30px 48px; }
+.step::before {
+  content: ""; position: absolute; left: 15px; top: 34px; bottom: 4px; width: 2px; border-radius: 1px;
+  background: linear-gradient(rgba(120, 170, 225, 0.28), rgba(120, 170, 225, 0.12));
+}
+.step:last-child::before { display: none; }
+.step h2 { display: flex; align-items: center; gap: 10px; font-size: 17px; margin: 0 0 14px; min-height: 32px; }
 .step-n {
-  display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%;
-  background: var(--accent-dim); color: var(--accent); font-size: 13px;
+  position: absolute; left: 0; top: 0;
+  display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%;
+  font-size: 13px; font-weight: 700; color: var(--accent);
+  background: radial-gradient(circle, rgba(74, 163, 255, 0.22), rgba(10, 14, 20, 0.95) 70%);
+  border: 1px solid rgba(74, 163, 255, 0.45);
+  transition: background 0.3s, color 0.3s, box-shadow 0.3s;
+}
+.step.is-done > h2 .step-n {
+  color: #04101f; border-color: #bfe0ff;
+  background: radial-gradient(circle, #ffffff 0 22%, #8ccaff 48%, var(--accent) 80%);
+  box-shadow: 0 0 10px rgba(74, 163, 255, 0.9), 0 0 26px rgba(74, 163, 255, 0.45);
+}
+.step.is-done::before {
+  background: linear-gradient(var(--accent), rgba(74, 163, 255, 0.35));
+  box-shadow: 0 0 8px rgba(74, 163, 255, 0.6);
+}
+.step.is-current > h2 .step-n { box-shadow: 0 0 0 0 rgba(74, 163, 255, 0.55); animation: step-pulse 2.4s ease-out infinite; }
+@keyframes step-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(74, 163, 255, 0.55); }
+  70%, 100% { box-shadow: 0 0 0 10px rgba(74, 163, 255, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .step.is-current > h2 .step-n { animation: none; box-shadow: 0 0 0 3px rgba(74, 163, 255, 0.35); }
 }
 
 .choices { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
 .choice {
-  display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; cursor: pointer;
-  background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius);
+  position: relative; display: flex; gap: 10px; align-items: flex-start; padding: 13px 34px 13px 14px; cursor: pointer;
+  background: var(--glass); border: 1px solid var(--glass-line); border-radius: 12px;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
-.choice:hover { border-color: var(--accent); }
-.choice:has(input:checked) { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.choice:hover { border-color: rgba(74, 163, 255, 0.6); }
+.choice:has(input:checked) {
+  border-color: var(--accent); box-shadow: var(--glow);
+  background: linear-gradient(160deg, rgba(74, 163, 255, 0.16), var(--glass) 60%);
+}
+/* The picked tile's star, top right. */
+.choice:has(input:checked)::after {
+  content: "✦"; position: absolute; top: 9px; right: 12px; color: #cfe7ff; font-size: 14px;
+  text-shadow: 0 0 8px var(--accent), 0 0 16px var(--accent);
+}
 .choice:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
 .choice.disabled { cursor: not-allowed; opacity: 0.7; }
 .choice.disabled:hover { border-color: var(--line); }
@@ -68,7 +116,15 @@ a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .choice-text { font-size: 12px; overflow-wrap: anywhere; }
 
 .fleet { display: flex; flex-direction: column; gap: 10px; }
-.fleet-row { padding: 12px 14px; background: var(--panel-raised); border: 1px solid var(--line); border-radius: var(--radius); }
+/* --team: the aircraft's team colour (ctlform.js sets it on the row). */
+.fleet-row {
+  position: relative; padding: 12px 14px 12px 18px; overflow: hidden;
+  background: var(--glass); border: 1px solid var(--glass-line); border-radius: 12px;
+}
+.fleet-row::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--team); box-shadow: 0 0 10px var(--team);
+}
 .fleet-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .fleet-id { font-weight: 700; font-variant-numeric: tabular-nums; }
 .fleet-model { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -91,13 +147,16 @@ a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .run-actions { display: flex; align-items: center; gap: 12px; }
 button.big { padding: 8px 28px; font-size: 15px; }
 .form-error {
-  color: var(--live); margin: 0 0 12px; padding: 8px 12px; border-radius: 6px;
-  border: 1px solid #ff5a4d55; background: rgba(255,90,77,0.08); overflow-wrap: anywhere;
+  color: #ff8f85; margin: 0 0 12px; padding: 9px 12px; border-radius: 10px;
+  border: 1px solid rgba(255, 90, 77, 0.4); background: rgba(255, 90, 77, 0.1); overflow-wrap: anywhere;
 }
 
+/* A live run or sweep, "in flight": a glowing green card. */
 .banner {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 0 0 24px; padding: 14px 16px;
-  background: rgba(70,211,138,0.08); border: 1px solid rgba(70,211,138,0.4); border-radius: var(--radius);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin: 0 0 24px; padding: 14px 18px;
+  background: linear-gradient(110deg, rgba(70, 211, 138, 0.14), var(--glass) 55%);
+  border: 1px solid rgba(70, 211, 138, 0.45); border-radius: 12px;
+  box-shadow: 0 0 22px rgba(70, 211, 138, 0.12);
 }
 .banner-text { flex: 1; min-width: 240px; overflow-wrap: anywhere; }
 .banner-actions { display: flex; gap: 8px; align-items: center; }

@@ -92,6 +92,7 @@ const OUTLINE_PX = 2;       // CSS px (× pixel ratio)
 const OUTLINE = {
   plain: { color: 0xdbe4ef, alpha: 0.8 },
   sky: { color: 0x0b1220, alpha: 0.9 },
+  chart: { color: 0x8fd0ff, alpha: 0.85 }, // a light halo: glowing markers on the dark chart
 };
 
 // Picking: a click is a short, nearly still press; the nearest aircraft within
@@ -508,13 +509,22 @@ export class Scene {
     this._env.setOrigin(latDeg, lonDeg, altHaeM);
   }
 
+  // The editor map's look: "imagery" (the default: daylight dome and ground
+  // map) or "chart" (a dark star chart with a zoom-aware grid; aircraft get a
+  // light halo instead of the dark outline). Only map environment shows it.
+  setMapLook(look) {
+    if (look !== "imagery" && look !== "chart") throw new Error(`unknown map look: ${look}`);
+    this._env.setChart(look === "chart");
+    this._applyEnvironment();
+  }
+
   // The per-environment state outside environment.js: the body two-tone
   // (module-wide in meshes.js, so set from the scene that is live) and the
   // outline colour.
   _applyEnvironment() {
     const day = this._daylight;
     setTwoTone(day);
-    const o = day ? OUTLINE.sky : OUTLINE.plain;
+    const o = this._env.chart ? OUTLINE.chart : day ? OUTLINE.sky : OUTLINE.plain;
     this._outlineMat.uniforms.uColor.value.setHex(o.color);
     this._outlineMat.uniforms.uAlpha.value = o.alpha;
   }

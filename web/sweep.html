@@ -6,94 +6,130 @@
   <title>ASTRUM · Sweep</title>
   <link rel="icon" type="image/png" href="./img/favicon.png" />
   <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/cosmos.css" />
   <link rel="stylesheet" href="./css/studio.css" />
   <link rel="stylesheet" href="./css/sweepview.css" />
 </head>
-<body class="studio">
+<body class="studio sweep-page">
+  <div class="sky" aria-hidden="true"><i></i><i></i><i></i></div>
   <header class="studio-top">
-    <a class="brand" href="./"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Studio</em></a>
-    <a class="crumb" href="./sweeps.html">Sweeps</a>
-    <a class="top-link" href="./view.html">Replay viewer</a>
+    <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM</a>
+    <nav class="nav-tabs" aria-label="Studio pages">
+      <a href="./interactive.html">Interactive</a>
+      <a href="./sandbox.html">Sandbox</a>
+      <a href="./sweeps.html" aria-current="true">Sweeps</a>
+      <a href="./view.html">Replay</a>
+    </nav>
   </header>
 
   <main class="studio-main">
     <p id="loadError" class="form-error" role="alert" hidden></p>
 
     <section id="content" hidden>
-      <section class="sweep-summary" aria-labelledby="scenario">
-        <p id="sweepId" class="sweep-id mono muted"></p>
-        <h1 id="scenario"></h1>
-        <div class="state-line">
-          <span id="stateBadge" class="state-badge">running</span>
-          <span id="stateReason" class="muted small"></span>
+      <!-- The hero: the sweep's name and state, its orbit progress ring, counts and facts. -->
+      <section class="sweep-summary glass" aria-labelledby="scenario">
+        <div class="sweep-head">
+          <p id="sweepId" class="sweep-id mono muted"></p>
+          <h1 id="scenario"></h1>
+          <div class="state-line">
+            <span id="stateBadge" class="state-badge">running</span>
+            <span id="stateReason" class="muted small"></span>
+          </div>
+          <p class="chips">
+            <span id="chipOk" class="chip ok">ok 0</span>
+            <span id="chipFailed" class="chip failed">failed 0</span>
+            <span id="chipRunning" class="chip running">running 0</span>
+            <span id="chipQueued" class="chip queued">queued 0</span>
+            <span id="chipStopped" class="chip stopped">stopped 0</span>
+          </p>
+          <div class="sweep-actions">
+            <button id="stopBtn" type="button" hidden>Stop sweep</button>
+          </div>
         </div>
         <div class="progress-line">
-          <progress id="progress" value="0" max="1" aria-label="Sweep progress"></progress>
-          <span id="progressText" class="mono"></span>
+          <div id="ring" class="orbit-ring" aria-hidden="true"></div>
+          <progress id="progress" class="visually-hidden" value="0" max="1" aria-label="Sweep progress"></progress>
+          <span id="progressText" class="mono muted small"></span>
         </div>
-        <p class="chips">
-          <span id="chipOk" class="chip ok">ok 0</span>
-          <span id="chipFailed" class="chip failed">failed 0</span>
-          <span id="chipRunning" class="chip running">running 0</span>
-          <span id="chipQueued" class="chip queued">queued 0</span>
-          <span id="chipStopped" class="chip stopped">stopped 0</span>
-        </p>
         <dl class="kv sweep-facts">
           <dt>mode</dt><dd id="mode"></dd>
           <dt>jobs</dt><dd id="jobs"></dd>
           <dt>wall time</dt><dd id="wall" class="mono"></dd>
           <dt>out</dt><dd><code id="out"></code></dd>
         </dl>
-        <div class="sweep-actions">
-          <button id="stopBtn" type="button" hidden>Stop sweep</button>
+        <div class="sweep-notes">
+          <p id="actionError" class="form-error" role="alert" hidden></p>
+          <p id="pollNote" class="muted small" hidden></p>
+          <p id="pollError" class="form-error" role="alert" hidden></p>
         </div>
-        <p id="actionError" class="form-error" role="alert" hidden></p>
-        <p id="pollNote" class="muted small" hidden></p>
-        <p id="pollError" class="form-error" role="alert" hidden></p>
       </section>
 
-      <section class="sweep-section" aria-labelledby="runsHead">
+      <section class="sweep-section sweep-panel glass" aria-labelledby="runsHead">
         <h2 id="runsHead">Runs</h2>
         <div id="strip" class="run-strip"></div>
-        <p class="muted small">Each square is a run; click one to select its row in the results.</p>
+        <p class="muted small">Each star is a run; click one to select its row in the results.</p>
       </section>
 
-      <section class="sweep-section" aria-labelledby="allRunsHead">
-        <div class="results-head">
-          <h2 id="allRunsHead">All runs</h2>
-          <div class="tracks-legend">
-            <span><i class="swatch ok"></i>ok</span>
-            <span><i class="swatch failed"></i>failed</span>
-            <span><i class="swatch stopped"></i>stopped</span>
-            <span><i class="swatch selected"></i>selected</span>
+      <!-- The dashboard: All runs and Compare runs side by side on wide screens. -->
+      <div class="sweep-dash">
+        <section class="sweep-section sweep-panel glass" aria-labelledby="allRunsHead">
+          <div class="results-head">
+            <h2 id="allRunsHead">All runs</h2>
+            <div class="tracks-legend">
+              <span><i class="swatch ok"></i>ok</span>
+              <span><i class="swatch failed"></i>failed</span>
+              <span><i class="swatch stopped"></i>stopped</span>
+              <span><i class="swatch selected"></i>selected</span>
+            </div>
           </div>
-        </div>
-        <p id="tracksEmpty" class="muted">No finished runs yet.</p>
-        <p id="tracksNote" class="muted small" hidden></p>
-        <p id="tracksError" class="form-error" role="alert" hidden></p>
-        <div class="tracks-wrap">
-          <canvas id="tracksCanvas" class="tracks-canvas" aria-label="Flight paths of every finished run, top-down. Click a path to select its run. Arrow keys pan, plus and minus zoom, 0 fits."></canvas>
-          <div id="tracksTip" class="tracks-tip small" hidden></div>
-        </div>
-        <div class="tracks-time">
-          <input id="timeSlider" type="range" min="0" max="0" step="0.1" value="0" aria-label="Sim time" disabled />
-          <output id="timeLabel" class="mono" for="timeSlider">t = 0.0 s</output>
-        </div>
-        <div class="tracks-controls">
-          <button id="playBtn" type="button" disabled>Play</button>
-          <label class="filter-label">Speed
-            <select id="speedSelect">
-              <option value="1">1×</option>
-              <option value="4">4×</option>
-              <option value="16">16×</option>
-            </select>
-          </label>
-          <label class="filter-label"><input id="pathsToggle" type="checkbox" checked /> Paths</label>
-          <label class="filter-label"><input id="positionsToggle" type="checkbox" checked /> Positions at t</label>
-        </div>
-      </section>
+          <p id="tracksEmpty" class="muted">No finished runs yet.</p>
+          <p id="tracksNote" class="muted small" hidden></p>
+          <p id="tracksError" class="form-error" role="alert" hidden></p>
+          <div class="tracks-wrap">
+            <canvas id="tracksCanvas" class="tracks-canvas" aria-label="Flight paths of every finished run, top-down. Click a path to select its run. Arrow keys pan, plus and minus zoom, 0 fits."></canvas>
+            <div id="tracksTip" class="tracks-tip small" hidden></div>
+          </div>
+          <div class="tracks-time">
+            <input id="timeSlider" type="range" min="0" max="0" step="0.1" value="0" aria-label="Sim time" disabled />
+            <output id="timeLabel" class="mono" for="timeSlider">t = 0.0 s</output>
+          </div>
+          <div class="tracks-controls">
+            <button id="playBtn" type="button" disabled>Play</button>
+            <label class="filter-label">Speed
+              <select id="speedSelect">
+                <option value="1">1×</option>
+                <option value="4">4×</option>
+                <option value="16">16×</option>
+              </select>
+            </label>
+            <label class="filter-label"><input id="pathsToggle" type="checkbox" checked /> Paths</label>
+            <label class="filter-label"><input id="positionsToggle" type="checkbox" checked /> Positions at t</label>
+          </div>
+        </section>
 
-      <section class="sweep-section" aria-labelledby="resultsHead">
+        <section class="sweep-section sweep-panel glass" aria-labelledby="compareHead">
+          <div class="results-head">
+            <h2 id="compareHead">Compare runs</h2>
+            <label class="filter-label">X axis
+              <select id="xAxis"></select>
+            </label>
+            <label class="filter-label">Y axis
+              <select id="yAxis"></select>
+            </label>
+            <label class="filter-label">Colour by
+              <select id="colourBy"></select>
+            </label>
+          </div>
+          <p class="muted small">Each point is a run; click one (or step with the left and right arrows) to select it.</p>
+          <p id="compareEmpty" class="muted" hidden>Nothing to plot yet.</p>
+          <div id="compareWrap" class="compare-wrap" hidden>
+            <canvas id="scatter" class="scatter" aria-label="Scatter plot of the runs"></canvas>
+            <div id="scatterTip" class="scatter-tip" hidden></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="sweep-section sweep-panel glass" aria-labelledby="resultsHead">
         <div class="results-head">
           <h2 id="resultsHead">Results</h2>
           <label class="filter-label">Status
@@ -110,27 +146,6 @@
         <p id="resultsError" class="form-error" role="alert" hidden></p>
         <div id="resultsWrap" class="results-wrap" hidden>
           <table id="results" class="results-table"></table>
-        </div>
-      </section>
-
-      <section class="sweep-section" aria-labelledby="compareHead">
-        <div class="results-head">
-          <h2 id="compareHead">Compare runs</h2>
-          <label class="filter-label">X axis
-            <select id="xAxis"></select>
-          </label>
-          <label class="filter-label">Y axis
-            <select id="yAxis"></select>
-          </label>
-          <label class="filter-label">Colour by
-            <select id="colourBy"></select>
-          </label>
-        </div>
-        <p class="muted small">Each point is a run; click one (or step with the left and right arrows) to select it.</p>
-        <p id="compareEmpty" class="muted" hidden>Nothing to plot yet.</p>
-        <div id="compareWrap" class="compare-wrap" hidden>
-          <canvas id="scatter" class="scatter" aria-label="Scatter plot of the runs"></canvas>
-          <div id="scatterTip" class="scatter-tip" hidden></div>
         </div>
       </section>
     </section>

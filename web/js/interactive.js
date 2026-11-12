@@ -11,7 +11,8 @@
 import {
   getControllers, getCurrentRun, startRun, stopRun, ApiError,
 } from "./api.js";
-import { $, showError } from "./dom.js";
+import { $, h, showError } from "./dom.js";
+import { teamColor } from "./format.js";
 import { ControllerForm } from "./ctlform.js";
 import { ScenarioPicker } from "./scenariopicker.js";
 
@@ -23,6 +24,14 @@ const el = {
   form: $("setup"), fields: $("setupFields"), fleet: $("fleet"), fleetEmpty: $("fleetEmpty"),
   speedSeg: $("speedSeg"), maxTime: $("maxTime"), maxTimeHint: $("maxTimeHint"), maxTimeError: $("maxTimeError"),
   formError: $("formError"), runBtn: $("runBtn"), runNote: $("runNote"),
+  envList: $("envList"), planEnv: $("planEnv"), planScenario: $("planScenario"), planSpeed: $("planSpeed"),
+  planMax: $("planMax"), planFleet: $("planFleet"), planLocked: $("planLocked"),
+};
+
+// The four constellation steps, in order (css/studio.css lights them).
+const steps = {
+  env: el.envList.closest(".step"), scenario: $("scenarioList").closest(".step"),
+  fleet: el.fleet.closest(".step"), run: el.maxTime.closest(".step"),
 };
 
 const state = {
@@ -56,7 +65,7 @@ function onPick(entry, doc, error) {
     : Number.isFinite(max) ? `empty: the scenario's ${max > 0 ? `${max} s` : "no limit"}; 0 = until stopped`
     : "empty: the scenario's limit; 0 = until stopped";
   showError(el.formError, "");
-  syncRunButton();
+  sync();
 }
 
 // ---- run ----
@@ -80,12 +89,64 @@ function maxTimeValue() {
   return { value: x };
 }
 
-function syncRunButton() {
+// Everything derived from the state, redone on every change: the Run button
+// and the locked form, the steps' is-done / is-current, the flight plan.
+function sync() {
   const active = !!state.activeRun;
   el.fields.disabled = active;
   el.runBtn.disabled = active || state.starting || !state.scenario || !state.doc;
   el.runNote.textContent = active ? "Another run is active."
     : state.starting ? "Starting…" : "";
+  el.planLocked.hidden = !active;
+  syncSteps();
+  renderPlan();
+}
+
+// Environment: one is picked; Scenario and Controllers (optional): its doc is
+// read; Run: never done. The first step not done is the current one.
+function syncSteps() {
+  const env = !!el.envList.querySelector("input:checked");
+  const loaded = !!state.scenario && !!state.doc;
+  const done = [[steps.env, env], [steps.scenario, loaded], [steps.fleet, loaded], [steps.run, false]];
+  let current = null;
+  for (const [step, isDone] of done) {
+    step.classList.toggle("is-done", isDone);
+    if (!isDone && !current) current = step;
+  }
+  for (const [step] of done) step.classList.toggle("is-current", step === current);
+}
+
+// The flight plan card: what Launch would start.
+function renderPlan() {
+  const env = el.envList.querySelector("input:checked")?.closest(".choice")?.querySelector(".choice-title");
+  el.planEnv.textContent = env ? env.textContent : "—";
+  el.planScenario.textContent = state.scenario
+    ? state.doc ? state.scenario.name : `${state.scenario.name} (reading…)` : "—";
+  el.planSpeed.textContent = state.speed === 0 ? "Max (as fast as the host allows)"
+    : state.speed === 1 ? "1× (real time)" : `${state.speed}×`;
+  const max = maxTimeValue();
+  const limit = state.doc?.scenario?.sim?.max_time_s;
+  el.planMax.textContent = max.error ? "invalid"
+    : max.value === 0 ? "until stopped"
+    : max.value !== undefined ? `${max.value} s`
+    : !state.doc ? "—"
+    : !Number.isFinite(limit) ? "scenario's limit"
+    : limit > 0 ? `${limit} s (scenario)` : "no limit (scenario)";
+  const aircraft = state.doc ? [...state.doc.scenario.aircraft].sort((a, b) => a.id - b.id) : [];
+  el.planFleet.replaceChildren(...aircraft.map((a) => {
+    // The row's controller select (ctlform.js), when the form has one.
+    const select = $(`ctl-${a.id}`);
+    const ctl = select && select.value !== "" ? select.selectedOptions[0]?.textContent : null;
+    const style = Number.isInteger(a.team) ? `--team: ${teamColor(a.team)}` : null;
+    return h("li", { class: "plan-ac", style },
+      h("span", { class: "plan-dot", "aria-hidden": "true" }),
+      h("span", { class: "plan-ac-id", text: `#${a.id}` }),
+      h("span", { class: "plan-ac-model", text: a.model }),
+      h("span", { class: ctl ? "plan-ac-ctl" : "plan-ac-ctl muted", text: ctl || "uncommanded" }));
+  }));
+  if (!aircraft.length) {
+    el.planFleet.append(h("li", { class: "muted small", text: state.scenario ? "Reading the scenario…" : "Pick a scenario." }));
+  }
 }
 
 async function submit(e) {
@@ -98,7 +159,7 @@ async function submit(e) {
     return;
   }
   state.starting = true;
-  syncRunButton();
+  sync();
   try {
     const run = await startRun(body);
     location.href = `./view.html?run=${encodeURIComponent(run.id)}`;
@@ -109,7 +170,7 @@ async function submit(e) {
     if (err instanceof ApiError && err.status === 409) pollActive();
   }
   state.starting = false;
-  syncRunButton();
+  sync();
 }
 
 // ---- the active run ----
@@ -132,7 +193,7 @@ async function pollActive() {
 function renderActive() {
   const run = state.activeRun;
   el.active.hidden = !run;
-  syncRunButton();
+  sync();
   if (!run) return;
   el.activeId.textContent = run.id;
   const ctl = Array.isArray(run.assignments) ? run.assignments.length : 0;
@@ -168,10 +229,16 @@ for (const b of el.speedSeg.querySelectorAll("[data-speed]")) {
     for (const o of el.speedSeg.querySelectorAll("[data-speed]")) {
       o.setAttribute("aria-pressed", String(o === b));
     }
+    sync();
   });
 }
 el.maxTime.addEventListener("change", () => showError(el.maxTimeError, maxTimeValue().error || ""));
-el.fleet.addEventListener("controllerchange", () => showError(el.formError, ""));
+el.maxTime.addEventListener("input", sync);
+el.envList.addEventListener("change", sync);
+el.fleet.addEventListener("controllerchange", () => {
+  showError(el.formError, "");
+  sync();
+});
 el.form.addEventListener("submit", submit);
 
 async function boot() {
@@ -184,6 +251,7 @@ async function boot() {
     return;
   }
   form = new ControllerForm({ host: el.fleet, controllers: state.controllers });
+  sync();
   const want = new URLSearchParams(location.search).get("scenario");
   if (want !== null) picker.pick(want);
 }

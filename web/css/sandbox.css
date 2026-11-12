@@ -1,4 +1,5 @@
-/* Sandbox (scenario editor) page; builds on style.css's theme and controls. */
+/* Sandbox (scenario editor) page; builds on style.css's theme and controls and
+   cosmos.css's glass, glows and starfield (which shows through the docks). */
 
 #sandbox {
   position: fixed; inset: 0;
@@ -11,44 +12,103 @@
 }
 @media (max-width: 1280px) { #sandbox { grid-template-columns: 236px minmax(0, 1fr) 300px; } }
 
+/* ---- Top bar: glass, the actions in groups split by faint rules ---- */
 .sb-top {
-  grid-area: top;
+  grid-area: top; position: relative; z-index: 6;
   display: flex; align-items: center; gap: 14px; padding: 0 12px; min-width: 0;
-  background: var(--panel-solid); border-bottom: 1px solid var(--line);
+  background: var(--glass-strong); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--glass-line);
+  box-shadow: 0 1px 0 rgba(74, 163, 255, 0.06), 0 8px 24px rgba(0, 0, 0, 0.25);
 }
 .sb-source { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.sb-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex: none; }
+.sb-actions { margin-left: auto; display: flex; gap: 10px; align-items: center; flex: none; }
+.sb-group { display: flex; gap: 6px; align-items: center; }
+.sb-group + .sb-group { padding-left: 10px; border-left: 1px solid var(--glass-line); }
 
-.sb-left { grid-area: left; border-right: 1px solid var(--line); }
-.sb-right { grid-area: right; border-left: 1px solid var(--line); }
+/* ---- Docks: glass over the starfield ---- */
+.sb-left, .sb-right { background: var(--glass-strong); backdrop-filter: blur(12px); }
+.sb-left { grid-area: left; border-right: 1px solid var(--glass-line); }
+.sb-right { grid-area: right; border-left: 1px solid var(--glass-line); }
+.sb-left .dock-head, .sb-right .dock-head {
+  border-bottom-color: var(--glass-line);
+  background: linear-gradient(180deg, rgba(74, 163, 255, 0.07), transparent);
+}
 
-.sb-stage { grid-area: stage; position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+/* ---- Stage: the map, its imagery vignette, banners, scale and hint chips ---- */
+.sb-stage { grid-area: stage; position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg); }
 .sb-view { position: absolute; inset: 0; }
+/* Darkens the imagery's edges so the glass docks and chips read against it;
+   the chart is dark already. */
+.sb-vignette {
+  position: absolute; inset: 0; z-index: 3; pointer-events: none;
+  background: radial-gradient(ellipse 75% 70% at 50% 50%, transparent 55%, rgba(5, 10, 24, 0.55) 100%);
+  box-shadow: inset 0 0 60px rgba(5, 10, 24, 0.45);
+}
+.sb-stage.is-chart .sb-vignette { display: none; }
 
 .sb-banner {
-  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 5;
-  padding: 6px 12px; border-radius: var(--radius);
-  background: var(--panel); border: 1px solid var(--accent); pointer-events: none;
+  position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5;
+  padding: 7px 14px; border-radius: 10px; pointer-events: none;
+  background: var(--glass-strong); backdrop-filter: blur(10px);
+  border: 1px solid rgba(74, 163, 255, 0.5); box-shadow: var(--glow);
 }
-.sb-banner-error { border-color: var(--live); color: var(--live); top: 48px; pointer-events: auto; }
+.sb-banner-error {
+  top: 52px; pointer-events: auto; color: var(--live);
+  border-color: rgba(255, 90, 77, 0.6);
+  box-shadow: 0 0 0 1px rgba(255, 90, 77, 0.3), 0 0 18px rgba(255, 90, 77, 0.25);
+}
 
 .sb-scale {
-  position: absolute; left: 12px; bottom: 34px; z-index: 4; pointer-events: none;
+  position: absolute; left: 12px; bottom: 16px; z-index: 4; pointer-events: none;
   display: flex; align-items: center; gap: 8px; font-size: 11px;
   text-shadow: 0 1px 2px rgba(0,0,0,0.8);
 }
 .sb-scale-bar { width: 100px; height: 6px; border: 2px solid var(--text); border-top: 0; }
-.sb-hint {
-  position: absolute; left: 12px; right: 12px; bottom: 6px; margin: 0; z-index: 4; pointer-events: none;
-  text-shadow: 0 1px 2px rgba(0,0,0,0.9); color: var(--text); opacity: 0.85;
-}
-.sb-k { color: #ffd166; font-weight: 700; }
 
-.sb-section { padding: 10px 12px 14px; border-bottom: 1px solid var(--line); }
+/* The hint: a floating row of glass chips, bottom centre, clear of the scale
+   bar; extra rows stack upwards. */
+.sb-hint {
+  position: absolute; left: 140px; right: 140px; bottom: 12px; z-index: 4; margin: 0; pointer-events: none;
+  display: flex; flex-wrap: wrap-reverse; justify-content: center; gap: 6px;
+}
+.sb-chip {
+  padding: 3px 10px; border-radius: 999px; white-space: nowrap; font-size: 12px; color: var(--text);
+  background: var(--glass); backdrop-filter: blur(8px); border: 1px solid var(--glass-line);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+.sb-k { color: var(--warn); font-weight: 700; }
+
+/* ---- Dock sections: collapsible, the summary styled like .dock-title ---- */
+.sb-section { padding: 10px 12px 14px; border-bottom: 1px solid var(--glass-line); }
+.sb-section:not([open]) { padding-bottom: 10px; }
+.sb-sum {
+  display: flex; align-items: center; gap: 8px; cursor: pointer; list-style: none;
+  margin: -2px -4px; padding: 2px 4px; border-radius: 6px; user-select: none;
+}
+.sb-sum::-webkit-details-marker { display: none; }
+.sb-sum:hover { background: rgba(74, 163, 255, 0.07); }
+.sb-sum:hover .sb-h { color: var(--text); }
+/* The chevron: points right when closed, down when open. */
+.sb-sum::before {
+  content: ""; flex: none; width: 5px; height: 5px; margin: 0 2px 0 1px;
+  border: solid var(--muted); border-width: 0 1.5px 1.5px 0;
+  transform: rotate(-45deg); transition: transform 0.15s;
+}
+.sb-section[open] > .sb-sum::before { transform: rotate(45deg); }
+.sb-section[open] > .sb-sum { margin-bottom: 6px; }
 .sb-h {
   display: flex; align-items: center; gap: 8px;
-  margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+  margin: 0; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
 }
+
+/* The Scenario JSON summary's validity badge. */
+.sb-status {
+  margin-left: auto; padding: 0 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
+  color: var(--ok); background: rgba(70, 211, 138, 0.12); border: 1px solid rgba(70, 211, 138, 0.4);
+  font-variant-numeric: tabular-nums;
+}
+.sb-status.is-bad { color: var(--live); background: rgba(255, 90, 77, 0.12); border-color: rgba(255, 90, 77, 0.45); }
+
 .sb-pad { padding: 8px 12px; }
 .sb-row { display: flex; gap: 6px; }
 
@@ -61,37 +121,77 @@
 .sb-form .sb-check input { width: auto; }
 .sb-span { grid-column: 1 / -1; margin: 0; }
 .sb-error { color: var(--live); font-size: 12px; margin: 0; white-space: pre-line; }
-#pickOriginBtn[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+#pickOriginBtn[aria-pressed="true"] { background: var(--accent); color: var(--bg); box-shadow: var(--glow); }
 
-.sb-fleet { list-style: none; margin: 0; padding: 4px 0; }
+/* ---- Fleet list: a team stripe (--team, from sandbox.js) and a glowing selection ---- */
+.sb-fleet { list-style: none; margin: 0; padding: 6px; display: flex; flex-direction: column; gap: 2px; }
 .sb-fleet li {
-  display: flex; align-items: center; gap: 8px; padding: 4px 12px; cursor: pointer;
-  border-left: 2px solid transparent;
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px; cursor: pointer;
+  border-radius: 8px; border-left: 3px solid var(--team);
+  transition: background 0.15s, box-shadow 0.15s;
 }
 .sb-fleet li:hover { background: rgba(74,163,255,0.08); }
-.sb-fleet li[aria-selected="true"] { background: rgba(74,163,255,0.16); border-left-color: var(--accent); }
+.sb-fleet li[aria-selected="true"] { background: rgba(74,163,255,0.16); box-shadow: var(--glow); }
 .sb-fleet li:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .sb-fleet .sb-id { font-weight: 700; font-variant-numeric: tabular-nums; min-width: 2.5em; }
 .sb-fleet .sb-meta { color: var(--muted); font-size: 12px; margin-left: auto; }
 .sb-fleet .sb-bad { color: var(--live); }
 
+/* ---- Problems, check result, JSON ---- */
 .sb-issues { list-style: none; margin: 0 0 6px; padding: 0; font-size: 12px; }
 .sb-issues li { color: var(--live); padding: 1px 0; }
 .sb-issues li.sb-ok { color: var(--ok); }
+.sb-json-tools { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; }
 .sb-json {
   margin: 0; max-height: 46vh; overflow: auto; padding: 8px;
-  background: rgba(0,0,0,0.35); border: 1px solid var(--line); border-radius: 6px;
+  background: rgba(0,0,0,0.35); border: 1px solid var(--glass-line); border-radius: 8px;
   font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
 }
-
-/* The save dialog and the check result. */
-#saveDialog {
-  width: min(420px, calc(100vw - 32px)); padding: 14px 16px;
-  color: var(--text); background: var(--panel-solid); border: 1px solid var(--line); border-radius: var(--radius);
+#checkResult {
+  margin: 10px 12px; padding: 8px 10px; font-size: 12px;
+  background: var(--glass); border: 1px solid var(--glass-line); border-radius: 10px;
 }
-#saveDialog::backdrop { background: rgba(0,0,0,0.5); }
-#saveDialog .sb-h { margin: 0 0 4px; }
-.sb-dialog-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
-#checkResult { margin: 0 0 8px; font-size: 12px; }
 #checkResult:empty { display: none; }
 #checkResult p { margin: 0 0 4px; }
+#checkResult .sb-issues { margin: 0; }
+
+/* ---- Save dialog: glass, rounded, a few stars in its corner ---- */
+#saveDialog {
+  width: min(420px, calc(100vw - 32px)); padding: 16px 18px; overflow: hidden;
+  color: var(--text); background: var(--glass-strong); backdrop-filter: blur(14px);
+  border: 1px solid var(--glass-line); border-radius: 14px;
+  box-shadow: var(--glow), 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+#saveDialog::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background:
+    radial-gradient(1.5px 1.5px at 88% 18%, var(--star), transparent),
+    radial-gradient(1px 1px at 78% 8%, var(--star), transparent),
+    radial-gradient(1px 1px at 95% 40%, var(--star), transparent),
+    radial-gradient(ellipse 45% 60% at 100% 0%, var(--nebula-a), transparent 70%),
+    radial-gradient(ellipse 40% 50% at 0% 100%, var(--nebula-b), transparent 70%);
+}
+#saveDialog::backdrop { background: rgba(5, 10, 24, 0.6); backdrop-filter: blur(2px); }
+#saveDialog .sb-h { margin: 0 0 4px; color: var(--text); font-size: 12px; }
+#saveTitle::before { content: "✦" / ""; color: var(--accent); text-shadow: 0 0 8px rgba(74, 163, 255, 0.8); }
+.sb-dialog-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  .sb-sum::before, .sb-fleet li { transition: none; }
+}
+
+/* ---- Narrow: one scrolling column (top bar, map, fleet, scenario) ---- */
+@media (max-width: 900px) {
+  html, body { height: auto; overflow: auto; }
+  #sandbox {
+    position: static; min-height: 100vh;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto 60vh auto auto;
+    grid-template-areas: "top" "stage" "left" "right";
+  }
+  .sb-top { flex-wrap: wrap; row-gap: 8px; padding: 8px 12px; }
+  .sb-actions { margin-left: 0; flex-wrap: wrap; }
+  .sb-left, .sb-right { border: 0; border-top: 1px solid var(--glass-line); overflow: visible; }
+  .sb-left .dock-body, .sb-right .dock-body { overflow: visible; }
+  .sb-hint { left: 12px; right: 12px; bottom: 40px; }
+}

@@ -24,8 +24,11 @@ const PLAN_DEBOUNCE_MS = 400;
 const PLAN_ROWS = 20;        // the plan table's rows; the rest is counted
 const DEFAULT_MAX_TIME_S = 60;
 const ACTIVE_POLL_MS = 2000;
+const GALLERY_ROWS = 2;      // a gallery's rows of cards until its Show all
 
 const el = {
+  envList: $("envList"),
+  savedMore: $("savedMore"), savedCount: $("savedCount"), recentMore: $("recentMore"), recentCount: $("recentCount"),
   savedError: $("savedError"), savedEmpty: $("savedEmpty"), savedList: $("savedList"),
   loadError: $("loadError"), form: $("sweep"), fleet: $("fleet"), fleetEmpty: $("fleetEmpty"), fleetError: $("fleetError"),
   maxTime: $("maxTime"), maxTimeError: $("maxTimeError"), repeats: $("repeats"), repeatsError: $("repeatsError"),
@@ -71,6 +74,16 @@ const picker = new ScenarioPicker({
 });
 const cloud = new StartCloud({ canvas: el.startCanvas, legend: el.startLegend, tip: el.startTip, fitBtn: el.startFit });
 
+// The numbered steps, in order (the constellation syncSteps lights).
+const steps = ["envHead", "scenarioHead", "fleetHead", "variationHead", "settingsHead", "planHead"]
+  .map((id) => $(id).closest("section.step"));
+
+// The galleries: each list, its Show all toggle and its count; `open` once shown whole.
+const galleries = [
+  { list: el.savedList, more: el.savedMore, count: el.savedCount, open: false, cols: 0 },
+  { list: el.recentList, more: el.recentMore, count: el.recentCount, open: false, cols: 0 },
+];
+
 // ---- the scenario ----
 
 // The picker's report of each pick: the scenario, and its doc (null while it
@@ -114,27 +127,52 @@ function numberOf(input, errorNode, { integer = false, min = 0, exclusive = fals
   return msg ? undefined : x;
 }
 
+// The run settings' request fields, or null; every refused field is marked.
+function runSettings() {
+  const maxTime = numberOf(el.maxTime, el.maxTimeError, { min: 0, exclusive: true });
+  const repeats = numberOf(el.repeats, el.repeatsError, { integer: true, min: 1 });
+  const jobs = numberOf(el.jobs, el.jobsError, { integer: true, min: 0 });
+  const runTimeout = numberOf(el.runTimeout, el.runTimeoutError, { min: 0 });
+  if ([maxTime, repeats, jobs, runTimeout].includes(undefined)) return null;
+  return { max_time_s: maxTime, repeats, jobs, run_timeout_s: runTimeout };
+}
+
 // The POST /api/sweeps/plan body for the form: the picked scenario, its
 // controllers and the run settings, plus the variation's fields. Null while no
 // scenario is picked or a field is not valid; every problem is marked.
 function buildRequest() {
   if (!state.doc) return null;
   const { ok, assignments } = form.assignments();
-  const maxTime = numberOf(el.maxTime, el.maxTimeError, { min: 0, exclusive: true });
-  const repeats = numberOf(el.repeats, el.repeatsError, { integer: true, min: 1 });
-  const jobs = numberOf(el.jobs, el.jobsError, { integer: true, min: 0 });
-  const runTimeout = numberOf(el.runTimeout, el.runTimeoutError, { min: 0 });
+  const settings = runSettings();
   const fields = variation.fields();
-  if (!ok || !fields || [maxTime, repeats, jobs, runTimeout].includes(undefined)) return null;
+  if (!ok || !fields || !settings) return null;
   return {
     scenario: state.scenario.name,
     assignments,
-    max_time_s: maxTime,
-    repeats,
-    jobs,
-    run_timeout_s: runTimeout,
+    ...settings,
     ...fields,
   };
+}
+
+// The constellation: a step is lit (is-done) once its part of the form is
+// set: an environment, the scenario's doc, valid controllers, variation and
+// run settings, and a plan on screen for the request as it is. The first step
+// not lit is the one to do next (is-current).
+function syncSteps() {
+  const picked = !!state.doc;
+  const done = [
+    !!el.envList.querySelector("input:checked"),
+    picked,
+    picked && form.assignments().ok,
+    picked && variation.fields() !== null,
+    picked && runSettings() !== null,
+    state.plannedJson !== null,
+  ];
+  const current = done.indexOf(false);
+  steps.forEach((step, i) => {
+    step.classList.toggle("is-done", done[i]);
+    step.classList.toggle("is-current", i === current);
+  });
 }
 
 // Why no request can be made, for the buttons that need one.
@@ -174,7 +212,10 @@ function clearPlan() {
 function changed() {
   const request = buildRequest();
   const json = JSON.stringify(request ?? null);
-  if (json === state.handledJson) return;
+  if (json === state.handledJson) {
+    syncSteps();
+    return;
+  }
   clearTimeout(state.timer);
   state.seq += 1;
   state.plannedJson = null;
@@ -191,6 +232,7 @@ function changed() {
   }
   state.handledJson = json;
   syncRunSweep();
+  syncSteps();
 }
 
 // Plan `request`; with `check`, the runs' aircraft trims are built and checked too.
@@ -216,6 +258,7 @@ async function send(request, check) {
     if (seq === state.seq) {
       el.planBusy.hidden = true;
       syncRunSweep();
+      syncSteps();
     }
   }
 }
@@ -232,7 +275,10 @@ function renderPlan(plan) {
   setStale(false);
   showError(el.planError, "");
   cloud.set(state.doc, plan);
-  el.planSummary.textContent = `${plan.runs} ${plan.runs === 1 ? "run" : "runs"} · ${plan.in_process ? "in-process" : "with controllers (processes)"}`;
+  // The run count stands out; the text reads as one line.
+  el.planSummary.replaceChildren(
+    h("span", { class: "plan-count", text: String(plan.runs) }),
+    ` ${plan.runs === 1 ? "run" : "runs"} · ${plan.in_process ? "in-process" : "with controllers (processes)"}`);
   const withSample = plan.rows.some((r) => r.sample != null);
   const shown = plan.rows.slice(0, PLAN_ROWS);
   el.planTable.replaceChildren(
@@ -294,6 +340,24 @@ async function save(overwrite) {
   }
 }
 
+// ---- the galleries ----
+
+// Show a gallery's first GALLERY_ROWS rows of cards (by the grid's columns at
+// this width), or all of them once opened; Show all appears only when some are
+// hidden. `force` re-fits after the cards change, else only a column change does.
+function fitGallery(g, force) {
+  const cols = getComputedStyle(g.list).gridTemplateColumns.split(" ").filter(Boolean).length || 1;
+  if (!force && cols === g.cols) return;
+  g.cols = cols;
+  const items = [...g.list.children];
+  const limit = cols * GALLERY_ROWS;
+  items.forEach((li, i) => { li.hidden = !g.open && i >= limit; });
+  g.more.hidden = items.length <= limit;
+  g.more.textContent = g.open ? "Show fewer" : `Show all ${items.length}`;
+  g.more.setAttribute("aria-expanded", String(g.open));
+  g.count.textContent = items.length ? String(items.length) : "";
+}
+
 // ---- saved sweeps ----
 
 // List the saved sweeps, the invalid ones too, with why.
@@ -303,6 +367,7 @@ async function refreshSaved() {
     showError(el.savedError, "");
     el.savedEmpty.hidden = entries.length > 0;
     el.savedList.replaceChildren(...entries.map(savedItem));
+    fitGallery(galleries[0], true);
   } catch (err) {
     showError(el.savedError, `Cannot list the saved sweeps: ${err.message || err}`);
   }
@@ -311,13 +376,13 @@ async function refreshSaved() {
 function savedItem(entry) {
   const button = h("button", { type: "button", text: "Open" });
   button.addEventListener("click", () => openSweep(entry.name));
-  return h("li", { class: "saved-item" },
+  return h("li", { class: entry.error ? "saved-item glass is-invalid" : "saved-item glass" },
     h("div", { class: "saved-text" },
       h("span", { class: "saved-name", text: entry.name }),
-      entry.summary ? h("span", { class: "small", text: entry.summary }) : null,
-      entry.base ? h("span", { class: "muted small", text: `base ${entry.base}` }) : null,
+      entry.summary ? h("span", { class: "small saved-summary", text: entry.summary }) : null,
+      entry.base ? h("span", { class: "muted small saved-base", text: `base ${entry.base}` }) : null,
       entry.error ? h("span", { class: "field-error", text: entry.error }) : null),
-    button);
+    h("div", { class: "saved-actions" }, button));
 }
 
 // Open the saved sweep `name`: its scenario, controllers, run settings and the
@@ -478,16 +543,27 @@ async function refreshRecent() {
     showError(el.recentError, "");
     el.recentEmpty.hidden = sweeps.length > 0;
     el.recentList.replaceChildren(...sweeps.map(recentItem));
+    fitGallery(galleries[1], true);
   } catch (err) {
     showError(el.recentError, `Cannot list the sweeps: ${err.message || err}`);
   }
 }
 
+// A sweep's card: its link, scenario and state, and a bar of its ok and
+// failed runs out of the total (the text says the same).
 function recentItem(sweep) {
-  return h("li", { class: "saved-item" },
+  const share = (n) => `${sweep.total > 0 ? Math.min(100, (100 * n) / sweep.total) : 0}%`;
+  const ok = h("span", { class: "run-bar-ok" });
+  ok.style.width = share(sweep.ok);
+  const failed = h("span", { class: "run-bar-failed" });
+  failed.style.width = share(sweep.failed);
+  return h("li", { class: "saved-item glass" },
     h("div", { class: "saved-text" },
       h("a", { class: "saved-name", href: `./sweep.html?id=${encodeURIComponent(sweep.id)}`, text: sweep.id }),
-      h("span", { class: "small", text: `${sweep.scenario} · ${sweep.state}` }),
+      h("span", { class: "small" },
+        `${sweep.scenario} · `,
+        h("span", { class: "sweep-state", "data-state": sweep.state, text: sweep.state })),
+      h("span", { class: "run-bar", "aria-hidden": "true" }, ok, failed),
       h("span", { class: "muted small", text: `${sweep.ok} ok · ${sweep.failed} failed of ${sweep.total}` }),
       h("span", { class: "muted small", text: startedText(sweep.started_at) })));
 }
@@ -517,6 +593,13 @@ el.saveName.addEventListener("input", () => {
   showError(el.saveError, "");
 });
 el.saveReplace.addEventListener("click", () => save(true));
+for (const g of galleries) {
+  g.more.addEventListener("click", () => {
+    g.open = !g.open;
+    fitGallery(g, true);
+  });
+  new ResizeObserver(() => fitGallery(g, false)).observe(g.list);
+}
 
 // Unsaved changes: the request differs from the one last saved or opened (or,
 // for a fresh pick, from its first plan).

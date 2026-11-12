@@ -415,7 +415,9 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 | `sweeps.html` | the Sweeps builder, `sweeps.js` |
 | `sweep.html` | the sweep page: state, progress, results, All runs, Compare runs |
 | `style.css` | the theme tokens and shared controls for every page |
-| `css/studio.css` | the studio pages' scrolling layout (index, interactive) |
+| `css/cosmos.css` | the shared shell on every page: the twinkling starfield (`.sky`), the page tabs, glass panels and glows |
+| `css/studio.css` | the studio pages' scrolling layout (index, interactive, sweeps, sweep) and their shared parts: the constellation stepper (`.step`, lit with `is-done` / `is-current`), choice tiles, aircraft cards |
+| `css/interactive.css` | the Interactive page: the two columns and the sticky Flight plan card, over `studio.css` |
 | `css/sandbox.css` | the scenario editor's layout, over `style.css` |
 | `css/sweeps.css` | the Sweeps builder's form |
 | `css/sweepview.css` | the sweep page, over `studio.css` |
@@ -423,7 +425,7 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 | `js/ctlform.js` | the per-aircraft controller form (Interactive and Sweeps) |
 | `js/dom.js` | DOM helpers: `$`, `h()`, `showError` |
 | `js/editstore.js` | a scenario's initial conditions as a store the scene reads (the editor's fleet) |
-| `js/environment.js` | background, fog, lights, the ENU grid, and the sky and map looks (`setMode`) |
+| `js/environment.js` | background, fog, lights, the ENU grid, and the sky and map looks (`setMode`; `setChart` swaps the map's imagery for the editor's star chart) |
 | `js/eventlog.js` | the aircraft dock's event log: a virtual list, click to seek |
 | `js/fleet.js` | the fleet dock: aircraft grouped by team, one status row each, pin to target |
 | `js/format.js` | number and time formatting for the HUD |
@@ -438,7 +440,7 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 | `js/plots.js` | the plots dock: stacked, time-synced uPlot charts for the selection |
 | `js/prefs.js` | viewer preferences persisted in `localStorage` (`astrum.viewer.v1`) |
 | `js/runpanel.js` | a studio run's panel on `view.html?run=<id>`: state, Stop, log, metrics, Open full replay |
-| `js/sandbox.js` | the scenario editor: map, edits, spawn, undo and redo, world origin, the JSON panel |
+| `js/sandbox.js` | the scenario editor: map, edits, spawn, undo and redo, world origin, the JSON panel, the Imagery / Chart map look (persisted in `localStorage`, `astrum.sandbox.v1`) |
 | `js/scatter.js` | the canvas scatter plot behind Compare runs |
 | `js/scenariopicker.js` | the environment and scenario steps; only flyable scenarios can be picked |
 | `js/scene.js` | the 3-D view: camera, sizing, one object per aircraft, and edit mode (the Scene edit API) |
@@ -452,7 +454,7 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 | `js/ui.js` | the HUD shell: top bar, transport, overlays, drag-and-drop, keyboard shortcuts |
 | `js/variation.js` | a sweep's variation: its random draws, its grid and the draw settings |
 
-**Every page** (`index.html` and the studio pages, `view.html` included) links `style.css`; the studio pages add `css/studio.css` or their own sheet. Every page reaches `/api` only through `js/api.js`.
+**Every page** (`index.html` and the studio pages, `view.html` included) links `style.css` then `css/cosmos.css`; the studio pages add `css/studio.css` or their own sheet. Every page reaches `/api` only through `js/api.js`.
 
 **Crate `astrum-web`** (`crates/astrum-web/`): the live bridge and the MCAP exporter (`astrum-web-export`) both project telemetry through the one `astrum_web::FrameJson` shape, and the server adds the studio's API.
 

@@ -1,9 +1,11 @@
 // The starting positions of a sweep on a TopDown canvas. The base scenario's
 // aircraft are arrows: muted, or in their series colour when the sweep moves
-// them. Each planned run adds one dot per moving aircraft at its start, so the
-// spread of the draws and of the grid shows; a dot carries a heading tick when
-// the run turns the aircraft. The legend counts each moving aircraft's starts;
-// the tooltip shows a dot's run values (keys and numbers) or a base arrow's pose.
+// them. Each planned run adds one star per moving aircraft at its start (a
+// soft halo, the series-coloured disc and a bright core), so the spread of the
+// draws and of the grid shows and dense starts glow; a star carries a heading
+// tick when the run turns the aircraft. The legend counts each moving
+// aircraft's starts; the tooltip shows a star's run values (keys and numbers)
+// or a base arrow's pose.
 //
 // Positions are local east/north metres from the scenario's origin by a flat
 // approximation (n = Δlat · 111132.92, e = Δlon · 111412.84 · cos(lat0)): a
@@ -18,6 +20,11 @@ const M_PER_DEG_LON_EQUATOR = 111412.84;
 const SERIES = ["--accent", "--ok", "--warn", "--live", "--series-5", "--series-6"];
 const TIP_GAP_PX = 14;
 const HEADING_EPS_DEG = 0.01;
+const STAR_HALO_PX = 5.5; // a start's soft halo
+const STAR_BODY_PX = 2.4; // its disc, in the series colour
+const STAR_CORE_PX = 1.1; // its core, the series colour toward --star
+const STAR_HALO_ALPHA = 0.2;
+const STAR_CORE_MIX = 0.7; // how far the core is toward --star
 
 // East and north metres of (lat, lon) from the origin (lat0, lon0).
 function enuOf(lat, lon, lat0, lon0) {
@@ -30,13 +37,33 @@ function enuOf(lat, lon, lat0, lon0) {
 // A run value's key in short form: `aircraft.7.offset.forward_m` → `#7 forward_m`.
 const shortKey = (key) => key.replace(/^aircraft\.(\d+)\.(offset\.)?/, "#$1 ");
 
-// The colours of this page, read once per call: the muted grey and the series
-// colour of an aircraft id (by id, so an aircraft keeps its colour as others change).
+// `color` (#rgb or #rrggbb) as [r, g, b], or null for any other form.
+function rgbOf(color) {
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color);
+  if (!m) return null;
+  const hex = m[1].length === 3 ? [...m[1]].map((c) => c + c).join("") : m[1];
+  return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16));
+}
+
+// A start's three colours from its series colour: the halo (translucent), the
+// disc and the core (toward `star`). A colour that is not hex keeps one colour.
+function starOf(color, star) {
+  const c = rgbOf(color);
+  const s = rgbOf(star) ?? [255, 255, 255];
+  if (!c) return { halo: color, body: color, core: color };
+  const core = c.map((v, i) => Math.round(v + (s[i] - v) * STAR_CORE_MIX));
+  return { halo: `rgba(${c.join(", ")}, ${STAR_HALO_ALPHA})`, body: color, core: `rgb(${core.join(", ")})` };
+}
+
+// The colours of this page, read once per call: the muted grey, the series
+// colour of an aircraft id (by id, so an aircraft keeps its colour as others
+// change) and its start's star colours.
 function palette() {
   const css = getComputedStyle(document.documentElement);
   const get = (name) => css.getPropertyValue(name).trim();
   const series = SERIES.map(get);
-  return { muted: get("--muted"), colorOf: (id) => series[id % series.length] };
+  const stars = series.map((c) => starOf(c, get("--star")));
+  return { muted: get("--muted"), colorOf: (id) => series[id % series.length], starOf: (id) => stars[id % stars.length] };
 }
 
 export class StartCloud {
@@ -76,7 +103,7 @@ export class StartCloud {
     this.#tip.hidden = true;
   }
 
-  #layers({ muted, colorOf }) {
+  #layers({ muted, colorOf, starOf }) {
     const doc = this.#doc;
     if (!doc) return [];
     const { origin_lat_deg: lat0, origin_lon_deg: lon0 } = doc.scenario.world;
@@ -89,21 +116,30 @@ export class StartCloud {
       label: `#${a.id}`,
       data: { kind: "base", id: a.id, model: a.model, heading_deg: a.heading_deg, alt_hae_m: a.alt_hae_m },
     }));
-    const dots = [];
+    // Each start is three items at one place, one per layer (halo, disc, core),
+    // all carrying its data, so a hover on any of them shows the run.
+    const halos = [];
+    const bodies = [];
+    const cores = [];
     for (const run of this.#plan?.initial ?? []) {
       for (const s of run.aircraft) {
         const b = base.get(s.id);
         // A tick only where the run turns the aircraft away from its base heading.
         const turned = b && Math.abs(((s.heading_deg - b.heading_deg + 540) % 360) - 180) > HEADING_EPS_DEG;
-        dots.push({
-          ...enuOf(s.lat_deg, s.lon_deg, lat0, lon0),
-          heading_deg: turned ? s.heading_deg : undefined,
-          color: colorOf(s.id),
-          data: { kind: "start", run: run.run, id: s.id },
-        });
+        const at = enuOf(s.lat_deg, s.lon_deg, lat0, lon0);
+        const star = starOf(s.id);
+        const data = { kind: "start", run: run.run, id: s.id };
+        halos.push({ ...at, color: star.halo, radius: STAR_HALO_PX, data });
+        bodies.push({ ...at, heading_deg: turned ? s.heading_deg : undefined, color: star.body, radius: STAR_BODY_PX, data });
+        cores.push({ ...at, color: star.core, radius: STAR_CORE_PX, data });
       }
     }
-    return [{ kind: "arrows", items: arrows }, { kind: "dots", items: dots }];
+    return [
+      { kind: "arrows", items: arrows },
+      { kind: "dots", items: halos },
+      { kind: "dots", items: bodies },
+      { kind: "dots", items: cores },
+    ];
   }
 
   #renderLegend({ colorOf }) {
@@ -122,6 +158,7 @@ export class StartCloud {
       const name = base ? `aircraft ${id} (${base.model})` : `aircraft ${id}`;
       const swatch = h("span", { class: "swatch" });
       swatch.style.background = colorOf(id);
+      swatch.style.boxShadow = `0 0 6px ${colorOf(id)}`;
       return h("span", { class: "start-legend-row" }, swatch, `${name}: ${starts} ${starts === 1 ? "start" : "starts"}`);
     }));
   }

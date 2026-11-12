@@ -17,6 +17,7 @@ import { Scene } from "./scene.js";
 import { EditStore } from "./editstore.js";
 import { Datum, DEG2RAD } from "./geo.js";
 import { ApiError, checkScenario, getEnvironments, getModels, getScenario, saveScenario } from "./api.js";
+import { teamColor } from "./format.js";
 
 const DEFAULT_ENVIRONMENT = "empty";
 const HISTORY_MAX = 200;            // undo steps kept
@@ -39,6 +40,9 @@ const AIRCRAFT_FIELDS = [
   ["control_rate_hz", "unset"], ["team"], ["health"], ["ammo", "unset"],
 ];
 const AIRCRAFT_DEFAULTS = { team: 0, health: 100 };
+// Page preferences kept across visits (localStorage, JSON): the map look.
+const PREFS_KEY = "astrum.sandbox.v1";
+const MAP_LOOKS = new Set(["imagery", "chart"]);
 
 const $ = (id) => document.getElementById(id);
 
@@ -69,6 +73,10 @@ const scene = new Scene($("view"));
 scene.setCameraMode("map");
 scene.setEditing({ onSelect, onEdit, onPoint });
 scene.setModelScale(1); // true size up close: spacing reads right; the on-screen floor keeps far ones visible
+{
+  const look = loadPrefs().look;
+  setLook(MAP_LOOKS.has(look) ? look : "imagery");
+}
 
 // ---- Scenario helpers ------------------------------------------------------
 
@@ -700,6 +708,7 @@ function renderFleet(issues) {
     li.tabIndex = 0;
     li.dataset.id = String(a.id);
     li.setAttribute("aria-selected", String(state.selection.includes(a.id)));
+    li.style.setProperty("--team", teamColor(a.team ?? 0)); // the row's team stripe
     const sw = document.createElement("span");
     sw.className = "swatch";
     sw.style.background = scene.colorOf(a.id) ?? "";
@@ -728,7 +737,7 @@ function renderFleet(issues) {
 }
 
 function renderIssues(issues = validate(state.scenario)) {
-  const all = [...issues.map((i) => i.msg), ...state.entry.values()];
+  const all = [...new Set([...issues.map((i) => i.msg), ...state.entry.values()])];
   const ul = $("issues");
   if (!all.length) {
     const li = document.createElement("li");
@@ -736,12 +745,16 @@ function renderIssues(issues = validate(state.scenario)) {
     li.textContent = "No problems found.";
     ul.replaceChildren(li);
   } else {
-    ul.replaceChildren(...[...new Set(all)].map((m) => {
+    ul.replaceChildren(...all.map((m) => {
       const li = document.createElement("li");
       li.textContent = m;
       return li;
     }));
   }
+  // The Scenario JSON summary's badge: "valid", or how many problems are listed.
+  const status = $("jsonStatus");
+  status.textContent = all.length ? `${all.length} issue${all.length === 1 ? "" : "s"}` : "valid";
+  status.classList.toggle("is-bad", all.length > 0);
   renderInspector(issues);
   renderWorld(issues);
   renderSim(issues);
@@ -801,6 +814,29 @@ function setView(mode) {
   scene.setCameraMode(mode);
   $("viewMapBtn").setAttribute("aria-pressed", String(mode === "map"));
   $("viewOrbitBtn").setAttribute("aria-pressed", String(mode === "orbit"));
+}
+
+// The map look (Imagery | Chart); the stage drops its imagery vignette on the chart.
+function setLook(look) {
+  scene.setMapLook(look);
+  $("lookImageryBtn").setAttribute("aria-pressed", String(look === "imagery"));
+  $("lookChartBtn").setAttribute("aria-pressed", String(look === "chart"));
+  document.querySelector(".sb-stage").classList.toggle("is-chart", look === "chart");
+}
+
+function loadPrefs() {
+  try {
+    const p = JSON.parse(localStorage.getItem(PREFS_KEY));
+    return p && typeof p === "object" ? p : {};
+  } catch {
+    return {};
+  }
+}
+
+function savePrefs(patch) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ ...loadPrefs(), ...patch }));
+  } catch { /* storage unavailable: the look just isn't remembered */ }
 }
 
 // The scale bar: a round length 60–150 px long at the view's scale.
@@ -997,6 +1033,9 @@ function wire() {
   $("redoBtn").addEventListener("click", redo);
   $("viewMapBtn").addEventListener("click", () => setView("map"));
   $("viewOrbitBtn").addEventListener("click", () => setView("orbit"));
+  for (const look of MAP_LOOKS) {
+    $(look === "chart" ? "lookChartBtn" : "lookImageryBtn").addEventListener("click", () => { setLook(look); savePrefs({ look }); });
+  }
   $("fitBtn").addEventListener("click", () => scene.frameFleet());
   $("dupBtn").addEventListener("click", duplicate);
   $("delBtn").addEventListener("click", removeSelected);
@@ -1055,7 +1094,7 @@ function wire() {
   $("spawnPattern").addEventListener("change", () => {
     $("spawnSpacingLabel").textContent = $("spawnPattern").value === "random" ? "Box side (m)" : "Spacing (m)";
   });
-  const section = form.closest("section");
+  const section = form.closest(".sb-section");
   const preview = (on) => { state.previewSpawn = on || section.contains(document.activeElement); updatePreview(); };
   section.addEventListener("pointerenter", () => preview(true));
   section.addEventListener("pointerleave", () => preview(false));

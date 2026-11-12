@@ -10,6 +10,7 @@
 // controller is picked.
 
 import { h, showError } from "./dom.js";
+import { teamColor } from "./format.js";
 
 const TARGET_UNITS = { heading_deg: "°", alt_hae_m: "m", tas_mps: "m/s" };
 
@@ -154,7 +155,9 @@ export class ControllerForm {
       this.#host.dispatchEvent(new Event("controllerchange"));
     });
     const team = Number.isInteger(a.team) ? `team ${a.team}` : null;
-    this.#host.append(h("div", { class: "fleet-row" },
+    // --team colours the row's stripe (css/studio.css).
+    const style = Number.isInteger(a.team) ? `--team: ${teamColor(a.team)}` : null;
+    this.#host.append(h("div", { class: "fleet-row", style },
       h("div", { class: "fleet-head" },
         h("span", { class: "fleet-id", text: `#${a.id}` }),
         h("span", { class: "fleet-model", text: a.model }),

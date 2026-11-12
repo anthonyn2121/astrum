@@ -10,7 +10,8 @@
 // nearest item within HIT_PX as onHover(item | null, {x, y}); click reports it
 // as onPick(item). Both pass the layer's item, whose `data` is the caller's.
 // Colours are CSS colour strings from the items; the grid and labels take the
-// page's own variables. No dependencies.
+// canvas's --chart-grid, --chart-label and --chart-halo (else the page's
+// --line, --muted and --panel-solid). No dependencies.
 
 const ARROW_NOSE_PX = 8;
 const ARROW_TAIL_PX = 6;
@@ -234,12 +235,14 @@ export class TopDown {
     ctx.setTransform(this.#dpr, 0, 0, this.#dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     if (!w || !h) return;
-    const css = getComputedStyle(document.documentElement);
+    // Read from the canvas, so a page can theme one picture (--chart-*); each
+    // falls back to the page's own variable.
+    const css = getComputedStyle(this.#canvas);
     const theme = {
-      line: cssVar(css, "--line", "rgba(90,130,170,0.22)"),
-      muted: cssVar(css, "--muted", "#7d8da0"),
+      line: cssVar(css, "--chart-grid", "") || cssVar(css, "--line", "rgba(90,130,170,0.22)"),
+      muted: cssVar(css, "--chart-label", "") || cssVar(css, "--muted", "#7d8da0"),
       text: cssVar(css, "--text", "#dbe4ef"),
-      halo: cssVar(css, "--panel-solid", "#101620"),
+      halo: cssVar(css, "--chart-halo", "") || cssVar(css, "--panel-solid", "#101620"),
     };
     this.#grid(theme);
     for (const layer of this.#layers) {

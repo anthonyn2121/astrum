@@ -1,69 +1,176 @@
 /* The sweep page (sweep.html): on top of studio.css. */
 
-.sweep-id { margin: 0 0 4px; font-size: 12px; overflow-wrap: anywhere; }
-.sweep-summary h1 { overflow-wrap: anywhere; }
-.state-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin: 0 0 14px; }
+/* Page tokens: the deep sky behind the two charts (a faint starfield on a radial
+   gradient). Pills, chips and run stars glow with their own status colour (--c). */
+.sweep-page {
+  --sky-deep: #05080f;
+  --sky-core: #0d1830;
+  --chart-sky:
+    radial-gradient(1px 1px at 12% 18%, var(--star), transparent),
+    radial-gradient(1px 1px at 68% 34%, var(--star), transparent),
+    radial-gradient(1px 1px at 41% 77%, var(--star), transparent),
+    radial-gradient(1.5px 1.5px at 86% 82%, var(--star), transparent),
+    radial-gradient(1px 1px at 27% 54%, var(--star), transparent),
+    radial-gradient(ellipse 70% 60% at 50% 45%, var(--sky-core), var(--sky-deep) 80%);
+}
+.sweep-page .studio-main { max-width: 1560px; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* ---- The hero: head (name, state, counts, stop), the orbit ring, the facts ---- */
+.sweep-summary {
+  position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(260px, 360px);
+  grid-template-areas: "head ring facts" "notes notes notes";
+  align-items: center; gap: 6px 32px; margin: 0 0 22px; padding: 22px 26px; overflow: hidden;
+}
+.sweep-summary::before {
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(ellipse 40% 90% at 0% 0%, var(--nebula-a), transparent 70%),
+    radial-gradient(ellipse 30% 80% at 62% 50%, var(--nebula-b), transparent 70%);
+}
+.sweep-head { grid-area: head; min-width: 0; }
+.sweep-id { margin: 0 0 4px; font-size: 12px; overflow-wrap: anywhere; letter-spacing: 0.3px; }
+.sweep-summary h1 { overflow-wrap: anywhere; font-size: 28px; letter-spacing: 0.3px; text-shadow: 0 0 22px rgba(74, 163, 255, 0.35); }
+.state-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin: 4px 0 14px; }
+
+/* The state pill: a glowing pill with a live dot; it pulses while the sweep runs. */
 .state-badge {
-  font-weight: 600; font-size: 12px; padding: 2px 10px; border-radius: 999px;
-  border: 1px solid var(--line); background: var(--panel-raised); color: var(--text);
+  --c: var(--text);
+  display: inline-flex; align-items: center; gap: 7px;
+  font-weight: 700; font-size: 12px; letter-spacing: 0.6px; text-transform: uppercase;
+  padding: 3px 12px 3px 10px; border-radius: 999px;
+  color: var(--c); border: 1px solid color-mix(in srgb, var(--c) 55%, transparent);
+  background: color-mix(in srgb, var(--c) 12%, transparent);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--c) 30%, transparent);
 }
-.state-badge.running { color: var(--accent); border-color: var(--accent); }
-.state-badge.finished { color: var(--ok); border-color: #46d38a88; }
-.state-badge.stopped, .state-badge.interrupted { color: var(--warn); border-color: #ffb54788; }
-.state-badge.failed { color: var(--live); border-color: #ff5a4d88; }
+.state-badge.running { --c: var(--accent); }
+.state-badge.finished { --c: var(--ok); }
+.state-badge.stopped, .state-badge.interrupted { --c: var(--warn); }
+.state-badge.failed { --c: var(--live); }
+.state-badge::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--c);
+  box-shadow: 0 0 8px var(--c);
+}
+.state-badge.running::before { animation: sweep-pulse 1.6s ease-in-out infinite; }
 
-.progress-line { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; margin: 0 0 12px; }
-.progress-line progress { width: min(420px, 100%); height: 10px; accent-color: var(--accent); }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+/* Status count chips: each glows in its status colour. */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; }
 .chip {
-  padding: 1px 9px; border-radius: 999px; border: 1px solid var(--line);
-  font-size: 12px; font-variant-numeric: tabular-nums;
+  --c: var(--muted);
+  padding: 2px 10px; border-radius: 999px; font-size: 12px; font-variant-numeric: tabular-nums;
+  color: var(--c); border: 1px solid color-mix(in srgb, var(--c) 45%, transparent);
+  background: color-mix(in srgb, var(--c) 9%, transparent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--c) 18%, transparent);
 }
-.chip.ok { color: var(--ok); border-color: #46d38a88; }
-.chip.failed { color: var(--live); border-color: #ff5a4d88; }
-.chip.running { color: var(--accent); border-color: var(--accent); }
-.chip.stopped { color: var(--warn); border-color: #ffb54788; }
-.chip.queued { color: var(--muted); }
+.chip.ok { --c: var(--ok); }
+.chip.failed { --c: var(--live); }
+.chip.running { --c: var(--accent); }
+.chip.stopped { --c: var(--warn); }
+.chip.queued { --c: var(--muted); box-shadow: none; }
 
-.sweep-facts { max-width: 560px; margin: 0 0 14px; }
+.sweep-actions { display: flex; gap: 12px; align-items: center; margin: 0; }
+.sweep-actions:has(> [hidden]:only-child) { display: none; }
+.sweep-notes { grid-area: notes; }
+.sweep-notes > * { margin: 8px 0 0; }
+
+/* The orbit ring (sweepview.js): track, arc, satellite at the arc's head, done/total. */
+.progress-line { grid-area: ring; display: flex; flex-direction: column; align-items: center; gap: 4px; margin: 0; }
+.orbit-ring { --c: var(--accent); width: 132px; height: 132px; }
+.orbit-ring[data-state="finished"] { --c: var(--ok); }
+.orbit-ring[data-state="stopped"], .orbit-ring[data-state="interrupted"] { --c: var(--warn); }
+.orbit-ring[data-state="failed"] { --c: var(--live); }
+.orbit-ring svg { display: block; overflow: visible; }
+.ring-orbit { fill: none; stroke: var(--glass-line); stroke-width: 1; stroke-dasharray: 2 5; }
+.ring-track { fill: none; stroke: rgba(120, 170, 225, 0.14); stroke-width: 6; }
+.ring-arc {
+  fill: none; stroke: var(--c); stroke-width: 6; stroke-linecap: round;
+  transform: rotate(-90deg); transform-origin: 60px 60px;
+  filter: drop-shadow(0 0 4px var(--c));
+  transition: stroke-dashoffset 0.6s ease;
+}
+.ring-sat { transform-origin: 60px 60px; transition: transform 0.6s ease; }
+.ring-sat-halo { fill: var(--c); opacity: 0.3; }
+.ring-sat-core { fill: var(--star); filter: drop-shadow(0 0 3px var(--c)); }
+.ring-text { fill: var(--text); font-size: 20px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; font-variant-numeric: tabular-nums; }
+.ring-total { fill: var(--muted); font-size: 12px; font-weight: 500; }
+.ring-label { fill: var(--muted); font-size: 9px; letter-spacing: 1.5px; text-transform: uppercase; text-anchor: middle; }
+
+/* The facts in their own glass card. */
+.sweep-facts {
+  grid-area: facts; align-self: stretch; align-content: center; margin: 0; padding: 14px 16px;
+  background: var(--glass-strong); border: 1px solid var(--glass-line); border-radius: 10px;
+}
 .sweep-facts code { overflow-wrap: anywhere; }
-.sweep-actions { display: flex; gap: 12px; align-items: center; margin: 0 0 12px; }
-.sweep-summary .form-error { margin-bottom: 10px; }
 
-.sweep-section { margin: 0 0 30px; }
-.sweep-section > h2 { font-size: 16px; margin: 0 0 12px; }
+/* ---- Panels ---- */
+.sweep-section { margin: 0 0 22px; }
+.sweep-panel { padding: 16px 18px; min-width: 0; }
+.sweep-section h2 { font-size: 15px; margin: 0 0 12px; letter-spacing: 0.3px; }
+.sweep-section h2::before { content: "✦ "; color: var(--accent); text-shadow: 0 0 8px var(--accent); }
+.sweep-panel > p:last-child { margin-bottom: 0; }
 
-/* The run strip: one square per run, coloured by status. */
-.run-strip { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 10px; }
-.run-cell {
-  width: 16px; height: 16px; padding: 0; border: 0; border-radius: 3px;
-  background: var(--muted); opacity: 0.35;
+/* The dashboard: All runs and Compare runs side by side on wide screens. */
+.sweep-dash { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 22px; }
+@media (min-width: 1300px) {
+  .sweep-dash { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+  .sweep-dash .tracks-canvas { height: 440px; }
+  .sweep-dash .compare-wrap { height: 440px; }
 }
-.run-cell.running { background: var(--accent); opacity: 1; }
-.run-cell.ok { background: var(--ok); opacity: 1; }
-.run-cell.failed { background: var(--live); opacity: 1; }
-.run-cell.stopped { background: var(--warn); opacity: 1; }
-.run-cell.selected { outline: 2px solid var(--text); outline-offset: 2px; }
 
-/* The results table. */
-.results-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 10px; }
-.results-head h2 { margin: 0; font-size: 16px; }
+/* The run strip: one star per run, glowing by status. */
+.run-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 2px 12px; }
+.run-cell {
+  --c: var(--muted);
+  width: 14px; height: 14px; padding: 0; border: 0; border-radius: 50%;
+  background: radial-gradient(circle at 50% 50%, var(--star) 0 18%, var(--c) 45%);
+  opacity: 0.3; cursor: pointer; transition: box-shadow 0.2s, transform 0.15s, opacity 0.2s;
+}
+.run-cell:hover:not(:disabled) { transform: scale(1.25); }
+.run-cell.queued { background: var(--muted); opacity: 0.25; }
+.run-cell.running { --c: var(--accent); opacity: 1; animation: sweep-pulse 1.2s ease-in-out infinite; }
+.run-cell.ok { --c: var(--ok); opacity: 1; }
+.run-cell.failed { --c: var(--live); opacity: 1; }
+.run-cell.stopped { --c: var(--warn); opacity: 1; }
+.run-cell.running, .run-cell.ok, .run-cell.failed, .run-cell.stopped {
+  box-shadow: 0 0 8px color-mix(in srgb, var(--c) 70%, transparent);
+}
+.run-cell.selected {
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--sky-deep), 0 0 0 4px var(--text), 0 0 14px color-mix(in srgb, var(--c) 80%, transparent);
+}
+.run-cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+
+@keyframes sweep-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.85); }
+}
+
+/* ---- The results table (sticky solid header and footer) ---- */
+.results-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 12px; }
+.results-head h2 { margin: 0; }
 .filter-label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .results-wrap {
-  max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius);
+  max-height: 60vh; overflow: auto; border: 1px solid var(--glass-line); border-radius: var(--radius);
+  background: rgba(5, 8, 15, 0.45);
 }
 .results-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
 .results-table th, .results-table td {
-  padding: 5px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line);
+  padding: 6px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line);
 }
 .results-table td.num { text-align: right; }
 .results-table td.status { white-space: normal; min-width: 180px; overflow-wrap: anywhere; }
 .results-table thead th {
   position: sticky; top: 0; z-index: 1; background: var(--panel-raised); color: var(--muted); font-weight: 600;
+  border-bottom-color: var(--glass-line); box-shadow: 0 1px 0 var(--glass-line);
 }
 .results-table tbody tr { cursor: pointer; }
 .results-table tbody tr:hover td { background: rgba(74,163,255,0.06); }
 .results-table tbody tr.selected td { background: rgba(74,163,255,0.16); }
+.results-table tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 .results-table tfoot th, .results-table tfoot td {
   position: sticky; bottom: 0; background: var(--panel-raised); border-bottom: 0; border-top: 1px solid var(--line);
   color: var(--muted);
@@ -76,38 +183,46 @@ button.sort:hover { color: var(--accent); }
 th[aria-sort="ascending"] button.sort::after { content: " ▲"; color: var(--accent); }
 th[aria-sort="descending"] button.sort::after { content: " ▼"; color: var(--accent); }
 
-/* Compare runs: the scatter plot (scatter.js) on a canvas, the hover text over it. */
+/* ---- Compare runs: the scatter plot (scatter.js) on a star-chart canvas, the hover text over it ---- */
 .compare-wrap {
   position: relative; height: min(52vh, 440px); min-height: 280px;
-  border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-solid); overflow: hidden;
+  border: 1px solid var(--glass-line); border-radius: var(--radius); background: var(--chart-sky); overflow: hidden;
+  box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.5);
+}
+.scatter, .tracks-canvas {
+  --chart-grid: rgba(120, 170, 225, 0.12);
+  --chart-label: rgba(170, 195, 225, 0.72);
+  --chart-halo: var(--sky-deep);
 }
 .scatter { position: absolute; inset: 0; width: 100%; height: 100%; display: block; border-radius: var(--radius); }
 .scatter:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.scatter-tip, .tracks-tip {
+  background: var(--glass-strong); border: 1px solid var(--glass-line); border-radius: 8px;
+  box-shadow: var(--glow); backdrop-filter: blur(8px);
+}
 .scatter-tip {
   position: absolute; z-index: 2; margin: 0; max-width: 320px; padding: 5px 8px; pointer-events: none;
   transform: translate(12px, 12px); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
-  background: var(--panel-raised); border: 1px solid var(--line); border-radius: 6px;
 }
 .scatter-tip.left { transform: translate(calc(-100% - 12px), 12px); }
 
-/* The All runs panel (sweeptracks.js on topdown.js): the legend, the canvas, its tooltip and the time bar. */
+/* ---- All runs (sweeptracks.js on topdown.js): the legend, the star-chart canvas, its tooltip and the time bar ---- */
 .tracks-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted); font-size: 12px; }
 .tracks-legend span { display: inline-flex; align-items: center; gap: 6px; }
-.swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: var(--muted); }
-.swatch.ok { background: var(--ok); }
-.swatch.failed { background: var(--live); }
-.swatch.stopped { background: var(--warn); }
-.swatch.selected { background: var(--accent); }
+.swatch { --c: var(--muted); display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--c); box-shadow: 0 0 6px var(--c); }
+.swatch.ok { --c: var(--ok); }
+.swatch.failed { --c: var(--live); }
+.swatch.stopped { --c: var(--warn); }
+.swatch.selected { --c: var(--accent); }
 .tracks-wrap { position: relative; min-width: 0; margin: 0 0 12px; }
 .tracks-canvas {
-  display: block; width: 100%; height: 420px; border: 1px solid var(--line); border-radius: var(--radius);
-  background: var(--panel-solid);
+  display: block; width: 100%; height: 420px; border: 1px solid var(--glass-line); border-radius: var(--radius);
+  background: var(--chart-sky); box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.5);
 }
 .tracks-canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 @media (max-width: 800px) { .tracks-canvas { height: 300px; } }
 .tracks-tip {
   position: absolute; top: 0; left: 0; max-width: 260px; padding: 6px 9px; pointer-events: none;
-  background: var(--panel-raised); border: 1px solid var(--line); border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums;
 }
 .tracks-tip div { white-space: nowrap; }
@@ -116,3 +231,19 @@ th[aria-sort="descending"] button.sort::after { content: " ▼"; color: var(--ac
 .tracks-time input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
 .tracks-time output { min-width: 96px; text-align: right; font-variant-numeric: tabular-nums; }
 .tracks-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+
+/* ---- Narrow screens: the hero stacks ---- */
+@media (max-width: 980px) {
+  .sweep-summary {
+    grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "head ring" "facts facts" "notes notes";
+    gap: 14px 20px; padding: 18px;
+  }
+}
+@media (max-width: 600px) {
+  .sweep-summary { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "ring" "facts" "notes"; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .state-badge.running::before, .run-cell.running { animation: none; }
+  .run-cell, .ring-arc, .ring-sat { transition: none; }
+}

@@ -7,6 +7,7 @@
   <link rel="icon" type="image/png" href="./img/favicon.png" />
   <link rel="stylesheet" href="./vendor/uPlot.min.css" />
   <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/cosmos.css" />
   <script type="importmap">
     {
       "imports": {
@@ -21,7 +22,13 @@
        can be hidden one by one, and presentation mode hides them all. -->
   <div id="app">
     <header id="topbar">
-      <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM <em>Replay</em></a>
+      <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM</a>
+      <nav class="nav-tabs" aria-label="Studio pages">
+        <a href="./interactive.html">Interactive</a>
+        <a href="./sandbox.html">Sandbox</a>
+        <a href="./sweeps.html">Sweeps</a>
+        <a href="./view.html" aria-current="page">Replay</a>
+      </nav>
       <div class="source">
         <span id="statusPill" class="pill idle">idle</span>
         <span id="sourceLabel" class="source-label muted">no source</span>

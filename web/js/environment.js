@@ -9,7 +9,9 @@
 //     map streamed in LOD rings under wherever the camera is looking;
 //   * "map": the editor's look (scene edit mode): the sky's daylight, dome
 //     and ground map for any fleet, without clouds or near haze, so the
-//     imagery stays clear from straight above.
+//     imagery stays clear from straight above; or, with setChart(true), a
+//     dark star chart instead of the dome and imagery (navy, a grid that
+//     keeps its spacing on screen at any zoom, faint fixed stars).
 //
 // The plain objects (lights, grid, fog, background) always exist and are
 // retuned per mode; everything the sky adds is built on entering it and freed
@@ -62,6 +64,26 @@ const MAP_LOOK = {
   ...SKY,
   fog: { color: HAZE, near: 120000, far: 300000 },
   gridOpacity: 0.16,
+};
+
+// The editor's star chart (map mode with setChart): the sky's lights over a
+// deep navy ground, no fog, and the chart grid in place of the faint ENU grid.
+const CHART_BG = 0x050a18;
+const CHART_LOOK = {
+  ...MAP_LOOK,
+  background: CHART_BG,
+  fog: { color: CHART_BG, near: 1e7, far: 2e7 },
+  gridOpacity: 0,
+};
+// The chart grid: a plane following the view's focus, fading out toward its
+// edge. Its finest lines are ≥ minPx apart on screen; each tenth one is a
+// brighter major line, and the finest level fades out as the view zooms out.
+const CHART = {
+  half: 2000000,   // m
+  minPx: 20,       // device px
+  minor: 0x14304f,
+  major: 0x5a9ae6,
+  star: 0xcfe2ff,
 };
 
 // The sun: elevation above the horizon and compass azimuth (0 = north,
@@ -123,6 +145,7 @@ const MAP = {
 const ORDER_DOME = -1000;
 const ORDER_MAP = -900;     // + zoom
 const ORDER_CLOUDS = 1;     // + 0.5 for whichever layer is nearer the camera
+const ORDER_CHART = -900;   // the chart grid takes the map's place
 
 // Scratch values for the per-frame paths (never retained).
 const _enu = { e: 0, n: 0, u: 0 };
@@ -340,6 +363,11 @@ class GroundMap {
     return mesh;
   }
 
+  // Hidden under the editor's chart look; its tiles stay loaded.
+  set visible(v) {
+    this._group.visible = v;
+  }
+
   _dropTile(t) {
     this._group.remove(t.mesh);
     t.mesh.geometry.dispose();
@@ -497,6 +525,74 @@ function cloudLayer(spec, frag, uniforms) {
   return mesh;
 }
 
+// The chart grid. Spacing comes from the ground metres per pixel at each
+// fragment (fwidth), so it holds on screen in the top-down map and recedes in
+// the orbit view. Opaque on the chart's navy (it is the ground, drawn first
+// like the tiles); faint stars hashed per screen cell sit behind the lines.
+const CHART_VERT = /* glsl */ `
+varying vec2 vXZ;
+void main() {
+  vec4 w = modelMatrix * vec4(position, 1.0);
+  vXZ = w.xz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}`;
+const CHART_FRAG = /* glsl */ `
+uniform vec3 uBg, uMinor, uMajor, uStar;
+uniform vec2 uCentre;
+uniform float uHalf, uMinPx;
+varying vec2 vXZ;
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+// Coverage of lines every \`s\` metres, \`w\` px wide.
+float lines(vec2 p, float s, float w) {
+  vec2 c = p / s;
+  vec2 g = abs(fract(c - 0.5) - 0.5) / fwidth(c);
+  return 1.0 - clamp(min(g.x, g.y) - w + 1.0, 0.0, 1.0);
+}
+void main() {
+  vec2 dp = fwidth(vXZ);
+  float lod = log2(max(max(dp.x, dp.y) * uMinPx, 1e-3)) / log2(10.0);
+  float s0 = pow(10.0, floor(lod)), f = fract(lod);
+  float fine = lines(vXZ, s0, 1.0) * (1.0 - f);
+  float mid = lines(vXZ, s0 * 10.0, 1.0);
+  float major = lines(vXZ, s0 * 100.0, 1.5);
+  vec2 cell = floor(gl_FragCoord.xy / 3.0);
+  float h = hash12(cell);
+  vec3 col = uBg + uStar * step(0.996, h) * (h - 0.996) * 120.0;
+  col = mix(col, uMinor, max(fine * 0.55, mid * mix(0.85, 1.0, f)));
+  col = mix(col, uMajor, max(mid * f * 0.35, major * 0.8));
+  float edge = 1.0 - smoothstep(0.6 * uHalf, uHalf, length(vXZ - uCentre));
+  gl_FragColor = vec4(mix(uBg, col, edge), 1.0);
+  #include <colorspace_fragment>
+}`;
+
+function chartGrid() {
+  const geom = new THREE.PlaneGeometry(2 * CHART.half, 2 * CHART.half);
+  geom.rotateX(-Math.PI / 2); // XY → XZ
+  const mesh = new THREE.Mesh(geom, new THREE.ShaderMaterial({
+    vertexShader: CHART_VERT,
+    fragmentShader: CHART_FRAG,
+    uniforms: {
+      uBg: { value: new THREE.Color(CHART_BG) },
+      uMinor: { value: new THREE.Color(CHART.minor) },
+      uMajor: { value: new THREE.Color(CHART.major) },
+      uStar: { value: new THREE.Color(CHART.star) },
+      uCentre: { value: new THREE.Vector2() },
+      uHalf: { value: CHART.half },
+      uMinPx: { value: CHART.minPx },
+    },
+    side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
+  }));
+  mesh.frustumCulled = false;
+  mesh.renderOrder = ORDER_CHART;
+  return mesh;
+}
+
 export class Environment {
   constructor(scene, { maxAnisotropy = 1 } = {}) {
     this._scene = scene;
@@ -507,6 +603,8 @@ export class Environment {
     this._failed = new Set(); // tile keys not to request again this source
     this._sky = null;         // { dome, clouds: { cumulus, cirrus } | null } in sky / map mode
     this._map = null;         // GroundMap in sky / map mode with a datum
+    this._chart = false;      // setChart: the map mode's star-chart look
+    this._chartGrid = null;   // its grid, built on first use
 
     // One background colour and one fog, retuned per mode (same fog type, so
     // a mode switch recompiles no material).
@@ -553,11 +651,24 @@ export class Environment {
       this._sun.position.copy(PLAIN_SUN_POS);
       return;
     }
-    this._applyLook(mode === "sky" ? SKY : MAP_LOOK);
+    this._applyLook(mode === "sky" ? SKY : this._chart ? CHART_LOOK : MAP_LOOK);
     this._sun.position.copy(SUN_DIR);
     if (!this._sky) this._buildDome();
     if (mode === "sky") this._buildClouds();
     else this._disposeClouds();
+  }
+
+  // The map mode's look: imagery (false, the default) or the star chart. Kept
+  // across modes; only map mode shows it.
+  setChart(on) {
+    if (!!on === this._chart) return;
+    this._chart = !!on;
+    if (this._mode === "map") this._applyLook(this._chart ? CHART_LOOK : MAP_LOOK);
+  }
+
+  // Whether the star chart is showing (chart look in map mode).
+  get chart() {
+    return this._chart && this._mode === "map";
   }
 
   get hasDatum() {
@@ -605,9 +716,20 @@ export class Environment {
   // camera, drift the clouds, and stream the map around `focus` (the orbit
   // target / tracked point / map centre). `viewH` is the view height in CSS px.
   frame(camera, focus, viewH) {
+    const chart = this.chart;
+    if (chart && !this._chartGrid) {
+      this._chartGrid = chartGrid();
+      this._scene.add(this._chartGrid);
+    }
+    if (this._chartGrid) {
+      this._chartGrid.visible = chart;
+      this._chartGrid.position.set(focus.x, 0, focus.z);
+      this._chartGrid.material.uniforms.uCentre.value.set(focus.x, focus.z);
+    }
     const sky = this._sky;
     if (!sky) return;
     const cam = camera.position;
+    sky.dome.visible = !chart;
     sky.dome.position.copy(cam);
     const clouds = sky.clouds;
     if (clouds) {
@@ -624,7 +746,12 @@ export class Environment {
       clouds.cirrus.renderOrder = ORDER_CLOUDS + (nearerCumulus ? 0 : 0.5);
     }
     if (!this._datum) return;
+    if (chart) {
+      if (this._map) this._map.visible = false;
+      return;
+    }
     if (!this._map) this._map = new GroundMap(this._scene, this._datum, this._failed, this._aniso);
+    this._map.visible = true;
     this._map.frame(camera, focus, viewH, performance.now());
   }
 
@@ -719,5 +846,11 @@ export class Environment {
     this._grid.material.dispose();
     this._disc.geometry.dispose();
     this._disc.material.dispose();
+    if (this._chartGrid) {
+      this._scene.remove(this._chartGrid);
+      this._chartGrid.geometry.dispose();
+      this._chartGrid.material.dispose();
+      this._chartGrid = null;
+    }
   }
 }
