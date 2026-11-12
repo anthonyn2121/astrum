@@ -50,7 +50,7 @@ Setpoint Tracker::update(const Estimate& state, const FlatReference& ref, double
 double collective_for(double thrust, const DemandMap& map) {
   if (!(thrust > 0.0) || !std::isfinite(thrust)) return 0.0;
   return std::clamp(map.hover_collective * std::pow(thrust / kGravity, 1.0 / map.thrust_exponent),
-                    0.0, 1.0);
+                    0.0, map.max_collective);
 }
 
 MultirotorRaw to_demands(const Setpoint& command, const DemandMap& map) {

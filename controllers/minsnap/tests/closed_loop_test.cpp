@@ -44,9 +44,9 @@ Mat3 exp_map(const Vec3& w, double dt) {
 
 struct Quad {
   Vec3 p, v;
-  Mat3 rot;                        // FLU -> ENU
-  Vec3 omega;                      // body rate, FLU
-  double hover_collective = 0.44;  // what the airframe really needs (the law is told 0.44)
+  Mat3 rot;                         // FLU -> ENU
+  Vec3 omega;                       // body rate, FLU
+  double hover_collective = 0.408;  // the F450's, measured (the law's default)
   double exponent = 1.8;
   double rate_tau_s = 0.04;
   double drag = 0.007;  // m/s^2 per (m/s)^2, ~ the F450's flat-plate drag
@@ -228,12 +228,28 @@ TEST(ClosedLoop, RecoversFromAnInitialOffsetAndVelocity) {
 }
 
 TEST(ClosedLoop, HoldsTheLineWithAWrongHoverCollective) {
-  // The airframe needs 0.48 where the controller assumes 0.44: the integral term and the
-  // position loop take up the 20 % thrust error.
+  // The airframe needs 0.44 where the controller assumes 0.408: the integral term and the
+  // position loop take up the 14 % thrust error. The heuristic plan (6 m/s through the
+  // gates) leaves them the time to. (This was 0.48 against 0.44, 17 %, before the hover
+  // collective default became the measured 0.408; the integral limit, 2 m/s^2, is 20 % of
+  // gravity, so errors much beyond 15 % are not this test's.)
   const Course course = slalom();
-  RaceLaw law(RaceLawParams{});
+  RaceLawParams params;
+  params.plan.planner = PlannerKind::Heuristic;
+  RaceLaw law(params);
   Quad quad = hovering_at({0.0, 0.0, 2.0}, 0.0);
-  quad.hover_collective = 0.48;
+  quad.hover_collective = 0.44;
+  const Flight f = fly(law, quad, course, 60.0);
+  expect_clean(f, course, 0.15);
+}
+
+TEST(ClosedLoop, TimeOptimalPlanHoldsTheLineWithAWrongHoverCollective) {
+  // The time-optimal plan reaches the first gate sooner, so the integrator has less time:
+  // a 10 % thrust error (0.43 where 0.408 is assumed) is held to the same 0.15 m.
+  const Course course = slalom();
+  RaceLaw law{RaceLawParams{}};
+  Quad quad = hovering_at({0.0, 0.0, 2.0}, 0.0);
+  quad.hover_collective = 0.43;
   const Flight f = fly(law, quad, course, 60.0);
   expect_clean(f, course, 0.15);
 }
@@ -255,19 +271,37 @@ TEST(ClosedLoop, ReplansAfterAShove) {
   }
 }
 
-TEST(ClosedLoop, LooserLimitsFlyFasterAndStillCleanly) {
+TEST(ClosedLoop, TighterLimitsFlySlowerAndStillCleanly) {
+  // (The defaults are the airframe's true limits, so "looser" no longer exists: this is the
+  // same check the other way round.)
   const Course course = slalom();
-  RaceLawParams loose;
-  loose.plan.cruise_mps = 4.0;
-  loose.plan.max_accel_mps2 = 9.0;
-  loose.plan.max_rate_rad_s = 0.7;
-  loose.plan.max_yaw_rate = 0.9;
-  RaceLaw a{RaceLawParams{}}, b(loose);
+  RaceLawParams tight;
+  tight.plan.max_rate_rad_s = 0.5;
+  tight.plan.max_speed_mps = 8.0;
+  tight.plan.max_tilt_rad = 0.6;
+  tight.plan.max_yaw_rate = 0.5;
+  RaceLaw a{RaceLawParams{}}, b(tight);
   const Flight defaults = fly(a, hovering_at({0.0, 0.0, 2.0}, 0.0), course, 90.0);
-  const Flight quick = fly(b, hovering_at({0.0, 0.0, 2.0}, 0.0), course, 90.0);
+  const Flight slow = fly(b, hovering_at({0.0, 0.0, 2.0}, 0.0), course, 90.0);
   expect_clean(defaults, course, 0.05);
-  expect_clean(quick, course, 0.1);
-  EXPECT_LT(quick.time_s, defaults.time_s);
+  expect_clean(slow, course, 0.05);
+  EXPECT_GT(slow.time_s, defaults.time_s);
+  EXPECT_LT(slow.peak_tilt_rad, 0.6 + 0.1);
+}
+
+TEST(ClosedLoop, TimeOptimalPlannerFliesFasterThanTheHeuristicOne) {
+  const Course course = slalom();
+  RaceLawParams heuristic;
+  heuristic.plan.planner = PlannerKind::Heuristic;
+  RaceLaw a{RaceLawParams{}}, b(heuristic);
+  const Flight optimal = fly(a, hovering_at({0.0, 0.0, 2.0}, 0.0), course, 90.0);
+  const Flight cruise = fly(b, hovering_at({0.0, 0.0, 2.0}, 0.0), course, 90.0);
+  expect_clean(optimal, course, 0.05);
+  expect_clean(cruise, course, 0.05);
+  EXPECT_LT(optimal.time_s, 0.85 * cruise.time_s);
+  // Within what the planner was told: the thrust tilts no further than the tracker's limit.
+  EXPECT_LT(optimal.peak_tilt_rad, RaceLawParams{}.gains.max_tilt_rad);
+  EXPECT_EQ(optimal.plans, 1u);
 }
 
 TEST(ClosedLoop, TimeScaleTradesSpeedForMargin) {

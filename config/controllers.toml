@@ -659,21 +659,135 @@ min = 0.01
 [[controller]]
 id = "cpp-minsnap"
 name = "C++ min-snap race"
-description = "Minimum-snap trajectory through the gates of a race scenario, tracked with a geometric SO(3) controller on raw rate and collective demands (C++, multirotor)."
+description = "Time-optimal minimum-snap trajectory through the gates of a race scenario, tracked with a geometric SO(3) controller on raw rate and collective demands (C++, multirotor)."
 command = ["build/controllers/minsnap/astrum-minsnap-controller", "--law", "minsnap"]
 id_flag = "--id"
 kinds = ["multirotor"]
 needs_fleet = false
 
 [[controller.param]]
+name = "planner"
+flag = "--planner"
+label = "Planner"
+type = "choice"
+choices = ["time-optimal", "heuristic"]
+default = "time-optimal"
+
+[[controller.param]]
+name = "max-speed"
+flag = "--max-speed-mps"
+label = "Max speed"
+unit = "m/s"
+type = "number"
+default = 12.0
+min = 0.5
+max = 30.0
+
+[[controller.param]]
+name = "max-thrust"
+flag = "--max-thrust-mps2"
+label = "Max thrust (per unit mass)"
+unit = "m/s^2"
+type = "number"
+default = 16.7
+min = 10.0
+max = 60.0
+
+[[controller.param]]
+name = "min-thrust"
+flag = "--min-thrust-mps2"
+label = "Min thrust (per unit mass)"
+unit = "m/s^2"
+type = "number"
+default = 2.9
+min = 0.0
+max = 9.5
+
+[[controller.param]]
+name = "max-tilt"
+flag = "--max-tilt-deg"
+label = "Max tilt"
+unit = "deg"
+type = "number"
+default = 50.0
+min = 5.0
+max = 80.0
+
+[[controller.param]]
+name = "max-rate"
+flag = "--max-rate"
+label = "Max roll/pitch rate"
+unit = "rad/s"
+type = "number"
+default = 0.75
+min = 0.05
+max = 3.0
+
+[[controller.param]]
+name = "max-yaw-rate"
+flag = "--max-yaw-rate"
+label = "Max yaw rate"
+unit = "rad/s"
+type = "number"
+default = 0.75
+min = 0.05
+max = 3.0
+
+[[controller.param]]
+name = "limit-margin"
+flag = "--limit-margin"
+label = "Fraction of each limit used"
+type = "number"
+default = 0.9
+min = 0.3
+max = 1.0
+
+[[controller.param]]
+name = "opt-iterations"
+flag = "--opt-iterations"
+label = "Optimiser iterations (first plan)"
+type = "integer"
+default = 130
+min = 0
+max = 2000
+
+[[controller.param]]
+name = "replan-iterations"
+flag = "--replan-iterations"
+label = "Optimiser iterations (extension / re-plan)"
+type = "integer"
+default = 20
+min = 0
+max = 2000
+
+[[controller.param]]
+name = "snap-weight"
+flag = "--snap-weight"
+label = "Snap cost weight"
+type = "number"
+default = 0.001
+min = 0.0
+max = 1.0
+
+[[controller.param]]
 name = "cruise"
 flag = "--cruise-mps"
-label = "Cruise speed"
+label = "Cruise speed (heuristic planner)"
 unit = "m/s"
 type = "number"
 default = 6.0
 min = 0.5
 max = 20.0
+
+[[controller.param]]
+name = "max-accel"
+flag = "--max-accel-mps2"
+label = "Max acceleration (heuristic planner)"
+unit = "m/s^2"
+type = "number"
+default = 8.0
+min = 0.5
+max = 30.0
 
 [[controller.param]]
 name = "time-scale"
@@ -684,46 +798,6 @@ type = "number"
 default = 1.0
 min = 0.5
 max = 10.0
-
-[[controller.param]]
-name = "max-speed"
-flag = "--max-speed-mps"
-label = "Max speed"
-unit = "m/s"
-type = "number"
-default = 10.0
-min = 0.5
-max = 30.0
-
-[[controller.param]]
-name = "max-accel"
-flag = "--max-accel-mps2"
-label = "Max acceleration"
-unit = "m/s^2"
-type = "number"
-default = 8.0
-min = 0.5
-max = 30.0
-
-[[controller.param]]
-name = "max-rate"
-flag = "--max-rate"
-label = "Max roll/pitch rate"
-unit = "rad/s"
-type = "number"
-default = 0.7
-min = 0.05
-max = 3.0
-
-[[controller.param]]
-name = "max-yaw-rate"
-flag = "--max-yaw-rate"
-label = "Max yaw rate between gates"
-unit = "rad/s"
-type = "number"
-default = 0.8
-min = 0.05
-max = 3.0
 
 [[controller.param]]
 name = "approach"
@@ -760,9 +834,18 @@ name = "hover-collective"
 flag = "--hover-collective"
 label = "Hover collective"
 type = "number"
-default = 0.44
+default = 0.408
 min = 0.1
 max = 0.95
+
+[[controller.param]]
+name = "max-collective"
+flag = "--max-collective"
+label = "Max collective"
+type = "number"
+default = 0.62
+min = 0.2
+max = 1.0
 
 [[controller.param]]
 name = "rate-gain"

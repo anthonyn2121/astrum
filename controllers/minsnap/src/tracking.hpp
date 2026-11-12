@@ -28,14 +28,17 @@ struct TrackingGains {
   double k_att_xy = 8.0;        // roll / pitch attitude error -> rate, 1/s
   double k_att_z = 3.0;         // yaw attitude error -> rate, 1/s
   double max_tilt_rad =
-      1.0471975511965976;  // 60 deg: F_des is never tilted further than this from vertical
+      0.9599310885968813;  // 55 deg: F_des is never tilted further than this from vertical
 };
 
 // How a thrust and a body rate become MultirotorRaw demands.
 struct DemandMap {
-  double hover_collective = 0.44;  // collective that holds altitude
-  double thrust_exponent = 1.8;    // thrust ~ collective^exponent around hover
-  double rate_gain = 0.75;         // rad/s of body rate per unit of demand
+  double hover_collective = 0.408;  // collective that holds altitude (measured on the F450)
+  double thrust_exponent = 1.8;     // thrust ~ collective^exponent around hover
+  double rate_gain = 0.75;          // rad/s of body rate per unit of demand
+  // The F450's roll / pitch rate loop is unstable for a collective of about 0.70 - 0.97
+  // and badly damped from 0.6: the collective never goes above this.
+  double max_collective = 0.62;
 };
 
 struct Estimate {
@@ -71,7 +74,8 @@ class Tracker {
   Vec3 integral_;
 };
 
-// Normalised collective for a thrust of `thrust` m/s^2 (per unit mass), clamped to [0, 1].
+// Normalised collective for a thrust of `thrust` m/s^2 (per unit mass), clamped to
+// [0, map.max_collective].
 double collective_for(double thrust, const DemandMap& map);
 
 // The sim demands for a tracking command.

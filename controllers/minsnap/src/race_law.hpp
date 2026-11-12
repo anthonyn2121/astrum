@@ -1,14 +1,15 @@
 // The min-snap race law (`--law minsnap`): flies a multirotor through a racing course.
 //
 // It reads the course (RaceCourse: gate poses and hardware dimensions) and the race
-// progress (RaceState) off the wire, plans a minimum-snap trajectory through the gates
-// from the aircraft's current state (planner.hpp), tracks it with the geometric
+// progress (RaceState) off the wire, plans a time-optimal minimum-snap trajectory through
+// the gates from the aircraft's current state (planner.hpp), tracks it with the geometric
 // controller of Mellinger & Kumar (tracking.hpp) and answers with MultirotorRaw
 // demands. It re-plans from the current state when the aircraft is far from the
 // reference or has not passed the gate it should have by now (a missed gate); until the
 // course arrives, and after the race finishes, it holds position. A plan covers at most
 // `--horizon-gates` gates and is extended from its own reference as the aircraft nears the
-// last of them, so the cost of planning does not grow with the length of the course.
+// last of them, so the cost of planning does not grow with the length of the course; an
+// extension or a re-plan starts its time optimisation from the plan it replaces.
 
 #ifndef ASTRUM_MINSNAP_RACE_LAW_HPP
 #define ASTRUM_MINSNAP_RACE_LAW_HPP
@@ -25,6 +26,9 @@
 #include "tracking.hpp"
 
 namespace astrum::minsnap {
+
+// The tracker may tilt the thrust this much further than the plan does, to correct errors.
+inline constexpr double kTrackerTiltHeadroomRad = 0.08726646259971647;  // 5 deg
 
 struct RaceLawParams {
   PlanParams plan;
@@ -43,7 +47,8 @@ Course course_from_wire(const RaceCourse& wire);
 
 class RaceLaw : public Law {
  public:
-  explicit RaceLaw(const RaceLawParams& params);
+  // `log`, when set, receives one line per plan made.
+  explicit RaceLaw(const RaceLawParams& params, Logger log = nullptr);
 
   std::vector<VehicleKind> vehicle_kinds() const override { return {VehicleKind::Multirotor}; }
   bool wants_race() const override { return true; }
@@ -57,9 +62,11 @@ class RaceLaw : public Law {
   StartState measured_start(const VehicleState& state) const;
   void make_plan(const VehicleState& state, const StartState& start);
   bool window_ends_soon() const;
+  bool past_exit_point(const FlatReference& ref) const;
   bool needs_replan(const VehicleState& state, const FlatReference& ref) const;
 
   RaceLawParams params_;
+  Logger log_;
   Tracker tracker_;
   std::optional<RaceCourse> wire_course_;
   std::optional<Course> course_;

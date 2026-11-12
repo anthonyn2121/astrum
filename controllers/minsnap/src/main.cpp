@@ -4,7 +4,9 @@
 
 #include <memory>
 #include <stdexcept>
+#include <string>
 
+#include "astrum/log.hpp"
 #include "astrum/math.hpp"
 #include "astrum/runtime.hpp"
 #include "race_law.hpp"
@@ -18,24 +20,45 @@ using astrum::minsnap::RaceLawParams;
 // when the flags are parsed, before the entry's `make` reads them.
 struct Flags {
   RaceLawParams params;
-  double max_tilt_deg = 60.0;
+  std::string planner = astrum::minsnap::to_string(RaceLawParams{}.plan.planner);
+  double max_tilt_deg = astrum::rad_to_deg(RaceLawParams{}.plan.max_tilt_rad);
 };
 
 void add_options(astrum::Options& o, Flags& f) {
   RaceLawParams& p = f.params;
-  o.add("--cruise-mps", "m/s", "speed through the gates (planner)", "ASTRUM_MINSNAP_CRUISE_MPS",
-        &p.plan.cruise_mps)
+  o.add("--planner", "name",
+        "time-optimal (fastest lap within the limits) or heuristic (cruise speed, stretched to "
+        "the limits)",
+        "ASTRUM_MINSNAP_PLANNER", &f.planner)
+      .add("--cruise-mps", "m/s", "heuristic planner: speed through the gates",
+           "ASTRUM_MINSNAP_CRUISE_MPS", &p.plan.cruise_mps)
       .add("--time-scale", "x", "stretch all segment times by this factor (> 1 = slower, safer)",
            "ASTRUM_MINSNAP_TIME_SCALE", &p.plan.time_scale)
-      .add("--max-speed-mps", "m/s", "the plan is stretched until its peak speed is below this",
-           "ASTRUM_MINSNAP_MAX_SPEED_MPS", &p.plan.max_speed_mps)
-      .add("--max-accel-mps2", "m/s^2", "... and its peak acceleration below this",
-           "ASTRUM_MINSNAP_MAX_ACCEL_MPS2", &p.plan.max_accel_mps2)
-      .add("--max-rate", "rad/s",
-           "... and its peak roll / pitch body rate below this (demand saturates at 0.75)",
+      .add("--max-speed-mps", "m/s", "speed limit", "ASTRUM_MINSNAP_MAX_SPEED_MPS",
+           &p.plan.max_speed_mps)
+      .add("--max-thrust-mps2", "m/s^2", "thrust limit per unit mass, |acceleration + gravity|",
+           "ASTRUM_MINSNAP_MAX_THRUST_MPS2", &p.plan.max_thrust_mps2)
+      .add("--min-thrust-mps2", "m/s^2", "thrust floor per unit mass (0 = none)",
+           "ASTRUM_MINSNAP_MIN_THRUST_MPS2", &p.plan.min_thrust_mps2)
+      .add("--max-tilt-deg", "deg",
+           "largest tilt of the thrust from vertical the plan asks for (the tracker may tilt "
+           "5 deg further)",
+           "ASTRUM_MINSNAP_MAX_TILT_DEG", &f.max_tilt_deg)
+      .add("--max-rate", "rad/s", "roll / pitch body rate limit (the demand saturates at 0.75)",
            "ASTRUM_MINSNAP_MAX_RATE", &p.plan.max_rate_rad_s)
-      .add("--max-yaw-rate", "rad/s", "mean yaw rate allowed between two gates' headings",
+      .add("--max-yaw-rate", "rad/s", "yaw rate limit (heuristic: mean rate between two headings)",
            "ASTRUM_MINSNAP_MAX_YAW_RATE", &p.plan.max_yaw_rate)
+      .add("--limit-margin", "0..1", "fraction of each limit the plan is allowed to use",
+           "ASTRUM_MINSNAP_LIMIT_MARGIN", &p.plan.limit_margin)
+      .add("--max-accel-mps2", "m/s^2", "heuristic planner: peak acceleration |r''|",
+           "ASTRUM_MINSNAP_MAX_ACCEL_MPS2", &p.plan.max_accel_mps2)
+      .add("--opt-iterations", "n", "time-optimal planner: optimiser iterations of a first plan",
+           "ASTRUM_MINSNAP_OPT_ITERATIONS", &p.plan.opt_iterations)
+      .add("--replan-iterations", "n",
+           "time-optimal planner: optimiser iterations of an extension or re-plan",
+           "ASTRUM_MINSNAP_REPLAN_ITERATIONS", &p.plan.replan_iterations)
+      .add("--snap-weight", "w", "time-optimal planner: weight of the snap cost against the time",
+           "ASTRUM_MINSNAP_SNAP_WEIGHT", &p.plan.snap_weight)
       .add("--approach-m", "m", "entry / exit waypoint distance from the gate plane",
            "ASTRUM_MINSNAP_APPROACH_M", &p.plan.approach_m)
       .add("--hull-radius-m", "m",
@@ -63,8 +86,9 @@ void add_options(astrum::Options& o, Flags& f) {
            "ASTRUM_MINSNAP_K_ATT", &p.gains.k_att_xy)
       .add("--k-yaw", "1/s", "yaw attitude error -> body rate gain", "ASTRUM_MINSNAP_K_YAW",
            &p.gains.k_att_z)
-      .add("--max-tilt-deg", "deg", "largest tilt of the commanded thrust from vertical",
-           "ASTRUM_MINSNAP_MAX_TILT_DEG", &f.max_tilt_deg)
+      .add("--max-collective", "0..1",
+           "collective is never commanded above this (the F450 rate loop is unstable near 0.7)",
+           "ASTRUM_MINSNAP_MAX_COLLECTIVE", &p.demands.max_collective)
       .add("--hover-collective", "0..1", "collective that holds altitude",
            "ASTRUM_MINSNAP_HOVER_COLLECTIVE", &p.demands.hover_collective)
       .add("--thrust-exponent", "n", "thrust ~ collective^n around hover",
@@ -85,9 +109,14 @@ int main(int argc, char** argv) {
       {"minsnap", "minimum-snap trajectory through the gates + geometric tracking (multirotor)",
        [flags](astrum::Options& o) { add_options(o, *flags); },
        [flags](const astrum::LawContext&) -> std::unique_ptr<astrum::Law> {
-         flags->params.gains.max_tilt_rad = astrum::deg_to_rad(flags->max_tilt_deg);
-         if (const auto error = flags->params.validate()) throw std::invalid_argument(*error);
-         return std::make_unique<RaceLaw>(flags->params);
+         RaceLawParams& p = flags->params;
+         const auto planner = astrum::minsnap::planner_from_string(flags->planner);
+         if (!planner) throw std::invalid_argument("--planner must be time-optimal or heuristic");
+         p.plan.planner = *planner;
+         p.plan.max_tilt_rad = astrum::deg_to_rad(flags->max_tilt_deg);
+         p.gains.max_tilt_rad = p.plan.max_tilt_rad + astrum::minsnap::kTrackerTiltHeadroomRad;
+         if (const auto error = p.validate()) throw std::invalid_argument(*error);
+         return std::make_unique<RaceLaw>(p, astrum::stderr_logger("astrum-minsnap-controller"));
        }},
   };
   return astrum::run_main(

@@ -36,7 +36,7 @@ TEST(Tracking, OnTheReferenceItHoversWithNoRateDemand) {
   EXPECT_NEAR(norm(s.attitude_error), 0.0, 1e-12);
   EXPECT_NEAR(norm(s.omega), 0.0, 1e-12);
   const MultirotorRaw raw = to_demands(s, DemandMap{});
-  EXPECT_NEAR(raw.collective, 0.44, 1e-12);
+  EXPECT_NEAR(raw.collective, 0.408, 1e-12);  // the F450's measured hover collective
   EXPECT_NEAR(raw.roll_rate, 0.0, 1e-12);
   EXPECT_NEAR(raw.pitch_rate, 0.0, 1e-12);
   EXPECT_NEAR(raw.yaw_rate, 0.0, 1e-12);
@@ -151,7 +151,7 @@ TEST(Tracking, DemandsAreClampedAndNeverNaN) {
   EXPECT_EQ(raw.roll_rate, 1.0);
   EXPECT_EQ(raw.pitch_rate, 1.0);
   EXPECT_EQ(raw.yaw_rate, -1.0);
-  EXPECT_EQ(raw.collective, 1.0);
+  EXPECT_EQ(raw.collective, DemandMap{}.max_collective);
   s.thrust = -3.0;
   EXPECT_EQ(to_demands(s, DemandMap{}).collective, 0.0);
   s.omega = {std::nan(""), 0, 0};
@@ -167,6 +167,31 @@ TEST(Tracking, CollectiveFollowsTheThrustModel) {
   EXPECT_NEAR(collective_for(kGravity * 2.0, m),
               m.hover_collective * std::pow(2.0, 1.0 / m.thrust_exponent), 1e-12);
   EXPECT_EQ(collective_for(0.0, m), 0.0);
+}
+
+TEST(Tracking, CollectiveStaysBelowTheUnstableRateLoopBand) {
+  // Above a collective of about 0.62 the F450's roll / pitch rate loop is badly damped,
+  // and from 0.70 to 0.97 it is unstable (controllers/minsnap/README.md, "Limits").
+  const DemandMap m;
+  EXPECT_LE(m.max_collective, 0.62);
+  EXPECT_GT(m.max_collective, m.hover_collective);
+  // Thrust a plan may ask for (1.7 g) is inside the clamp ...
+  EXPECT_LT(collective_for(1.7 * kGravity, m), m.max_collective);
+  // ... the thrust of the clamp itself is not exceeded, however much is asked for.
+  const double at_clamp =
+      kGravity * std::pow(m.max_collective / m.hover_collective, m.thrust_exponent);
+  EXPECT_NEAR(collective_for(at_clamp, m), m.max_collective, 1e-9);
+  for (double f : {at_clamp * 1.01, 2.0 * at_clamp, 1e3, 1e9}) {
+    EXPECT_EQ(collective_for(f, m), m.max_collective) << f;
+  }
+  // Through the demand map, for a tracker that is told to climb hard.
+  Setpoint s;
+  s.thrust = 4.0 * kGravity;
+  EXPECT_EQ(to_demands(s, m).collective, m.max_collective);
+  // A tighter clamp is honoured.
+  DemandMap tight;
+  tight.max_collective = 0.5;
+  EXPECT_EQ(collective_for(3.0 * kGravity, tight), 0.5);
 }
 
 }  // namespace

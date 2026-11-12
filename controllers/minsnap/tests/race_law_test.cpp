@@ -92,6 +92,59 @@ TEST(RaceLaw, ValidatesItsParameters) {
   p = {};
   p.gains.max_tilt_rad = 2.0;
   EXPECT_TRUE(p.validate());
+  // The F450 limits and the optimiser's settings.
+  p = {};
+  p.plan.max_thrust_mps2 = 9.0;
+  EXPECT_NE(p.validate()->find("--max-thrust-mps2"), std::string::npos);
+  p = {};
+  p.plan.min_thrust_mps2 = 10.0;
+  EXPECT_NE(p.validate()->find("--min-thrust-mps2"), std::string::npos);
+  p = {};
+  p.plan.min_thrust_mps2 = 0.0;
+  EXPECT_FALSE(p.validate());  // no floor is allowed
+  p = {};
+  p.plan.limit_margin = 1.2;
+  EXPECT_NE(p.validate()->find("--limit-margin"), std::string::npos);
+  p.plan.limit_margin = 0.0;
+  EXPECT_NE(p.validate()->find("--limit-margin"), std::string::npos);
+  p = {};
+  p.plan.snap_weight = -1.0;
+  EXPECT_NE(p.validate()->find("--snap-weight"), std::string::npos);
+  p = {};
+  p.plan.opt_iterations = -1;
+  EXPECT_TRUE(p.validate());
+  p = {};
+  p.plan.replan_iterations = -1;
+  EXPECT_TRUE(p.validate());
+  // The plan may not tilt further than the tracker allows.
+  p = {};
+  p.plan.max_tilt_rad = p.gains.max_tilt_rad + 0.1;
+  EXPECT_NE(p.validate()->find("--max-tilt-deg"), std::string::npos);
+  // The collective clamp: above the hover collective, at most full, and high enough for the
+  // thrust the plan may ask for.
+  p = {};
+  p.demands.max_collective = p.demands.hover_collective;
+  EXPECT_NE(p.validate()->find("--max-collective"), std::string::npos);
+  p.demands.max_collective = 1.1;
+  EXPECT_NE(p.validate()->find("--max-collective"), std::string::npos);
+  p = {};
+  p.demands.max_collective = 0.5;  // 1.7 g needs about 0.55
+  EXPECT_NE(p.validate()->find("--max-thrust-mps2"), std::string::npos);
+}
+
+TEST(RaceLaw, DefaultsAreTheMeasuredAirframe) {
+  const RaceLawParams p;
+  EXPECT_FALSE(p.validate());
+  EXPECT_EQ(p.plan.planner, PlannerKind::TimeOptimal);
+  EXPECT_DOUBLE_EQ(p.demands.hover_collective, 0.408);
+  EXPECT_DOUBLE_EQ(p.plan.max_rate_rad_s, 0.75);
+  EXPECT_DOUBLE_EQ(p.plan.max_yaw_rate, 0.75);
+  EXPECT_DOUBLE_EQ(p.plan.max_speed_mps, 12.0);
+  EXPECT_NEAR(p.plan.max_thrust_mps2, 1.7 * 9.80665, 0.05);
+  EXPECT_NEAR(p.plan.min_thrust_mps2, 0.3 * 9.80665, 0.05);
+  EXPECT_NEAR(p.plan.max_tilt_rad, 50.0 * 3.14159265358979 / 180.0, 1e-12);
+  // The tracker may tilt a little further than the plan, never less.
+  EXPECT_GE(p.gains.max_tilt_rad, p.plan.max_tilt_rad);
 }
 
 TEST(RaceLaw, HoversUntilTheCourseArrives) {
@@ -117,6 +170,40 @@ TEST(RaceLaw, PlansOnceOnTheCourseAndFliesIt) {
     law.step(input(level_state(ref.position, t), std::nullopt, 0));
   }
   EXPECT_EQ(law.plans_made(), 1u);
+}
+
+TEST(RaceLaw, LogsOneLineForEveryPlan) {
+  std::vector<std::string> lines;
+  RaceLaw law{RaceLawParams{}, [&](LogLevel level, std::string_view m) {
+                EXPECT_EQ(level, LogLevel::Info);
+                lines.emplace_back(m);
+              }};
+  law.step(input(level_state({0, 0, 2}, 0.0), slalom()));
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("plan 1: gates 0..2, time-optimal"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[0].find("iterations"), std::string::npos) << lines[0];
+  EXPECT_NE(lines[0].find("planned in"), std::string::npos) << lines[0];
+  // A re-plan from the old one says so.
+  law.step(input(level_state({3.0, 0.5, 2}, 1.0), std::nullopt, 0));
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_NE(lines[1].find("plan 2"), std::string::npos) << lines[1];
+}
+
+TEST(RaceLaw, AFirstPlanStartsAtTheAttitudeTheAircraftHas) {
+  // Level: no acceleration to start with. Rolled 0.2 rad: the thrust it already points
+  // sideways gives the plan's start its acceleration, so the attitude does not jump.
+  RaceLaw level{RaceLawParams{}};
+  level.step(input(level_state({0, 0, 2}, 0.0), slalom()));
+  EXPECT_NEAR(norm(level.plan()->at(0.0).acceleration), 0.0, 1e-9);
+  EXPECT_NEAR(norm(level.plan()->at(0.0).jerk), 0.0, 1e-9);
+
+  RaceLaw rolled{RaceLawParams{}};
+  VehicleState s = level_state({0, 0, 2}, 0.0);
+  s.roll = 0.2;
+  rolled.step(input(s, slalom()));
+  const Vec3 a = rolled.plan()->at(0.0).acceleration;
+  EXPECT_NEAR(std::hypot(a.x, a.y), 9.80665 * std::tan(0.2), 1e-6);
+  EXPECT_NEAR(a.z, 0.0, 1e-9);
 }
 
 TEST(RaceLaw, ANewCourseReplansFromTheCurrentState) {
@@ -197,7 +284,8 @@ TEST(RaceLaw, ExtendsItsPlanAlongALongCourse) {
   const Plan& last = *law.plan();
   EXPECT_EQ(last.first_gate() + last.gate_count(), 12u);  // the plan reached the final gate
   EXPECT_GE(law.plans_made(), 3u);
-  EXPECT_LE(law.plans_made(), 6u);  // extensions only: never a re-plan for tracking error
+  EXPECT_LE(law.plans_made(), 6u);      // extensions only: never a re-plan for tracking error
+  EXPECT_TRUE(last.info().warm_start);  // an extension continues the plan it replaces
 }
 
 TEST(RaceLaw, HoldsWhenTheRaceIsFinished) {
