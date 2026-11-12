@@ -1,0 +1,13 @@
+# C++ hold controller flies aircraft 1 (c172x) from east to north at 1500 m HAE, 50 m/s TAS.
+#
+#   astrum run config/demos/cpp.toml --watch
+#
+# The controller closes the loop itself (`--law hold`, raw actuators); run it with
+# `--law autopilot` (or ASTRUM_LAW=autopilot) to hand the target to the sim's built-in
+# inner loop instead. Telemetry shows psi converging 90° → 0° over the 40 s scenario.
+
+base = "config/scenario.demo.toml"
+
+controllers = [
+  "build/controllers/cpp/astrum-controller --law hold --id 1 --heading 0 --alt 1500 --speed 50",
+]

@@ -3,97 +3,58 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ASTRUM · 3-D Replay</title>
+  <title>ASTRUM · Studio</title>
   <link rel="icon" type="image/png" href="./img/favicon.png" />
   <link rel="stylesheet" href="./style.css" />
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "./vendor/three.module.js",
-        "three/addons/controls/OrbitControls.js": "./vendor/OrbitControls.js"
-      }
-    }
-  </script>
+  <link rel="stylesheet" href="./css/cosmos.css" />
+  <link rel="stylesheet" href="./css/studio.css" />
 </head>
-<body>
-  <div id="view"></div>
-
-  <!-- Idle splash: the full logo greets you until telemetry starts streaming. -->
-  <div id="splash"><img src="./img/astrum-logo.png" alt="ASTRUM — Aerospace Simulation" /></div>
-
-  <!-- Top bar -->
-  <header id="topbar">
-    <div class="brand"><img class="mark" src="./img/astrum-mark.png" alt="ASTRUM" /> ASTRUM <em>Replay</em></div>
-    <div class="source">
-      <span id="statusPill" class="pill idle">idle</span>
-      <span id="sourceLabel" class="muted">no source</span>
-    </div>
-    <div class="source-controls">
-      <input id="wsUrl" type="text" spellcheck="false" placeholder="ws://host:8080/telemetry" />
-      <button id="connectBtn" title="Connect to a live/replay WebSocket">Connect</button>
-      <button id="openFileBtn" title="Open a astrum-web-export JSON bag">Open file…</button>
-      <input id="fileInput" type="file" accept=".json,application/json" hidden />
-    </div>
+<body class="studio">
+  <div class="sky" aria-hidden="true"><i></i><i></i><i></i></div>
+  <header class="studio-top">
+    <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM</a>
+    <nav class="nav-tabs" aria-label="Studio pages">
+      <a href="./interactive.html">Interactive</a>
+      <a href="./sandbox.html">Sandbox</a>
+      <a href="./sweeps.html">Sweeps</a>
+      <a href="./view.html">Replay</a>
+    </nav>
   </header>
 
-  <!-- Left: fleet -->
-  <aside id="fleet">
-    <div class="panel-title">Fleet <span id="fleetCount" class="badge">0</span></div>
-    <ul id="fleetList"></ul>
-  </aside>
+  <main class="studio-main">
+    <section class="home-hero">
+      <img src="./img/astrum-logo.png" alt="ASTRUM — Aerospace Simulation" />
+      <p class="muted">Fly JSBSim scenarios with SDK controllers and watch them in 3-D.</p>
+    </section>
 
-  <!-- Right: selected aircraft readout -->
-  <aside id="readout" class="hidden">
-    <div class="panel-title">Aircraft <span id="ro-id" class="badge">—</span></div>
-    <div id="ro-kind" class="kind-tag">—</div>
-    <dl>
-      <dt>sim time</dt><dd><span id="ro-time">—</span> s</dd>
-      <dt>latitude</dt><dd><span id="ro-lat">—</span>°</dd>
-      <dt>longitude</dt><dd><span id="ro-lon">—</span>°</dd>
-      <dt>altitude</dt><dd><span id="ro-alt">—</span> m</dd>
-      <dt class="sep">ENU east</dt><dd><span id="ro-e">—</span> m</dd>
-      <dt>ENU north</dt><dd><span id="ro-n">—</span> m</dd>
-      <dt>ENU up</dt><dd><span id="ro-u">—</span> m</dd>
-      <dt class="sep">heading</dt><dd><span id="ro-hdg">—</span>°</dd>
-      <dt>pitch</dt><dd><span id="ro-pitch">—</span>°</dd>
-      <dt>roll</dt><dd><span id="ro-roll">—</span>°</dd>
-      <dt class="sep">airspeed</dt><dd><span id="ro-as">—</span> m/s</dd>
-      <dt>ground speed</dt><dd><span id="ro-gs">—</span> m/s</dd>
-      <dt>vertical speed</dt><dd><span id="ro-vs">—</span> m/s</dd>
-    </dl>
-  </aside>
+    <!-- Filled by js/home.js while a studio run or a sweep is live. -->
+    <p id="liveRun" class="home-live" role="status" hidden></p>
+    <p id="liveSweep" class="home-live" role="status" hidden></p>
 
-  <!-- View toggles -->
-  <div id="toggles">
-    <label><input type="checkbox" id="tglFollow" /> Follow cam</label>
-    <label><input type="checkbox" id="tglTrails" checked /> Trails</label>
-    <label><input type="checkbox" id="tglLabels" checked /> Labels</label>
-    <button id="fitBtn" title="Frame the selection">Reset view</button>
-  </div>
+    <nav class="cards" aria-label="Studio">
+      <a class="card" href="./interactive.html">
+        <h2>Interactive</h2>
+        <p>Pick an environment, a scenario and a controller per aircraft, then fly it live — faster than real time when the host allows — and pause, step or re-pace the sim as it flies.</p>
+        <span class="card-cta">Set up a run →</span>
+      </a>
+      <a class="card" href="./sandbox.html">
+        <h2>Sandbox</h2>
+        <p>Place aircraft on a map, set their positions, headings and speeds, then save the scenario and fly it.</p>
+        <span class="card-cta">Edit a scenario →</span>
+      </a>
+      <a class="card" href="./sweeps.html">
+        <h2>Sweeps</h2>
+        <p>Vary starting positions and attitudes around a saved scenario - random draws and grids, in each aircraft's own frame - preview every run, and save the sweep to fly with <code>astrum sweep</code>.</p>
+        <span class="card-cta">Build a sweep →</span>
+      </a>
+      <a class="card" href="./view.html">
+        <h2>Replay viewer</h2>
+        <p>Attach to a running sim (or a bag being replayed with <code>astrum play</code>), or open an <code>astrum-web-export</code> file — no services needed.</p>
+        <span class="card-cta">Open the viewer →</span>
+      </a>
+    </nav>
+  </main>
 
-  <!-- Bottom transport -->
-  <footer id="transport">
-    <button id="playBtn" class="icon" title="Play / pause (space)">▶</button>
-    <button id="liveBtn" class="live" title="Jump to live head">LIVE</button>
-    <span id="timeCur" class="time">0:00.0</span>
-    <input id="scrub" type="range" min="0" max="1000" value="0" />
-    <span id="timeTot" class="time">0:00.0</span>
-    <select id="speedSel" title="Playback speed">
-      <option value="0.25">0.25×</option>
-      <option value="0.5">0.5×</option>
-      <option value="1" selected>1×</option>
-      <option value="2">2×</option>
-      <option value="4">4×</option>
-      <option value="8">8×</option>
-    </select>
-    <span id="fps" class="muted">—</span>
-  </footer>
-
-  <!-- Ground-map credit (default tile source is Esri World Imagery). -->
-  <div id="mapAttribution">Imagery © Esri, Maxar, Earthstar Geographics</div>
-
-  <div id="dropHint">Drop a <code>astrum-web-export</code> JSON here</div>
-
-  <script type="module" src="./js/main.js"></script>
+  <script type="module" src="./js/home.js"></script>
 </body>
 </html>

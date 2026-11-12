@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astrum-optimal"
+version = "3.0.0"
+description = "Optimal-control laws (LQR, MPC, formation guidance) for ASTRUM."
+requires-python = ">=3.12"
+# Versions are pinned by the dev image (docker/Dockerfile); astrum-client brings zenoh + pycapnp.
+dependencies = ["astrum-client", "numpy", "scipy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["astrum_optimal", "astrum_optimal.laws"]

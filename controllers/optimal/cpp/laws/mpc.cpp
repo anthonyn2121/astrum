@@ -1,174 +1,164 @@
-// MPC control law (skeleton).
+// MPC control law (`--law mpc`).
 //
-// Receding-horizon (model-predictive) control. Each frame it predicts the
-// error-state N steps ahead with a linear model, minimizes a quadratic cost over
-// the input sequence, and applies the first move — then re-plans next frame.
+// Same cascade as laws/lqr.cpp — astrum::OuterLoops supplies saturated bank / pitch /
+// throttle targets — but each attitude axis is flown by a receding-horizon controller
+// that plans WITH the actuator limits:
 //
-// Like laws/lqr.cpp the channels are decoupled for clarity:
+//   minimize   sum_{k=1..N-1} x_k' Q x_k + x_N' P x_N + sum_{k=0..N-1} u_k' R u_k
+//   subject to x_{k+1} = A x_k + B u_k,  -1 <= u_k <= 1
 //
-//   lateral      x_lat = [heading_err, roll,  roll_rate ]   -> aileron
-//   longitudinal x_lon = [alt_err,     pitch, pitch_rate]   -> elevator
-//   speed        x_spd = [airspeed_err]                     -> throttle
+// with x = [angle - target, rate] (include/attitude_axes.hpp). The prediction step IS
+// the control period: (A, B) is the exact zero-order-hold discretization at the
+// telemetry's controlPeriodS dt (in configure()), the horizon is
+// N = round(--horizon-s / dt) steps of dt, and each sample re-plans and applies u_0.
+// The terminal weight P is the axis's discrete Riccati
+// solution, so when no limit is active the first move equals the LQR law's exactly; when
+// the plan saturates, the box-constrained QP is solved by accelerated projected gradient,
+// warm-started from the previous plan shifted by one step.
 //
-// Each channel is regulated to zero error. For the *unconstrained* quadratic
-// problem the optimal first move is a constant linear gain on the current
-// error-state (computed once in ChannelMpc), so the hot path is a single
-// matrix-vector product. That gain approaches the LQR gain as N -> inf — the
-// point of MPC is what you add next:
-//
-// Because heading and altitude respond over *seconds*, the model is discretized
-// on a coarse step (--horizon-s / --horizon, ~0.1 s) so a modest step count still
-// looks seconds ahead — the horizon must outlast the mode you're regulating, or
-// the optimizer sees the control do nothing and won't use it. This model step is
-// independent of the 120 Hz control rate: the loop re-solves and applies the
-// first move on every telemetry frame regardless.
-//
-// What to do: (1) replace the placeholder per-channel (A, B) below with *your*
-// linearized model, tune (Q, R) and the horizon; (2) add the hard limits LQR
-// can't express — bank/pitch/actuator bounds — at the marked hook in
-// ChannelMpc::move, which then needs a QP solver (e.g. OSQP) instead of the
-// closed form. The shipped model flies `--law mpc` (its gains land near the
-// proven LQR law) so you have a working loop to grow.
+// What to do: replace the axis models / weights in attitude_axes.hpp, tune --horizon-s
+// (the QP has N variables, so long horizons cost CPU when a limit is active),
+// and add state constraints (e.g. a rate limit) as further QP rows if you need them.
 
-#include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
+#include <cmath>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-#include "astrum_control.hpp"
+#include "astrum/control.hpp"
+#include "attitude_axes.hpp"
+#include "laws.hpp"
 
 namespace astrum {
 namespace {
 
-// Unconstrained condensed MPC for one linear channel x[k+1] = A x + B u.
-// Regulates the error-state to zero over an N-step horizon with stage cost
-// x'Qx + u'Ru. Precomputes the first-move feedback gain K so the optimal first
-// input is u0 = -K x0.
-class ChannelMpc {
+// Prediction steps of dt covering horizon_s seconds.
+int horizon_steps(double horizon_s, double dt) {
+  const double steps = std::round(horizon_s / dt);
+  if (!(steps >= 1.0) || steps > 1e5) {
+    throw std::invalid_argument("--horizon-s must cover at least one control period (got " +
+                                std::to_string(horizon_s) + " s)");
+  }
+  return static_cast<int>(steps);
+}
+
+class AxisMpc {
  public:
-  ChannelMpc(const Eigen::MatrixXd& A, const Eigen::MatrixXd& B, const Eigen::MatrixXd& Q,
-             const Eigen::MatrixXd& R, int N) {
-    const int n = static_cast<int>(B.rows());
-    const int m = static_cast<int>(B.cols());
-
-    // Condensed prediction: X = Sx x0 + Su U, over k = 1..N.
-    Eigen::MatrixXd Sx(N * n, n);
-    Eigen::MatrixXd Su = Eigen::MatrixXd::Zero(N * n, N * m);
-    Eigen::MatrixXd Apow = Eigen::MatrixXd::Identity(n, n);
-    for (int i = 0; i < N; ++i) {
-      Apow = Apow * A;  // A^(i+1)
-      Sx.block(i * n, 0, n, n) = Apow;
-      Eigen::MatrixXd AjB = B;  // A^0 B, then A^1 B, ...
-      for (int j = i; j >= 0; --j) {
-        // block (i, j) = A^(i-j) B ; iterate j downward so AjB tracks A^(i-j) B.
-        Su.block(i * n, j * m, n, m) = AjB;
-        AjB = A * AjB;
-      }
+  AxisMpc(const AxisDesign& axis, double dt, int horizon) {
+    const LinearModel m = axis.model(dt);
+    const DlqrResult terminal = dlqr(m.A, m.B, axis.Q, axis.R);
+    if (!terminal.converged) {
+      throw std::runtime_error(std::string("dlqr (MPC terminal cost) for the ") + axis.name +
+                               " axis did not converge after " +
+                               std::to_string(terminal.iterations) + " iterations");
     }
 
-    // Block-diagonal weights (kron(I_N, Q/R)).
-    Eigen::MatrixXd Qbar = Eigen::MatrixXd::Zero(N * n, N * n);
-    Eigen::MatrixXd Rbar = Eigen::MatrixXd::Zero(N * m, N * m);
-    for (int i = 0; i < N; ++i) {
-      Qbar.block(i * n, i * n, n, n) = Q;
-      Rbar.block(i * m, i * m, m, m) = R;
+    // Condensed prediction over k = 1..N: x_k = A^k x0 + sum_{j<k} A^(k-1-j) B u_j.
+    const int n = 2;
+    const int N = horizon;
+    Eigen::MatrixXd Sx(n * N, n);
+    Eigen::MatrixXd Su = Eigen::MatrixXd::Zero(n * N, N);
+    Eigen::MatrixXd Ak = m.A;
+    for (int k = 0; k < N; ++k) {
+      Sx.middleRows(k * n, n) = Ak;  // A^(k+1)
+      Ak = m.A * Ak;
+      if (k > 0) Su.block(k * n, 0, n, k) = m.A * Su.block((k - 1) * n, 0, n, k);
+      Su.block(k * n, k, n, 1) = m.B;
     }
 
-    // U* = -(Su'Qbar Su + Rbar)^-1 Su'Qbar Sx x0 ; keep the first m rows.
-    const Eigen::MatrixXd H = Su.transpose() * Qbar * Su + Rbar;
-    const Eigen::MatrixXd Kfull = H.ldlt().solve(Su.transpose() * Qbar * Sx);
-    k_ = Kfull.topRows(m);
+    // H = Su' Qbar Su + Rbar, F = Su' Qbar Sx with Qbar = diag(Q, ..., Q, P).
+    Eigen::MatrixXd QSu(n * N, N);
+    Eigen::MatrixXd QSx(n * N, n);
+    for (int k = 0; k < N; ++k) {
+      const Eigen::MatrixXd& W = k + 1 == N ? terminal.P : Eigen::MatrixXd(axis.Q);
+      QSu.middleRows(k * n, n) = W * Su.middleRows(k * n, n);
+      QSx.middleRows(k * n, n) = W * Sx.middleRows(k * n, n);
+    }
+    h_ = Su.transpose() * QSu;
+    h_.diagonal().array() += axis.R(0, 0);
+    f_ = Su.transpose() * QSx;
+    unconstrained_ = h_.ldlt().solve(f_);  // U* = -unconstrained_ x0
+    lipschitz_ = Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd>(h_).eigenvalues().maxCoeff();
+    plan_ = Eigen::VectorXd::Zero(N);
   }
 
-  // First optimal input for the current error-state x0.
-  Eigen::VectorXd move(const Eigen::VectorXd& x0) const {
-    // ---- CONSTRAINT HOOK --------------------------------------------------
-    // Unconstrained closed form. To enforce hard limits (|u| <= umax, bank <=
-    // phi_max, ...), replace this with a QP over the horizon subject to those
-    // bounds (OSQP) and return the first solved input.
-    return -k_ * x0;
+  // First input of the optimal plan for error-state x0, within [-1, 1].
+  double move(const Eigen::Vector2d& x0) {
+    Eigen::VectorXd u = -unconstrained_ * x0;
+    if (u.cwiseAbs().maxCoeff() > 1.0) {
+      // Warm start: last plan shifted one step (the horizon moved by exactly dt).
+      Eigen::VectorXd warm(plan_.size());
+      warm.head(plan_.size() - 1) = plan_.tail(plan_.size() - 1);
+      warm(plan_.size() - 1) = plan_(plan_.size() - 1);
+      u = solve_box_qp(h_, f_ * x0, -1.0, 1.0, warm, lipschitz_, 500, 1e-9);
+    }
+    plan_ = u;
+    return u(0);
   }
-
-  double scalar_move(const Eigen::VectorXd& x0) const { return move(x0)(0); }
 
  private:
-  Eigen::MatrixXd k_;
+  Eigen::MatrixXd h_;
+  Eigen::MatrixXd f_;
+  Eigen::MatrixXd unconstrained_;
+  double lipschitz_ = 1.0;
+  Eigen::VectorXd plan_;
 };
-
-// Euler-discretized placeholder model for one 2nd-order attitude channel
-// [track_err, angle, angle_rate] with a single actuator. `couple` is the
-// track-error/angle coupling (e.g. -g/V for heading-vs-bank, -V for altitude-vs-
-// pitch); `b` the actuator->angular-accel gain (sign encodes actuator polarity).
-Eigen::MatrixXd attitude_A(double couple, double dt) {
-  Eigen::Matrix3d A;
-  A << 1.0, couple * dt, 0.0, 0.0, 1.0, dt, 0.0, 0.0,
-      1.0 - 2.0 * dt;  // 2.0 = placeholder angular-rate damping
-  return A;
-}
 
 class MpcLaw : public Law {
  public:
-  explicit MpcLaw(const Cli& cli) {
-    const int N = cli.horizon;
-    const double dt = cli.horizon_s / N;  // coarse model step (~0.1s), NOT the control rate
-
-    // --- PLACEHOLDER MODELS (Euler-discretized). Replace with your own. ---
-    // Continuous-time constants (all PLACEHOLDER — swap in your linearization):
-    const double g_over_v = 9.81 / 50.0;  // turn-rate per unit bank at ~50 m/s
-    const double v = 50.0;                // airspeed for the climb-rate coupling
-    const double b = 4.0;                 // actuator -> angular acceleration
-
-    // Lateral: heading changes with bank; roll is a damped 2nd-order response to
-    // aileron. State [heading_err, roll, roll_rate], input aileron.
-    Eigen::Vector3d B_lat(0.0, 0.0, b * dt);
-    Eigen::Vector3d q_lat(6.0, 1.0, 0.1);
-    lat_ = std::make_unique<ChannelMpc>(attitude_A(-g_over_v, dt), B_lat, q_lat.asDiagonal(),
-                                        r1(1.0), N);
-
-    // Longitudinal: altitude changes with pitch; pitch is a damped response to
-    // elevator (elevator+ pitches DOWN, hence -B). State [alt_err, pitch,
-    // pitch_rate], input elevator.
-    Eigen::Vector3d B_lon(0.0, 0.0, -b * dt);
-    Eigen::Vector3d q_lon(0.02, 1.0, 0.05);
-    lon_ = std::make_unique<ChannelMpc>(attitude_A(-v, dt), B_lon, q_lon.asDiagonal(), r1(16.0), N);
-
-    // Speed: single integrator; more throttle raises airspeed (reduces error).
-    Eigen::MatrixXd A_spd(1, 1);
-    A_spd << 1.0;
-    Eigen::MatrixXd B_spd(1, 1);
-    B_spd << -b * dt;
-    spd_ = std::make_unique<ChannelMpc>(A_spd, B_spd, r1(1.0), r1(500.0), N);
+  MpcLaw(const LawContext& context, double horizon_s)
+      : outer_(context.limits), reference_(context.reference), horizon_s_(horizon_s) {
+    if (!(std::isfinite(horizon_s) && horizon_s > 0.0)) {
+      throw std::invalid_argument("--horizon-s must be finite and > 0, got " +
+                                  std::to_string(horizon_s));
+    }
   }
 
-  Command control(const VehicleState& s, const Reference& ref) override {
-    const double heading_err = wrap_pi(ref.heading_rad - s.yaw);
-    const double alt_err = ref.alt_m - s.alt_m;
-    const double airspeed_err = ref.airspeed_mps - s.airspeed;
+  std::vector<VehicleKind> vehicle_kinds() const override { return {VehicleKind::FixedWing}; }
 
-    Eigen::Vector3d x_lat(heading_err, s.roll, s.p);
-    Eigen::Vector3d x_lon(alt_err, s.pitch, s.q);
-    Eigen::VectorXd x_spd(1);
-    x_spd << airspeed_err;
+  void configure(double control_period_s) override {
+    const int steps = horizon_steps(horizon_s_, control_period_s);
+    roll_.emplace(roll_axis(), control_period_s, steps);
+    pitch_.emplace(pitch_axis(), control_period_s, steps);
+  }
 
-    const double aileron = lat_->scalar_move(x_lat);
-    const double elevator = lon_->scalar_move(x_lon);
-    const double throttle = kThrottleTrim + spd_->scalar_move(x_spd);
-    const double rudder = 0.0;  // coordinated-turn assumption; not modeled here
-
-    return Command::raw(aileron, elevator, rudder, throttle);
+  LawResult step(const StepInput& input) override {
+    if (!roll_ || !pitch_) throw std::logic_error("mpc: step before configure");
+    const VehicleState& s = input.state;
+    const AttitudeTargets target = outer_.update(s, reference_);
+    const double aileron = roll_->move(Eigen::Vector2d(s.roll - target.bank_rad, s.p));
+    const double elevator = pitch_->move(Eigen::Vector2d(s.pitch - target.pitch_rad, s.q));
+    return Action{RawActuators{aileron, elevator, /*rudder=*/0.0, target.throttle}};
   }
 
  private:
-  // 1x1 weight matrix helper (keeps the channel construction readable).
-  static Eigen::MatrixXd r1(double v) {
-    Eigen::MatrixXd m(1, 1);
-    m << v;
-    return m;
-  }
-
-  static constexpr double kThrottleTrim = 0.6;
-  std::unique_ptr<ChannelMpc> lat_, lon_, spd_;
+  OuterLoops outer_;
+  Reference reference_;
+  double horizon_s_;
+  std::optional<AxisMpc> roll_;
+  std::optional<AxisMpc> pitch_;
 };
 
 }  // namespace
 
-std::unique_ptr<Law> make_mpc_law(const Cli& cli) { return std::make_unique<MpcLaw>(cli); }
+std::unique_ptr<Law> make_mpc_law(const LawContext& context, double horizon_s) {
+  return std::make_unique<MpcLaw>(context, horizon_s);
+}
+
+LawEntry mpc_law_entry() {
+  // Shared by the flag registration and the factory (both live as long as the entry).
+  auto horizon_s = std::make_shared<double>(0.5);
+  return LawEntry{
+      "mpc", "box-constrained MPC attitude loops under saturated outer loops (fixed-wing)",
+      [horizon_s](Options& options) {
+        options.add("--horizon-s", "s",
+                    "MPC look-ahead (mpc only): round(horizon-s / control period) steps",
+                    "ASTRUM_MPC_HORIZON_S", horizon_s.get());
+      },
+      [horizon_s](const LawContext& context) { return make_mpc_law(context, *horizon_s); }};
+}
 
 }  // namespace astrum

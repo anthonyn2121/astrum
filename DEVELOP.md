@@ -10,75 +10,122 @@ ASTRUM is **one server + many clients** talking over Zenoh.
 - **The sim** (`astrum-sim`) is the authoritative state server. It's a headless
   [Bevy](https://bevyengine.org/) ECS: one *entity* per aircraft, each owning its
   own [JSBSim](https://github.com/JSBSim-Team/jsbsim) flight-dynamics model. Every
-  tick it **publishes** telemetry (`astrum/telemetry/<id>`) and drains **subscribed**
-  commands (`astrum/command/**`).
+  tick it drains the commands it received (`astrum/command/<id>`), steps physics, and
+  **publishes** telemetry (`astrum/telemetry/<id>`). It also answers
+  `get astrum/scenario` with its scenario TOML, `get astrum/status` with its run status
+  (JSON), and `get astrum/control/<pause|resume|step|speed>` requests (`astrum ctl`).
 - **Controllers** (`controllers/*`) are separate processes — the flight-control
   logic. They **subscribe** to telemetry and **publish** commands. They never touch
   the sim's memory; only bytes over Zenoh.
-- **The wire** is [Cap'n Proto](https://capnproto.org/), one schema
-  (`crates/astrum-proto/schema/astrum.capnp`) shared by Rust, C++, and Python.
+- **The wire** is [Cap'n Proto](https://capnproto.org/), one schema (v3,
+  `crates/astrum-proto/schema/astrum.capnp`) shared by Rust, C++, and Python.
 
 ```
-controllers ──put astrum/command/<id>─────►  sim (subscribes astrum/command/**)
+controllers ──put astrum/command/<id>─────►  sim (subscribes astrum/command/*)
 controllers ◄──put astrum/telemetry/<id>───  sim (publishes per aircraft; id in the key)
+subscribers ◄──put astrum/events───────────  sim (hits, kills, mode changes, ...; one per event)
+subscribers ◄──put astrum/tick─────────────  sim (TickEnd: after a tick's telemetry and events)
+controllers ──token astrum/alive/controller/<id>──►  sim (liveliness: who is connected)
+astrum ctl  ──get astrum/control/*, astrum/status──►  sim (pause / step / speed / status)
 ```
 
-Both key spaces ride **one** Zenoh session on a single endpoint (`tcp/…:7447`) — the sim (and bag
-replay) `mode=peer` **listen** there, everyone else `mode=peer` **connects** to it. Peer mode makes
-a controller's `open()` non-fatal if the sim isn't up yet: it returns at once and Zenoh retries the
-connection in the background, so a controller started alongside the sim just attaches once the sim
-finishes its ~10 s JSBSim load (a Zenoh `client` would instead abort `open()` on that cold start).
-
-**`astrum-race`** (§5b) — the drone-racing environment, kept a separate app so a racing change can't
-disturb the WVR combat environment — speaks the *same* wire on the same two key spaces, plus two of
-its own for the racing task:
-
-```
-controllers ◄──put astrum/race/course/<id>──  astrum-race (the gates, republished ~1 Hz)
-controllers ◄──put astrum/race/state/<id>───  astrum-race (gate progress, every tick)
-```
-
-It publishes `Telemetry` and takes `Command` unchanged, because a quadrotor's four normalized
-channels are the same four channels — only the *task* state needed new messages (§8). It listens on
-the same default endpoint as the sim, so run one or the other, or give one `--listen` a different
-port. Everything else in this section is about the sim.
+Both key spaces ride **one** Zenoh session on a single endpoint (`tcp/…:7447`). The sim (and
+`astrum play`) **listens as a Zenoh router**; every other process (recorder, web bridge, C++
+and Python controllers) opens a `mode=client` session that connects to it. The router routes
+between its clients, so the recorder sees the commands a controller sends (Zenoh 1.10 routers do
+not forward between two *peers*, which is why clients are not peers). A client's open waits for a
+sim that is still starting, up to its connect timeout, then fails with a clear message:
+controllers exit 1 after `--startup-timeout`; `astrum record` takes `--connect-timeout`
+(`ASTRUM_CONNECT_TIMEOUT_S`, default 60 s); `astrum web` never gives up: it keeps retrying in the
+background and serves pages meanwhile.
 
 Each entity is addressed by its id *in the key* — not a socket or a port — so **one endpoint serves
-the whole fleet no matter how many aircraft you add** (there are no ports to manage per entity), and
-any client can subscribe to a single aircraft (`astrum/telemetry/<id>`) or the entire fleet
-(`astrum/telemetry/*`). That makes cross-entity state sharing free: a controller can watch its
-neighbours' telemetry as easily as its own, with no extra wiring. The sim is the one authoritative
-hub (a star: it `listen`s, everyone else `connect`s), and telemetry is best-effort streaming, not an
-on-demand query — Zenoh's mesh routing and queryable/storage are available but unused today.
+the whole fleet no matter how many aircraft you add**, and any client can subscribe to a single
+aircraft (`astrum/telemetry/<id>`) or the entire fleet (`astrum/telemetry/*`). The command key id
+must equal `Command.targetId`; the sim refuses mismatches.
+
+Rules every client follows (the C++ and Python SDKs implement them for you — see
+[`controllers/README.md`](controllers/README.md)):
+
+- QoS for telemetry and commands: CongestionControl `Drop`, express, priority `InteractiveHigh`,
+  declared publishers; events and `TickEnd`: `Block`, priority `Data`. **Every client** — the
+  controller SDKs and `astrum_net::Session::connect` (recorder, web bridge, `astrum ctl`) — asks for
+  Zenoh's low-latency transport (`transport/unicast/lowlatency = true`,
+  `transport/unicast/qos/enabled = false`) for its streams; it has one lane per link, so priorities
+  reorder nothing on it. The recorder and bridge must not use the default transport for them:
+  Zenoh 1.10's transmission pipeline on a link without QoS lanes (the sim's router disables them
+  for low latency) sets the congestion flag on bit `Priority::DEFAULT` but `refill` clears the bit
+  of queue 0 (`zenoh-transport` `src/common/pipeline.rs`, `push_network_message` / both `refill`
+  impls; 1.10.2, the latest, is the same), so after one dropped sample a client never received
+  telemetry again — the bridge went blank at `--speed 0`, or after a hiccup even at 1×. (On the
+  default transport ~7000 of a 20000-sample burst arrived, then none; `tests/low_latency.rs` pins
+  that a slow client keeps receiving on the clients' transport.) The price: nothing is dropped on
+  low latency, so **a client that falls behind slows the sim, and one that stops reading — a
+  suspended recorder, web bridge, `astrum ctl` or controller — freezes it, and its control plane
+  with it, until it reads again or its connection dies** (the command lease does not release it:
+  measured, a stopped bridge held `--speed 0` at one tick for 43 s). There is also no
+  fragmentation (a message must fit one frame: the TCP link's Zenoh MTU, ~48 KiB on loopback, ≥ 32
+  KiB on any link), so a Rust client's **queries** — scenario, status, control — use a second
+  session on the default transport (`Session::connect` opens both; `Session::close` closes both):
+  their replies are `Block`, which the latch does not touch, and fragment, so a scenario of any
+  size arrives.
+- Telemetry subscriptions are **latest-value** (one slot per aircraft), never a FIFO — except the
+  web bridge's `SampledTelemetry`, a bounded trail thinned by sim time.
+- **One command per telemetry sample**, carrying the controller instance's random `epoch`, `seq`
+  (strictly increasing from 1 within the epoch) and `telemetryTick` (the `Telemetry.tick` it
+  answers). Raw commands are a **lease**: stop sending for `sim.command_lease_s` and the sim's
+  failsafe hold takes over (`controlMode = failsafe`).
+- **Ownership**: the first epoch whose command the sim applies owns the aircraft; other epochs are
+  refused until the owner's token disappears or its lease expires. `Telemetry.command` reports the
+  owner and every refusal — a controller that finds itself refused as `notOwner` stops (exit 2).
+- **Presence**: a controller holds the liveliness token `astrum/alive/controller/<id>` while it
+  runs. When it goes away (exit, crash, lost connection) a lockstep run fails at once and any
+  other commanded aircraft enters the failsafe hold without waiting for its lease. A controller
+  without a token still works; leases and the lockstep timeout cover it.
+- A law declares the vehicle kinds it flies; the runtime refuses (exit 2) any other kind,
+  including unknown values. A law's `dt` is `Telemetry.controlPeriodS`, never a flag.
+- Decoding is untrusted input: a bad payload is logged, counted and skipped.
 
 ## 2. The golden rule: everything runs in Docker
 
 Nothing (Rust, JSBSim, Zenoh, Cap'n Proto) is installed on the host — it all lives
-in the `astrum-dev` image. You run commands *inside* a container.
+in the `astrum-dev` image. You run commands *inside* a container, as the unprivileged
+`astrum` user built with your UID/GID (the Makefile exports them), so files you create in
+the bind mount stay yours.
 
 ```bash
-make build      # build the image once (compiles JSBSim from source — slow first time)
-make verify     # sanity-check the toolchain (compilers, libs, JSBSim link + run)
-make shell      # open a shell in a fresh container (workspace mounted, on the network)
-make help       # list all make targets
+make dev        # build the astrum-dev image if missing or changed, start the long-lived dev
+                # container, open a bash shell in it at /workspace (rerun: another shell, same container)
+make build      # rebuild the image explicitly (compiles JSBSim from source — slow first time)
+make down       # stop and remove the dev container
+make clean      # down + volumes + the local image
+make ps         # container status
 ```
 
 Your source is bind-mounted at `/workspace`, so **edit files on the host in your
-normal editor**, and build/run/test them in a container. One-off commands:
+normal editor**, and build/run/test them in the container. Shells opened by `make dev`
+share one container, so their processes see each other on loopback. `verify fmt fmt-check
+lint test test-rust test-cpp test-python wire-fixtures deny bench smoke ci` work both on the
+host (each in a fresh `docker compose run --rm -T dev` container) and inside the dev
+container (run in place); `dev build down clean ps` are host-only.
 
-```bash
-docker compose run --rm --no-deps sim bash -lc '<command>'
-```
+The container publishes 7447 (Zenoh) and 8080 (web viewer) on **127.0.0.1** on the host only.
+
+The dev shell's prompt is starship's Catppuccin Mocha powerline preset, with Catppuccin `ls`
+colours (vivid). Its separators and icons are Nerd Font glyphs: set a
+[Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) in your host terminal,
+or they show as boxes; a [Catppuccin](https://catppuccin.com/ports) theme for the terminal
+itself matches the rest. Point `STARSHIP_CONFIG` at your own `starship.toml` to change it
+(the image's is `/etc/astrum/starship.toml`, the wiring `docker/shell/bashrc`).
 
 ## Quick start
 
 The fast path from a fresh checkout to a running sim. Every command below runs
-**inside the dev container** (§2) — nothing is built on your host. Do the one-time
-image build, then open a container shell and run steps 1–3 inside it:
+**inside the dev container** (§2). Open a container shell (the first run builds the image)
+and run steps 1–3 inside it:
 
 ```bash
-make build      # one time — builds the astrum-dev image (compiles JSBSim; slow first run)
-make shell      # open a shell in the container; run the steps below there
+make dev        # on the host; run the steps below in the shell it opens
 ```
 
 **1. Build the Rust code** (the sim + every crate in the workspace):
@@ -88,12 +135,14 @@ cargo build --workspace              # debug build of every crate
 cargo build --release --workspace    # optimized build (what the demos run)
 ```
 
-**2. Build the C++ code** (the example flight controller, built with CMake):
+**2. Build the C++ code** (all controllers are one CMake project):
 
 ```bash
-cmake -S controllers/cpp -B controllers/cpp/build -DCMAKE_BUILD_TYPE=Release   # configure
-cmake --build controllers/cpp/build -j                                         # compile
-# → produces the binary ./controllers/cpp/build/astrum-controller
+cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release   # configure
+cmake --build build/controllers -j                                     # compile
+# → build/controllers/cpp/astrum-controller
+#   build/controllers/optimal/cpp/astrum-optimal-controller
+#   build/controllers/common/cpp/astrum-wire-fixture
 ```
 
 **3. Run a scenario from a config** (a `config/*.toml` fleet definition):
@@ -104,44 +153,41 @@ cargo run --release -p astrum-sim -- config/scenario.demo.toml             # pic
 cargo run -p astrum-sim -- --help                                          # list every flag + its env fallback
 ```
 
-The scenario is a plain positional argument; every binary also still honours its
-old `ASTRUM_*` env var as a fallback (so `docker compose` and `make` keep working
-unchanged). Precedence is **CLI arg > `$ENV` > default** — see `--help`.
+Every binary honours an `ASTRUM_*` env var per flag as a fallback (so scripts and
+`make` can configure them). Precedence is **CLI arg > `$ENV` > default** — see `--help`.
 
-The sim loads the fleet from the TOML, spins up one JSBSim model per aircraft
-(the first load takes ~10 s), then publishes telemetry over Zenoh until
-`max_time_s` is reached (or you Ctrl-C). Scenario format + the bundled examples
-are in §5.
-
-Prefer not to keep a shell open? Run any single command in a throwaway container
-instead of `make shell`:
-
-```bash
-docker compose run --rm --no-deps sim bash -lc 'cargo build --workspace'
-```
+The sim loads the fleet from the TOML, spins up (and, for fixed-wing, trims) one JSBSim
+model per aircraft, then publishes telemetry over Zenoh until `max_time_s` is reached (or
+you Ctrl-C). Any startup failure — bad scenario, model load, trim, network — exits
+non-zero with a message. Scenario format + the bundled examples are in §5.
 
 To see everything working together — sim + controller + the 3-D browser view —
-the demos do it in one command: `make demo` and `make replay` (§7).
+the demos do it in one command: `astrum run config/demos/cpp.toml` and
+`astrum run config/scenario.example.toml --watch` (§7).
 
 ## 3. Repo layout — where files go
 
 ```
 crates/            # Rust workspace (one crate per responsibility)
-  astrum-fdm/       #   JSBSim FFI: safe `Fdm` wrapper over the C++ engine
-  astrum-geo/       #   WGS84 geodetic ↔ ECEF ↔ ENU coordinate math
-  astrum-proto/     #   the Cap'n Proto schema + encode/decode helpers
-  astrum-net/       #   Zenoh transport (telemetry + command key exprs, one session)
-  astrum-bag/       #   record/replay telemetry to a file ("bag")
-  astrum-web/       #   WebSocket+HTTP bridge (astrum-web) + bag→JSON exporter (astrum-web-export)
-  astrum-sim/       #   the Bevy ECS app — the sim binary (fleet + WVR gun combat)
-  astrum-race/      #   the drone-racing environment: a SEPARATE Bevy app (F450 + gates)
-controllers/       # flight controllers (clients), one dir per language
-  cpp/  python/
-web/               # browser 3-D replay renderer (Three.js, vendored; static app served by astrum-web)
-config/            # scenario files (*.toml) — the fleet + world origin
-docker/            # Dockerfile + entrypoint for the dev image
-scripts/           # helper scripts (e.g. verify-toolchain.sh)
-docker-compose.yml # service presets: sim, controllers, recorder, replay
+  astrum-fdm/       #   JSBSim FFI: safe `Fdm` wrapper (C shim, crate-owned lock, `Fdm: Send`)
+  astrum-geo/       #   WGS84 geodetic ↔ ECEF ↔ ENU math, local-level ↔ grid rotations
+  astrum-proto/     #   the Cap'n Proto schema v3 + encode/decode + wire fixtures
+  astrum-net/       #   Zenoh transport (keys, QoS, LatestTelemetry, CommandSender, events, tick ends, presence, control, scenario)
+  astrum-bag/       #   MCAP record (telemetry + commands + events) / replay (telemetry + events) / run metrics (astrum-bag-metrics) / per-run flight tracks for sweep overviews (`tracks`)
+  astrum-web/       #   axum bridge + tile proxy (astrum-web) + MCAP→JSON exporter (astrum-web-export)
+  astrum-sim/       #   the Bevy ECS app — the sim binary + the embedded env seam (env.rs) + run supervision (launch.rs), sweeps (sweep.rs, IC offsets perturb.rs), file/environment catalog (catalog.rs), controller catalog (controllers.rs), the astrum CLI
+  astrum-env/       #   PyO3 module `astrum_env` + the dogfight Gym adapter (python/)
+controllers/       # flight controllers (clients); README.md is the SDK contract, CMakeLists.txt the one C++ project
+  common/cpp/       #   the C++ SDK: astrum::wire / control / cli / client / runtime + wire-fixture tool
+  cpp/  python/     #   example controllers (python/astrum_client is the Python SDK)
+  optimal/          #   LQR / MPC / figure-eight / formation laws on the SDK runtime (cpp/, python/astrum_optimal)
+  examples/         #   out_of_tree/: a C++ controller built against an installed SDK
+web/               # browser 3-D replay renderer (Three.js, vendored; served by astrum-web)
+config/            # scenario files (*.toml) — the fleet + world origin; run files, sweeps; controllers.toml (the controller catalog)
+docker/            # Dockerfile, entrypoint, pinned Python requirements
+scripts/           # bin/astrum, build-release, verify-toolchain, smoke, wire-fixtures, build-astrum-env, sources
+docs/              # architecture diagram, dogfight env design + onboarding
+docker-compose.yml # the one long-lived `dev` service
 Makefile           # the commands you'll actually type
 ```
 
@@ -149,52 +195,94 @@ Makefile           # the commands you'll actually type
 | I want to add… | Put it in… | Then… |
 |---|---|---|
 | A new Rust library crate | `crates/<name>/` | add it to `members` in the root `Cargo.toml` |
-| A new controller | `controllers/<name>/` | (optional) add a compose service for demos |
-| A new scenario | `config/<name>.toml` | run with `cargo run -p astrum-sim -- config/<name>.toml` |
+| A new controller | `controllers/<name>/` | C++: `add_subdirectory` in `controllers/CMakeLists.txt`; one `config/controllers.toml` entry per law (the web studio launches only catalog entries); (optional) a run file under `config/demos/` |
+| A new scenario | `config/<name>.toml` | run with `astrum run config/<name>.toml` |
+| A scenario field | `crates/astrum-sim/src/scenario.rs` | see §5 |
+| A schema field | `crates/astrum-proto/schema/astrum.capnp` | see §8 |
 | A test | `crates/<crate>/tests/<name>.rs` | see §6 |
 
 ## 4. Build & run the sim
 
-Inside a shell (`make shell`) or via `docker compose run`:
+Inside a dev shell (`make dev`):
 
 ```bash
 cargo build --workspace                                          # compile everything
 cargo run -p astrum-sim                                          # run the sim (uses config/scenario.example.toml)
 cargo run --release -p astrum-sim -- config/scenario.demo.toml   # pick a scenario (positional)
-cargo run -p astrum-sim -- --listen tcp/0.0.0.0:7447 config/scenario.demo.toml
+cargo run -p astrum-sim -- --listen tcp/0.0.0.0:7447 --threads 8 config/scenario.demo.toml
 ```
 
 The sim's flags (run `astrum-sim --help` to see them, each with its `[env: …]`
-fallback shown). Every flag falls back to the env var, then the default:
+fallback). Every flag falls back to the env var, then the default:
 | Flag | Env fallback | Default | Meaning |
 |---|---|---|---|
 | *(positional)* `scenario` | `ASTRUM_SCENARIO` | `config/scenario.example.toml` | which scenario to load |
-| `--listen` | `ASTRUM_ZENOH_LISTEN` | `tcp/0.0.0.0:7447` | Zenoh endpoint the sim listens on (telemetry + commands) |
+| `--listen` | `ASTRUM_ZENOH_LISTEN` | `tcp/0.0.0.0:7447` | Zenoh endpoint the sim's router listens on |
+| `--threads` | `ASTRUM_THREADS` | scenario `sim.threads` | FDM stepping threads (0 = all cores, capped at the fleet size) |
+| `--speed` | `ASTRUM_SPEED` | scenario `sim.speed` | pace as × real time (1 = real time, 0 = as fast as possible) |
+| `--record` | `ASTRUM_RECORD` | — | record every tick's telemetry + received commands to this MCAP bag, in-process |
+
+SIGINT/SIGTERM end the run cleanly at the end of the tick (a `--record` bag is finished); a
+second signal exits at once. `make bench` measures the headless tick cost for a few fleet sizes
+and thread counts. To fly many variants of a scenario at once, write a sweep file and run
+`astrum sweep config/sweep.<name>.toml --jobs 8 --overwrite` (README §Run files and sweeps).
+
+Process supervision lives in the `astrum_sim::launch` library, not the CLI: `LiveRun` starts one
+run (the sim, companions such as the `--watch` viewer, the controllers) and supervises it on its
+own thread, routing output to the tagged terminal, per-process log files, or `LogLine`s over a
+channel; `run_processes` is a sweep's process mode on top of it. There is no process-global state:
+the caller owns the `Children` registry (the CLI's second Ctrl-C kills it) and each run's stop
+flag. `LiveRun::stop`/`kill`/drop act on that run only; the spec's shared `stop` stops every run
+sharing it. `start` (on failure), `wait` and drop block until the run's processes are reaped —
+call them from a blocking thread in async code. `astrum_sim::catalog` classifies files for
+`astrum list`, finds JSBSim models (`jsbsim_models`) and defines the environments (`empty`).
+
+Sweeps are the `astrum_sim::sweep` library, the CLI only prints: `Sweep::plan` (or
+`plan_scenario` from an in-memory base `Scenario`) expands the grid, draws the `[[perturb]]`
+samples (`astrum_sim::perturb`: level-frame offsets via astrum-geo, rigid groups, spreads, from
+the crate's one PRNG `rng::SplitMix64`, which `CombatRng` also wraps) and validates every run;
+`check_trim` builds each run's trimmed aircraft with the sim's own `build_fdm`; `execute(sweep,
+jobs, stop, on_event, run_one)` flies the pool, calling `on_event` with `RunEvent::Started` /
+`Finished { outcome, metrics }` from the worker threads, writing `<stem>.metrics.json` and
+rewriting `summary.csv` (atomically) at every start and finish. `SweepFile` serialises back to
+TOML (`to_toml`).
 
 ## 5. Scenarios
 
-A scenario is a TOML file: a world origin + a fleet. Copy an existing one and edit.
+A scenario is a TOML file (v2): a world origin, sim settings and a fleet. Unknown keys are
+errors; units are SI, heights are above the WGS84 ellipsoid (HAE), airspeeds are true (TAS).
+Copy an existing one and edit:
 
 ```toml
 [world]                      # ENU grid origin (WGS84). Keep it near your fleet.
 origin_lat_deg = 37.6188
 origin_lon_deg = -122.3756
-origin_alt_m   = 0.0
+origin_alt_hae_m = 0.0
 
 [sim]
 rate_hz    = 120.0           # fixed physics step = 1/rate_hz seconds
 max_time_s = 40.0            # 0 = run forever; >0 = stop after N sim-seconds
-realtime   = true            # true ≈ wall-clock (for live control); false = as fast as possible
+speed      = 1.0             # × wall-clock (1 for live control / watching); 0 = as fast as possible
+seed       = 0               # gun dispersion + each aircraft's JSBSim RNG
+threads    = 1               # FDM stepping threads (0 = all cores, ≤ fleet); identical results for any value
+command_lease_s = 0.5        # raw-command lease → failsafe hold; 0 disables
+lockstep   = false           # wait each tick for commands from lockstep aircraft
+lockstep_timeout_s = 30.0    # fatal if a lockstep wait exceeds this
 
 [[aircraft]]                 # one entity per block; `id` must be unique
 id = 1
-model = "c172x"              # a JSBSim aircraft under $JSBSIM_ROOT
-# kind = "multirotor"        # optional; inferred from model (F450 → multirotor, else fixed-wing)
+model = "c172x"              # known: c172x (trainer), f16 (fighter), F450 (multirotor)
+# kind = "multirotor"        # required (with autopilot_profile for fixed-wing) for other models
 lat_deg = 37.6188
 lon_deg = -122.3756
-alt_ft = 5000.0
+alt_hae_m = 1524.0
 heading_deg = 90.0
-airspeed_kts = 100.0         # a multirotor initialises at hover: airspeed_kts = 0.0
+tas_mps = 55.0               # a multirotor initialises at hover: tas_mps = 0.0
+# climb_deg = 0.0 / bank_deg = 0.0   # flight-path angle (+ climbing) / roll (+ right wing down) at spawn; |x| < 90
+# trim = true                # default: fixed-wing yes, multirotor no; a failed trim is fatal
+# lockstep = false
+# control_rate_hz = 30.0     # telemetry (+ lockstep commands) at this rate; divides rate_hz
+# team = 0 / health = 100.0 / ammo = 511
 ```
 
 Bundled examples: `scenario.example.toml` (2-ship fleet), `scenario.demo.toml`
@@ -204,71 +292,23 @@ Bundled examples: `scenario.example.toml` (2-ship fleet), `scenario.demo.toml`
 
 **Vehicle classes.** Each aircraft is a fixed-wing or a multirotor (`VehicleKind`),
 which decides its control law — the four `fcs/*-cmd-norm` inputs are surface
-deflections on a fixed-wing but body-rate + collective demands on a multirotor.
-`kind` is inferred from `model`; set it explicitly for a model the inference
-doesn't know. A fleet can mix classes freely. A multirotor entity also needs its
-stability-augmentation loop engaged (`fcs/ScasEngage = 1`); `spawn_fleet` does this
-automatically for the multirotor class — without it roll/pitch/yaw commands are inert.
+(f16: FLCS) commands on a fixed-wing but body-rate + collective demands on a multirotor.
+`kind` comes from the known-model table; set `kind` (and `autopilot_profile` for a
+fixed-wing) for any other model. A fleet can mix classes freely. A multirotor also needs its
+stability-augmentation loop engaged (`fcs/ScasEngage = 1`); spawn does this automatically.
 
-## 5b. The drone-racing environment (`astrum-race`)
+**Lockstep.** For reproducible runs with external controllers set `sim.lockstep = true` and
+`lockstep = true` on the aircraft they fly: the sim waits each tick for a command answering the
+last published tick (republishing that telemetry every 100 ms while waiting). Without lockstep a
+command lands on whichever tick it arrives.
 
-A **second, separate** Bevy app: a DJI F450 and a course of racing gates randomized
-per seed. It is not a mode of `astrum-sim` — that crate hosts the WVR gun-combat
-environment, and the two share only the task-neutral crates: `astrum-fdm` (JSBSim),
-`astrum-geo` (coordinates) and `astrum-proto`/`astrum-net` (the wire). Design notes:
-`docs/racing-environment-design.md`.
-
-```bash
-make race-course SEED=42 GATES=10       # print the gates a seed draws, without flying
-make race SEED=42                       # fly it, publishing on tcp/…:7447
-make race LISTEN=tcp/0.0.0.0:7448       # …on another endpoint (a sim already has 7447)
-make race-offline SEED=42               # physics only: no transport, no port bound
-cargo run -p astrum-race -- --help      # the flags, inside a shell
-```
-
-Its scenario is `config/race.toml` — a different schema from a fleet scenario:
-`[world]` / `[sim]` as above, plus a single `[drone]` and a `[course]` table that is
-the **randomization envelope** (gate count, leg lengths, turn and climb limits,
-clearances, flight volume). Every `[course]` field has a default, so an absent table
-is still a valid course. Course generation is fallible before the app is built, so an
-unsatisfiable envelope is a clear error rather than an app that spins.
-
-A run ends in exactly one way: something writes an `Outcome` onto the `RaceProgress`
-resource and `stop_when_finished` exits the app. The outcomes are `Complete` (every gate,
-in order — the only way to win), `CrashedGround`, `CrashedGate`, `TimedOut` and
-`SpawnFailed`, and the one that ended the run goes out on `astrum/race/state/<id>` so an
-off-process controller learns *why* it stopped rather than just that telemetry ceased.
-
-Crashing is real, not cosmetic. The F450's hull is built from its own JSBSim model files
-(four 9.4″ rotor discs on 0.1651 m arms over a core box from the gear feet to the rotor
-plane), and it has **10.92 cm of clearance per side** in the 31″ opening — 4.08 cm at the
-worst heading, where the drone presents a corner and reaches 0.35287 m rather than
-0.28448 m.
-
-The opening is 31″ and not the 25″ of the original brief. 25″ passed the airframe only
-within **±13° of the gate's normal**, while a gate's normal bisects a turn of up to 120°
-and so can be crossed 60° off — the geometry and the envelope contradicted each other.
-27.78″ is the exact size at which heading stops mattering; 31″ is the first whole inch past
-it. §2 of the design doc has the crab table and the before/after clearances.
-
-Two numbers to know before writing a controller. The **lateral corridor is ±0.109 m inside
-a ±0.394 m hole**: the scorer credits a pass on where the CG pierced the plane, so a
-crossing it would credit can still be a crash — that ordering is deliberate. And the
-vertical **headroom is 0.249 m**, not the 0.394 m the opening looks like it offers, because
-what reaches the top bar is a blade tip at the rotor plane. §4b of the design doc has the
-derivation and why the hull is five parts rather than one box.
-
-The drone launches holding station on gate 0's approach. **Nothing flies the course
-yet**, but both seams for a controller that will are in place:
-
-* **In-process** — write the `FlightCommand` component (target altitude, heading,
-  horizontal velocity); see §7 of the design doc.
-* **Off-process** — subscribe to `astrum/telemetry/<id>` for the drone's state and
-  `astrum/race/{course,state}/<id>` for the track and gate progress, then publish
-  `Command` on `astrum/command/<id>`: `Control::Raw` to fly the four channels
-  yourself, `Control::Autopilot` to drive the inner loop. Raw control here is a
-  **lease** — unrefreshed for 0.5 s it lapses and the inner loop resumes station
-  keeping, because a quadrotor with a frozen collective and a dead controller falls.
+**Adding a scenario field.** Add it to `Sim` / `World` / `AircraftSpec` in
+`crates/astrum-sim/src/scenario.rs` with a serde default (or `Option`) so existing scenarios still
+load — the structs are `deny_unknown_fields`, so a typo in a file is an error, not a silent
+default. Check it in `Scenario::validate`, document it in `config/scenario.example.toml`, and
+cover the boundary in `crates/astrum-sim/tests/scenario.rs`. The sim serves the scenario back on
+`astrum/scenario` (and the recorder stores it in the bag) via `Scenario::to_toml`, so the field
+is included automatically.
 
 ## 6. Tests — the convention that matters
 
@@ -276,6 +316,7 @@ yet**, but both seams for a controller that will are in place:
 inline `#[cfg(test)] mod tests` in `src/`.** Rationale: `src/` stays production
 code, and integration tests exercise the crate through its **public API** (the
 same surface real callers use). If a test needs an item, that item must be `pub`.
+Write behaviour and boundary tests, not tests of wiring or forwarding.
 
 A minimal test — create `crates/astrum-geo/tests/my_test.rs`:
 
@@ -290,137 +331,340 @@ fn origin_maps_to_zero() {
 }
 ```
 
-**Running tests / lint / format** (in a container):
-```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings   # must be clean
-cargo fmt --all                                          # format before committing
-```
+**Format, lint, test** — each target runs in a fresh container, so run them from the host:
 
-The C++ and Python **controllers** have their own formatter + linter (config at
-`.clang-format` and `ruff.toml`), run from the host via make:
-```bash
-make fmt     # clang-format -i (C++) + ruff format + ruff check --fix (Python)
-make lint    # ruff check + ruff format --check (Python) + clang-format --dry-run --Werror (C++)
-```
+| Target | Rust | C++ | Python |
+|---|---|---|---|
+| `make fmt` | `cargo fmt --all` | `clang-format -i` | `ruff format` + `ruff check --fix` |
+| `make fmt-check` | `cargo fmt --all --check` | `clang-format --dry-run --Werror` | `ruff format --check` |
+| `make lint` | `cargo clippy --workspace --all-targets -- -D warnings` | — | `ruff check` |
+| `make test-*` | `test-rust`: `cargo test --workspace` | `test-cpp`: CMake build + `ctest --test-dir build/controllers` | `test-python`: builds `astrum_env`, pytest over `controllers/python`, `controllers/optimal/python`, `crates/astrum-env/python`, then the env smoke |
 
-Two things to know:
+`make test` runs all three suites, `make deny` runs `cargo deny check`, and **`make ci`** is the
+full gate (fmt-check + lint + test + deny). C++ and Python sources are the git-tracked files listed
+by `scripts/sources.sh` (config in `.clang-format`, `ruff.toml`).
+
+Three things to know:
 - **Shared test fixtures** go in `tests/common/mod.rs` (a subdirectory with
   `mod.rs` is *not* itself a test binary). Put `#![allow(dead_code)]` at its top,
   since each test binary uses only some of the helpers. See
   `crates/astrum-sim/tests/common/mod.rs`.
 - **The sim's tests drive the real app.** `astrum-sim` is a **lib + bin**: the
-  logic is in `src/lib.rs` (`build_app(...)`), and `src/main.rs` is thin process
-  wiring. Tests call `build_app(scenario)` and pump `app.update()` — the same
-  schedule the binary runs. See `crates/astrum-sim/tests/simulation.rs`.
+  logic is in `src/lib.rs` (`build_app(scenario, mode)`), and `src/main.rs` is thin process
+  wiring. Tests call `build_app` (or the embedded `SimEnv`) and pump `app.update()` — the
+  same schedule the binary runs. See `crates/astrum-sim/tests/simulation.rs`.
+- **Process supervision is tested without JSBSim.** `crates/astrum-sim/tests/launch.rs` drives
+  `LiveRun`, `run_processes` and `astrum run` with shell-script stand-ins for `astrum-sim`.
 
-⚠️ **JSBSim gotcha:** JSBSim has process-global init state, so constructing two
-flight models from two threads at once *segfaults*. Cargo runs tests in parallel,
-so any test binary that builds a `Fdm`/aircraft must serialize construction with a
-`static Mutex<()>` — copy the pattern from `crates/astrum-fdm/tests/fdm.rs`.
+**JSBSim and threads:** JSBSim has process-global initialisation state (a lazily-filled
+unit-conversion table and a static debug level written by every constructor). `astrum-fdm`
+owns a process-wide lock around it — lifecycle calls (load, IC, trim, reset, drop) exclusive,
+everything else shared — so `Fdm` is `Send` and tests need **no** locking of their own; build
+FDMs from as many threads as you like. `crates/astrum-fdm/tests/concurrency.rs` is the
+regression test.
+
+**Initial attitude and trim:** `InitialConditions` carries `gamma_deg` (flight-path angle) and
+`phi_deg` (bank). A non-zero `gamma_deg` is staged after `ic/vt-fps` — JSBSim scales the existing
+velocity vector, so a climb angle set at zero speed is silently lost — and a level start stages
+exactly the pre-climb sequence (pinned bit-for-bit by `level_start_replays_the_original_staging_sequence`).
+`TrimMode::Full` trims bank back to 0, so the sim uses `TrimMode::Turn` (JSBSim `tTurn`) for a
+banked start; the shim mutes `setupTurn`'s INFO line while debug output is silenced.
 
 ## 7. Running the whole stack (sim + controller)
 
-The demos are one-command, self-terminating, and tear themselves down:
+The demos are run files under `config/demos/` (README §Run files and sweeps); each is one
+command, self-terminating, and tears itself down:
 
 ```bash
-make demo           # C++ controller flies aircraft 1 in the bounded scenario
-make demo-python    # same, with the Python controller
-make demo-quad      # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
-make demo-formation # leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
+astrum list                                # every scenario / run / sweep file, with its kind
+astrum controllers                         # the controller catalog: id, vehicle kinds, name
+astrum controllers render py-hold --id 1   # one entry's command line (--param NAME=VALUE, --fleet IDS)
+astrum run config/demos/cpp.toml           # C++ controller flies aircraft 1 in the bounded scenario
+astrum run config/demos/python.toml        # same, with the Python controller
+astrum run config/demos/quad.toml          # F450 quadrotor climbs + yaws under the built-in multirotor autopilot
+astrum run config/demos/formation.toml     # leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
+make smoke                                 # every config/demos/*.toml, then every catalog entry (10 s each), in lockstep, as fast as possible; fails on the first failure (CI runs this)
 ```
 
-**Watch it in 3-D.** `make replay` starts the fleet sim + the `astrum-web` bridge; open
-http://localhost:8080 to see every aircraft on the ENU grid (orbit/follow cameras, trails,
-playback transport). It works against a *live* sim or a bag being replayed by `astrum-bag-play`
-(both publish on the telemetry endpoint the bridge subscribes to). For an offline, service-free view,
-bake a bag to JSON and drag it onto the page (or use "Open file…"):
+`astrum` rebuilds the release binaries and the C++ controllers first when their sources
+changed (a no-op otherwise). Run it from `/workspace`: paths in files are relative to it.
+
+**Watch it in 3-D.** `--watch` (e.g. `astrum run config/scenario.example.toml --watch`)
+also starts the `astrum web` bridge; open http://localhost:8080/view.html to see every aircraft on the ENU grid (orbit/follow cameras, trails,
+playback transport). It works against a *live* sim or a bag being replayed by `astrum play`
+(both listen on the endpoint the bridge connects to). For an offline, service-free view,
+bake an MCAP bag to JSON and drag it onto the page (or use Source ▸ "Open export file…"):
 
 ```bash
-make replay                                          # sim + renderer at http://localhost:8080
-make export BAG=recordings/session.bag OUT=out.json  # bag → astrum-replay-bag JSON
-make down                                            # stop the sim + renderer
+astrum run config/scenario.example.toml --watch --record recordings/session.mcap  # sim + renderer, recorded
+astrum record recordings/session.mcap                 # or record an already-running sim
+astrum play recordings/session.mcap                   # replay it (run `astrum web` in another shell)
+astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (v3) JSON
 ```
 
-The renderer is static files under `web/` (Three.js vendored in `web/vendor/`; the module contract
-lives in `web/js/`); the bridge and exporter are the two binaries in `crates/astrum-web/`, both
-projecting telemetry through the one `astrum_web::FrameJson` shape.
+### The web studio and renderer
 
-**Ground map.** For **fixed-wing** fleets — which fly a real geographic route — the renderer lays a
-slippy-map (XYZ / Web-Mercator) aerial layer flat under the aircraft, centred on the scenario's ENU
-datum. Multirotor and idle views keep the plain ENU grid. Tiles are served by `astrum-web` at
-`/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every tile under
-`tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling, and an area
-viewed once while online works **offline** afterward; a tile that 404s (offline + uncached) is
-skipped and the grid shows through. The upstream is configurable:
+**`web/`** is the browser app: static files that `astrum web` serves from `--root` (default `web`). The viewer and the studio pages are plain ES modules; the table lists every file except `web/vendor/` (Three.js and uPlot, vendored) and `web/img/`.
+
+| File | Owns |
+|---|---|
+| `index.html` | the studio home page: cards for Interactive, Sandbox, Sweeps and the viewer; `home.js` announces a live run or sweep |
+| `view.html` | the 3-D replay viewer (`?run=<id>` adds a studio run's panel; `?sweep=<id>&run=<n>` a sweep run) |
+| `interactive.html` | the Interactive setup page, `interactive.js` |
+| `sandbox.html` | the scenario editor, `sandbox.js` with `editstore.js` |
+| `sweeps.html` | the Sweeps builder, `sweeps.js` |
+| `sweep.html` | the sweep page: state, progress, results, All runs, Compare runs |
+| `style.css` | the theme tokens and shared controls for every page |
+| `css/cosmos.css` | the shared shell on every page: the twinkling starfield (`.sky`), the page tabs, glass panels and glows |
+| `css/studio.css` | the studio pages' scrolling layout (index, interactive, sweeps, sweep) and their shared parts: the constellation stepper (`.step`, lit with `is-done` / `is-current`), choice tiles, aircraft cards |
+| `css/interactive.css` | the Interactive page: the two columns and the sticky Flight plan card, over `studio.css` |
+| `css/sandbox.css` | the scenario editor's layout, over `style.css` |
+| `css/sweeps.css` | the Sweeps builder's form |
+| `css/sweepview.css` | the sweep page, over `studio.css` |
+| `js/api.js` | the `/api` client: every studio call, and `ApiError` (status and message) |
+| `js/ctlform.js` | the per-aircraft controller form (Interactive and Sweeps) |
+| `js/dom.js` | DOM helpers: `$`, `h()`, `showError` |
+| `js/editstore.js` | a scenario's initial conditions as a store the scene reads (the editor's fleet) |
+| `js/environment.js` | background, fog, lights, the ENU grid, and the sky and map looks (`setMode`; `setChart` swaps the map's imagery for the editor's star chart) |
+| `js/eventlog.js` | the aircraft dock's event log: a virtual list, click to seek |
+| `js/fleet.js` | the fleet dock: aircraft grouped by team, one status row each, pin to target |
+| `js/format.js` | number and time formatting for the HUD |
+| `js/geo.js` | WGS84 geodetic ⇄ ECEF ⇄ ENU, the same math as `crates/astrum-geo` |
+| `js/geometry.js` | relative geometry (range, ATA, aspect, …) with the dogfight env's definitions |
+| `js/home.js` | the home page's announcement of a live studio run and a running sweep |
+| `js/inspector.js` | the aircraft dock's readout: flight state, attitude, combat state, geometry to the target |
+| `js/interactive.js` | the Interactive page: environment, scenario, controllers, speed and time, then `POST /api/runs` |
+| `js/main.js` | the entry point: wires the store, scene, sources and HUD; owns playback and selection state |
+| `js/meshes.js` | procedural F-16-style jet and F450 quad meshes, their colours and placement |
+| `js/net.js` | the telemetry sources: the bridge's WebSocket, or an export file |
+| `js/plots.js` | the plots dock: stacked, time-synced uPlot charts for the selection |
+| `js/prefs.js` | viewer preferences persisted in `localStorage` (`astrum.viewer.v1`) |
+| `js/runpanel.js` | a studio run's panel on `view.html?run=<id>`: state, Stop, log, metrics, Open full replay |
+| `js/sandbox.js` | the scenario editor: map, edits, spawn, undo and redo, world origin, the JSON panel, the Imagery / Chart map look (persisted in `localStorage`, `astrum.sandbox.v1`) |
+| `js/scatter.js` | the canvas scatter plot behind Compare runs |
+| `js/scenariopicker.js` | the environment and scenario steps; only flyable scenarios can be picked |
+| `js/scene.js` | the 3-D view: camera, sizing, one object per aircraft, and edit mode (the Scene edit API) |
+| `js/simcontrol.js` | the live sim's control bar (`GET /api/bridge`, `POST /api/bridge/control`) |
+| `js/startcloud.js` | a sweep's starting positions on a top-down canvas |
+| `js/store.js` | the timeline store: per-aircraft tracks and `sampleAt(id, t)` |
+| `js/sweeps.js` | the Sweeps builder: base scenario, controllers, run settings, plan, Save, `?sweep=<name>` |
+| `js/sweeptracks.js` | the All runs panel of the sweep page: every run's flight on a top-down canvas |
+| `js/sweepview.js` | the sweep page: state, counts, runs, results table, Stop |
+| `js/topdown.js` | the top-down canvas picture (north up, metres) with arrow, dot and path layers |
+| `js/ui.js` | the HUD shell: top bar, transport, overlays, drag-and-drop, keyboard shortcuts |
+| `js/variation.js` | a sweep's variation: its random draws, its grid and the draw settings |
+
+**Every page** (`index.html` and the studio pages, `view.html` included) links `style.css` then `css/cosmos.css`; the studio pages add `css/studio.css` or their own sheet. Every page reaches `/api` only through `js/api.js`.
+
+**Crate `astrum-web`** (`crates/astrum-web/`): the live bridge and the MCAP exporter (`astrum-web-export`) both project telemetry through the one `astrum_web::FrameJson` shape, and the server adds the studio's API.
+
+| Module | Owns |
+|---|---|
+| `src/api.rs` | the `/api` router and its guard (Host, Origin, JSON body) and the bridge, catalog, scenario and sweep handlers |
+| `src/assign.rs` | the controllers a run flies: scenario, assignments, command lines, lockstep flags |
+| `src/bridge.rs` | `Bridge`: the browser-facing feeds of whichever sim is attached |
+| `src/bin/web.rs` | the `astrum-web` binary: CLI flags, server wiring, the sweep base port 27500 |
+| `src/bin/export.rs` | the `astrum-web-export` binary: a bag to an `astrum-replay` JSON |
+| `src/catalogs.rs` | the environments, model profiles, controller catalog and scenario listing |
+| `src/export.rs` | `ExportDoc`: decodes a bag's telemetry and events into the renderer's shapes |
+| `src/lib.rs` | the shared JSON shapes (`FrameJson`, `EventJson`) and message builders |
+| `src/runs.rs` | `Runs`: the one live interactive run (`/api/runs`) and its monitor |
+| `src/scenarios.rs` | `PUT /api/scenarios/<name>` and `POST /api/scenario-check` |
+| `src/server.rs` | the HTTP service: telemetry WebSocket, `/api`, tile proxy, static files |
+| `src/sweepruns.rs` | `SweepRuns`: the one web sweep, flown from the browser (results, tracks, replays) |
+| `src/sweeps.rs` | sweep planning and saving (`/api/sweeps/plan`, `/api/sweeps/saved`) |
+
+**The bridge** (`crates/astrum-web/src/bridge.rs`) thins telemetry and feeds the browsers.
+
+- Telemetry is thinned by `astrum_net::SampledTelemetry`: at most `--sample-hz` (default 30) samples per sim second per aircraft, plus the newest.
+- At most `BATCH_SAMPLES` = 120 pending samples per aircraft. Past that the trail is halved (every other sample, the newest always, and the period doubled), so a batch always spans the whole stretch since the last one.
+- One `frames` batch goes out at most `--max-hz` (default 30) times per second, so trails stay smooth faster than real time.
+- `store.js` appends each aircraft's samples in order and keeps 20 min of sim time at 30 Hz (`LIVE_CAPACITY`).
+- Telemetry carries only the vehicle class, so the bridge polls `astrum/scenario` every 5 s and sends each aircraft's JSBSim model (`{"type":"models","models":[{"id","model"}…]}`) on connect and whenever it changes.
+- Exports carry the same list as `meta.models`.
+- `{"type":"run","run":N,"endpoint"}` goes out on connect and on every `Bridge::attach` and `detach`.
+- The bridge owns the browser feeds for the server's lifetime. Each run gets a fresh session and `SampledTelemetry`, and pumps publish only while their run is current, so nothing from an old run follows the new run's messages.
+- `/api` lives in `src/api.rs`. Its guard (`api::guard`) wraps the whole nested API service, so new routes inherit the Host, Origin and JSON-body checks.
+- Control values are checked by `astrum_net::ControlRequest::validate` against `astrum_net::MIN_SPEED`, the one limit the sim and the API share.
+
+
+**Studio runs** (`crates/astrum-web/src/runs.rs`): `Runs` owns the one live interactive run.
+
+- A start is checked by `assign.rs`: the scenario, then the assignments, then whether each controller program exists. So "not built" names the aircraft instead of failing in `LiveRun::start`.
+- The start is launched on the blocking pool (`LiveRun::start` with `Log::Channel`), so a client that goes away mid-request cannot leave a half-started run.
+- The log and monitor threads exist before the run's record is installed, and act only once it is. A failed install drops the run and its lines.
+- The monitor `wait`s for the run, drains its log, writes `metrics.json`, sends the bridge back to `--connect` if it still carries the run, and only then marks it finished. So `finished` means the metrics are on disk and the bridge is home.
+- Each `LiveSpec` controller is a `launch::ControllerCmd` carrying its name and log source. `astrum run` and sweeps use `launch::numbered` (`controller k` / `ctlk`); studio runs name them by aircraft (`aircraft N's controller` / `aircraft N`).
+- Stop requests flip the run's own stop handle and await the monitor's `watch` channel. Nothing holds a lock across an await.
+- The log ring's `seq` is monotonic over the server's lifetime, so a reader's stale `since` never hides a new run's lines.
+- `astrum-web` stops the active run when told to shut down (`Runs::close`), and waits for it after serving (`Runs::shutdown`).
+- Tests (`tests/runs.rs`) fly a shell-script stand-in sim and the real one, which must be built first (`cargo build -p astrum-sim`; or set `ASTRUM_SKIP_REAL_SIM=1`).
+
+**Web sweeps** (`crates/astrum-web/src/sweepruns.rs`): `SweepRuns` owns the one web sweep, as `Runs` owns the live run, and is independent of it.
+
+- A start resolves the request (`sweeps::resolve`), plans it with `Sweep::plan_scenario`, refuses what `astrum sweep` refuses (no `astrum-sim`, too few ports, a failed `check_trim`), and only then creates `<runs-dir>/sweeps/<id>/`.
+- A supervisor thread runs `sweep::execute` with `run_in_process` or `launch::run_processes`, exactly as the CLI does. Its `on_event` updates the in-memory run states.
+- `meta.json` is rewritten atomically when the sweep ends, before the record says so.
+- A sweep that the disk says is `running` but no server owns reads back as `interrupted`.
+- `GET /api/sweeps` reads each finished sweep's `meta.json` (its `ok`/`failed` counts) only, and skips a sweep whose meta or summary cannot be read.
+- A stop request that the processes do not answer within `STOP_GRACE` (5 s, `SweepRunsConfig::stop_grace` in tests) is escalated to a kill, repeated every second until the supervisor ends.
+- The flight tracks (`GET /api/sweeps/<id>/tracks`) read each finished run's bag through `astrum_bag::tracks`, thinned to `points`. They are cached as `run-NNNN.tracks-<points>.json` beside the bag; a cache older than its bag, or one that does not read, is rebuilt.
+- Tests (`tests/sweepruns.rs`) fly the `pair` scenario in-process, and one process-mode sweep on the real sim with the Python controller (same build requirement as `tests/runs.rs`).
+
+**Tests.** The real-sim tests in `tests/runs.rs` and `tests/sweepruns.rs` need `cargo build -p astrum-sim` first (they fly that binary; `ASTRUM_SIM_BIN` points them elsewhere):
+
+```bash
+cargo build -p astrum-sim                                    # once, before the astrum-web tests
+cargo test -p astrum-web --locked                            # every astrum-web test
+ASTRUM_SKIP_REAL_SIM=1 cargo test -p astrum-web --locked     # skip the real-sim tests
+```
+
+**Running the studio from the dev container.**
+
+- `make dev` builds the image if it is missing or out of date, starts the `dev` container (the checkout is bind-mounted at `/workspace`) and opens a shell in it. Each further `make dev` opens another shell in the same container.
+- Inside it, `astrum web` serves the studio (`/` is the home page) and the viewer on one port. `astrum run config/scenario.example.toml --watch` starts a sim, its bridge and the viewer as well.
+- `docker-compose.yml` sets `ASTRUM_WEB_BIND=0.0.0.0:8080` and `ASTRUM_WEB_ROOT=/workspace/web` in the container, and publishes `127.0.0.1:7447` (Zenoh) and `127.0.0.1:8080` (HTTP and WebSocket) on the host.
+- Zenoh has no authentication here: anyone who can reach 7447 can command aircraft.
+
+**Ports.**
+
+| Port | Used by |
+|---|---|
+| `7447` | Zenoh. The sim's router listens on it (`--listen`, default `tcp/0.0.0.0:7447`); the bridge's `--connect` default is `tcp/127.0.0.1:7447`. |
+| `8080` | `astrum web`: the studio, `/api`, static files, `/tiles/`, and the WebSocket `/telemetry`. Default bind `127.0.0.1:8080`. |
+| `27500 + N - 1` | Run N of a process-mode web sweep (loopback in the container; not published). |
+| a free loopback port | Each studio live run's sim. |
+
+**Conventions for studio pages.**
+
+- Every `/api` call goes through `web/js/api.js`; no other module calls `/api` itself. (`environment.js` fetches map tiles, not `/api`.)
+- Text from files, servers or URLs reaches the DOM only through `textContent`: `h()`'s string children and `text:` attributes in `dom.js`. `web/` uses no `innerHTML`.
+- No build step: plain ES modules and CSS served as they are, with no package manifest. Three.js and uPlot are vendored under `web/vendor/`.
+
+**Scene edit API** (the sandbox; sweep previews build on it). `Scene.setEditing({onSelect, onEdit,
+onPoint})` turns on edit mode (and the `"map"` environment: imagery for any fleet); the scene only
+*reports* what the pointer did and draws what its store says. `onSelect(ids, "replace" | "toggle" |
+"add")` for clicks / Shift+clicks / Shift+boxes; `onEdit({type: "move" | "raise" | "rotate", phase:
+"start" | "move" | "end" | "cancel", changes})` with `[{id, e, n, u}]` (ENU m) or `[{id,
+heading_deg}]` (the TRUE heading, Shift-snapped to 5° in true terms); and `onPoint({e, n})` for a
+click on empty ground. Presses on an aircraft or knob are taken in the capture phase, so
+OrbitControls and the tracked-view hand-off never steal them; a perspective drag ignores pointer
+rays within 3° of the drag plane and hits beyond 4× the aircraft's distance. `setSelection(ids)`
+(last = primary, which gets the handles), `cancelEdit()`, `setOrigin(lat°, lon°, alt)` (the map
+datum from a `[world]`, no telemetry), `setCameraMode("map")` (orthographic, north up; pans and
+zooms by itself), `viewCenter()` / `setViewCenter(e, n)`, and `setGhosts(layer, [{kind, e, n, u,
+heading_deg, climb_deg?, bank_deg?, color?}])` (named instanced translucent preview layers —
+`"spawn"` is the sandbox's, a sweep cloud takes its own; `null` clears one; each ghost sized by its
+own distance). Static initial conditions render through `editstore.js`'s
+`EditStore.setScenario(world, aircraft, kindOf)`, which offers what `Scene.update` reads from a
+store (`ids()`, `track(id).kind`, `sampleAt(id, t)`). Headings everywhere — telemetry `psi_rad`,
+editor samples, edit events, ghosts — are true headings in the aircraft's local level; the scene
+turns each onto the grid by `geo.js` `Datum.northBearing` at the aircraft's lat/lon (meridian
+convergence, ≈ −sin(lat)·Δlon: 0.2° at 30 km east at 37° N), in the viewer and the sandbox alike.
+A horizontal drag keeps each aircraft's `alt_hae_m`; its grid height is recomputed, so far out it
+sits below the flat drag plane by the Earth's curvature (d²/2R: ~18 m at 15 km).
+
+**Ground map and sky.** Only when the fleet includes an **F-16** (a scenario `model` starting with
+`f16`; the bridge polls the sim's scenario and sends `{"type":"models",…}`, exports carry
+`meta.models`) does the renderer switch to daytime: a sky dome with the sun, a drifting cumulus deck
+(~1.8 km) and cirrus (~9 km), haze fog, and slippy-map (XYZ / Web-Mercator) aerial imagery streamed
+in level-of-detail rings around the ground point below the camera — fine tiles near it, coarser
+ones out to ~150 km — each tile placed at its exact WGS84 position in the scenario's ENU frame, so
+the map follows the Earth's curvature and stays under the aircraft however far they fly. Every other
+platform (c172x, F450, unknown) keeps the dark ENU grid with no map in the viewer; the sandbox
+editor always shows the map (the `"map"` look: daylight, no clouds), its origin set from the
+scenario's `[world]`. Tiles are served by
+`astrum web` at `/tiles/{z}/{x}/{y}.jpg`: it proxies an upstream tile server and disk-caches every
+tile under `tilecache/` (git-ignored). So any datum gets crisp imagery with zero manual bundling,
+and an area viewed once while online works **offline** afterward; a tile that 404s (offline +
+uncached) is skipped and the coarser level or the haze shows through. Set `ASTRUM_TILE_URL`,
+`ASTRUM_TILE_CACHE`, `ASTRUM_WEB_MAX_HZ` or `ASTRUM_WEB_SAMPLE_HZ` in the dev shell to override them:
 
 ```bash
 # Default: Esri World Imagery (global aerial, no key). Point elsewhere with:
-ASTRUM_TILE_URL='https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}' make replay  # public-domain, US-only
-ASTRUM_TILE_URL='' make replay        # cache-only: serve tiles already cached, never fetch
-ASTRUM_TILE_CACHE=/path/to/tiles      # relocate the on-disk cache (default ./tilecache)
+ASTRUM_TILE_URL='https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}' astrum web  # public-domain, US-only
+ASTRUM_TILE_URL='' astrum web                    # cache-only: serve tiles already cached, never fetch
+ASTRUM_TILE_CACHE=/workspace/mytiles astrum web  # relocate the on-disk cache (default ./tilecache)
 ```
 
 Imagery is © its provider (the page footer credits the Esri default); mind the tile source's terms
 of service if you redistribute or use it beyond evaluation.
 
-**To develop your own controller**, don't add a compose service — treat it as a
-process you run in a dev shell against a running sim:
+**To develop your own controller**, treat it as a process you run in a dev shell against
+a running sim:
 
 ```bash
-# 1. start just the sim (bounded scenario), detached
-ASTRUM_SCENARIO=config/scenario.demo.toml docker compose up -d sim
+# 1. shell 1: start just the sim (bounded scenario; add --watch for the viewer)
+astrum run config/scenario.demo.toml
 
-# 2. open a shell on the same network (sim resolves by name)
-make shell
+# 2. shell 2: another `make dev` on the host (same container, same loopback)
 
-# 3. build + run YOUR controller, pointing at the sim; rerun as you iterate.
+# 3. build + run YOUR controller against the default tcp/127.0.0.1:7447; rerun as you iterate.
 #    The bundled controllers take flags (env vars still work as a fallback):
-python controllers/python/example.py --connect tcp/sim:7447 --id 1
-./controllers/cpp/build/astrum-controller --connect tcp/sim:7447 --id 1
+python controllers/python/example.py --id 1                 # --law hold (default) | autopilot
+build/controllers/cpp/astrum-controller --id 1
 
-# 4. when done
-docker compose down
+# 4. when done: Ctrl-C in shell 1
 ```
 
-Compose services (`controller`, `controller-python`) are just **canned demo
-presets** — add one only when you want a controller to be a permanent part of the
-topology. See `controllers/cpp/README.md` and `controllers/python/README.md` for
-how a controller subscribes, decodes telemetry, and publishes commands.
+Run files (`config/demos/*.toml`) are just **canned demo presets** — add your controller to
+one's `controllers` when you want it launched with the sim. [`controllers/README.md`](controllers/README.md)
+is the SDK contract (the law API, the control loop, outcomes and exit codes);
+`controllers/cpp/README.md` and `controllers/python/README.md` cover each SDK.
+
+**Controller catalog.** When a controller program gains, renames or drops a flag or law, update
+its entries in `config/controllers.toml`. `crates/astrum-sim/tests/controllers.rs` pins the
+shipped entry list, kinds and default renders, and `controllers/optimal/python/tests/test_catalog.py`
+parses every `py-*` entry's default command line with the real program parser (and checks the
+law's vehicle kinds), so a renamed Python flag fails `make test-python`.
+
+**RL environment.** `bash scripts/build-astrum-env.sh` builds the `astrum_env` module and prints
+its staging directory for `PYTHONPATH`; `make test-python` does that and runs its tests. See
+`crates/astrum-env/README.md` and `docs/dogfight-env-onboarding.md`.
 
 ## 8. Cap'n Proto wire quick reference
 
-The schema (`crates/astrum-proto/schema/astrum.capnp`) defines these messages:
-- **`Telemetry`** — sim → subscribers (published on `astrum/telemetry/<id>`; the id is in the key,
-  no topic frame). Carries `vehicleKind` (fixed-wing | multirotor) so a subscriber knows the class
-  without the scenario.
-- **`Command`** — controllers → sim; a union of **`raw`** actuator setpoints
-  (`fcs/*-cmd-norm`) *or* high-level **`autopilot`** targets.
-- **`BagFrame`** — one recorded telemetry sample + timestamp (for record/replay).
-- **`RaceCourse`** / **`RaceState`** — `astrum-race` → subscribers, on
-  `astrum/race/course/<id>` and `astrum/race/state/<id>`: the gate list (centre, normal heading,
-  hardware dimensions) and the run's progress, including how it ended (`finished` + `outcome`).
-  These are separate top-level messages rather than fields on `Telemetry`, which means "one
-  aircraft's authoritative state" and would otherwise carry a dead course column in every combat
-  recording and replay frame.
+The schema (`crates/astrum-proto/schema/astrum.capnp`, v3) defines four messages:
+- **`Telemetry`** — sim → subscribers (`astrum/telemetry/<id>`; the id is in the key). Geodetic
+  position (HAE), world-grid `enu` + `velEnu`, local-level `velNed`, attitude, `tasMps`,
+  `faultFlags`, `vehicleKind`, `tick`, `bodyRates`, `aero`, `combat`, `controlMode`,
+  `controlPeriodS`, `command` (owner epoch, last applied seq, refusals).
+- **`Command`** — controllers → sim; `targetId` (must equal the key id), a union of **`raw`**
+  fixed-wing actuator setpoints (`fcs/*-cmd-norm`), **`multirotor`** body-rate demands +
+  collective, *or* high-level **`autopilot`** targets (heading, HAE altitude, TAS), plus `epoch`,
+  `seq`, `telemetryTick` and `trigger`.
+- **`Event`** — sim → subscribers (`astrum/events`); `tick`, `simTimeS` and a `kind` union
+  (trigger pressed / released, hit, kill, mode change, controller up / down, run ended). See the
+  README's "Events".
+- **`TickEnd`** — sim → subscribers (`astrum/tick`); `tick`, `simTimeS`, sent after the tick's
+  telemetry and events.
 
-Two properties of the racing pair are worth knowing before you write a subscriber. Every progress
-figure is a **cumulative counter, not an event** (`passed`, `missed`, `pendingGate`), so a subscriber
-that skips messages loses nothing — which is why both channels publish with `CongestionControl::Drop`
-and why a read returns the *latest* sample and discards the backlog. And the course is **republished
-~1 Hz** even though it never changes, because Zenoh pub/sub has no late-joiner replay and the normal
-case is a controller started after the environment. An `outcome` your build does not recognise decodes
-as `running`, so an old controller against a new environment degrades rather than misreads.
+Recordings are MCAP files (one channel per Zenoh key, raw payload bytes); there is no
+recording message in the schema.
 
-Change the schema in **one** place; Rust regenerates on build, C++ regenerates via
-its CMake step, and Python loads it at runtime (`capnp.load(...)`). Keeping one
-schema is what guarantees the three languages stay wire-compatible.
+Change the schema in **one** place; Rust regenerates on build, C++ regenerates via its
+CMake step, and Python loads it at runtime (`capnp.load(...)` of the copy packaged with
+`astrum_client`, a symlink to the schema in the checkout).
+
+**Adding a schema field.** Changes must be **additive**: append a field with the next ordinal
+(never renumber, retype or reuse one), so old and new peers stay wire-compatible. Then:
+
+1. Rust: extend the types and encode/decode in `crates/astrum-proto/src/lib.rs`.
+2. C++: extend the codec in `controllers/common/cpp` (`wire.cpp`); Python: `astrum_client/wire.py`.
+3. Add the canonical value to `crates/astrum-proto/tests/fixtures/values.json` and teach the
+   fixture writers about it (`crates/astrum-proto/examples/wire_fixture.rs`,
+   `controllers/common/cpp/tools/wire_fixture.cpp`, `astrum_client/wire_fixture.py`). A new event
+   kind is an `event_<kind>` entry plus its name in the event kind lists of all three writers.
+4. `make wire-fixtures` regenerates every `<kind>.<lang>.bin` file (every kind in Rust, C++ and
+   Python); `make test` checks that every language decodes every file to `values.json` exactly.
 
 ## 9. Before you commit
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+make fmt   # format everything
+make ci    # fmt-check + lint + all tests + cargo deny
 ```
-All three must pass. That's the bar.
+
+`make ci` must pass — that's the bar, and it's what GitHub Actions runs
+(`.github/workflows/ci.yml`: build the image, `make verify`, `make ci`, `make smoke`, with the
+cargo registry and target dir cached between runs via `.github/compose.ci.yml`).

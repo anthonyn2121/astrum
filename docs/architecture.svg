@@ -52,20 +52,22 @@
   <text class="chip" x="70" y="163">RUST WORKSPACE · crates/</text>
 
   <g>
-    <circle cx="66" cy="205" r="5" fill="#F5B301"/>
-    <text class="cName" x="80" y="210">astrum-sim</text><text class="cDesc" x="80" y="226">headless Bevy 0.19 ECS state server</text>
-    <circle cx="66" cy="246" r="5" fill="#F97316"/>
-    <text class="cName" x="80" y="251">astrum-fdm</text><text class="cDesc" x="80" y="267">JSBSim C-shim FFI · one FDM per entity</text>
-    <circle cx="66" cy="287" r="5" fill="#22D3EE"/>
-    <text class="cName" x="80" y="292">astrum-geo</text><text class="cDesc" x="80" y="308">WGS84 ↔ ECEF ↔ ENU frames</text>
-    <circle cx="66" cy="328" r="5" fill="#A78BFA"/>
-    <text class="cName" x="80" y="333">astrum-proto</text><text class="cDesc" x="80" y="349">Cap'n Proto wire schema (shared)</text>
-    <circle cx="66" cy="369" r="5" fill="#34D399"/>
-    <text class="cName" x="80" y="374">astrum-net</text><text class="cDesc" x="80" y="390">Zenoh transport · sync · Bevy NonSend</text>
-    <circle cx="66" cy="410" r="5" fill="#FB7185"/>
-    <text class="cName" x="80" y="415">astrum-bag</text><text class="cDesc" x="80" y="431">telemetry bag record / replay</text>
-    <circle cx="66" cy="451" r="5" fill="#38BDF8"/>
-    <text class="cName" x="80" y="456">astrum-web</text><text class="cDesc" x="80" y="472">SUB→WebSocket bridge + static HTTP</text>
+    <circle cx="66" cy="200" r="5" fill="#F5B301"/>
+    <text class="cName" x="80" y="205">astrum-sim</text><text class="cDesc" x="80" y="220">headless Bevy 0.19 ECS state server</text>
+    <circle cx="66" cy="236" r="5" fill="#F97316"/>
+    <text class="cName" x="80" y="241">astrum-fdm</text><text class="cDesc" x="80" y="256">safe JSBSim wrapper · Fdm: Send, crate lock</text>
+    <circle cx="66" cy="272" r="5" fill="#22D3EE"/>
+    <text class="cName" x="80" y="277">astrum-geo</text><text class="cDesc" x="80" y="292">WGS84 ↔ ECEF ↔ ENU · local-level ↔ grid</text>
+    <circle cx="66" cy="308" r="5" fill="#A78BFA"/>
+    <text class="cName" x="80" y="313">astrum-proto</text><text class="cDesc" x="80" y="328">Cap'n Proto schema v3 · zero-copy decode</text>
+    <circle cx="66" cy="344" r="5" fill="#34D399"/>
+    <text class="cName" x="80" y="349">astrum-net</text><text class="cDesc" x="80" y="364">Zenoh router/client · LatestTelemetry · events</text>
+    <circle cx="66" cy="380" r="5" fill="#FB7185"/>
+    <text class="cName" x="80" y="385">astrum-bag</text><text class="cDesc" x="80" y="400">MCAP record (telem, cmds, events) / replay</text>
+    <circle cx="66" cy="416" r="5" fill="#38BDF8"/>
+    <text class="cName" x="80" y="421">astrum-web</text><text class="cDesc" x="80" y="436">axum WS bridge · tile proxy · export</text>
+    <circle cx="66" cy="452" r="5" fill="#C084FC"/>
+    <text class="cName" x="80" y="457">astrum-env</text><text class="cDesc" x="80" y="472">PyO3 Env / BatchEnv · embedded RL</text>
   </g>
 
   <!-- dependency bracket crates -> sim -->
@@ -75,32 +77,32 @@
   <rect class="panel" x="436" y="128" width="728" height="364" rx="14" filter="url(#sh)"/>
   <rect x="452" y="142" width="316" height="30" rx="8" fill="#F5B301"/>
   <text class="chip" x="466" y="163">SIMULATION ENGINE · astrum-sim</text>
-  <text class="psub" x="452" y="194">Headless Bevy 0.19 ECS · steps every FDM once per loop · 120 Hz fixed step (Pacer)</text>
+  <text class="psub" x="452" y="194">Headless Bevy 0.19 ECS · f64 world grid · FDMs stepped in parallel (sim.threads) · clock = tick·dt</text>
 
   <!-- pipeline boxes -->
   <rect class="box" x="468" y="210" width="664" height="38" rx="8"/>
   <rect x="468" y="210" width="5" height="38" rx="2.5" fill="#22D3EE"/>
-  <text class="boxT" x="800" y="234" text-anchor="middle">Scenario loader   ·   config/*.toml → fleet spec</text>
+  <text class="boxT" x="800" y="234" text-anchor="middle">Scenario v2   ·   config/*.toml (SI · HAE · TAS) · served on astrum/scenario</text>
   <line x1="800" y1="248" x2="800" y2="260" stroke="#6B7688" stroke-width="2" marker-end="url(#mGray)"/>
 
   <rect class="box" x="468" y="262" width="664" height="38" rx="8"/>
   <rect x="468" y="262" width="5" height="38" rx="2.5" fill="#F97316"/>
-  <text class="boxT" x="800" y="286" text-anchor="middle">spawn_fleet   ·   1 JSBSim FGFDMExec + VehicleKind per aircraft</text>
+  <text class="boxT" x="800" y="286" text-anchor="middle">spawn_fleet   ·   1 JSBSim FDM per aircraft · trimmed · VehicleKind</text>
   <line x1="800" y1="300" x2="800" y2="312" stroke="#6B7688" stroke-width="2" marker-end="url(#mGray)"/>
 
   <rect class="box" x="468" y="314" width="664" height="92" rx="8"/>
-  <text class="boxD" x="480" y="332">ECS World   ·   entity · components · systems</text>
+  <text class="boxD" x="480" y="332">Update tick   ·   chained systems, left to right</text>
   <rect x="480" y="342" width="316" height="52" rx="7" fill="#12202A" stroke="#2C4657" stroke-width="1.1"/>
-  <text class="boxT" x="638" y="366" text-anchor="middle">physics step</text>
-  <text class="boxD" x="638" y="384" text-anchor="middle">astrum-fdm ▸ JSBSim dynamics</text>
+  <text class="boxT" x="638" y="366" text-anchor="middle">ingest_commands → autopilot</text>
+  <text class="boxD" x="638" y="384" text-anchor="middle">ownership · tick checks · lockstep · lease</text>
   <rect x="804" y="342" width="320" height="52" rx="7" fill="#12202A" stroke="#2C4657" stroke-width="1.1"/>
-  <text class="boxT" x="964" y="366" text-anchor="middle">inner-loop autopilots</text>
-  <text class="boxD" x="964" y="384" text-anchor="middle">fixed-wing · multirotor</text>
+  <text class="boxT" x="964" y="366" text-anchor="middle">fire_guns → step_fdm (parallel)</text>
+  <text class="boxD" x="964" y="384" text-anchor="middle">→ step_bullets → swept hit test → damage</text>
   <line x1="800" y1="406" x2="800" y2="418" stroke="#6B7688" stroke-width="2" marker-end="url(#mGray)"/>
 
   <rect class="box" x="468" y="420" width="664" height="40" rx="8"/>
   <rect x="468" y="420" width="5" height="40" rx="2.5" fill="#34D399"/>
-  <text class="boxT" x="800" y="445" text-anchor="middle">Net bridge   ·   ingest_commands · autopilot_step · publish_telemetry</text>
+  <text class="boxT" x="800" y="445" text-anchor="middle">publish_telemetry → events → TickEnd  ·  shared with the embedded env</text>
 
   <!-- RIGHT: wire schema -->
   <rect class="panel" x="1188" y="128" width="372" height="364" rx="14" filter="url(#sh)"/>
@@ -108,30 +110,30 @@
   <text class="chip" x="1218" y="163">WIRE SCHEMA · astrum.capnp</text>
 
   <text class="monoK" x="1206" y="200">struct Telemetry {</text>
-  <text class="mono"  x="1206" y="220">  id · simTime · geo(lat,lon,alt)</text>
-  <text class="mono"  x="1206" y="240">  enu · velNed · attitude</text>
-  <text class="mono"  x="1206" y="260">  airspeed · vehicleKind }</text>
+  <text class="mono"  x="1206" y="220">  id · simTime · tick · geo(HAE) · enu</text>
+  <text class="mono"  x="1206" y="240">  vel · attitude · tas · rates · aero</text>
+  <text class="mono"  x="1206" y="260">  combat · mode · period · command }</text>
   <text class="monoK" x="1206" y="294">struct Command {</text>
-  <text class="mono"  x="1206" y="314">  targetId ·</text>
-  <text class="mono"  x="1206" y="334">  raw | autopilot }</text>
-  <text class="monoK" x="1206" y="368">struct BagFrame {</text>
-  <text class="mono"  x="1206" y="388">  recvWallNs · telemetry }</text>
+  <text class="mono"  x="1206" y="314">  targetId · epoch · seq · telemetryTick</text>
+  <text class="mono"  x="1206" y="334">  raw | multirotor | autopilot · trigger }</text>
+  <text class="monoK" x="1206" y="368">struct Event {</text>
+  <text class="mono"  x="1206" y="388">  tick · hit | kill | mode | … }</text>
   <line x1="1206" y1="410" x2="1542" y2="410" stroke="#26324A" stroke-width="1.2"/>
-  <text class="cDesc" x="1206" y="432">One schema shared by the Rust sim and</text>
-  <text class="cDesc" x="1206" y="450">the C++ / Python controllers.</text>
+  <text class="cDesc" x="1206" y="432">One schema: Rust sim, C++ / Python SDKs</text>
+  <text class="cDesc" x="1206" y="450">(wire fixtures) · bags: MCAP, raw payloads.</text>
   <line x1="1374" y1="492" x2="1374" y2="514" stroke="#5B4B86" stroke-width="1.6" stroke-dasharray="5 4"/>
   <text class="tag" x="1374" y="508" text-anchor="middle">payload</text>
 
   <!-- sim <-> bus arrows -->
   <line x1="772" y1="492" x2="772" y2="514" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
   <line x1="830" y1="514" x2="830" y2="492" stroke="#FB923C" stroke-width="3" marker-end="url(#mOrange)"/>
-  <text class="aLbl" x="766" y="507" text-anchor="end" fill="#34D399">telemetry</text>
+  <text class="aLbl" x="766" y="507" text-anchor="end" fill="#34D399">telemetry · events</text>
   <text class="aLbl" x="836" y="507" fill="#FB923C">commands</text>
 
   <!-- ============ ZENOH BUS ============ -->
   <rect x="40" y="516" width="1520" height="62" rx="14" fill="url(#busGrad)" stroke="#A78BFA" stroke-width="1.6" filter="url(#sh)"/>
   <text class="busT" x="800" y="544" text-anchor="middle">ZENOH 1.10.0  ·  TRANSPORT BUS</text>
-  <text class="busS" x="800" y="566" text-anchor="middle">single TCP endpoint :7447  ·  Cap'n Proto payload  ·  keys astrum/telemetry/&lt;id&gt; + astrum/command/&lt;id&gt;  ·  sim LISTENs, all others CONNECT (peer)</text>
+  <text class="busS" x="800" y="566" text-anchor="middle">one TCP endpoint :7447 (127.0.0.1)  ·  Drop · express · InteractiveHigh (events, tick ends: Block)  ·  keys astrum/telemetry/&lt;id&gt; + command/&lt;id&gt; + events + tick  ·  sim = router, all others connect as clients</text>
 
   <!-- bus -> controllers -->
   <line x1="392" y1="578" x2="392" y2="604" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
@@ -142,7 +144,7 @@
   <!-- bus -> observation -->
   <line x1="1150" y1="578" x2="1150" y2="604" stroke="#34D399" stroke-width="3" marker-end="url(#mGreen)"/>
   <line x1="1230" y1="604" x2="1230" y2="578" stroke="#34D399" stroke-width="2.4" stroke-dasharray="6 5" marker-end="url(#mGreen)"/>
-  <text class="aLbl" x="1144" y="596" text-anchor="end" fill="#34D399">telemetry</text>
+  <text class="aLbl" x="1144" y="596" text-anchor="end" fill="#34D399">telemetry · events</text>
   <text class="aLbl" x="1236" y="596" fill="#8FE9C6">replay re-pub</text>
 
   <!-- ============ BOTTOM ROW ============ -->
@@ -151,22 +153,22 @@
   <rect class="panel" x="40" y="606" width="760" height="452" rx="14" filter="url(#sh)"/>
   <rect x="56" y="620" width="372" height="30" rx="8" fill="#38BDF8"/>
   <text class="chip" x="70" y="641">FLIGHT CONTROLLERS · external processes</text>
-  <text class="psub" x="56" y="672">C++ / Python · connect to :7447 · you write only the control law</text>
+  <text class="psub" x="56" y="672">C++ / Python SDKs, one contract · latest-value telemetry · one command per tick (lease)</text>
 
   <rect class="box" x="64" y="686" width="712" height="50" rx="8"/>
   <rect x="64" y="686" width="5" height="50" rx="2.5" fill="#38BDF8"/>
   <text class="cName" x="82" y="708">controllers/cpp</text>
-  <text class="cDesc" x="82" y="726">example hold law · raw | autopilot modes (cppzmq→zenoh-cpp + capnp)</text>
+  <text class="cDesc" x="82" y="726">laws hold | autopilot · on the C++ SDK in controllers/common (astrum::runtime)</text>
 
   <rect class="box" x="64" y="742" width="712" height="50" rx="8"/>
   <rect x="64" y="742" width="5" height="50" rx="2.5" fill="#38BDF8"/>
   <text class="cName" x="82" y="764">controllers/python</text>
-  <text class="cDesc" x="82" y="782">example hold law · eclipse-zenoh + pycapnp (no codegen)</text>
+  <text class="cDesc" x="82" y="782">laws hold | autopilot · on the Python SDK astrum_client (eclipse-zenoh + pycapnp)</text>
 
   <rect class="box" x="64" y="798" width="712" height="128" rx="8"/>
   <rect x="64" y="798" width="5" height="128" rx="2.5" fill="#F5B301"/>
-  <text class="cName" x="82" y="820">controllers/optimal   —   clean-API scaffold (LQR / MPC)</text>
-  <text class="cDesc" x="82" y="842">runtime ▸ Zenoh session · Cap'n Proto codec · state decode · body-rate estimate · clamp</text>
+  <text class="cName" x="82" y="820">controllers/optimal   —   laws on the SDK runtime (LQR / MPC)</text>
+  <text class="cDesc" x="82" y="842">runtime ▸ session · codec · fleet snapshot · events · ownership · kind check · clamp · dt</text>
   <text class="cDesc" x="82" y="862">laws (the only files you write) ▸</text>
   <g font-family="DejaVu Sans Mono, monospace" font-weight="700" font-size="13">
     <rect x="86" y="876" width="70" height="30" rx="15" fill="#23304a" stroke="#3A4C6E"/><text x="121" y="896" text-anchor="middle" fill="#CFE0FF">lqr</text>
@@ -178,7 +180,7 @@
   <!-- formation callout -->
   <rect x="64" y="936" width="712" height="104" rx="10" fill="#1E1A10" stroke="#7a5c1e" stroke-width="1.4"/>
   <rect x="64" y="936" width="5" height="104" rx="2.5" fill="#F5B301"/>
-  <text class="boxT" x="82" y="962" fill="#FFD98A">Formation MPC demo   ·   make demo-formation</text>
+  <text class="boxT" x="82" y="962" fill="#FFD98A">Formation MPC demo   ·   astrum run config/demos/formation.toml</text>
   <text class="cDesc" x="82" y="986">Leader (aircraft 1) flies a figure-8 (Gerono lemniscate). Three F-16 followers</text>
   <text class="cDesc" x="82" y="1006">each run an independent per-follower MPC to hold their left / right / trail slot</text>
   <text class="cDesc" x="82" y="1026">— fully decentralized: every follower watches only the leader's telemetry.</text>
@@ -187,23 +189,23 @@
   <rect class="panel" x="820" y="606" width="740" height="452" rx="14" filter="url(#sh)"/>
   <rect x="836" y="620" width="336" height="30" rx="8" fill="#FB7185"/>
   <text class="chip" x="850" y="641">RECORDING &amp; VISUALIZATION</text>
-  <text class="psub" x="836" y="672">telemetry subscribers · offline &amp; live playback</text>
+  <text class="psub" x="836" y="672">telemetry + command subscribers · offline &amp; live playback</text>
 
   <rect class="box" x="844" y="686" width="692" height="50" rx="8"/>
   <rect x="844" y="686" width="5" height="50" rx="2.5" fill="#FB7185"/>
   <text class="cName" x="862" y="708">recorder   ·   astrum-bag</text>
-  <text class="cDesc" x="862" y="726">subscribes telemetry → .bag stream (ROS-style, Cap'n Proto BagFrames)</text>
+  <text class="cDesc" x="862" y="726">telemetry + commands + events → MCAP (raw payloads, scenario metadata)</text>
 
   <rect class="box" x="844" y="742" width="692" height="50" rx="8"/>
   <rect x="844" y="742" width="5" height="50" rx="2.5" fill="#FB7185"/>
   <text class="cName" x="862" y="764">replay   ·   astrum-bag</text>
-  <text class="cDesc" x="862" y="782">.bag → re-publish onto the bus, paced ~real-time</text>
+  <text class="cDesc" x="862" y="782">MCAP → re-publish telemetry + events, paced by sim time (--rate)</text>
 
   <rect class="box" x="844" y="798" width="692" height="66" rx="8"/>
   <rect x="844" y="798" width="5" height="66" rx="2.5" fill="#38BDF8"/>
   <text class="cName" x="862" y="820">astrum-web   ·   bridge</text>
-  <text class="cDesc" x="862" y="840">Zenoh SUB → WebSocket :8080 + static HTTP server</text>
-  <text class="cDesc" x="862" y="857">astrum-web-export ▸ bag → JSON (offline load)</text>
+  <text class="cDesc" x="862" y="840">axum · sampled SUB → batches ≤ --max-hz · every event → WS 127.0.0.1:8080</text>
+  <text class="cDesc" x="862" y="857">static web/ · /tiles proxy · Origin check · export ▸ MCAP → astrum-replay v3</text>
 
   <line x1="1190" y1="864" x2="1190" y2="882" stroke="#38BDF8" stroke-width="3" marker-end="url(#mBlue)"/>
   <text class="aLbl" x="1200" y="877" fill="#38BDF8">WebSocket</text>
@@ -213,7 +215,7 @@
   <text class="cName" x="862" y="908">Browser   ·   vanilla ES-module Three.js</text>
   <text class="cDesc" x="862" y="932">procedural F-16 / F450 meshes chosen by VehicleKind · ENU↔three math</text>
   <text class="cDesc" x="862" y="952">orbit &amp; follow cameras · flight trails · entity pick</text>
-  <text class="cDesc" x="862" y="972">timeline keyed on sim_time_s with interpolation · HUD overlay</text>
+  <text class="cDesc" x="862" y="972">timeline keyed on sim_time_s · hit / kill markers · HUD (HP · ammo)</text>
 
   <!-- ============ FOOTER ============ -->
   <line x1="40" y1="1078" x2="1560" y2="1078" stroke="#26324A" stroke-width="1.2"/>
@@ -227,5 +229,5 @@
     <line x1="742" y1="-4" x2="776" y2="-4" stroke="#34D399" stroke-width="2.4" stroke-dasharray="6 5" marker-end="url(#mGreen)"/>
     <text class="legend" x="784" y="0">replay re-publish</text>
   </g>
-  <text class="foot" x="1542" y="1104" text-anchor="end">all services in the astrum-dev image · orchestrated by docker-compose</text>
+  <text class="foot" x="1542" y="1104" text-anchor="end">every process in one dev container (astrum-dev image) · launched by astrum run</text>
 </svg>

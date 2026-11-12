@@ -1,67 +1,86 @@
 //! `astrum-web` — stream live/replayed telemetry to the browser and serve the
-//! static 3-D renderer.
+//! static 3-D renderer, on one port.
 //!
-//! One process, two jobs, on a single TCP port:
-//!  * **`GET /telemetry`** (WebSocket) — every connected browser gets one JSON
-//!    [`astrum_web::FrameJson`] per telemetry sample. The upstream is a Zenoh
-//!    telemetry subscriber, so the source is either the live sim or
-//!    `astrum-bag-play` — the renderer can't tell the difference.
-//!  * **`GET /…`** — static files from the renderer root (`web/`).
+//!  * **`GET /telemetry`** (WebSocket) — every aircraft's telemetry thinned to
+//!    at most `--sample-hz` samples per SIM second (plus each aircraft's
+//!    newest), batched as `{"type":"frames","frames":[FrameJson…]}` at most
+//!    `--max-hz` times per wall second (several samples per aircraft each,
+//!    time-ordered per aircraft),
+//!    plus every `astrum/events` event as `{"type":"events","events":[EventJson…]}`
+//!    (in order, never throttled; a browser that connects mid-run gets only the
+//!    events from then on), plus the scenario's aircraft models as
+//!    `{"type":"models","models":[{"id":1,"model":"f16"}…]}` (on connect and
+//!    whenever they change), plus `{"type":"run","run":N,"endpoint":"…"}` on
+//!    connect and whenever the bridge is attached elsewhere (everything after
+//!    it belongs to the new run). The upstream is the Zenoh stream, so the
+//!    source is either the live sim or `astrum-bag-play`. Upgrades from another
+//!    origin, or naming a `Host` other than `localhost`, an IP address or one
+//!    of `--allowed-hosts`, are refused.
+//!  * **`/api/…`** — the JSON API (`astrum_web::api`): bridge status and run
+//!    control, the studio's catalogs, its live interactive runs and its sweeps
+//!    (one of each at a time, under `--runs-dir`), behind the same `Host` check.
+//!  * **`GET /tiles/<z>/<x>/<y>.jpg`** — slippy-map tile proxy with a disk cache.
+//!  * **`GET /…`** — static files from `--root`.
 //!
-//! It's deliberately synchronous (Zenoh embeds its own runtime; we drive none):
-//! a background thread runs the blocking subscriber and fans each frame out to
-//! per-client channels; one thread per browser drains its channel to the socket.
-//! The HTTP upgrade handshake is done by hand and the raw socket handed to
-//! `tungstenite` for framing.
+//! The bridge attaches to `--connect` at startup and keeps retrying in the
+//! background until a sim answers there; the server runs whether or not one
+//! ever does. Starting a run (`POST /api/runs`) re-attaches it to that run's
+//! sim. Shutting the server down stops the active run and sweep first.
 //!
-//! Config (CLI arg > env > default): see `--help`. Each flag falls back to its
-//! `ASTRUM_*` env var, so compose/CI keep working.
+//! Config (CLI arg > env > default): see `--help`.
 
 use std::error::Error;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use astrum_net::{Session, TelemetrySubscriber};
-use astrum_web::FrameJson;
+use astrum_sim::launch::sibling;
+use astrum_web::bridge::{Bridge, BridgeConfig};
+use astrum_web::catalogs::Catalogs;
+use astrum_web::runs::{Runs, RunsConfig};
+use astrum_web::server::{self, Config};
+use astrum_web::sweepruns::{SweepRuns, SweepRunsConfig, STOP_GRACE};
 use clap::Parser;
-use tungstenite::handshake::derive_accept_key;
-use tungstenite::protocol::{Role, WebSocket};
-use tungstenite::Message;
 
-/// Live browser clients: each holds the sending half of a bounded channel the
-/// broadcast thread pushes frames into.
-type Clients = Arc<Mutex<Vec<SyncSender<Arc<String>>>>>;
+/// How often the scenario is re-fetched, so a restarted sim or replay with
+/// another fleet reaches the browsers within a few seconds.
+const MODELS_POLL: Duration = Duration::from_secs(5);
 
-/// Per-client outbound queue depth. If a browser can't keep up we drop frames
-/// for it (it just renders the next state) rather than growing memory.
-const CLIENT_QUEUE: usize = 2048;
+/// The first loopback port a process-mode web sweep's run listens on (run N
+/// on `SWEEP_BASE_PORT + N - 1`).
+const SWEEP_BASE_PORT: u16 = 27500;
 
 /// Stream live/replayed telemetry to browsers over WebSocket and serve the
 /// static 3-D renderer, both on one port.
 #[derive(Parser)]
 #[command(name = "astrum-web", version, about)]
 struct Cli {
-    /// Zenoh endpoint to subscribe to (the sim or a replay).
-    #[arg(long, env = "ASTRUM_ZENOH_CONNECT", default_value_t = astrum_net::DEFAULT_CONNECT_ENDPOINT.to_string())]
+    /// Zenoh endpoint of the sim (or replay) to attach to at startup; the
+    /// bridge waits for one to answer there.
+    #[arg(long, env = "ASTRUM_ZENOH_CONNECT", default_value = astrum_net::DEFAULT_CONNECT_ENDPOINT)]
     connect: String,
 
-    /// HTTP/WebSocket listen address.
-    #[arg(long, env = "ASTRUM_WEB_BIND", default_value = "0.0.0.0:8080")]
+    /// HTTP/WebSocket listen address (loopback by default; pass 0.0.0.0:8080 to
+    /// expose it, e.g. inside a container).
+    #[arg(long, env = "ASTRUM_WEB_BIND", default_value = "127.0.0.1:8080")]
     bind: String,
 
     /// Static renderer directory to serve.
     #[arg(long, env = "ASTRUM_WEB_ROOT", default_value = "web")]
     root: PathBuf,
 
+    /// Most sample batches per (wall) second sent to each browser.
+    #[arg(long, env = "ASTRUM_WEB_MAX_HZ", default_value_t = 30.0)]
+    max_hz: f64,
+
+    /// Most telemetry samples per aircraft per SIM second sent to each browser
+    /// (each batch also carries every aircraft's newest sample), so trails stay
+    /// smooth when the sim runs faster than real time.
+    #[arg(long, env = "ASTRUM_WEB_SAMPLE_HZ", default_value_t = 30.0)]
+    sample_hz: f64,
+
     /// Upstream slippy-map tile template (`{z}`/`{x}`/`{y}` placeholders); the
     /// renderer's ground map is proxied + cached through `/tiles/`. Default: Esri
-    /// World Imagery (global aerial, no key). Set empty to serve cache only.
+    /// World Imagery (global aerial, no key). Empty = serve the cache only.
     #[arg(
         long,
         env = "ASTRUM_TILE_URL",
@@ -70,378 +89,144 @@ struct Cli {
     tile_url: String,
 
     /// On-disk cache directory for proxied map tiles (created on first miss). A
-    /// tile fetched once while online is served from here forever after (offline).
+    /// tile fetched once while online is served from here afterwards (offline).
     #[arg(long, env = "ASTRUM_TILE_CACHE", default_value = "tilecache")]
     tile_cache: PathBuf,
+
+    /// Extra host names (comma-separated, no port) the telemetry WebSocket and
+    /// `/api` answer for, besides `localhost` and IP addresses — e.g. the
+    /// machine's DNS name when browsing to it from elsewhere. Any other `Host`
+    /// is refused, so a rebound attacker domain cannot reach them.
+    #[arg(long, env = "ASTRUM_WEB_ALLOWED_HOSTS", value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
+
+    /// Config directory: the controller catalog (`controllers.toml`, read at
+    /// startup) and the scenarios (`scenario.<name>.toml`) the studio offers.
+    #[arg(long, env = "ASTRUM_CONFIG_DIR", default_value = "config")]
+    config_dir: PathBuf,
+
+    /// Where live interactive runs go: one directory per run (its
+    /// `scenario.toml`, `run.mcap` and `metrics.json`).
+    #[arg(long, env = "ASTRUM_RUNS_DIR", default_value = "runs/web")]
+    runs_dir: PathBuf,
+
+    /// The `astrum-sim` binary live runs fly on (default: next to this one).
+    #[arg(long, env = "ASTRUM_SIM_BIN")]
+    sim: Option<PathBuf>,
 }
 
-/// Shared, read-only server config handed to every connection thread.
-struct ServerCfg {
-    root: PathBuf,
-    tile_url: String,
-    tile_cache: PathBuf,
-    agent: ureq::Agent,
-}
-
-/// Unique-suffix counter for atomic tile-cache writes (temp file → rename).
-static TILE_TMP: AtomicU64 = AtomicU64::new(0);
-
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let upstream = cli.connect;
-    let bind = cli.bind;
-
-    let clients: Clients = Arc::new(Mutex::new(Vec::new()));
-
-    // Background: blocking Zenoh subscriber → JSON → fan out to every browser.
-    {
-        let clients = Arc::clone(&clients);
-        let upstream = upstream.clone();
-        thread::Builder::new().name("telemetry-sub".into()).spawn(move || {
-            if let Err(e) = pump_telemetry(&upstream, &clients) {
-                eprintln!("[astrum-web] telemetry pump exited: {e}");
-            }
-        })?;
+    let period = |flag: &str, hz: f64| -> Result<Duration, String> {
+        Some(hz)
+            .filter(|hz| hz.is_finite() && *hz > 0.0)
+            .and_then(|hz| Duration::try_from_secs_f64(1.0 / hz).ok())
+            .ok_or_else(|| format!("{flag} must be a positive number, got {hz}"))
+    };
+    let min_period = period("--max-hz", cli.max_hz)?;
+    let sample_period = period("--sample-hz", cli.sample_hz)?;
+    let mut allowed_hosts = Vec::new();
+    for host in cli.allowed_hosts.iter().map(|h| h.trim()).filter(|h| !h.is_empty()) {
+        if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+            return Err(format!(
+                "--allowed-hosts: {host:?} is not a bare host name (letters, digits, '.', '-'; \
+                 no port)"
+            )
+            .into());
+        }
+        allowed_hosts.push(host.to_owned());
     }
+    let catalogs = Catalogs::load(&cli.config_dir).map_err(|e| e.to_string())?;
+    let bridge = Bridge::new(BridgeConfig { min_period, sample_period, models_poll: MODELS_POLL });
+    bridge.attach(&cli.connect);
+    let sim = cli.sim.unwrap_or_else(|| sibling("astrum-sim"));
+    let runs = Runs::new(
+        RunsConfig { dir: cli.runs_dir, sim, connect: cli.connect.clone() },
+        bridge.clone(),
+    );
+    let sweeps = SweepRuns::new(SweepRunsConfig {
+        dir: runs.config().dir.join("sweeps"),
+        sim: runs.config().sim.clone(),
+        base_port: SWEEP_BASE_PORT,
+        stop_grace: STOP_GRACE,
+    });
 
-    // Blocking HTTPS client for the tile proxy: bounded timeouts so an offline
-    // upstream fails fast (the browser then falls back to the plain grid).
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(15))
-        .user_agent(concat!("astrum-web/", env!("CARGO_PKG_VERSION")))
-        .build();
-    let cfg = Arc::new(ServerCfg {
+    let cfg = Config {
         root: cli.root,
         tile_url: cli.tile_url,
         tile_cache: cli.tile_cache,
-        agent,
-    });
-
-    let listener = TcpListener::bind(&bind)?;
-    println!("[astrum-web] serving {} on http://{bind}", cfg.root.display());
-    println!("[astrum-web] telemetry WebSocket at ws://{bind}/telemetry (upstream {upstream})");
-    if cfg.tile_url.is_empty() {
-        println!("[astrum-web] map tiles: cache-only ({})", cfg.tile_cache.display());
-    } else {
-        println!("[astrum-web] map tiles: {} → cache {}", cfg.tile_url, cfg.tile_cache.display());
-    }
-
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[astrum-web] accept error: {e}");
-                continue;
-            }
-        };
-        let clients = Arc::clone(&clients);
-        let cfg = Arc::clone(&cfg);
-        thread::spawn(move || {
-            if let Err(e) = handle_conn(stream, clients, &cfg) {
-                // A dropped browser tab is routine — only note it at debug level.
-                let _ = e;
-            }
-        });
-    }
-    Ok(())
-}
-
-/// Subscribe to the telemetry stream and broadcast each sample as JSON to every
-/// connected browser, pruning clients whose channel has closed.
-fn pump_telemetry(upstream: &str, clients: &Clients) -> Result<(), Box<dyn Error>> {
-    let session = Session::connect(upstream)?;
-    let mut sub = TelemetrySubscriber::connect(&session)?;
-    sub.subscribe_all()?;
-    loop {
-        let sample = sub.recv()?;
-        let json = match serde_json::to_string(&FrameJson::from_sample(&sample)) {
-            Ok(j) => Arc::new(j),
-            Err(_) => continue,
-        };
-        let mut guard = clients.lock().unwrap();
-        guard.retain(|tx| match tx.try_send(Arc::clone(&json)) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => true, // slow client: skip this frame
-            Err(TrySendError::Disconnected(_)) => false, // gone: prune
-        });
-    }
-}
-
-/// A parsed HTTP request head.
-struct Head {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-}
-
-impl Head {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-
-    /// Whether this is a WebSocket upgrade request.
-    fn is_websocket(&self) -> bool {
-        self.header("upgrade").is_some_and(|u| u.to_ascii_lowercase().contains("websocket"))
-            && self.header("sec-websocket-key").is_some()
-    }
-}
-
-fn handle_conn(mut stream: TcpStream, clients: Clients, cfg: &ServerCfg) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let Some(head) = read_head(&mut stream)? else { return Ok(()) };
-
-    if head.is_websocket() {
-        return serve_websocket(stream, clients, &head);
-    }
-    if head.method != "GET" {
-        return write_simple(&mut stream, 405, "Method Not Allowed", "only GET is served");
-    }
-    if head.path == "/telemetry" {
-        return write_simple(
-            &mut stream,
-            426,
-            "Upgrade Required",
-            "connect a WebSocket to /telemetry",
-        );
-    }
-    let path = head.path.split(['?', '#']).next().unwrap_or("/");
-    if let Some(rest) = path.strip_prefix("/tiles/") {
-        return serve_tile(&mut stream, cfg, rest);
-    }
-    serve_static(&mut stream, &cfg.root, &head.path)
-}
-
-/// Serve one slippy-map tile, fetching + caching from the upstream tile server on
-/// a cache miss. `rest` is the `<z>/<x>/<y>.jpg` path after `/tiles/`. A miss with
-/// no reachable upstream is a 404, so the renderer falls back to the plain grid.
-fn serve_tile(stream: &mut TcpStream, cfg: &ServerCfg, rest: &str) -> std::io::Result<()> {
-    let Some((z, x, y)) = parse_tile(rest) else {
-        return write_simple(stream, 400, "Bad Request", "bad tile path");
+        allowed_hosts,
+        catalogs,
+        runs: runs.clone(),
+        sweeps: sweeps.clone(),
     };
-    let cache_path =
-        cfg.tile_cache.join(z.to_string()).join(x.to_string()).join(format!("{y}.jpg"));
-
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        return write_tile(stream, &bytes);
-    }
-    if let Some(bytes) = fetch_tile(cfg, z, x, y) {
-        let _ = cache_tile(&cache_path, &bytes); // best-effort: a failed write just re-fetches
-        return write_tile(stream, &bytes);
-    }
-    write_simple(stream, 404, "Not Found", "tile unavailable")
-}
-
-/// Parse + validate a `<z>/<x>/<y>[.jpg]` tile path. Rejects anything non-numeric
-/// or out of the zoom's range (so the coords can't escape the cache directory).
-fn parse_tile(rest: &str) -> Option<(u32, u32, u32)> {
-    let mut it = rest.split('/');
-    let z: u32 = it.next()?.parse().ok()?;
-    let x: u32 = it.next()?.parse().ok()?;
-    let y_str = it.next()?;
-    if it.next().is_some() {
-        return None; // no extra path components
-    }
-    let y: u32 = y_str.strip_suffix(".jpg").unwrap_or(y_str).parse().ok()?;
-    if z > 22 {
-        return None;
-    }
-    let max = 1u32 << z;
-    if x >= max || y >= max {
-        return None;
-    }
-    Some((z, x, y))
-}
-
-/// Fetch a tile from the upstream server. `None` on any error (offline, non-200,
-/// oversized), which the caller turns into a 404.
-fn fetch_tile(cfg: &ServerCfg, z: u32, x: u32, y: u32) -> Option<Vec<u8>> {
-    if cfg.tile_url.is_empty() {
-        return None;
-    }
-    let url = cfg
-        .tile_url
-        .replace("{z}", &z.to_string())
-        .replace("{x}", &x.to_string())
-        .replace("{y}", &y.to_string());
-    let resp = cfg.agent.get(&url).call().ok()?;
-    if resp.status() != 200 {
-        return None;
-    }
-    let mut buf = Vec::new();
-    resp.into_reader().take(8 * 1024 * 1024).read_to_end(&mut buf).ok()?;
-    if buf.is_empty() {
-        None
+    let tiles = if cfg.tile_url.is_empty() {
+        format!("cache-only ({})", cfg.tile_cache.display())
     } else {
-        Some(buf)
-    }
-}
+        format!("{} → cache {}", cfg.tile_url, cfg.tile_cache.display())
+    };
+    let root = cfg.root.display().to_string();
+    let app = server::router(cfg, bridge)?;
 
-/// Write `bytes` to the cache at `path` via a unique temp file + atomic rename,
-/// so a concurrent reader never sees a half-written tile.
-fn cache_tile(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let n = TILE_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("part-{n}"));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
-}
-
-fn write_tile(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
-    let header = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: image/jpeg\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: public, max-age=604800\r\n\
-         Connection: close\r\n\r\n",
-        bytes.len()
+    let listener = tokio::net::TcpListener::bind(&cli.bind)
+        .await
+        .map_err(|e| format!("binding {}: {e}", cli.bind))?;
+    let addr = listener.local_addr()?;
+    println!("[astrum-web] serving {root} on http://{addr}");
+    println!(
+        "[astrum-web] telemetry WebSocket at ws://{addr}/telemetry (attached to {}, ≤{} \
+         samples per sim second in ≤{} batches per second)",
+        cli.connect, cli.sample_hz, cli.max_hz
     );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(bytes)
-}
-
-/// Complete the WebSocket handshake by hand, then drain this client's channel to
-/// the socket until the browser leaves.
-fn serve_websocket(mut stream: TcpStream, clients: Clients, head: &Head) -> std::io::Result<()> {
-    let key = head.header("sec-websocket-key").unwrap_or_default();
-    let accept = derive_accept_key(key.as_bytes());
-    let resp = format!(
-        "HTTP/1.1 101 Switching Protocols\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    println!("[astrum-web] map tiles: {tiles}");
+    println!(
+        "[astrum-web] live runs: {} into {}",
+        runs.config().sim.display(),
+        runs.config().dir.display()
     );
-    stream.write_all(resp.as_bytes())?;
-    // The writer loop only writes; clear the head read-timeout so it's inert.
-    stream.set_read_timeout(None)?;
+    let host =
+        if addr.ip().is_unspecified() { "localhost".to_owned() } else { addr.ip().to_string() };
+    println!("[astrum-web] studio ready: open http://{host}:{}/ (Ctrl-C to stop)", addr.port());
 
-    let (tx, rx) = sync_channel::<Arc<String>>(CLIENT_QUEUE);
-    clients.lock().unwrap().push(tx);
-
-    let mut ws = WebSocket::from_raw_socket(stream, Role::Server, None);
-    loop {
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(msg) => {
-                if ws.write(Message::Text((*msg).clone())).is_err() || ws.flush().is_err() {
-                    break;
-                }
-            }
-            // Idle: ping to detect a browser that left without a clean close.
-            Err(RecvTimeoutError::Timeout) => {
-                if ws.write(Message::Ping(Vec::new())).is_err() || ws.flush().is_err() {
-                    break;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    let closing = runs.clone();
+    let closing_sweeps = sweeps.clone();
+    let shutdown = async move {
+        shutdown_signal().await;
+        // Stop the active run now: open WebSockets hold the graceful shutdown.
+        closing.close();
+        closing_sweeps.close();
+    };
+    let served = axum::serve(listener, app).with_graceful_shutdown(shutdown).await;
+    // Wait for the run's processes to be reaped (and its metrics written).
+    tokio::task::spawn_blocking(move || {
+        runs.shutdown();
+        sweeps.shutdown();
+    })
+    .await?;
+    served?;
     Ok(())
 }
 
-/// Serve a file from `root`. Rejects any path that escapes the root.
-fn serve_static(stream: &mut TcpStream, root: &Path, req_path: &str) -> std::io::Result<()> {
-    let rel = req_path.split(['?', '#']).next().unwrap_or("/").trim_start_matches('/');
-    let rel = if rel.is_empty() { "index.html" } else { rel };
-
-    // Only allow plain forward path components — no `..`, no absolute/root/prefix.
-    let safe = Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)));
-    if !safe {
-        return write_simple(stream, 403, "Forbidden", "bad path");
-    }
-
-    let full = root.join(rel);
-    match std::fs::read(&full) {
-        Ok(bytes) => {
-            let ctype = content_type(&full);
-            let header = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: {ctype}\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-cache\r\n\
-                 Connection: close\r\n\r\n",
-                bytes.len()
-            );
-            stream.write_all(header.as_bytes())?;
-            stream.write_all(&bytes)?;
-            Ok(())
+/// Resolves on Ctrl-C or SIGTERM (`docker stop`).
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(_) => std::future::pending().await,
         }
-        Err(_) => write_simple(stream, 404, "Not Found", &format!("no such file: /{rel}")),
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
     }
-}
-
-fn write_simple(
-    stream: &mut TcpStream,
-    code: u16,
-    reason: &str,
-    body: &str,
-) -> std::io::Result<()> {
-    let header = format!(
-        "HTTP/1.1 {code} {reason}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body.as_bytes())
-}
-
-/// Guess a content type from a file extension (only the ones the renderer uses).
-fn content_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js" | "mjs") => "text/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("json") => "application/json; charset=utf-8",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg", // the bundled map raster under the fleet
-        Some("ico") => "image/x-icon",
-        Some("wasm") => "application/wasm",
-        _ => "application/octet-stream",
-    }
-}
-
-/// Read and parse the HTTP request head (up to the blank line). `Ok(None)` on a
-/// closed/oversized/timed-out connection.
-fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<Head>> {
-    const MAX: usize = 16 * 1024;
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    loop {
-        let n = match stream.read(&mut chunk) {
-            Ok(0) => return Ok(None),
-            Ok(n) => n,
-            Err(_) => return Ok(None), // timeout / reset — nothing to serve
-        };
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(end) = find_head_end(&buf) {
-            return Ok(Some(parse_head(&buf[..end])));
-        }
-        if buf.len() > MAX {
-            return Ok(None);
-        }
-    }
-}
-
-/// Index just past the CRLFCRLF that ends the head, if present.
-fn find_head_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-}
-
-fn parse_head(bytes: &[u8]) -> Head {
-    let text = String::from_utf8_lossy(bytes);
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
-    let headers = lines
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-        .collect();
-    Head { method, path, headers }
 }

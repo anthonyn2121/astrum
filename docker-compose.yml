@@ -1,244 +1,51 @@
 name: astrum
 
-# ASTRUM runtime topology: an authoritative `sim` service (Bevy ECS state server)
-# and one or more `controller` services (flight controllers), talking over Zenoh
-# on a shared network. Both share one dev image built from docker/Dockerfile.
+# The ASTRUM dev environment: one long-lived `dev` container from the
+# `astrum-dev` image (docker/Dockerfile), with the checkout bind-mounted at
+# /workspace. `make dev` builds the image if it is missing or out of date,
+# starts the container and opens a shell in it; every further `make dev` opens
+# another shell in the same container, so processes started in one shell reach
+# the others over loopback. Inside, `astrum run …` starts the sim, its
+# controllers and the viewer as processes; host-side `make` targets run one-off
+# commands in fresh containers of this service (`docker compose run --rm dev`).
 #
-# The sim LISTENs on one Zenoh endpoint (tcp/0.0.0.0:7447); every other service
-# CONNECTs to tcp/sim:7447. Telemetry (astrum/telemetry/<id>) and commands
-# (astrum/command/<id>) share that single endpoint — no more separate ports.
-#
-#   sim        (runs astrum-sim: telemetry out, commands in)
-#   recorder   (astrum-bag-record; `--profile record up recorder`)
-#   controller (builds & runs controllers/cpp/astrum-controller)
-#   formation  (leader figure-eight + 3 decentralized MPC followers; `make demo-formation`)
-
-# Shared base for the four formation controllers — all run the Python optimal
-# runtime against the sim, differing only in their law/slot args (`command`).
-x-formation-controller: &formation-controller
-  image: astrum-dev:latest
-  working_dir: /workspace
-  profiles: ["formation"]
-  volumes:
-    - ./:/workspace
-    - cargo-registry:/usr/local/cargo/registry
-    - cargo-target:/workspace/target
-  environment:
-    # Each controller CONNECTS to the sim by name (run.py reads this as --connect).
-    ASTRUM_ZENOH_CONNECT: tcp/sim:7447
-  depends_on:
-    - sim
-  networks:
-    - astrum
+# Published ports bind to 127.0.0.1 only: Zenoh has no authentication here, so
+# anyone who can reach 7447 can command aircraft.
 
 services:
-  sim:
+  dev:
+    image: astrum-dev:latest
     build:
       context: .
       dockerfile: docker/Dockerfile
-    image: astrum-dev:latest
+      args:
+        # Run as the host user so files written into the bind mount keep the
+        # host's ownership (`make` exports these from `id -u` / `id -g`).
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
     working_dir: /workspace
+    # tini as PID 1: forwards SIGTERM so `make down` stops the container promptly.
+    init: true
     volumes:
       - ./:/workspace
       - cargo-registry:/usr/local/cargo/registry
       - cargo-target:/workspace/target
     environment:
-      # The sim LISTENs here; every other service connects to tcp/sim:7447.
-      ASTRUM_ZENOH_LISTEN: tcp/0.0.0.0:7447
-      # Overridable from the host env (e.g. `make demo` injects the bounded
-      # single-ship scenario); defaults to the multi-aircraft fleet.
-      ASTRUM_SCENARIO: ${ASTRUM_SCENARIO:-config/scenario.example.toml}
-    ports:
-      - "7447:7447"   # Zenoh (telemetry + commands)
-    networks:
-      - astrum
-    command:
-      - bash
-      - -lc
-      - "cargo run --release -p astrum-sim"
-
-  recorder:
-    # Records the live telemetry stream to a bag file for later replay
-    # (`astrum-bag-play`). Opt-in: `docker compose --profile record up recorder`.
-    image: astrum-dev:latest
-    working_dir: /workspace
-    profiles: ["record"]
-    volumes:
-      - ./:/workspace
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-target:/workspace/target
-    environment:
-      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
-      ASTRUM_BAG: /workspace/recordings/session.bag
-      ASTRUM_BAG_SECONDS: "0" # record until stopped
-    depends_on:
-      - sim
-    networks:
-      - astrum
-    command:
-      - bash
-      - -lc
-      - "mkdir -p recordings && cargo run --release -p astrum-bag --bin astrum-bag-record"
-
-  replay:
-    # The browser-based 3-D replay renderer. Serves the static `web/` app over
-    # HTTP and bridges the live telemetry PUB to connected browsers over
-    # WebSocket (one JSON frame per sample). Point a browser at
-    # http://localhost:8080 while the sim (or `astrum-bag-play`) is running.
-    # Started alongside the fleet by `make replay`, or on its own:
-    #   docker compose up replay
-    image: astrum-dev:latest
-    working_dir: /workspace
-    volumes:
-      - ./:/workspace
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-target:/workspace/target
-    environment:
-      # Subscribe to the sim's telemetry; serve the renderer on :8080.
-      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
+      # The viewer (`astrum run --watch`, `astrum web`) listens on all
+      # interfaces *inside* the container so the port mapping reaches it (the
+      # binary defaults to loopback); the host side publishes on 127.0.0.1.
       ASTRUM_WEB_BIND: 0.0.0.0:8080
       ASTRUM_WEB_ROOT: /workspace/web
+      # Map-tile proxy settings and the browser batch / sample rates, passed
+      # through from the host when set (unset → astrum-web's defaults).
+      ASTRUM_TILE_URL:
+      ASTRUM_TILE_CACHE:
+      ASTRUM_WEB_MAX_HZ:
+      ASTRUM_WEB_SAMPLE_HZ:
     ports:
-      - "8080:8080"   # HTTP + WebSocket (/telemetry)
-    depends_on:
-      - sim
-    networks:
-      - astrum
-    command:
-      - bash
-      - -lc
-      - "cargo run --release -p astrum-web --bin astrum-web"
-
-  controller:
-    # Reuses the image built by the `sim` service (no second build).
-    image: astrum-dev:latest
-    working_dir: /workspace
-    volumes:
-      - ./:/workspace
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-target:/workspace/target
-    environment:
-      # The controller CONNECTS to the sim service by name.
-      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
-      # Command aircraft 1 to fly north at 1500 m / 50 m/s, closing the loop in
-      # the controller (raw actuators). Run with ASTRUM_CONTROL_MODE=autopilot to
-      # hand the target to the sim's built-in inner loop instead.
-      ASTRUM_TARGET_ID: "1"
-      ASTRUM_TARGET_HEADING_DEG: "0"
-      ASTRUM_TARGET_ALT_M: "1500"
-      ASTRUM_TARGET_SPD_MPS: "50"
-      ASTRUM_CONTROL_MODE: ${ASTRUM_CONTROL_MODE:-raw}
-    depends_on:
-      - sim
-    networks:
-      - astrum
-    command:
-      - bash
-      - -lc
-      - "cmake -S controllers/cpp -B controllers/cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build controllers/cpp/build -j && exec ./controllers/cpp/build/astrum-controller"
-
-  controller-python:
-    # The Python twin of `controller` — same wiring, runs controllers/python.
-    # Opt-in: `docker compose --profile python up sim controller-python`
-    # (or `make demo-python`). No build step; pyzmq + pycapnp ship in the image.
-    image: astrum-dev:latest
-    working_dir: /workspace
-    profiles: ["python"]
-    volumes:
-      - ./:/workspace
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-target:/workspace/target
-    environment:
-      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
-      ASTRUM_TARGET_ID: "1"
-      ASTRUM_TARGET_HEADING_DEG: "0"
-      ASTRUM_TARGET_ALT_M: "1500"
-      ASTRUM_TARGET_SPD_MPS: "50"
-      ASTRUM_CONTROL_MODE: raw
-    depends_on:
-      - sim
-    networks:
-      - astrum
-    command:
-      - bash
-      - -lc
-      - "exec python controllers/python/example.py"
-
-  controller-quad:
-    # Flies the F450 quadrotor (ASTRUM's second vehicle class) via the built-in
-    # multirotor hover-hold autopilot: hands the sim one high-level target
-    # (climb + heading) and monitors. Reuses the Python controller unchanged —
-    # the wire protocol is vehicle-agnostic; only the sim's autopilot law differs.
-    # Opt-in: `docker compose --profile quad up sim controller-quad`
-    # (or `make demo-quad`), which pairs with config/scenario.quad.toml.
-    image: astrum-dev:latest
-    working_dir: /workspace
-    profiles: ["quad"]
-    volumes:
-      - ./:/workspace
-      - cargo-registry:/usr/local/cargo/registry
-      - cargo-target:/workspace/target
-    environment:
-      ASTRUM_ZENOH_CONNECT: tcp/sim:7447
-      ASTRUM_TARGET_ID: "1"
-      ASTRUM_TARGET_HEADING_DEG: "180"  # yaw from the initial 90° to 180°
-      ASTRUM_TARGET_ALT_M: "130"        # climb from 100 m to 130 m and hold
-      ASTRUM_TARGET_SPD_MPS: "0"        # ignored for a hovering rotorcraft
-      ASTRUM_CONTROL_MODE: autopilot    # the sim's multirotor hover-hold flies it
-    depends_on:
-      - sim
-    networks:
-      - astrum
-    command:
-      - bash
-      - -lc
-      - "exec python controllers/python/example.py"
-
-  # --- Formation demo: 1 leader + 3 decentralized MPC followers ---------------
-  # Opt-in via the `formation` profile (`make demo-formation`), paired with
-  # config/scenario.formation.toml. The leader flies a figure-eight; each
-  # follower independently watches the leader's telemetry and MPC-tracks its
-  # slot. Altitude 4572 m (15000 ft). The --speed 100 command settles ~120 m/s
-  # through the throttle loop; the speed-synced carrot and the 8 km x 4 km pattern
-  # drive the leader to ~41 deg of bank — an aggressive, easy-to-see figure-eight.
-  # This is about as tight as this formation holds: much tighter and the inner
-  # wingman/trail need >60 deg of bank to keep their slots and diverge (the f16's
-  # 60-deg cap is the limit). Shrink the slots too to carve a tighter pattern.
-  controller-lead:
-    <<: *formation-controller
-    command:
-      - bash
-      - -lc
-      - "exec python controllers/optimal/python/run.py --law figure8 --id 1
-         --alt 4572 --speed 100 --fig-rx 8000 --fig-ry 4000"
-
-  controller-wing-left:
-    <<: *formation-controller
-    command:
-      - bash
-      - -lc
-      - "exec python controllers/optimal/python/run.py --law formation --id 2
-         --leader 1 --slot left --alt 4572"
-
-  controller-wing-right:
-    <<: *formation-controller
-    command:
-      - bash
-      - -lc
-      - "exec python controllers/optimal/python/run.py --law formation --id 3
-         --leader 1 --slot right --alt 4572"
-
-  controller-trail:
-    <<: *formation-controller
-    command:
-      - bash
-      - -lc
-      - "exec python controllers/optimal/python/run.py --law formation --id 4
-         --leader 1 --slot trail --alt 4572"
-
-networks:
-  astrum:
-    driver: bridge
+      - "127.0.0.1:7447:7447"   # Zenoh (telemetry + commands) of `astrum run`'s sim
+      - "127.0.0.1:8080:8080"   # viewer: HTTP + WebSocket
+    command: ["sleep", "infinity"]
 
 volumes:
   cargo-registry:

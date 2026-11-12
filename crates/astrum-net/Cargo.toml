@@ -3,14 +3,22 @@ name = "astrum-net"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "ASTRUM Zenoh transport: telemetry & command pub/sub over the astrum-proto wire schema."
 
 [lib]
 name = "astrum_net"
 
+# Talk to a running sim's control plane (status, pause, resume, step, speed).
+[[bin]]
+name = "astrum-ctl"
+path = "src/bin/ctl.rs"
+
 [dependencies]
 astrum-proto = { path = "../astrum-proto" }
-# Zenoh pub/sub over key expressions. Used via its synchronous `.wait()` resolver
-# and blocking/non-blocking channel handlers, so it fits Bevy's synchronous
-# systems with no async runtime for us to drive (Zenoh embeds its own).
-zenoh = "1"
+zenoh = { workspace = true }
+# The control plane's status reply is JSON (low rate, read by people and tools).
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }

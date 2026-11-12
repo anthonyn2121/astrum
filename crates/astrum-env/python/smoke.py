@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""Smoke test for the `astrum_env` embedded RL environment.
+"""Smoke test for the `astrum_env` binding (run by `make test-python`).
 
-Proves the pyo3 seam end-to-end from Python: build → reset → observe → step
-(continuous controls + the learned trigger) → episode flags. It asserts the same
-invariants the Rust integration test (`astrum-sim/tests/env.rs`) does, so a green
-run here means the FFI marshalling is faithful.
+Exercises the PyO3 seam end-to-end: construct → reset(seed) → step (raw
+controls + trigger, autopilot targets) → gun_solution → body/grid rotations →
+BatchEnv, asserting the invariants a faithful marshalling layer must keep.
 
-Run it via the crate's build helper (which compiles the .so and puts it on the
-path):  bash crates/astrum-env/python/run_smoke.sh
+    PYTHONPATH="$(bash scripts/build-astrum-env.sh):crates/astrum-env/python" \
+        python crates/astrum-env/python/smoke.py
 """
 
 import astrum_env
+import numpy as np
 
-# A minimal two-team engagement (two C172s on opposing teams over SF Bay).
+# Two C172s on opposing teams over SF Bay, ~22 m apart north/south, both heading
+# east, so neither is in the other's gun line.
 SCENARIO = """
 [world]
 origin_lat_deg = 37.6188
 origin_lon_deg = -122.3756
-origin_alt_m = 0.0
+origin_alt_hae_m = 0.0
 
 [sim]
 rate_hz = 120.0
 max_time_s = 0.0
-realtime = false
+speed = 0.0
 seed = 7
 
 [[aircraft]]
@@ -30,9 +31,9 @@ id = 1
 model = "c172x"
 lat_deg = 37.6188
 lon_deg = -122.3756
-alt_ft = 5000.0
+alt_hae_m = 1524.0
 heading_deg = 90.0
-airspeed_kts = 100.0
+tas_mps = 55.0
 team = 0
 
 [[aircraft]]
@@ -40,50 +41,77 @@ id = 2
 model = "c172x"
 lat_deg = 37.6190
 lon_deg = -122.3756
-alt_ft = 5000.0
-heading_deg = 270.0
-airspeed_kts = 100.0
+alt_hae_m = 1524.0
+heading_deg = 90.0
+tas_mps = 55.0
 team = 1
 """
 
+COL = {n: i for i, n in enumerate(astrum_env.OBS_FIELDS)}
+
 
 def main() -> None:
-    env = astrum_env.DogfightEnv(SCENARIO)
+    env = astrum_env.Env(SCENARIO)
+    assert env.agent_ids == [1, 2], env.agent_ids
+    assert abs(env.dt - 1.0 / 120.0) < 1e-12, env.dt
 
-    ids = env.agent_ids()
-    assert ids == [1, 2], f"expected agents [1, 2], got {ids}"
+    obs = env.reset(seed=3)
+    assert obs.shape == (2, len(astrum_env.OBS_FIELDS)) and obs.dtype == np.float64
+    assert np.all(np.isfinite(obs))
+    assert np.all(obs[:, COL["tick"]] == 1), "first obs after reset is tick 1"
+    assert np.all(obs[:, COL["alive"]] == 1)
+    assert np.all(obs[:, COL["ammo"]] == astrum_env.GUN_AMMO)
+    assert np.all(np.abs(obs[:, COL["tas"]] - 55.0) < 2.0), obs[:, COL["tas"]]
+    assert np.all(np.abs(obs[:, COL["alt_hae_m"]] - 1524.0) < 5.0)
 
-    obs = env.reset()
-    assert len(obs) == 2, f"expected 2 observations, got {len(obs)}"
-    for o in obs:
-        assert o.alive, f"aircraft {o.id} should start alive"
-        assert abs(o.health - 100.0) < 1e-3, f"aircraft {o.id} should start at full HP"
-        assert o.ammo == 511, f"aircraft {o.id} should start armed, got {o.ammo}"
-        assert o.airspeed_mps > 0.0, f"aircraft {o.id} should be trimmed and moving"
-        # α/β/Nz (design doc §8 obs): finite, and trimmed flight sits near 1 g.
-        assert abs(o.nz_g) < 10.0, f"aircraft {o.id} Nz should be ~1 g, got {o.nz_g}"
-        assert o.alpha_rad == o.alpha_rad, f"aircraft {o.id} alpha must be finite"
-    print("reset:", *(repr(o) for o in obs), sep="\n  ")
-
-    # Agent 1 rolls hard and holds the trigger; agent 2 flies neutral, no trigger.
-    roll_and_fire = [0.2, -0.05, 0.0, 0.7, 1.0]
-    neutral = [0.0, 0.0, 0.0, 0.7, 0.0]
-    info = None
+    # Agent 1 holds the trigger with a right roll; agent 2 flies the sim autopilot.
+    act = np.array([[0.2, -0.05, 0.0, 0.7, 1.0], [0.0, 0.0, 0.0, 0.0, 0.0]])
+    hold = obs[1, COL["psi"]], obs[1, COL["alt_hae_m"]], 55.0
+    ap = np.array([[0.0, 0.0, 0.0, 0.0], [1.0, *hold]])
     for _ in range(40):
-        obs, info = env.step([(1, roll_and_fire), (2, neutral)])
+        obs, info = env.step(act, autopilot=ap)
+    assert obs[0, COL["ammo"]] < astrum_env.GUN_AMMO, "a held trigger fires rounds"
+    assert obs[1, COL["ammo"]] == astrum_env.GUN_AMMO, "a released trigger fires nothing"
+    assert obs[0, COL["p"]] > 0.1, f"right aileron rolls right, p={obs[0, COL['p']]:.3f}"
+    modes = [astrum_env.CONTROL_MODES[int(m)] for m in obs[:, COL["control_mode"]]]
+    assert modes == ["raw", "autopilot"], modes
+    assert not info.done() and info.tick == 41, info
+    assert np.array_equal(env.observe(), obs)
 
-    by_id = {o.id: o for o in obs}
-    assert by_id[1].ammo < 511, "a held trigger must fire rounds"
-    assert by_id[2].ammo == 511, "a released trigger fires nothing"
-    assert abs(by_id[1].p) > 0.3, f"full aileron should roll, got p={by_id[1].p:.3f}"
-    assert not info.terminated and not info.truncated, "40 ticks shouldn't end this episode"
-    print("after 40 ticks:", *(repr(o) for o in obs), sep="\n  ")
-    print("info:", repr(info))
+    sol = env.gun_solution(1, 2)
+    assert set(sol) == {"miss_m", "tof_s", "hit", "aim_dir", "aim_error_rad", "in_range"}
+    assert abs(np.linalg.norm(sol["aim_dir"]) - 1.0) < 1e-9
 
-    # reset() clears state for a fresh episode.
-    obs2 = env.reset()
-    assert all(o.alive for o in obs2) and all(o.ammo == 511 for o in obs2)
-    print(f"\nOK — pyo3 env seam works: {len(ids)} agents, reset/step/observe faithful.")
+    # Rotations are inverses and preserve length; nose · velocity ≈ cos(α)cos(β) · |v|.
+    v = [3.0, -1.0, 2.0]
+    assert np.allclose(env.grid_to_body(1, env.body_to_grid(1, v)), v, atol=1e-9)
+    nose = np.array(env.body_to_grid(1, [1.0, 0.0, 0.0]))
+    vel = obs[0, COL["vel_e"] : COL["vel_u"] + 1]
+    assert np.dot(nose, vel) / np.linalg.norm(vel) > 0.9
+
+    # Same seed ⇒ identical episode.
+    first = env.reset(seed=3)
+    for _ in range(40):
+        a, _ = env.step(act, autopilot=ap)
+    again = env.reset(seed=3)
+    for _ in range(40):
+        b, _ = env.step(act, autopilot=ap)
+    assert np.array_equal(first, again) and np.array_equal(a, b)
+
+    # BatchEnv: K envs stepped together match the single env bit-for-bit.
+    batch = astrum_env.BatchEnv([SCENARIO] * 3)
+    assert len(batch) == 3 and batch.agent_ids == [[1, 2]] * 3
+    bobs = batch.reset(seeds=[3, 3, 3])
+    assert bobs.shape == (3, 2, len(astrum_env.OBS_FIELDS))
+    acts = np.broadcast_to(act, (3, 2, 5)).copy()
+    aps = np.broadcast_to(ap, (3, 2, 4)).copy()
+    for _ in range(40):
+        bobs, term, trunc, tick = batch.step(acts, autopilot=aps)
+    assert not term.any() and not trunc.any() and np.all(tick == 41)
+    for k in range(3):
+        assert np.array_equal(bobs[k], b), f"batch env {k} diverged from Env"
+
+    print(f"OK — astrum_env binding: {len(env.agent_ids)} agents, Env + BatchEnv faithful.")
 
 
 if __name__ == "__main__":

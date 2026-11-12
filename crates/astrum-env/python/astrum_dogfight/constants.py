@@ -1,10 +1,14 @@
-"""Reference scales, ballistics, boundaries and reward magnitudes (design doc §8).
+"""Reference scales, boundaries and reward magnitudes (design doc §8).
 
 Every value here is a tunable hyperparameter of the *wrapper*, not the sim. They
 are collected in one place so a training config can override them wholesale.
+Gun ballistics are deliberately absent: lead, range and hit prediction come from
+the sim's own fire control (`astrum_env.Env.gun_solution`).
 """
 
 from math import radians
+
+import astrum_env
 
 # --- observation / action shape ---
 OBS_DIM = 31
@@ -19,17 +23,18 @@ BETA_REF = radians(20.0)  # rad; sideslip scale
 NZ_SCALE = 8.0  # (Nz - 1) / NZ_SCALE → ~1 at the 9 g cap
 R_MAX = 5000.0  # m; range normalization (beyond WEZ, within the merge)
 HP_MAX = 100.0
-AMMO_MAX = 511.0  # M61A1 magazine (§3.3)
+AMMO_MAX = float(astrum_env.GUN_AMMO)  # the sim's magazine size
 
-# --- gun ballistics for the WEZ / lead feature (§3.3; approximate, drag-free) ---
-MUZZLE_MPS = 1030.0  # muzzle velocity
-R_EFF = 1200.0  # effective gun range (m)
-LEAD_SIGMA = radians(3.0)  # rad; tracking-error scale for the gun-solution Gaussian
+# --- WEZ feature: tracking-error scale on the sim's gun-solution aim error ---
+LEAD_SIGMA = radians(3.0)  # rad
 
 # --- episode boundaries the wrapper enforces (§8.4) ---
-DECK_AGL = 300.0  # m; hard deck (~1000 ft AGL) — recovery room above real terrain
-R_BUBBLE = 15000.0  # m; horizontal engagement-bubble radius from arena center
-CEILING_AGL = 15000.0  # m; engagement-bubble ceiling above ground
+# The env has no terrain model, so the floor and ceiling are heights above the
+# WGS-84 ellipsoid (`alt_hae_m`), not above ground. Over SF Bay the geoid is
+# ~−32 m, so the floor sits ~330 m above mean sea level.
+DECK_HAE_M = 300.0  # m HAE; hard-deck floor
+R_BUBBLE = 15000.0  # m; horizontal engagement-bubble radius from the grid origin
+CEILING_HAE_M = 15000.0  # m HAE; engagement-bubble ceiling
 
 # --- Tier-2 scripted opponent: defensive maneuvers (§8.5) ---
 R_DETECT = 4000.0  # m; range within which a rear-hemisphere attacker triggers a break
@@ -45,7 +50,7 @@ MANEUVER_COOLDOWN_S = 3.0  # min dwell in level-hold before a maneuver may retri
 
 # --- Tier-3 FSM tactician: BFM thresholds + WEZ trigger (§8.5) ---
 # All transitions are dead-banded (separate enter/exit thresholds) and dwell-gated.
-FIRE_LEAD_RAD = radians(4.0)  # gun-solution cone: fire when lead error < this and in range
+FIRE_LEAD_RAD = radians(4.0)  # fire when the sim's aim error < this and its solution is in range
 THREAT_CONE_RAD = radians(45.0)  # attacker's nose-to-me angle below which I'm threatened
 THREAT_CONE_EXIT_RAD = radians(65.0)  # ... and above which the threat is considered cleared
 THREAT_RANGE = 2500.0  # m; attacker within this (and nose-on) ⇒ defensive
@@ -65,6 +70,11 @@ PURSUE_ROLL_DEADBAND = radians(5.0)  # stop rolling once the target is this near
 K_PURSUE_ROLL = 2.0  # lift-vector-on-target roll gain
 K_PURSUE_PULL = 1.5  # pull gain (× off-boresight angle) once rolled on
 FSM_MIN_DWELL_S = 0.4  # min time in a state before a non-survival transition (anti-chatter)
+# Tier-3's own raw control laws (not the sim autopilot's gains).
+K_ROLL_DAMP = 0.4  # aileron per rad/s of roll rate
+K_BREAK_ROLL = 2.5  # aileron per rad of bank error in a break
+PURSUIT_THR_TRIM = 0.6  # throttle at V_PURSUIT
+K_PURSUIT_THR = 0.02  # throttle per m/s of airspeed error
 
 # --- reward magnitudes (§8.3) ---
 R_KILL = 100.0  # terminal: bandit destroyed

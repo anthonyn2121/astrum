@@ -1,0 +1,33 @@
+# Process-mode sweep with Python controllers: the 4-ship formation demo with
+# follower 2 starting 100 m low / level / high and follower 3 starting 10 m/s
+# slow / matched / fast = 9 runs of 220 s. Lockstep at a 30 Hz control rate
+# (physics stays at 120 Hz); the Python laws discretize for the 30 Hz period the
+# telemetry carries (Telemetry.controlPeriodS).
+#
+#   astrum sweep config/sweep.formation.toml
+#
+# Compare the followers' slot capture across runs from the bags.
+
+base = "config/scenario.formation.toml"
+
+controllers = [
+  "python3 controllers/optimal/python/run.py --law=figure8 --id=1 --alt=4572 --speed=120 --fig-rx=8000 --fig-ry=4000 --max-bank-deg=60 --max-pitch-deg=24",
+  "python3 controllers/optimal/python/run.py --law=formation --id=2 --leader=1 --slot=left --alt=4572 --max-bank-deg=60 --max-pitch-deg=24",
+  "python3 controllers/optimal/python/run.py --law=formation --id=3 --leader=1 --slot=right --alt=4572 --max-bank-deg=60 --max-pitch-deg=24",
+  "python3 controllers/optimal/python/run.py --law=formation --id=4 --leader=1 --slot=trail --alt=4572 --max-bank-deg=60 --max-pitch-deg=24",
+]
+
+[set]
+"sim.lockstep" = true
+"aircraft.1.lockstep" = true
+"aircraft.2.lockstep" = true
+"aircraft.3.lockstep" = true
+"aircraft.4.lockstep" = true
+"aircraft.1.control_rate_hz" = 30.0
+"aircraft.2.control_rate_hz" = 30.0
+"aircraft.3.control_rate_hz" = 30.0
+"aircraft.4.control_rate_hz" = 30.0
+
+[vary]
+"aircraft.2.alt_hae_m" = [4472.0, 4572.0, 4672.0]
+"aircraft.3.tas_mps" = [110.0, 120.0, 130.0]

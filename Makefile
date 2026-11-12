@@ -1,104 +1,135 @@
 # ASTRUM — Docker-based dev environment
 #
-# Everything runs inside the `astrum-dev` image so nothing is installed on the host.
-# Run `make` (or `make help`) for the target list.
+# Everything runs inside the `astrum-dev` image so nothing is installed on the
+# host. `make dev` builds the image (if missing or out of date), starts the
+# long-lived `dev` container and opens a shell in it; inside, `astrum …` runs
+# scenarios, run files and sweeps. Containers run as the unprivileged image
+# user, built with the host's UID/GID (exported below) so files written into
+# the bind mount stay yours. Run `make` (or `make help`) for the target list.
+# `make ci` is the full gate.
+#
+# The task targets (verify … ci) work on the host — each in a fresh container —
+# and inside the dev container (the image sets ASTRUM_DEV=1), where they run in
+# place. The container targets (dev, build, down, ps, clean) are host-only.
 
 COMPOSE ?= docker compose
-SERVICE ?= sim
+
+UID ?= $(shell id -u)
+GID ?= $(shell id -g)
+export UID GID
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down demo demo-python demo-quad demo-formation race race-offline race-course replay export shell exec verify fmt lint logs ps clean
+.PHONY: help dev build down ps clean verify fmt fmt-check lint test test-rust test-cpp \
+        test-python wire-fixtures deny bench smoke ci
 
-# All hand-written C++ controller sources (excludes generated capnp, build dirs, and
-# virtualenvs — a pip-installed torch ships read-only .cpp templates that clang-format
-# -i would try, and fail, to rewrite).
-CPP_SRC = find controllers -type f \( -name '*.cpp' -o -name '*.hpp' \) \
-          -not -path '*/build/*' -not -path '*/.venv/*'
+# Run a bash script: in place inside the dev container, else in a fresh one
+# (no TTY): $(IN) '<bash script>'.
+ifeq ($(ASTRUM_DEV),1)
+IN = bash -c
+else
+IN = $(COMPOSE) run --rm -T dev bash -c
+endif
+
+# First line of every container target's recipe: they drive docker, which the
+# dev container doesn't have.
+HOST_ONLY = $(if $(filter 1,$(ASTRUM_DEV)),$(error make $@ runs on the host, not inside the dev container))
+
+# Hand-written sources from git (see scripts/sources.sh), NUL-separated.
+CPP_FILES = bash scripts/sources.sh cpp
+PY_FILES = bash scripts/sources.sh py
+
+# The C++ controllers' single CMake project (controllers/CMakeLists.txt).
+CMAKE_CONTROLLERS = cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-build: ## Build the ASTRUM dev image (compiles JSBSim from source)
+# The first image build shows its progress (it compiles JSBSim: minutes); after
+# that the image is only rebuilt when docker/ changed, quietly, before the
+# shell opens. Shells get TERM=xterm-256color (docker's default `xterm` means 8
+# colours; this one is in the image's terminfo whatever the host terminal is)
+# and the host's COLORTERM (truecolor support), for the Catppuccin prompt and
+# `ls` colours. Leaving the shell is never a make error, whatever its last
+# command returned.
+dev: ## Build the image if needed, start the dev container, open a shell in it (again: another shell)
+	$(HOST_ONLY)
+	@docker image inspect astrum-dev:latest >/dev/null 2>&1 || $(COMPOSE) build dev
+	@$(COMPOSE) --progress quiet up -d --build dev
+	@$(COMPOSE) exec -e TERM=xterm-256color -e COLORTERM --user astrum dev bash || true
+
+build: ## Rebuild the ASTRUM dev image (compiles JSBSim from source)
+	$(HOST_ONLY)
 	$(COMPOSE) build
 
-up: ## Start sim + controller services (detached)
-	$(COMPOSE) up -d
-
-down: ## Stop and remove services
+down: ## Stop and remove the dev container (and every shell in it)
+	$(HOST_ONLY)
 	$(COMPOSE) down
 
-demo: ## Run the integration demo: C++ controller flies aircraft 1 in a bounded scenario, then auto-tears-down
-	-ASTRUM_SCENARIO=config/scenario.demo.toml $(COMPOSE) up --exit-code-from sim sim controller
-	$(COMPOSE) down
-
-demo-python: ## Same demo, but the Python controller flies aircraft 1
-	-ASTRUM_SCENARIO=config/scenario.demo.toml $(COMPOSE) --profile python up --exit-code-from sim sim controller-python
-	$(COMPOSE) --profile python down
-
-demo-quad: ## Quadrotor demo: an F450 hovers/climbs under the built-in multirotor autopilot
-	-ASTRUM_SCENARIO=config/scenario.quad.toml $(COMPOSE) --profile quad up --exit-code-from sim sim controller-quad
-	$(COMPOSE) --profile quad down
-
-demo-formation: ## Formation demo: a leader flies a figure-eight; 3 F-16s MPC-track their slots (decentralized)
-	-ASTRUM_SCENARIO=config/scenario.formation.toml $(COMPOSE) --profile formation up --exit-code-from sim \
-	  sim controller-lead controller-wing-left controller-wing-right controller-trail
-	$(COMPOSE) --profile formation down
-
-# The racing environment is its own app rather than a compose service, so it runs as a
-# one-off container. It speaks the same Zenoh wire as the sim plus astrum/race/** for
-# the course and gate progress, so `race` publishes the service's port
-# (--service-ports) and takes the `sim` network alias (--use-aliases) — a controller
-# reaches it at tcp/sim:7447 exactly as it reaches the fleet sim. That means it also
-# collides with a running sim: use `race LISTEN=...` or `make down` first.
-#
-# SEED=n draws a different course; GATES=n resizes it; LISTEN=tcp/0.0.0.0:7448 moves
-# the endpoint. All override config/race.toml.
-RACE_ARGS = $(if $(SEED),--seed $(SEED)) $(if $(GATES),--gates $(GATES)) $(if $(LISTEN),--listen $(LISTEN))
-
-race: ## Drone racing: an F450 on a randomized gate course, on the wire (SEED=n GATES=n LISTEN=ep)
-	$(COMPOSE) run --rm --no-deps --service-ports --use-aliases sim bash -lc 'cargo run --release -p astrum-race -- $(RACE_ARGS)'
-
-race-offline: ## Fly a race with no transport at all — physics only, nothing published
-	$(COMPOSE) run --rm --no-deps sim bash -lc 'cargo run --release -p astrum-race -- --no-net $(RACE_ARGS)'
-
-race-course: ## Print the gate course a seed draws, without flying it (SEED=n GATES=n)
-	$(COMPOSE) run --rm --no-deps sim bash -lc 'cargo run --release -p astrum-race -- --dump-course $(RACE_ARGS)'
-
-replay: ## Start the fleet sim + the 3-D replay renderer, then open http://localhost:8080
-	$(COMPOSE) up -d sim replay
-	@echo "ASTRUM replay renderer → http://localhost:8080  (Ctrl-C-safe; run 'make down' to stop)"
-
-export: ## Bake a bag to a replay JSON the browser can open offline (BAG=path OUT=path)
-	$(COMPOSE) run --rm --no-deps \
-	  -e ASTRUM_BAG=$(or $(BAG),recordings/session.bag) \
-	  -e ASTRUM_WEB_EXPORT=$(or $(OUT),recordings/session.json) \
-	  sim bash -lc 'cargo run --release -p astrum-web --bin astrum-web-export'
-
-shell: ## Open a one-off shell in a fresh container (SERVICE=sim|controller)
-	$(COMPOSE) run --rm --no-deps $(SERVICE) bash
-
-exec: ## Exec a shell into an already-running container (SERVICE=sim|controller)
-	$(COMPOSE) exec $(SERVICE) bash
-
-verify: ## Verify the toolchain (versions + JSBSim link + functional run)
-	$(COMPOSE) run --rm --no-deps $(SERVICE) bash scripts/verify-toolchain.sh
-
-# fmt/lint run as the host user so in-place rewrites keep file ownership (not
-# root), and with ruff's cache off so no .ruff_cache lands on the bind mount.
-RUN_USER = $(COMPOSE) run --rm --no-deps --user $$(id -u):$$(id -g) $(SERVICE)
-
-fmt: ## Format the controllers in place (clang-format for C++, ruff for Python)
-	$(RUN_USER) bash -lc 'clang-format -i $$($(CPP_SRC)) && ruff format controllers && ruff check --no-cache --fix controllers'
-
-lint: ## Lint Python (ruff) and check C++ formatting (clang-format --dry-run)
-	$(RUN_USER) bash -lc 'ruff check --no-cache controllers && ruff format --check controllers && clang-format --dry-run --Werror $$($(CPP_SRC))'
-
-logs: ## Follow service logs
-	$(COMPOSE) logs -f
-
-ps: ## Show service status
+ps: ## Show whether the dev container is running
+	$(HOST_ONLY)
 	$(COMPOSE) ps
 
-clean: ## Stop services and remove volumes + the local image
+verify: ## Verify the toolchain (pinned versions agree, JSBSim/zenoh link + run)
+	$(IN) 'bash scripts/verify-toolchain.sh'
+
+fmt: ## Format everything in place (rustfmt, clang-format, ruff format + fixes)
+	$(IN) 'set -euo pipefail; \
+	  cargo fmt --all; \
+	  $(CPP_FILES) | xargs -0 -r clang-format -i; \
+	  $(PY_FILES) | xargs -0 -r ruff format --no-cache; \
+	  $(PY_FILES) | xargs -0 -r ruff check --no-cache --fix'
+
+fmt-check: ## Check formatting without rewriting (rustfmt, clang-format, ruff format)
+	$(IN) 'set -euo pipefail; \
+	  cargo fmt --all --check; \
+	  $(CPP_FILES) | xargs -0 -r clang-format --dry-run --Werror; \
+	  $(PY_FILES) | xargs -0 -r ruff format --no-cache --check'
+
+lint: ## Lint Rust (clippy -D warnings, all targets) and Python (ruff check)
+	$(IN) 'set -euo pipefail; \
+	  cargo clippy --workspace --all-targets --locked -- -D warnings; \
+	  $(PY_FILES) | xargs -0 -r ruff check --no-cache'
+
+test: test-rust test-cpp test-python ## Run every test suite
+
+test-rust: ## Rust tests (cargo test --workspace)
+	$(IN) 'cargo test --workspace --locked'
+
+test-cpp: ## C++ controller tests (CMake + ctest), then install the SDK and build the out-of-tree example against it
+	$(IN) 'set -euo pipefail; \
+	  $(CMAKE_CONTROLLERS); \
+	  cmake --build build/controllers -j"$$(nproc)"; \
+	  ctest --test-dir build/controllers --output-on-failure; \
+	  prefix="$$(mktemp -d)"; trap "rm -rf \"$$prefix\"" EXIT; \
+	  cmake --install build/controllers --prefix "$$prefix/install" >/dev/null; \
+	  cmake -S controllers/examples/out_of_tree -B "$$prefix/build" -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_PREFIX_PATH="$$prefix/install" >/dev/null; \
+	  cmake --build "$$prefix/build" -j"$$(nproc)"; \
+	  "$$prefix/build/hold-controller" --help >/dev/null; \
+	  echo "out-of-tree example: built and ran against the installed SDK"'
+
+test-python: ## Python tests: controllers + astrum-env adapter (builds the astrum_env module)
+	$(IN) 'set -euo pipefail; \
+	  stage="$$(bash scripts/build-astrum-env.sh)"; \
+	  export PYTHONPATH="$$stage:crates/astrum-env/python:$$PYTHONPATH"; \
+	  python -m pytest -q controllers/python controllers/optimal/python crates/astrum-env/python; \
+	  python crates/astrum-env/python/smoke.py'
+
+wire-fixtures: ## Regenerate the Rust/C++/Python wire fixtures (crates/astrum-proto/tests/fixtures)
+	$(IN) 'bash scripts/wire-fixtures.sh'
+
+deny: ## Dependency audit: licenses, advisories, bans, sources (cargo deny)
+	$(IN) 'cargo deny --locked check'
+
+bench: ## Headless sim throughput (µs/tick, × real time) for fixed fleets and thread counts
+	$(IN) 'cargo run --release --locked -q -p astrum-sim --example throughput 2>/dev/null | grep "^|"'
+
+smoke: ## Fly every demo (config/demos/*.toml) in lockstep, as fast as possible; fails on the first failing one
+	$(IN) 'bash scripts/smoke.sh'
+
+ci: fmt-check lint test deny ## Full gate: fmt-check + lint + all tests + deny (fails on any failure)
+
+clean: ## Remove the dev container, the volumes and the local image
+	$(HOST_ONLY)
 	$(COMPOSE) down -v --rmi local

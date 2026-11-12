@@ -1,0 +1,17 @@
+# In-process sweep (no controllers): does the uncommanded F-16 hold its spawn
+# trim across the envelope? 4 speeds x 3 altitudes = 12 runs of 60 s, flown at
+# once, one thread each, as fast as possible.
+#
+#   astrum sweep config/sweep.trim.toml
+#
+# Results: runs/sweep.trim/summary.csv plus one MCAP bag per run (export one
+# with `astrum export runs/sweep.trim/run-0001.mcap` to look at it).
+
+base = "config/scenario.example.toml"
+
+[set]
+"sim.max_time_s" = 60.0
+
+[vary]
+"aircraft.1.tas_mps" = [150.0, 200.0, 250.0, 300.0]
+"aircraft.1.alt_hae_m" = [1000.0, 4572.0, 9000.0]

@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # docker-compose.yml plus the CI overrides: cached cargo dirs, no
+      # incremental compilation or debuginfo (.github/compose.ci.yml).
+      COMPOSE_FILE: docker-compose.yml:.github/compose.ci.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Runner user ids
+        id: ids
+        run: |
+          echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
+          echo "gid=$(id -g)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build the dev image once (layers cached in the GitHub Actions cache) and
+      # load it as astrum-dev:latest, the tag docker-compose.yml runs.
+      - name: Build dev image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: astrum-dev:latest
+          load: true
+          build-args: |
+            UID=${{ steps.ids.outputs.uid }}
+            GID=${{ steps.ids.outputs.gid }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The cargo registry and target dir, bind-mounted into every container
+      # (.github/compose.ci.yml). Keyed on the toolchain and Cargo.lock; a
+      # changed Cargo.lock starts from the newest cache for the same toolchain,
+      # so only the changed dependencies compile. Saved only on a key miss.
+      - name: Cache cargo registry + target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo
+          key: cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ hashFiles('rust-toolchain.toml') }}-
+
+      # Created as the runner user (on a cache miss docker would create them
+      # as root).
+      - name: Cargo dirs
+        run: |
+          echo "ASTRUM_CI_CARGO=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/cargo/registry" "$RUNNER_TEMP/cargo/target"
+
+      - name: Verify toolchain
+        run: make verify
+
+      # fmt-check + clippy + Rust/C++/Python tests + cargo deny.
+      - name: make ci
+        run: make ci
+
+      # Every demo run file (config/demos/*.toml) against a live sim, in lockstep.
+      - name: make smoke
+        run: make smoke

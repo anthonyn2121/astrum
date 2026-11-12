@@ -1,0 +1,1 @@
+../../../crates/astrum-proto/schema/astrum.capnp

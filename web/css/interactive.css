@@ -1,0 +1,112 @@
+/* The Interactive page on top of studio.css: the hero, the in-flight banner,
+   the two-column layout (steps on the constellation rail | sticky flight plan
+   card with Launch) and the locked setup while a run is active. */
+
+.studio-main.ia-main { max-width: 1320px; }
+
+/* ---- Hero: title + lede over a soft glow, a small constellation at right ---- */
+.ia-hero { position: relative; margin: 4px 0 26px; padding: 18px 0 4px; isolation: isolate; }
+.ia-hero::before {
+  content: ""; position: absolute; z-index: -1; left: -60px; top: -40px; width: 560px; height: 220px;
+  background: radial-gradient(260px 110px at 32% 50%, var(--nebula-a), transparent),
+    radial-gradient(200px 90px at 72% 42%, var(--nebula-b), transparent);
+  pointer-events: none;
+}
+.ia-hero h1 {
+  font-size: 30px; letter-spacing: 0.01em; margin: 0 0 8px; color: var(--star);
+  text-shadow: 0 0 18px rgba(74, 163, 255, 0.45);
+}
+.ia-hero .lede { margin: 0; font-size: 15px; line-height: 1.55; }
+.ia-hero-art {
+  position: absolute; right: 0; top: 0; width: 180px; height: auto; opacity: 0.8; pointer-events: none;
+}
+.ia-hero-art polyline { fill: none; stroke: rgba(120, 170, 225, 0.35); stroke-width: 0.8; }
+.ia-hero-art circle { fill: var(--star); filter: drop-shadow(0 0 3px var(--accent)); }
+.ia-hero-art circle.bright { animation: ia-star 3.6s ease-in-out infinite; }
+@keyframes ia-star {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+/* ---- The active run, "in flight": a pulsing green live dot before the text ---- */
+.ia-live { position: relative; }
+.ia-live .banner-text { padding-left: 22px; position: relative; }
+.ia-live strong { color: var(--ok); }
+.live-dot {
+  position: absolute; left: 0; top: 0.35em; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--ok); box-shadow: 0 0 8px var(--ok);
+}
+.live-dot::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  border: 2px solid var(--ok); animation: ia-live 1.8s ease-out infinite;
+}
+@keyframes ia-live {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+
+/* ---- Layout: one column, the flight plan after the steps; two at >= 1100px ---- */
+.ia-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px 32px; align-items: start; }
+@media (min-width: 1100px) {
+  .ia-layout { grid-template-columns: minmax(0, 1fr) 340px; }
+  .flight-plan { position: sticky; top: 72px; max-height: calc(100vh - 92px); overflow: auto; }
+}
+
+/* ---- The flight plan card ---- */
+.flight-plan {
+  padding: 18px 20px 20px; background: var(--glass-strong);
+  box-shadow: var(--glow), 0 18px 40px rgba(0, 0, 0, 0.35);
+}
+.flight-plan h2 {
+  display: flex; align-items: center; gap: 8px; margin: 0 0 14px; font-size: 16px;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--star);
+}
+.flight-plan h2::before { content: "✦"; color: var(--accent); text-shadow: 0 0 10px var(--accent); }
+.plan-list { margin: 0 0 14px; display: flex; flex-direction: column; }
+.plan-list > div {
+  display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 10px; padding: 7px 0;
+  border-bottom: 1px dashed var(--glass-line);
+}
+.plan-list dt { color: var(--muted); font-size: 12px; padding-top: 1px; }
+.plan-list dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.plan-sub { margin: 0 0 8px; font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+.plan-fleet { list-style: none; margin: 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+/* --team: the aircraft's team colour (set per item by interactive.js). */
+.plan-ac {
+  display: grid; grid-template-columns: 10px auto minmax(0, 1fr); column-gap: 8px; row-gap: 1px; align-items: center;
+  padding: 7px 10px; border-radius: 8px; background: rgba(0, 0, 0, 0.25); border: 1px solid var(--glass-line);
+}
+.plan-dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--team);
+  box-shadow: 0 0 7px var(--team);
+}
+.plan-ac-id { font-weight: 700; font-variant-numeric: tabular-nums; }
+.plan-ac-model { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.plan-ac-ctl { grid-column: 2 / -1; font-size: 12px; overflow-wrap: anywhere; }
+.plan-ac-ctl:not(.muted) { color: var(--accent); }
+.plan-locked {
+  margin: 0 0 12px; padding: 8px 10px; border-radius: 8px; color: var(--ok);
+  border: 1px solid rgba(70, 211, 138, 0.4); background: rgba(70, 211, 138, 0.08);
+}
+.flight-plan .form-error { margin: 0 0 12px; }
+.flight-plan .run-actions { flex-direction: column; align-items: stretch; gap: 8px; }
+.flight-plan #runBtn { width: 100%; letter-spacing: 0.04em; }
+.flight-plan #runNote { text-align: center; }
+.flight-plan #runNote:empty { display: none; }
+
+/* ---- Locked setup while a run is active: dimmed but legible ---- */
+#setupFields:disabled { opacity: 1; filter: saturate(0.55); }
+#setupFields:disabled .step > :not(h2) { opacity: 0.62; }
+#setupFields:disabled .choice,
+#setupFields:disabled .seg button,
+#setupFields:disabled select,
+#setupFields:disabled input { cursor: not-allowed; }
+
+@media (max-width: 860px) {
+  .ia-hero-art { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ia-hero-art circle.bright,
+  .live-dot::after { animation: none; }
+}

@@ -1,22 +1,22 @@
-# Bounded single-aircraft scenario for the controller smoke test.
-# Aircraft 1 starts heading east (90°); the example C++ controller commands it
-# north (0°), so telemetry should show psi converging 90° → 0° over ~25-30 s.
+# Bounded single-aircraft scenario for the controller demo.
+# Aircraft 1 starts heading east (90°); the example controllers command it north
+# (0°) at 1500 m and 50 m/s, so telemetry shows psi converging 90° → 0°.
 
 [world]
 origin_lat_deg = 37.6188
 origin_lon_deg = -122.3756
-origin_alt_m = 0.0
+origin_alt_hae_m = 0.0
 
 [sim]
 rate_hz = 120.0
 max_time_s = 40.0
-realtime = true
+speed = 1.0
 
 [[aircraft]]
 id = 1
 model = "c172x"
 lat_deg = 37.6188
 lon_deg = -122.3756
-alt_ft = 5000.0
+alt_hae_m = 1524.0
 heading_deg = 90.0
-airspeed_kts = 100.0
+tas_mps = 55.0

@@ -1,36 +1,33 @@
 # ASTRUM scenario — a 4-ship F-16 formation demo.
 #
-# Aircraft 1 is the LEADER: flown by `laws/figure8.py`, it traces a horizontal
+# Aircraft 1 is the LEADER: flown by the `figure8` law, it traces a horizontal
 # figure-eight (a Gerono lemniscate) centred on the ENU origin. Aircraft 2-4 are
-# FOLLOWERS: each runs `laws/formation.py` independently, watching only the
+# FOLLOWERS: each runs the `formation` law independently, watching only the
 # leader's telemetry off the bus and driving its own slot error to zero with a
 # per-follower MPC — a fully decentralized formation.
 #
-# The controllers are wired up by the `formation` compose profile
-# (`make demo-formation`). Initial positions put each follower roughly at its
+# The controllers are wired up by the run file config/demos/formation.toml
+# (`astrum run config/demos/formation.toml`). Initial positions put each follower roughly at its
 # slot (left / right / trail) behind the leader; the MPC captures the rest.
 
 [world]
-# Pattern is centred here (ENU origin). F-16-friendly: high enough for a fast jet.
+# Pattern is centred here (ENU origin).
 origin_lat_deg = 37.6188
 origin_lon_deg = -122.3756
-origin_alt_m = 0.0
+origin_alt_hae_m = 0.0
 
 [sim]
 rate_hz = 120.0
-# Bounded so `make demo-formation` self-terminates. At ~120 m/s a full lap of the
-# 8 km x 4 km pattern takes ~320 s; 220 s covers the formation-capture transient
-# plus both hard lobes and the crossover (the most aggressive parts of the track).
+# Bounded so `astrum run config/demos/formation.toml` self-terminates: 220 s covers the formation
+# capture plus both lobes and the crossover of the 8 km x 4 km pattern at 120 m/s.
 max_time_s = 220.0
-# Real-time so the run is watchable in the 3-D replay renderer.
-realtime = true
+# Real time so the run is watchable in the 3-D replay renderer.
+speed = 1.0
 
 # --- Fleet -------------------------------------------------------------------
-# All F-16s (fixed-wing inferred from the model). ~15000 ft, ~233 kts (~120 m/s)
-# — the speed the leader's --speed 100 command settles at through the sim's
-# throttle loop, so starting there avoids a speed transient. The 8 km x 4 km
-# pattern drives the f16 inner loop to ~41 deg of bank at the lobes (well under
-# its 60-deg limit), with the load-factor feedforward holding altitude in the turn.
+# All F-16s at 4572 m HAE, trimmed at 120 m/s TAS — the leader's commanded speed
+# (the run file's `--speed=120`), so there is no speed transient at the start. At 100 m/s
+# a 30° turn already needs ~16° alpha here, and the slower inside follower sinks.
 
 [[aircraft]]
 # LEADER — figure-eight. Initial heading ~= the pattern tangent at tau=0
@@ -39,9 +36,9 @@ id = 1
 model = "f16"
 lat_deg = 37.6188
 lon_deg = -122.3756
-alt_ft = 15000.0
+alt_hae_m = 4572.0
 heading_deg = 63.0
-airspeed_kts = 233.0
+tas_mps = 120.0
 
 [[aircraft]]
 # FOLLOWER — left wing. Starts near its slot (~94 m west, ~31 m north of leader).
@@ -49,9 +46,9 @@ id = 2
 model = "f16"
 lat_deg = 37.619079
 lon_deg = -122.376666
-alt_ft = 15000.0
+alt_hae_m = 4572.0
 heading_deg = 63.0
-airspeed_kts = 233.0
+tas_mps = 120.0
 
 [[aircraft]]
 # FOLLOWER — right wing (~31 m west, ~94 m south of leader).
@@ -59,16 +56,16 @@ id = 3
 model = "f16"
 lat_deg = 37.617956
 lon_deg = -122.375952
-alt_ft = 15000.0
+alt_hae_m = 4572.0
 heading_deg = 63.0
-airspeed_kts = 233.0
+tas_mps = 120.0
 
 [[aircraft]]
-# FOLLOWER — trail (~125 m west, ~63 m south, 100 ft below the leader).
+# FOLLOWER — trail (~125 m west, ~63 m south, 30 m below the leader).
 id = 4
 model = "f16"
 lat_deg = 37.618234
 lon_deg = -122.377018
-alt_ft = 14900.0
+alt_hae_m = 4542.0
 heading_deg = 63.0
-airspeed_kts = 233.0
+tas_mps = 120.0

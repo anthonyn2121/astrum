@@ -62,6 +62,17 @@ pub fn air_density(alt_m: f64) -> f64 {
     }
 }
 
+/// Mean Earth radius (m), for the grid-curvature correction below.
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+/// Height above the ellipsoid of a world-grid point (origin height + Up +
+/// the tangent plane's curvature drop `(e² + n²) / 2R`). Within ~1 cm of the
+/// exact conversion inside a 50 km bubble, at a fraction of its cost — used
+/// for the density lookup and the ground (h = 0) cut-off of rounds.
+pub fn grid_altitude(origin_alt_hae_m: f64, p: DVec3) -> f64 {
+    origin_alt_hae_m + p.z + (p.x * p.x + p.y * p.y) / (2.0 * EARTH_RADIUS_M)
+}
+
 /// Ballistic properties of a projectile under the constant-`Cd` model. The drag
 /// acceleration is `−½·ρ·(Cd·A/m)·|v|·v`, so the only quantity that matters is
 /// the lumped `drag_factor = Cd·A/m` (m²/kg). The Mach-dependent seam (§12.1)

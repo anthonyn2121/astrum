@@ -3,14 +3,16 @@ name = "astrum-web"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "ASTRUM 3-D replay bridge: telemetry → JSON over WebSocket (live/replay) + a bag → JSON exporter for the browser renderer."
+rust-version.workspace = true
+publish.workspace = true
+description = "ASTRUM 3-D replay bridge: telemetry → JSON over WebSocket (live/replay) + an MCAP bag → JSON exporter for the browser renderer."
 
 [lib]
 name = "astrum_web"
 
-# `astrum-web` streams live/replayed telemetry to the browser over WebSocket and
-# serves the static Three.js renderer; `astrum-web-export` bakes a bag into a
-# single JSON document the renderer can open offline (no running services).
+# `astrum-web` streams fleet snapshots to the browser over WebSocket and serves
+# the static Three.js renderer + a map-tile proxy; `astrum-web-export` bakes a
+# bag into a single JSON document the renderer can open offline.
 [[bin]]
 name = "astrum-web"
 path = "src/bin/web.rs"
@@ -22,12 +24,23 @@ path = "src/bin/export.rs"
 [dependencies]
 astrum-proto = { path = "../astrum-proto" }
 astrum-net = { path = "../astrum-net" }
+astrum-bag = { path = "../astrum-bag" }
+# The studio's catalogs (scenarios, environments, controllers) and, later, runs.
+astrum-sim = { path = "../astrum-sim" }
 clap = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Sync WebSocket (no async runtime — matches the rest of the workspace). We do
-# the HTTP upgrade handshake by hand and hand the raw socket to tungstenite.
-tungstenite = "0.21"
-# Blocking HTTPS client for the map-tile proxy (rustls TLS with bundled roots, so
-# no system certs are needed). Only used to fetch-and-cache slippy-map tiles.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Reads the fleet's JSBSim models out of the scenario TOML.
+toml = { workspace = true }
+# HTTP + WebSocket server on tokio (already in the build via zenoh).
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "sync", "time"] }
+tower = { version = "0.5", default-features = false }
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+# Async HTTPS client for the map-tile proxy (rustls with bundled webpki roots,
+# so no system certificates are needed).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", default-features = false, features = ["util"] }

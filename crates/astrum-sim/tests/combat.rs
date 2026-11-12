@@ -1,256 +1,304 @@
-//! End-to-end tests of the gun-combat system chain
-//! (`fire_guns → step_bullets → resolve_hits → apply_damage → end_on_elimination`).
-//!
-//! These drive a *minimal* Bevy app that registers exactly the combat systems and
-//! feeds them hand-placed entities. The combat systems are decoupled from JSBSim
-//! (bullets never own an FDM, and death is a `Dead` marker rather than an FDM
-//! call), so this needs no `FdmInstance`, no `JSBSIM_LOCK`, and gives full control
-//! over geometry — letting each test assert a precise outcome. `App::new()` alone
-//! registers `Messages<AppExit>` and runs the `Update` schedule under
-//! `App::update()`, and exposes `App::should_exit()` to observe termination.
-//!
-//! Run:  `cargo test -p astrum-sim --test combat -- --nocapture`
+//! The gun-combat chain over hand-placed entities (no JSBSim): swept hit tests
+//! in relative motion, earliest-hit attribution, velocity inheritance, damage,
+//! termination, the events it reports, and determinism.
 
 use std::f64::consts::FRAC_PI_2;
 
-use astrum_geo::{Geodetic, LocalFrame};
+use astrum_fdm::FdmState;
+use astrum_geo::{Enu, Geodetic, LocalFrame};
+use astrum_proto::{EndReason, EventKind};
 use astrum_sim::combat::ballistics::DVec3;
-use astrum_sim::combat::components::{Bullet, Dead, Gun, Health, Team, Trigger};
-use astrum_sim::combat::resources::{CombatParams, CombatRng, CombatState};
 use astrum_sim::combat::systems::{
-    apply_damage, end_on_elimination, fire_guns, resolve_hits, step_bullets,
+    apply_damage, end_on_elimination, fire_guns, on_kill, resolve_hits, step_bullets,
 };
-use astrum_sim::components::{Aircraft, GeoState, SimParams, WorldFrame};
+use astrum_sim::combat::{
+    Bullet, CombatParams, CombatRng, CombatState, Dead, Gun, Health, Team, Trigger,
+};
+use astrum_sim::components::{Aircraft, AircraftState, SimClock, SimParams, SimStatus, WorldFrame};
+use astrum_sim::events::{publish_events, EventLog};
 use bevy::prelude::*;
 
 const DT: f64 = 1.0 / 120.0;
+const ORIGIN: (f64, f64) = (37.6188, -122.3756);
 
-/// A minimal app running the whole combat chain over hand-placed entities.
-fn combat_app(seed: u64, initial_living_teams: u8) -> App {
+fn params() -> SimParams {
+    SimParams {
+        rate_hz: 120.0,
+        dt: DT,
+        max_time_s: 0.0,
+        speed: 0.0,
+        lease_ticks: None,
+        lockstep: false,
+        lockstep_timeout_s: 1.0,
+    }
+}
+
+fn base_app(seed: u64, teams: u8) -> App {
     let mut app = App::new();
-    let origin = Geodetic::from_degrees(37.6188, -122.3756, 0.0);
-    app.insert_resource(SimParams { rate_hz: 120.0, dt: DT, max_time_s: 0.0, realtime: false })
-        .insert_resource(WorldFrame(LocalFrame::new(origin)))
+    app.insert_resource(params())
+        // The grid sits 3 km up, so level rounds never reach the h = 0 cut-off.
+        .insert_resource(WorldFrame(LocalFrame::new(Geodetic::from_degrees(
+            ORIGIN.0, ORIGIN.1, 3000.0,
+        ))))
         .insert_resource(CombatParams::default())
         .insert_resource(CombatRng::seeded(seed))
-        .insert_resource(CombatState { initial_living_teams })
-        .add_systems(
-            Update,
-            (fire_guns, step_bullets, resolve_hits, apply_damage, end_on_elimination).chain(),
-        );
+        .insert_resource(CombatState { initial_living_teams: teams })
+        .insert_resource(SimClock::default())
+        .insert_resource(SimStatus::default())
+        .insert_resource(EventLog::default())
+        .add_observer(on_kill);
     app
 }
 
-fn vec3(p: DVec3) -> Vec3 {
-    Vec3::new(p.x as f32, p.y as f32, p.z as f32)
+/// The full chain (aircraft are stationary here, so no FDM step is needed).
+fn combat_app(seed: u64, teams: u8) -> App {
+    let mut app = base_app(seed, teams);
+    app.add_systems(
+        Update,
+        (fire_guns, step_bullets, resolve_hits, apply_damage, end_on_elimination, publish_events)
+            .chain(),
+    );
+    app
 }
 
-/// Spawn an armed aircraft at `pos` (ENU, m) with ENU velocity `vel`, heading
-/// `psi_rad` (0 = North, +E), wings level. Trigger starts off.
-fn spawn_shooter(app: &mut App, id: u32, team: u8, pos: DVec3, vel: DVec3, psi_rad: f64, gun: Gun) {
-    let geo = GeoState {
-        psi_rad,
-        vel_east_mps: vel.x,
-        vel_north_mps: vel.y,
-        vel_down_mps: -vel.z,
-        ..Default::default()
-    };
+/// Every event of the latest update.
+fn events(app: &App) -> Vec<EventKind> {
+    app.world().resource::<EventLog>().last().iter().map(|e| e.kind.clone()).collect()
+}
+
+fn state(pos: DVec3, prev: DVec3, vel: DVec3, psi_rad: f64) -> AircraftState {
+    AircraftState {
+        // Near the grid origin, so local level == grid.
+        fdm: FdmState { lat_deg: ORIGIN.0, lon_deg: ORIGIN.1, psi_rad, ..Default::default() },
+        pos_enu: Enu { e: pos.x, n: pos.y, u: pos.z },
+        prev_pos_enu: Enu { e: prev.x, n: prev.y, u: prev.z },
+        vel_enu: Enu { e: vel.x, n: vel.y, u: vel.z },
+    }
+}
+
+fn spawn_shooter(app: &mut App, id: u32, team: u8, vel: DVec3, psi_rad: f64, gun: Gun) {
     app.world_mut().spawn((
         Aircraft { id },
-        geo,
-        Transform::from_translation(vec3(pos)),
+        state(DVec3::ZERO, DVec3::ZERO, vel, psi_rad),
         Team(team),
         Health::full(100.0),
-        Trigger(false),
+        Trigger(true),
         gun,
     ));
 }
 
-/// Spawn an unarmed target (no `Gun`, so it never fires) at `pos`.
-fn spawn_target(app: &mut App, id: u32, team: u8, pos: DVec3, health: f32) {
+fn spawn_target(app: &mut App, id: u32, team: u8, pos: DVec3, prev: DVec3, hp: f32) {
     app.world_mut().spawn((
         Aircraft { id },
-        GeoState::default(),
-        Transform::from_translation(vec3(pos)),
+        state(pos, prev, DVec3::ZERO, 0.0),
         Team(team),
-        Health::full(health),
-        Trigger(false),
+        Health::full(hp),
     ));
 }
 
-fn set_trigger(app: &mut App, id: u32, on: bool) {
-    let mut q = app.world_mut().query::<(&Aircraft, &mut Trigger)>();
-    let world = app.world_mut();
-    for (a, mut t) in q.iter_mut(world) {
-        if a.id == id {
-            t.0 = on;
-        }
-    }
+fn spawn_round(app: &mut App, prev: DVec3, pos: DVec3) {
+    let round = CombatParams::default().round;
+    app.world_mut().spawn(Bullet {
+        pos,
+        prev_pos: prev,
+        vel: (pos - prev) / DT,
+        ballistics: round,
+        owner_id: 99,
+        team: 0,
+        ttl_s: 3.0,
+    });
 }
 
 fn hp_of(app: &mut App, id: u32) -> f32 {
     let mut q = app.world_mut().query::<(&Aircraft, &Health)>();
-    let world = app.world();
-    q.iter(world).find(|(a, _)| a.id == id).map(|(_, h)| h.hp).expect("aircraft present")
+    q.iter(app.world()).find(|(a, _)| a.id == id).map(|(_, h)| h.hp).unwrap()
 }
 
 fn is_dead(app: &mut App, id: u32) -> bool {
-    let mut q = app.world_mut().query::<(&Aircraft, Option<&Dead>)>();
-    let world = app.world();
-    q.iter(world).find(|(a, _)| a.id == id).map(|(_, d)| d.is_some()).expect("aircraft present")
+    let mut q = app.world_mut().query::<(&Aircraft, Has<Dead>)>();
+    q.iter(app.world()).find(|(a, _)| a.id == id).map(|(_, d)| d).unwrap()
 }
 
-fn bullet_count(app: &mut App) -> usize {
+fn bullets(app: &mut App) -> Vec<Bullet> {
     let mut q = app.world_mut().query::<&Bullet>();
-    let world = app.world();
-    q.iter(world).count()
+    q.iter(app.world()).copied().collect()
 }
 
-/// Bit-exact, sorted bullet positions — for comparing two runs byte for byte.
-fn bullet_pos_bits(app: &mut App) -> Vec<[u32; 3]> {
-    let mut q = app.world_mut().query::<(&Bullet, &Transform)>();
-    let world = app.world();
-    let mut v: Vec<[u32; 3]> = q
-        .iter(world)
-        .map(|(_, t)| {
-            [t.translation.x.to_bits(), t.translation.y.to_bits(), t.translation.z.to_bits()]
-        })
-        .collect();
-    v.sort_unstable();
-    v
+fn hits_only(app: &mut App) {
+    app.add_systems(Update, (resolve_hits, apply_damage).chain());
 }
 
 #[test]
-fn swept_test_prevents_tunneling() {
-    // A very fast round whose single-tick step (~20 m) straddles an 8 m-radius
-    // target: both segment endpoints end up ~10 m from the target centre, so a
-    // point test at either tick would MISS — only the swept segment test catches
-    // it. We spawn the round directly to control the geometry exactly.
-    let mut app = combat_app(1, 2);
-    spawn_target(&mut app, 2, 1, DVec3::new(100.0, 0.0, 0.0), 100.0);
-    let round = CombatParams::default().round;
-    app.world_mut().spawn((
-        Bullet {
-            vel_enu: DVec3::new(2500.0, 0.0, 0.0),
-            ballistics: round,
-            owner_id: 1,
-            team: 0,
-            ttl_s: 3.0,
-        },
-        Transform::from_translation(Vec3::new(90.0, 0.0, 0.0)),
-    ));
-
+fn swept_test_catches_a_round_that_steps_past_a_target() {
+    // A 2500 m/s round steps 20.8 m in one tick, straddling an 8 m-radius target:
+    // both endpoints are ~10 m away, only the swept test sees the pass.
+    let mut app = base_app(1, 2);
+    hits_only(&mut app);
+    spawn_target(&mut app, 2, 1, DVec3::new(100.0, 0.0, 0.0), DVec3::new(100.0, 0.0, 0.0), 100.0);
+    spawn_round(&mut app, DVec3::new(90.0, 0.0, 0.0), DVec3::new(110.8, 0.0, 0.0));
     app.update();
+    assert!(hp_of(&mut app, 2) < 100.0);
+    assert!(bullets(&mut app).is_empty(), "a round that connects is consumed");
+}
 
-    assert!(
-        hp_of(&mut app, 2) < 100.0,
-        "swept test must catch a round that steps clean past a target"
-    );
-    assert_eq!(bullet_count(&mut app), 0, "a round that connects is consumed");
+#[test]
+fn a_target_moving_during_the_tick_is_tested_where_it_was() {
+    // A 1000 m/s round crosses in front of a target retreating south at 300 m/s.
+    // Its end-of-tick position is 9.5 m off the round's path (a miss for an
+    // end-point test), but in relative motion they pass 7.9 m apart: a hit.
+    let mut app = base_app(1, 2);
+    hits_only(&mut app);
+    spawn_target(&mut app, 2, 1, DVec3::new(4.17, -9.5, 0.0), DVec3::new(4.17, -7.0, 0.0), 100.0);
+    spawn_round(&mut app, DVec3::ZERO, DVec3::new(1000.0 * DT, 0.0, 0.0));
+    app.update();
+    assert!(hp_of(&mut app, 2) < 100.0, "the relative-motion sweep must register the pass");
+}
+
+#[test]
+fn a_round_hits_the_first_target_it_reaches() {
+    let mut app = base_app(1, 2);
+    hits_only(&mut app);
+    // Both targets lie within the hit radius of the round's 20 m segment.
+    spawn_target(&mut app, 7, 1, DVec3::new(17.0, 0.0, 0.0), DVec3::new(17.0, 0.0, 0.0), 100.0);
+    spawn_target(&mut app, 8, 1, DVec3::new(3.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0), 100.0);
+    spawn_round(&mut app, DVec3::new(-6.0, 0.0, 0.0), DVec3::new(14.0, 0.0, 0.0));
+    app.update();
+    assert!(hp_of(&mut app, 8) < 100.0, "the nearer target along the path takes the hit");
+    assert_eq!(hp_of(&mut app, 7), 100.0, "one round damages one target");
 }
 
 #[test]
 fn muzzle_velocity_is_boresight_plus_own_velocity() {
-    // Fire-only app: no `step_bullets`, so the round's stored velocity is the
-    // pristine muzzle velocity. Facing East (ψ=90°) while flying North at 200 m/s,
-    // the round should leave at (muzzle_speed East) + (own North velocity) — the
-    // physical lead the shooter's motion imparts.
-    let mut app = App::new();
-    app.insert_resource(SimParams { rate_hz: 120.0, dt: DT, max_time_s: 0.0, realtime: false })
-        .insert_resource(CombatParams::default())
-        .insert_resource(CombatRng::seeded(1))
-        .add_systems(Update, fire_guns);
-
+    let mut app = base_app(1, 1);
+    app.add_systems(Update, fire_guns);
     let mut gun = Gun::m61a1();
-    gun.dispersion_rad = 0.0; // deterministic boresight
-    spawn_shooter(&mut app, 1, 0, DVec3::ZERO, DVec3::new(0.0, 200.0, 0.0), FRAC_PI_2, gun);
-    set_trigger(&mut app, 1, true);
-
-    // 100 Hz gun on a 120 Hz step fires < 1 round/tick, so two ticks land exactly
-    // one round.
+    gun.dispersion_rad = 0.0;
+    // Facing east while flying north at 200 m/s.
+    spawn_shooter(&mut app, 1, 0, DVec3::new(0.0, 200.0, 0.0), FRAC_PI_2, gun);
+    // 100 rounds/s at 120 Hz: two ticks fire exactly one round.
     app.update();
     app.update();
-
-    let mut q = app.world_mut().query::<&Bullet>();
-    let world = app.world();
-    let bullets: Vec<&Bullet> = q.iter(world).collect();
-    assert_eq!(bullets.len(), 1, "two ticks at 100 Hz should fire exactly one round");
-    let v = bullets[0].vel_enu;
-    assert!((v.x - 1030.0).abs() < 1e-6, "East component should be the muzzle speed, got {}", v.x);
-    assert!((v.y - 200.0).abs() < 1e-6, "North component should inherit own velocity, got {}", v.y);
-    assert!(v.z.abs() < 1e-9, "level shot has no vertical component, got {}", v.z);
+    let b = bullets(&mut app);
+    assert_eq!(b.len(), 1);
+    assert!((b[0].vel - DVec3::new(1030.0, 200.0, 0.0)).length() < 1e-6, "{:?}", b[0].vel);
+    assert!((b[0].pos - DVec3::new(4.0, 0.0, 0.0)).length() < 1e-9, "leaves 4 m ahead on the nose");
 }
 
 #[test]
-fn sustained_burst_kills_target_and_ends_episode() {
-    // Shooter at the origin facing East, a stationary target 80 m ahead on the
-    // boresight. With zero dispersion every round connects; a 20 HP target dies
-    // after ten 2 HP hits, and the two-team engagement then terminates.
+fn sustained_burst_kills_and_decides_the_engagement() {
     let mut app = combat_app(42, 2);
     let mut gun = Gun::m61a1();
     gun.dispersion_rad = 0.0;
-    spawn_shooter(&mut app, 1, 0, DVec3::ZERO, DVec3::ZERO, FRAC_PI_2, gun);
-    spawn_target(&mut app, 2, 1, DVec3::new(80.0, 0.0, 0.0), 20.0);
-    set_trigger(&mut app, 1, true);
-
+    spawn_shooter(&mut app, 1, 0, DVec3::ZERO, FRAC_PI_2, gun);
+    spawn_target(&mut app, 2, 1, DVec3::new(80.0, 0.0, 0.0), DVec3::new(80.0, 0.0, 0.0), 20.0);
     let mut exited = false;
+    let mut seen = Vec::new();
     for _ in 0..400 {
         app.update();
+        seen.extend(events(&app));
         if app.should_exit().is_some() {
             exited = true;
             break;
         }
     }
+    assert!(exited, "one team eliminated ends the run");
+    assert!(is_dead(&mut app, 2) && hp_of(&mut app, 2) <= 0.0);
+    assert!(!is_dead(&mut app, 1));
 
-    assert!(exited, "the engagement should end once one team is eliminated");
-    assert!(is_dead(&mut app, 2), "the target should be marked Dead");
-    assert!(
-        hp_of(&mut app, 2) <= 0.0,
-        "the target's HP should be depleted, got {}",
-        hp_of(&mut app, 2)
+    // Reported: the press, every hit (the shooter's, on the target, where the
+    // round struck), the kill credited to the shooter, then the run's end.
+    assert_eq!(seen[0], EventKind::TriggerPressed { aircraft_id: 1, ammo: 511 });
+    let n = seen.len();
+    let hits = &seen[1..n - 2];
+    let damage = CombatParams::default().damage_per_hit;
+    for (i, hit) in hits.iter().enumerate() {
+        let EventKind::Hit { shooter_id, target_id, hit_points, pos_enu, .. } = *hit else {
+            panic!("event {i} between the press and the kill: {hit:?}");
+        };
+        assert_eq!((shooter_id, target_id), (1, 2));
+        assert_eq!(hit_points, 20.0 - damage * (i + 1) as f32);
+        let miss = ((pos_enu.e - 80.0).powi(2) + pos_enu.n.powi(2) + pos_enu.u.powi(2)).sqrt();
+        assert!(miss <= CombatParams::default().hit_radius_m + 1e-9, "struck {miss} m off");
+    }
+    assert!(matches!(seen[n - 2], EventKind::Kill { victim_id: 2, killer_id: Some(1), .. }));
+    assert!(matches!(
+        seen[n - 1],
+        EventKind::RunEnded { reason: EndReason::EngagementDecided, .. }
+    ));
+}
+
+#[test]
+fn a_shooter_destroyed_mid_burst_reports_its_release_then_its_death() {
+    let mut app = combat_app(5, 1);
+    spawn_shooter(&mut app, 1, 0, DVec3::ZERO, FRAC_PI_2, Gun::m61a1());
+    for _ in 0..30 {
+        app.update();
+    }
+    let mut q = app.world_mut().query::<(Entity, &Gun)>();
+    let (shooter, ammo) = q.iter(app.world()).map(|(e, g)| (e, g.ammo)).next().unwrap();
+    assert!(ammo < 511, "the burst fired");
+    // Destroyed by something other than a round: nobody to credit.
+    app.world_mut().entity_mut(shooter).insert(Dead);
+    app.update();
+    assert_eq!(
+        events(&app),
+        [
+            EventKind::TriggerReleased { aircraft_id: 1, rounds_fired: 511 - ammo, ammo },
+            EventKind::Kill {
+                victim_id: 1,
+                killer_id: None,
+                pos_enu: Enu { e: 0.0, n: 0.0, u: 0.0 }
+            },
+        ]
     );
-    assert!(!is_dead(&mut app, 1), "the shooter should survive");
 }
 
 #[test]
 fn friendly_fire_does_no_damage() {
-    // Same team, single-team scenario: rounds pass through the friendly and the
-    // episode never self-terminates.
     let mut app = combat_app(3, 1);
     let mut gun = Gun::m61a1();
     gun.dispersion_rad = 0.0;
-    spawn_shooter(&mut app, 1, 0, DVec3::ZERO, DVec3::ZERO, FRAC_PI_2, gun);
-    spawn_target(&mut app, 2, 0, DVec3::new(80.0, 0.0, 0.0), 20.0);
-    set_trigger(&mut app, 1, true);
-
+    spawn_shooter(&mut app, 1, 0, DVec3::ZERO, FRAC_PI_2, gun);
+    spawn_target(&mut app, 2, 0, DVec3::new(80.0, 0.0, 0.0), DVec3::new(80.0, 0.0, 0.0), 20.0);
     for _ in 0..200 {
         app.update();
     }
-
-    assert!((hp_of(&mut app, 2) - 20.0).abs() < f32::EPSILON, "a teammate takes no damage");
+    assert_eq!(hp_of(&mut app, 2), 20.0);
     assert!(app.should_exit().is_none(), "a single-team scenario never self-terminates");
 }
 
 #[test]
+fn rounds_below_the_ellipsoid_are_culled() {
+    let mut app = combat_app(1, 1);
+    // 3001 m below a grid origin 3000 m above the ellipsoid.
+    spawn_round(&mut app, DVec3::new(0.0, 0.0, -3000.5), DVec3::new(0.0, 0.0, -3001.0));
+    app.update();
+    assert!(bullets(&mut app).is_empty());
+}
+
+#[test]
 fn engagement_is_deterministic() {
-    // Two identical runs (same seed, dispersion on so the RNG is exercised) must
-    // produce byte-identical state: HP, round count, and every round's position.
     let run = || {
         let mut app = combat_app(7, 2);
-        spawn_shooter(&mut app, 1, 0, DVec3::ZERO, DVec3::ZERO, FRAC_PI_2, Gun::m61a1());
-        spawn_target(&mut app, 2, 1, DVec3::new(200.0, 0.0, 0.0), 1000.0);
-        set_trigger(&mut app, 1, true);
+        spawn_shooter(&mut app, 1, 0, DVec3::ZERO, FRAC_PI_2, Gun::m61a1());
+        spawn_shooter(&mut app, 3, 0, DVec3::new(0.0, 10.0, 0.0), FRAC_PI_2, Gun::m61a1());
+        spawn_target(
+            &mut app,
+            2,
+            1,
+            DVec3::new(200.0, 0.0, 0.0),
+            DVec3::new(200.0, 0.0, 0.0),
+            1000.0,
+        );
         for _ in 0..120 {
             app.update();
         }
-        (hp_of(&mut app, 2), bullet_count(&mut app), bullet_pos_bits(&mut app))
+        let mut pos: Vec<[u64; 3]> =
+            bullets(&mut app).iter().map(|b| b.pos.to_array().map(f64::to_bits)).collect();
+        pos.sort_unstable();
+        (hp_of(&mut app, 2).to_bits(), pos)
     };
-
-    let (hp_a, n_a, pos_a) = run();
-    let (hp_b, n_b, pos_b) = run();
-    assert_eq!(hp_a.to_bits(), hp_b.to_bits(), "target HP must be identical across runs");
-    assert_eq!(n_a, n_b, "round count must be identical across runs");
-    assert_eq!(pos_a, pos_b, "every round's position must be identical across runs");
-    assert!(n_a > 0, "the run should actually fire rounds");
-    assert!(hp_a < 1000.0, "the run should actually land hits");
+    let (hp_a, pos_a) = run();
+    assert!(!pos_a.is_empty() && f32::from_bits(hp_a) < 1000.0, "the run fires and hits");
+    assert_eq!(run(), (hp_a, pos_a));
 }

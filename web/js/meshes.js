@@ -1,10 +1,23 @@
-// Procedural aircraft meshes + the coordinate/attitude math that places them.
+// Procedural aircraft meshes, their colours, and the coordinate/attitude math
+// that places them.
 //
 // No external model assets: an F-16-style jet (slender fuselage, chin intake,
 // bubble canopy, cropped-delta wing, swept tail) and an F450-like quad (X-frame
-// + 4 rotors) are built from primitives, tinted by vehicle class with a per-id
-// hue so individuals in a fleet are distinguishable. The mesh is chosen by
-// VehicleKind (fixed-wing vs multirotor), not the specific JSBSim model.
+// + 4 rotors) are built from primitives. The mesh is chosen by VehicleKind
+// (fixed-wing vs multirotor), not the specific JSBSim model. Each kind also
+// has a flat few-triangle silhouette (buildGhostGeometry) for the scene's
+// instanced preview ghosts.
+//
+// Colours (aircraftColor): in the plain environment, a per-class hue band with
+// a per-id hue; in the sky environment, saturated team hues that stand out
+// against sky and imagery, with per-id jitter so teammates differ. The scene
+// recolours an aircraft in place (tintAircraft) when its team or the
+// environment changes. In the sky the body is also two-tone (setTwoTone):
+// a darker belly reads against bright sky from below, the full-colour top
+// against the ground from above. That is one onBeforeCompile shared by every
+// body material, keyed on the normal's y in aircraft axes, so all aircraft
+// share one program; geometry rotations are baked in so mesh-local normals
+// are aircraft-axis normals.
 //
 // Frames:
 //   * World is Three.js (Y up). We map the sim's ENU grid as
@@ -17,8 +30,17 @@
 
 import * as THREE from "three";
 
-// Visual exaggeration so ~10 m aircraft are legible against a km-scale grid.
-export const MODEL_SCALE = 4;
+// The two-tone belly factor in sky mode (diffuse × this on downward faces).
+const BELLY = 0.55;
+const twoTone = { value: 1 }; // shared uniform: 1 = off (plain), BELLY = on (sky)
+
+// Turn the sky two-tone on or off for every body material at once.
+export function setTwoTone(on) {
+  twoTone.value = on ? BELLY : 1;
+}
+
+// Sky-mode team hues (degrees): blue, red, green, amber; others are hashed.
+const TEAM_HUES = [215, 4, 140, 38];
 
 const _m = new THREE.Matrix4();
 const _x = new THREE.Vector3();
@@ -54,39 +76,80 @@ export function attitudeToQuaternion(phi, theta, psi, out = new THREE.Quaternion
   return out.setFromRotationMatrix(_m);
 }
 
-// Deterministic, distinct-per-aircraft colour within a per-class hue band.
-export function aircraftColor(kind, id) {
-  const baseHue = kind === "multirotor" ? 32 : 205; // amber vs. steel blue
-  const jitter = ((id * 47) % 70) - 35;             // ±35° spread across the fleet
-  const c = new THREE.Color();
-  c.setHSL((((baseHue + jitter) % 360) + 360) % 360 / 360, 0.62, 0.58);
-  return c;
+// The colour of aircraft `id` into `out`. Plain (`sky` false): a distinct
+// per-id hue within a per-class band; an unknown vehicle class (a newer sim)
+// renders as a desaturated jet. Sky: the team's hue, ±12° and lightness
+// 0.46–0.56 per id; a missing team counts as team 0.
+export function aircraftColor(kind, id, team, sky, out = new THREE.Color()) {
+  if (!sky) {
+    const baseHue = kind === "multirotor" ? 32 : 205; // amber vs. steel blue
+    const jitter = ((id * 47) % 70) - 35;             // ±35° spread across the fleet
+    return out.setHSL((((baseHue + jitter) % 360) + 360) % 360 / 360, kind === "unknown" ? 0.08 : 0.62, 0.58);
+  }
+  const t = Number.isInteger(team) ? team : 0;
+  const hue = t >= 0 && t < TEAM_HUES.length ? TEAM_HUES[t] : t * 137.508 + 75; // golden-angle hash
+  const jitter = (((id * 47) % 25) + 25) % 25 - 12;
+  const light = 0.46 + ((((id * 29) % 11) + 11) % 11) / 100;
+  // HSL in sRGB (not three's linear working space), so these are the
+  // saturated mid-tones the numbers say; the plain colours keep today's look.
+  return out.setHSL((((hue + jitter) % 360) + 360) % 360 / 360, 0.85, light, THREE.SRGBColorSpace);
 }
 
+// Recolour a built aircraft to `color`: its body materials (each keeping its
+// HSL offset from the base; fixed-colour parts stay), the base colour and the
+// label's border.
+export function tintAircraft(group, color) {
+  const ud = group.userData;
+  ud.baseColor.copy(color);
+  for (const m of ud.mats) {
+    const tone = m.userData.tone;
+    if (!tone) continue;
+    m.color.copy(color);
+    if (tone[0] || tone[1] || tone[2]) m.color.offsetHSL(tone[0], tone[1], tone[2]);
+  }
+  drawLabel(ud.label, color);
+  ud.label.material.map.needsUpdate = true;
+}
+
+// A constant-screen-size name tag. With `sizeAttenuation: false` three.js
+// multiplies the sprite's scale by its view depth, so a fixed scale is a fixed
+// on-screen size; the scene sets that scale each frame from the container
+// height, and lifts the tag in screen space (`center.y`) just clear of the
+// aircraft and any frame around it, whichever way the camera looks. Fog is off
+// so far-off tags stay legible. The canvas is 2:1 (the scene's NAME_ASPECT):
+// wide enough for a four-digit id at full size; longer ids are squeezed to fit.
 function labelSprite(text, color) {
   const canvas = document.createElement("canvas");
-  canvas.width = 256;
+  canvas.width = 128;
   canvas.height = 64;
-  const ctx = canvas.getContext("2d");
-  ctx.fillStyle = "rgba(10,14,20,0.72)";
-  roundRect(ctx, 4, 4, 248, 56, 12);
-  ctx.fill();
-  ctx.strokeStyle = `#${color.getHexString()}`;
-  ctx.lineWidth = 3;
-  roundRect(ctx, 4, 4, 248, 56, 12);
-  ctx.stroke();
-  ctx.fillStyle = "#e8eef6";
-  ctx.font = "bold 34px system-ui, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, 128, 34);
-
   const tex = new THREE.CanvasTexture(canvas);
   tex.anisotropy = 4;
-  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
-  sprite.scale.set(12, 3, 1);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, depthTest: false, transparent: true, sizeAttenuation: false, fog: false,
+  }));
+  sprite.center.set(0.5, -1); // until the scene places it
   sprite.renderOrder = 10;
+  sprite.userData.text = text;
+  drawLabel(sprite, color);
   return sprite;
+}
+
+// (Re)draw a name tag's canvas: dark plate, border in the aircraft colour.
+function drawLabel(sprite, color) {
+  const ctx = sprite.material.map.image.getContext("2d");
+  ctx.clearRect(0, 0, 128, 64);
+  ctx.fillStyle = "rgba(10,14,20,0.78)";
+  roundRect(ctx, 4, 4, 120, 56, 12);
+  ctx.fill();
+  ctx.strokeStyle = `#${color.getHexString()}`;
+  ctx.lineWidth = 4;
+  roundRect(ctx, 4, 4, 120, 56, 12);
+  ctx.stroke();
+  ctx.fillStyle = "#e8eef6";
+  ctx.font = "bold 40px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(sprite.userData.text, 64, 35, 104);
 }
 
 function roundRect(ctx, x, y, w, h, r) {
@@ -99,14 +162,35 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-function bodyMaterial(color) {
-  return new THREE.MeshStandardMaterial({
+// The shared two-tone patch: the normal's y in aircraft axes (flipped on back
+// faces, so a double-sided plate's underside counts as belly) darkens the
+// diffuse colour toward BELLY. One function for every body material, so its
+// source — three's program cache key — is the same and they share a program.
+function twoToneCompile(shader) {
+  shader.uniforms.uBelly = twoTone;
+  shader.vertexShader = shader.vertexShader
+    .replace("#include <common>", "#include <common>\nvarying float vBodyUp;")
+    .replace("#include <beginnormal_vertex>", "#include <beginnormal_vertex>\n\tvBodyUp = objectNormal.y;");
+  shader.fragmentShader = shader.fragmentShader
+    .replace("#include <common>", "#include <common>\nuniform float uBelly;\nvarying float vBodyUp;")
+    .replace("#include <color_fragment>", "#include <color_fragment>\n"
+      + "\tdiffuseColor.rgb *= mix(uBelly, 1.0, smoothstep(-0.3, 0.3, gl_FrontFacing ? vBodyUp : -vBodyUp));");
+}
+
+// A body material in the aircraft colour offset by `tone` (HSL deltas), or —
+// with `tone` null — a fixed colour that recolouring leaves alone.
+function bodyMaterial(color, tone = [0, 0, 0]) {
+  const m = new THREE.MeshStandardMaterial({
     color,
     metalness: 0.35,
     roughness: 0.55,
-    emissive: color.clone().multiplyScalar(0.0),
+    emissive: 0x000000,
     emissiveIntensity: 1.0,
   });
+  if (tone && (tone[0] || tone[1] || tone[2])) m.color.offsetHSL(tone[0], tone[1], tone[2]);
+  m.userData.tone = tone;
+  m.onBeforeCompile = twoToneCompile;
+  return m;
 }
 
 function box(w, h, d, mat, x = 0, y = 0, z = 0) {
@@ -124,12 +208,11 @@ function disc(radius, mat) {
 function buildJet(color, mats) {
   const g = new THREE.Group();
   const body = bodyMaterial(color); mats.push(body);
-  const accent = bodyMaterial(color.clone().offsetHSL(0, -0.08, -0.24)); mats.push(accent);
+  const accent = bodyMaterial(color, [0, -0.08, -0.24]); mats.push(accent);
 
   // Slender fuselage along Z (nose +Z) with a long pointed radome up front.
   g.add(box(0.85, 0.9, 6.4, body, 0, 0, -0.3));
-  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.42, 2.6, 16), accent);
-  nose.rotation.x = Math.PI / 2; // apex -> +Z
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.42, 2.6, 16).rotateX(Math.PI / 2), accent); // apex -> +Z
   nose.position.set(0, -0.05, 4.1);
   g.add(nose);
 
@@ -156,8 +239,7 @@ function buildJet(color, mats) {
   wing.lineTo(-3.1, -1.4);  // port trailing tip
   wing.lineTo(-3.1, -0.5);  // port leading tip
   wing.closePath();
-  const wingMesh = new THREE.Mesh(new THREE.ShapeGeometry(wing), wingMat);
-  wingMesh.rotation.x = Math.PI / 2;
+  const wingMesh = new THREE.Mesh(new THREE.ShapeGeometry(wing).rotateX(Math.PI / 2), wingMat);
   wingMesh.position.set(0, -0.12, -0.3);
   g.add(wingMesh);
 
@@ -165,7 +247,7 @@ function buildJet(color, mats) {
   g.add(box(3.4, 0.12, 1.0, body, 0, 0, -3.05));
 
   // Swept single vertical fin: shape XY -> world ZY (shape +x -> world -Z, aft).
-  const finMat = bodyMaterial(color.clone().offsetHSL(0, 0, -0.05));
+  const finMat = bodyMaterial(color, [0, 0, -0.05]);
   finMat.side = THREE.DoubleSide; mats.push(finMat);
   const fin = new THREE.Shape();
   fin.moveTo(0, 0);       // base leading
@@ -179,8 +261,7 @@ function buildJet(color, mats) {
   g.add(finMesh);
 
   // Exhaust nozzle + a static afterburner glow at the tail.
-  const nozzle = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.4, 0.7, 16), accent);
-  nozzle.rotation.x = Math.PI / 2;
+  const nozzle = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.4, 0.7, 16).rotateX(Math.PI / 2), accent);
   nozzle.position.set(0, 0, -3.7);
   g.add(nozzle);
   const burnerMat = new THREE.MeshBasicMaterial({ color: 0xff8a3d, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
@@ -190,14 +271,15 @@ function buildJet(color, mats) {
   g.add(burner);
 
   g.userData.rotors = []; // a jet has no spinning prop/rotor discs
+  g.userData.span = 9.5;  // nose-to-nozzle length, the largest dimension (model units)
   return g;
 }
 
 function buildMultirotor(color, mats) {
   const g = new THREE.Group();
   const body = bodyMaterial(color); mats.push(body);
-  const armMat = bodyMaterial(color.clone().offsetHSL(0, -0.05, -0.32)); mats.push(armMat);
-  const front = bodyMaterial(new THREE.Color(0xff5a4d)); mats.push(front); // heading marker
+  const armMat = bodyMaterial(color, [0, -0.05, -0.32]); mats.push(armMat);
+  const front = bodyMaterial(new THREE.Color(0xff5a4d), null); mats.push(front); // heading marker
 
   g.add(box(1.4, 0.5, 1.4, body)); // hub
 
@@ -226,34 +308,80 @@ function buildMultirotor(color, mats) {
   }
   g.userData.rotors = rotors;
   g.userData.spinAxis = "y";
+  g.userData.span = 5.6;  // rotor tip to rotor tip across the X-frame (model units)
   return g;
 }
 
-// Build one aircraft object. Returns a THREE.Group carrying, in userData:
-//   { id, kind, mats:[], rotors:[], spinAxis, halo, label }
-export function buildAircraft(kind, id) {
-  const color = aircraftColor(kind, id);
+// Build one aircraft object in `color`. Returns a THREE.Group carrying, in
+// userData:
+//   { id, kind, mats:[], bodies:[], rotors:[], spinAxis, span, baseColor, label }
+// `bodies` are the solid meshes (everything drawn with a `mats` material, not
+// the translucent rotor / afterburner discs); they are also on `maskLayer`,
+// which the scene's outline pass draws. `span` is the model's largest
+// dimension in model units (before the scene's scale), which the scene uses to
+// keep each aircraft a minimum size on screen. `label` is NOT parented to the
+// group: it keeps a constant on-screen size, so it must not inherit the
+// group's (distance-dependent) scale. The caller adds it to the scene and
+// positions it above the aircraft each frame.
+export function buildAircraft(kind, id, color, maskLayer) {
+  const base = color.clone();
   const mats = [];
-  const group = kind === "multirotor" ? buildMultirotor(color, mats) : buildJet(color, mats);
-  group.scale.setScalar(MODEL_SCALE);
-
-  // Selection halo (hidden until selected).
-  const halo = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(3.6, 1),
-    new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.5 }),
-  );
-  halo.visible = false;
-  group.add(halo);
-
-  const label = labelSprite(String(id), color);
-  label.position.set(0, 3.2, 0);
-  group.add(label);
+  const group = kind === "multirotor" ? buildMultirotor(base, mats) : buildJet(base, mats);
+  const bodies = [];
+  group.traverse((o) => {
+    if (!o.isMesh || !mats.includes(o.material)) return;
+    o.layers.enable(maskLayer);
+    bodies.push(o);
+  });
 
   group.userData.id = id;
   group.userData.kind = kind;
   group.userData.mats = mats;
-  group.userData.baseColor = color;
-  group.userData.halo = halo;
-  group.userData.label = label;
+  group.userData.bodies = bodies;
+  group.userData.baseColor = base;
+  group.userData.label = labelSprite(String(id), base);
   return group;
+}
+
+// A flat, few-triangle silhouette of the `kind`'s mesh for the scene's
+// instanced preview ghosts, in the same model units and axes (nose +Z, up
+// +Y) as buildAircraft: the jet's planform plus its fin, or the quad's hub,
+// nose marker and rotor discs. Returns { geom, span } (span as in userData).
+export function buildGhostGeometry(kind) {
+  if (kind === "multirotor") {
+    const shapes = [];
+    const hub = new THREE.Shape();
+    hub.moveTo(-0.7, -0.7); hub.lineTo(0.7, -0.7); hub.lineTo(0.7, 0.7); hub.lineTo(-0.7, 0.7); hub.closePath();
+    const nose = new THREE.Shape();
+    nose.moveTo(0, 1.6); nose.lineTo(-0.45, 0.85); nose.lineTo(0.45, 0.85); nose.closePath();
+    shapes.push(hub, nose);
+    const d = 2.3 * Math.SQRT1_2;
+    for (const [sx, sy] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const r = new THREE.Shape();
+      r.absarc(sx * d, sy * d, 1.15, 0, Math.PI * 2, false);
+      shapes.push(r);
+    }
+    return { geom: new THREE.ShapeGeometry(shapes, 8).rotateX(Math.PI / 2), span: 5.6 };
+  }
+  // Planform (shape +y → +Z, the nose), one outline from the nose round the
+  // starboard side and back up the port side.
+  const half = [
+    [0.45, 3.2], [0.5, 1.6], [3.1, -0.6], [3.1, -1.5], [0.5, -2.4],
+    [1.7, -2.6], [1.7, -3.5], [0.4, -3.6], [0.35, -4.05],
+  ];
+  const plan = new THREE.Shape();
+  plan.moveTo(0, 5.4);
+  for (const [x, y] of half) plan.lineTo(x, y);
+  for (let i = half.length - 1; i >= 0; i--) plan.lineTo(-half[i][0], half[i][1]);
+  plan.closePath();
+  const flat = new THREE.ShapeGeometry(plan).rotateX(Math.PI / 2).toNonIndexed();
+  const p = flat.attributes.position.array;
+  const fin = [0, 0.4, -1.4, 0, 2.2, -3.3, 0, 0.4, -3.4]; // the swept fin, one triangle
+  const pos = new Float32Array(p.length + fin.length);
+  pos.set(p);
+  pos.set(fin, p.length);
+  flat.dispose();
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  return { geom, span: 9.5 };
 }

@@ -1,73 +1,109 @@
-# ASTRUM example flight controller (Python)
+# ASTRUM Python controller SDK (`astrum_client`) and example controller
 
-The Python twin of [`controllers/cpp`](../cpp) — a minimal out-of-sim flight
-controller that talks to `astrum-sim` **only over Zenoh**, using the shared Cap'n
-Proto schema (`crates/astrum-proto/schema/astrum.capnp`) for the wire format. It
-exists to prove a controller in any language plugs into ASTRUM with nothing but
-**eclipse-zenoh + pycapnp** (both ship in the dev image); there is **no codegen step** —
-`capnp.load()` reads `astrum.capnp` at runtime. Telemetry and commands share **one**
-`mode=peer` Zenoh session connecting to `tcp/sim:7447` (not two ports); the id is in the key:
+This directory is the **`astrum-client`** package — the Python half of the controller SDK — plus
+`example.py`, the Python twin of [`controllers/cpp`](../cpp). The contract both SDKs implement
+(names, the `Law` API, the transport, the control-loop algorithm, outcomes and exit codes, the
+flags) is **[controllers/README.md](../README.md)**; this page only covers what is Python-specific.
 
-- **SUB** `astrum/telemetry/<id>` — telemetry for one aircraft.
-- **PUB** `astrum/command/<id>` — commands (target id + raw actuators *or* autopilot targets).
+## Install
 
-## Modes (`--mode`)
-
-- **`raw`** (default) — the controller closes a heading / altitude / airspeed hold loop
-  *itself* (identical gains to the C++ `HoldLaw`) and sends raw `fcs/*-cmd-norm`
-  deflections every telemetry tick. This is ASTRUM's intended usage: **you own the
-  control law**.
-- **`autopilot`** — the controller sends one high-level target (reasserted over the first
-  second of telemetry) and then just monitors; the sim's built-in proportional inner loop flies
-  the aircraft. Resending briefly clears the Zenoh startup race: Zenoh drops a `put` with no
-  matching subscriber yet (unlike ZMQ PUSH, which queued it), so a single shot at t=0 would be
-  lost while the sim loads JSBSim — receiving telemetry proves the link is up.
-
-## Configuration (flags)
-
-The same knobs as the C++ controller. Pass them as command-line flags (run
-`--help` for the list); each falls back to its old `ASTRUM_*` env var, then the
-default, so precedence is **CLI arg > `$ENV` > default** and the compose wiring is
-shared and unchanged.
-
-| Flag | Env fallback | Default | Meaning |
-|---|---|---|---|
-| `--connect` | `ASTRUM_ZENOH_CONNECT`      | `tcp/127.0.0.1:7447` | sim Zenoh endpoint (telemetry + commands) |
-| `--id`      | `ASTRUM_TARGET_ID`         | `1`    | aircraft id to subscribe to / command |
-| `--heading` | `ASTRUM_TARGET_HEADING_DEG`| `0`    | target heading in degrees (0 = due north) |
-| `--alt`     | `ASTRUM_TARGET_ALT_M`      | `1500` | target MSL altitude (m) |
-| `--speed`   | `ASTRUM_TARGET_SPD_MPS`    | `50`   | target airspeed (m/s) |
-| `--mode`    | `ASTRUM_CONTROL_MODE`      | `raw`  | `raw` or `autopilot` |
-| `--schema`  | `ASTRUM_SCHEMA`            | `../../crates/astrum-proto/schema/astrum.capnp` | schema to load |
-
-## Run (inside the dev container)
+The dev image puts `controllers/python` and `controllers/optimal/python` on `PYTHONPATH`.
+Anywhere else:
 
 ```bash
-python controllers/python/example.py --heading 0 --id 1
+pip install controllers/python            # astrum-client: eclipse-zenoh==1.10.0, pycapnp
+pip install controllers/optimal/python    # astrum-optimal (LQR / MPC / formation laws)
 ```
 
-Or the whole self-terminating demo (bounded single-ship scenario, auto teardown):
+The schema ships inside the package (`astrum_client/astrum.capnp`, a symlink to
+`crates/astrum-proto/schema/astrum.capnp` that builds copy) and is loaded once, lazily, by
+`astrum_client.wire`; its `/capnp/c++.capnp` import resolves from pycapnp's own install, so
+nothing depends on a checkout or `/usr/include`. `eclipse-zenoh` is pinned to the Rust `zenoh`
+crate's version (Zenoh is protocol-compatible only within a release; `make verify` checks it).
+
+## Modules
+
+| Module | What it holds |
+|---|---|
+| `astrum_client.wire` | `VehicleState`, `CommandStatus`, `RawActuators` / `MultirotorRaw` / `AutopilotTargets`, `Action`, `Command`, `Event` (+ detail kinds), `TickEnd`, the enums (`VehicleKind`, `ControlMode`, `ModeReason`, `EndReason`, `Refusal`); `decode_telemetry` / `decode_command` / `decode_event` / `decode_tick_end` (untrusted input → value or `DecodeError`) and the encoders |
+| `astrum_client.transport` | `open_session(connect, deadline)`, `TelemetrySubscriber(session, id \| None)`, `EventSubscriber(session, tick_ends)`, `CommandPublisher(session, id)`, `SimUnreachable`; every callback runs on Zenoh's receive thread in arrival order (`Callback(indirect=False)`) |
+| `astrum_client.loop` | `run_control_loop(telemetry, events, sink, law, options) -> Outcome`, `LoopOptions`, `Outcome` / `OutcomeKind`, `exit_code`, the `TelemetrySource` / `EventSource` / `CommandSink` protocols |
+| `astrum_client.runtime` | `Law`, `StepInput`, `Stop`, `Reference`, `AttitudeLimits`, `run_main(laws, argv=None, *, prog, description)` |
+| `astrum_client.cli` | the shared flags with `ASTRUM_*` env fallbacks and their validators |
+| `astrum_client.mathutil` | `wrap_pi`, `clamp`, the anti-windup integrator step |
+| `astrum_client.hold` | `HoldLaw`, the example raw-actuator hold law |
+| `astrum_client.wire_fixture` | writes the cross-language wire fixtures (`python -m astrum_client.wire_fixture`) |
+
+Deadlines are `time.monotonic()` values. `LoopOptions` takes an injectable `clock` and `logger`
+(defaults `time.monotonic`, `logging.getLogger("astrum")`), so the loop runs against fakes in
+[`tests/test_control_loop.py`](tests/test_control_loop.py).
+
+## A law
+
+```python
+from astrum_client.runtime import Law, StepInput, run_main
+from astrum_client.wire import Action, RawActuators, VehicleKind
+
+
+class Wings(Law):
+    vehicle_kinds = frozenset({VehicleKind.FIXED_WING})  # required, non-empty
+
+    @classmethod
+    def add_args(cls, parser):
+        parser.add_argument("--gain", type=float, default=1.5)
+
+    @classmethod
+    def from_args(cls, args):  # args.reference, args.limits are set; ValueError -> exit 2
+        return cls(args.gain)
+
+    def __init__(self, gain):
+        self.gain = gain
+
+    def configure(self, control_period_s):  # once, from Telemetry.controlPeriodS
+        self.dt = control_period_s
+
+    def step(self, inp: StepInput) -> Action:  # raise Stop("why") to refuse
+        return Action(RawActuators(aileron=-self.gain * inp.state.roll, throttle=0.6))
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_main({"wings": Wings}, prog="wings.py", description="level the wings"))
+```
+
+`inp.events` holds every event of an earlier tick (`tick < state.tick`) not delivered yet,
+oldest first: an event shows in `state` first and in `events` one step later. `inp.fleet` is a
+`{aircraft_id: VehicleState}` snapshot when the law sets `needs_fleet = True`; only such a law
+subscribes to `astrum/tick` and waits (at most `tick_end_wait_s`) for the tick's `TickEnd`
+before stepping, so every aircraft in the snapshot is at the same tick — other laws skip that
+wakeup, which costs a Python controller about a fifth of its lockstep throughput. The loop
+clamps raw / multirotor channels; a non-finite channel, a raw control of the other vehicle
+class, or an exception is a `LawFault` (exit 3). When the sim re-publishes a tick, the loop
+resends the last action without stepping.
+
+## The example controller
 
 ```bash
-make demo-python
+python controllers/python/example.py --id 1 --law hold --heading 0
+python controllers/python/example.py --id 1 --law autopilot --alt 130 --speed 0   # quad demo
+astrum run config/demos/python.toml   # bounded single-ship demo with auto teardown
 ```
 
-which is `docker compose --profile python up --exit-code-from sim sim controller-python`.
+- **`hold`** (default) — `HoldLaw`: heading / altitude / airspeed hold closed here, raw actuators
+  every tick (a lease: if they stop, the sim's failsafe takes over). Damps with the measured body
+  rates, limits bank / pitch to `--max-bank-deg` / `--max-pitch-deg`, and its integrators use
+  conditional-integration anti-windup. Fixed-wing only.
+- **`autopilot`** — hands the reference to the sim's inner loop every tick. Fixed-wing or
+  multirotor.
 
-## Notes
+`--help` lists every flag (see [controllers/README.md](../README.md#flags)); `--id` is required.
 
-- **Wire compatibility is by construction:** the same `astrum.capnp` is the source of
-  truth for the Rust sim, the C++ controller, and this script. Framing is Cap'n Proto's
-  flat serialization — pycapnp's `to_bytes()` / `from_bytes()` interoperate directly with
-  Rust's `serialize::write_message` / `read_message`. (Verified live: this controller
-  drove aircraft 1 from 90° to ~3.4° heading holding ~1500 m, the same trace as the C++
-  controller.)
-- Telemetry carries no body rates, so the raw hold loop estimates roll/pitch rate by
-  finite-differencing attitude between frames for damping — same as the C++ `HoldLaw`.
-- The aircraft id lives in the Zenoh **key** (`astrum/telemetry/<id>`), not a topic frame:
-  the subscriber declares that key and each sample's `payload` is the whole Cap'n Proto message.
-  Key matching is exact, so `astrum/telemetry/1` never matches `astrum/telemetry/10`.
-- This example follows **one** aircraft (`--id`), but the transport is fleet-wide:
-  subscribe `astrum/telemetry/*` instead of a single id to receive **every** aircraft's telemetry
-  over the same session (whole-fleet / swarm awareness). Adding aircraft needs no endpoint or port
-  change; the id is just another key.
+## Tests and wire fixtures
+
+```bash
+python -m pytest -q controllers/python controllers/optimal/python
+python -m astrum_client.wire_fixture    # writes crates/astrum-proto/tests/fixtures/*.python.bin
+```
+
+[`tests/test_wire_fixtures.py`](tests/test_wire_fixtures.py) decodes every `<kind>.<lang>.bin`
+present (rust / cpp / python, events included) and compares it field by field with
+`values.json`; the Python files must exist and match what the encoder produces today.

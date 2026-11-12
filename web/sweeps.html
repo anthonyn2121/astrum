@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ASTRUM · Sweeps</title>
+  <link rel="icon" type="image/png" href="./img/favicon.png" />
+  <link rel="stylesheet" href="./style.css" />
+  <link rel="stylesheet" href="./css/cosmos.css" />
+  <link rel="stylesheet" href="./css/studio.css" />
+  <link rel="stylesheet" href="./css/sweeps.css" />
+</head>
+<body class="studio">
+  <div class="sky" aria-hidden="true"><i></i><i></i><i></i></div>
+  <header class="studio-top">
+    <a class="brand" href="./" title="ASTRUM studio home"><img class="mark" src="./img/astrum-mark.png" alt="" /> ASTRUM</a>
+    <nav class="nav-tabs" aria-label="Studio pages">
+      <a href="./interactive.html">Interactive</a>
+      <a href="./sandbox.html">Sandbox</a>
+      <a href="./sweeps.html" aria-current="page">Sweeps</a>
+      <a href="./view.html">Replay</a>
+    </nav>
+  </header>
+
+  <main class="studio-main sweeps-main">
+    <h1>Sweeps</h1>
+    <p class="muted lede">Build a sweep of a saved scenario: the runs it would fly are planned as you set it up, and a saved sweep runs from the command line with <code>astrum sweep</code>.</p>
+
+    <p id="activeSweepStatus" class="visually-hidden" role="status"></p>
+    <section id="activeSweep" class="banner" hidden>
+      <div class="banner-text">
+        <strong>A sweep is running:</strong> <span id="activeSweepId" class="mono"></span> · <span id="activeSweepProgress" class="mono"></span>
+      </div>
+      <div class="banner-actions">
+        <a id="activeSweepOpen" class="button primary" href="./sweep.html">Open</a>
+        <button id="activeSweepStop" type="button">Stop it</button>
+      </div>
+      <p id="activeSweepError" class="form-error" role="alert" hidden></p>
+    </section>
+
+    <!-- The galleries: saved sweeps to open into the form, and every sweep flown.
+         Each shows two rows of cards until its Show all (sweeps.js fits them). -->
+    <section id="savedSweeps" class="gallery" aria-labelledby="savedHead">
+      <div class="gallery-head">
+        <h2 id="savedHead">Saved sweeps</h2>
+        <span id="savedCount" class="gallery-count"></span>
+        <span class="muted small gallery-help">Open one to load it into the form.</span>
+        <button id="savedMore" type="button" class="mini gallery-more" aria-controls="savedList" aria-expanded="false" hidden>Show all</button>
+      </div>
+      <p id="savedError" class="form-error" role="alert" hidden></p>
+      <p id="savedEmpty" class="muted small" hidden>No saved sweeps in the config directory.</p>
+      <ul id="savedList" class="saved-list gallery-list"></ul>
+    </section>
+
+    <section id="recentSweeps" class="gallery" aria-labelledby="recentHead">
+      <div class="gallery-head">
+        <h2 id="recentHead">Recent sweeps</h2>
+        <span id="recentCount" class="gallery-count"></span>
+        <span class="muted small gallery-help">Open one to see its runs.</span>
+        <button id="recentMore" type="button" class="mini gallery-more" aria-controls="recentList" aria-expanded="false" hidden>Show all</button>
+      </div>
+      <p id="recentError" class="form-error" role="alert" hidden></p>
+      <p id="recentEmpty" class="muted small" hidden>No sweeps yet.</p>
+      <ul id="recentList" class="saved-list gallery-list"></ul>
+    </section>
+
+    <p id="loadError" class="form-error" role="alert" hidden></p>
+
+    <!-- The builder: the steps, and beside them (>= 1200 px) the sticky plan. -->
+    <div class="sweeps-layout">
+    <form id="sweep" class="sweeps-steps" novalidate>
+      <fieldset id="sweepFields">
+        <section class="step" aria-labelledby="envHead">
+          <h2 id="envHead"><span class="step-n">1</span> Environment</h2>
+          <div id="envList" class="choices" role="radiogroup" aria-labelledby="envHead"></div>
+        </section>
+
+        <section class="step" aria-labelledby="scenarioHead">
+          <h2 id="scenarioHead"><span class="step-n">2</span> Scenario</h2>
+          <p id="scenarioError" class="form-error" role="alert" hidden></p>
+          <div id="scenarioList" class="choices" role="radiogroup" aria-labelledby="scenarioHead"></div>
+          <p id="scenarioEmpty" class="muted" hidden>No scenarios for this environment in the config directory.</p>
+        </section>
+
+        <section class="step" aria-labelledby="fleetHead">
+          <h2 id="fleetHead"><span class="step-n">3</span> Controllers <span class="muted small">optional</span></h2>
+          <p class="muted small">Without controllers the sweep flies in-process (fast, no external processes); with them each run launches the controllers.</p>
+          <p id="fleetEmpty" class="muted">Pick a scenario first.</p>
+          <p id="fleetError" class="form-error" role="alert" hidden></p>
+          <div id="fleet" class="fleet"></div>
+        </section>
+
+        <section class="step" aria-labelledby="variationHead">
+          <h2 id="variationHead"><span class="step-n">4</span> Variation <span class="muted small">optional</span></h2>
+          <p class="muted small">Vary where the aircraft start and how they point, around the scenario's own starting conditions. Each offset is in the aircraft's own frame: forward along its heading, right of it, and up.</p>
+          <div id="variation" class="variation"></div>
+        </section>
+
+        <section class="step" aria-labelledby="settingsHead">
+          <h2 id="settingsHead"><span class="step-n">5</span> Run settings</h2>
+          <div class="run-options">
+            <div class="field">
+              <label class="field-label" for="maxTime">Max sim time (s)</label>
+              <input id="maxTime" type="number" min="0" step="any" inputmode="decimal" required />
+              <span id="maxTimeError" class="field-error" role="alert" hidden></span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="repeats">Repeats</label>
+              <input id="repeats" type="number" min="1" step="1" inputmode="numeric" value="1" />
+              <span id="repeatsError" class="field-error" role="alert" hidden></span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="jobs">Parallel runs</label>
+              <input id="jobs" type="number" min="0" step="1" inputmode="numeric" value="0" />
+              <span class="muted small">0 = one per core</span>
+              <span id="jobsError" class="field-error" role="alert" hidden></span>
+            </div>
+            <div class="field">
+              <label class="field-label" for="runTimeout">Per-run wall timeout (s)</label>
+              <input id="runTimeout" type="number" min="0" step="any" inputmode="decimal" value="0" />
+              <span class="muted small">0 = none</span>
+              <span id="runTimeoutError" class="field-error" role="alert" hidden></span>
+            </div>
+          </div>
+        </section>
+      </fieldset>
+    </form>
+
+      <div class="plan-aside">
+        <section class="step plan-step" aria-labelledby="planHead">
+          <h2 id="planHead"><span class="step-n">6</span> Plan</h2>
+          <div class="plan-card glass">
+            <p id="planNote" class="muted small"></p>
+            <p id="planBusy" class="muted small plan-busy" role="status" hidden>Planning…</p>
+            <p id="planError" class="form-error" role="alert" hidden></p>
+            <div id="planBody" class="plan-body" aria-busy="false">
+              <p id="planSummary" class="plan-summary" role="status"></p>
+              <p id="planTrim" class="plan-trim small" role="status" hidden></p>
+              <section id="startPanel" class="start-panel" aria-labelledby="startHead" hidden>
+                <h3 id="startHead">Starting positions</h3>
+                <p class="muted small">Arrows are the scenario's aircraft; dots are each planned run's start for the aircraft the sweep moves. Drag to pan, wheel or + / − to zoom, double-click or Fit to frame.</p>
+                <div class="start-head">
+                  <div id="startLegend" class="start-legend small"></div>
+                  <button id="startFit" type="button">Fit</button>
+                </div>
+                <div class="start-wrap">
+                  <canvas id="startCanvas" class="start-canvas" aria-label="Starting positions, top-down: the scenario's aircraft as arrows, each planned start as a dot. Arrow keys pan, plus and minus zoom, 0 fits."></canvas>
+                  <div id="startTip" class="start-tip small" hidden></div>
+                </div>
+              </section>
+              <div class="plan-wrap" hidden id="planWrap">
+                <table id="planTable" class="plan-table"></table>
+              </div>
+              <p id="planMore" class="muted small" hidden></p>
+            </div>
+            <div class="plan-actions">
+              <button id="runSweep" type="button" class="primary" disabled>Run sweep</button>
+              <button id="checkTrims" type="button">Check trims</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <section class="step" aria-labelledby="saveHead">
+      <h2 id="saveHead">Save sweep</h2>
+      <form id="saveForm" class="save-form">
+        <div class="run-options">
+          <div class="field">
+            <label class="field-label" for="saveName">Name</label>
+            <input id="saveName" type="text" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}" required placeholder="my-sweep" autocomplete="off" />
+          </div>
+          <div class="field save-summary">
+            <label class="field-label" for="saveSummary">Summary</label>
+            <input id="saveSummary" type="text" maxlength="200" placeholder="one line, shown in the saved list" autocomplete="off" />
+          </div>
+        </div>
+        <p id="saveError" class="form-error" role="alert" hidden></p>
+        <div class="run-actions">
+          <button id="saveSubmit" type="submit" class="primary">Save</button>
+          <button id="saveReplace" type="button" hidden>Replace existing</button>
+        </div>
+        <div id="saveResult" class="save-result" role="status"></div>
+      </form>
+    </section>
+  </main>
+
+  <script type="module" src="./js/sweeps.js"></script>
+</body>
+</html>

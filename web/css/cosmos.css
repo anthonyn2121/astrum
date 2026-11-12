@@ -1,0 +1,104 @@
+/* The studio's shared look on top of style.css, on every page: the starfield
+   (.sky, twinkling unless the user prefers reduced motion), the page tabs,
+   glass panels, glows and the primary button. */
+
+:root {
+  --glass: rgba(16, 22, 34, 0.62);
+  --glass-strong: rgba(13, 18, 28, 0.86);
+  --glass-line: rgba(120, 170, 225, 0.2);
+  --glow: 0 0 0 1px rgba(74, 163, 255, 0.35), 0 0 18px rgba(74, 163, 255, 0.22);
+  --glow-strong: 0 0 0 1px rgba(74, 163, 255, 0.6), 0 0 26px rgba(74, 163, 255, 0.45);
+  --star: #eaf3ff;
+  --nebula-a: rgba(74, 163, 255, 0.09);
+  --nebula-b: rgba(180, 140, 255, 0.07);
+  --team: var(--accent);
+}
+
+/* ---- Starfield ----
+   <div class="sky" aria-hidden="true"><i></i><i></i><i></i></div>, first in
+   <body>: a fixed nebula and three star tiles of different sizes (so their
+   repeats don't line up), each twinkling on its own period. */
+body.studio { background: transparent; }
+.sky {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
+  background:
+    radial-gradient(ellipse 60% 45% at 18% 12%, var(--nebula-a), transparent 70%),
+    radial-gradient(ellipse 50% 40% at 86% 78%, var(--nebula-b), transparent 70%),
+    radial-gradient(ellipse 90% 70% at 50% 120%, rgba(74, 163, 255, 0.05), transparent 70%);
+}
+.sky i { position: absolute; inset: 0; background-repeat: repeat; will-change: opacity; }
+.sky i:nth-child(1) {
+  background-size: 233px 233px;
+  background-image:
+    radial-gradient(1px 1px at 17px 31px, var(--star), transparent),
+    radial-gradient(1px 1px at 92px 148px, var(--star), transparent),
+    radial-gradient(1px 1px at 151px 63px, var(--star), transparent),
+    radial-gradient(1px 1px at 204px 199px, var(--star), transparent),
+    radial-gradient(1px 1px at 61px 211px, var(--star), transparent),
+    radial-gradient(1px 1px at 188px 112px, var(--star), transparent);
+  opacity: 0.55;
+  animation: sky-twinkle 6.1s ease-in-out infinite;
+}
+.sky i:nth-child(2) {
+  background-size: 317px 317px;
+  background-image:
+    radial-gradient(1.5px 1.5px at 41px 87px, var(--star), transparent),
+    radial-gradient(1.5px 1.5px at 263px 41px, #cfe4ff, transparent),
+    radial-gradient(1.5px 1.5px at 129px 281px, var(--star), transparent),
+    radial-gradient(1px 1px at 212px 196px, #ffe9c7, transparent),
+    radial-gradient(1px 1px at 297px 251px, var(--star), transparent);
+  opacity: 0.7;
+  animation: sky-twinkle 8.3s ease-in-out -2.7s infinite;
+}
+.sky i:nth-child(3) {
+  background-size: 461px 461px;
+  background-image:
+    radial-gradient(2px 2px at 113px 59px, #ffffff, transparent),
+    radial-gradient(2px 2px at 377px 302px, #bcd9ff, transparent),
+    radial-gradient(1.5px 1.5px at 249px 418px, #ffffff, transparent),
+    radial-gradient(2.5px 2.5px at 31px 361px, rgba(160, 200, 255, 0.9), transparent);
+  opacity: 0.85;
+  animation: sky-twinkle 11.7s ease-in-out -5.1s infinite;
+}
+@keyframes sky-twinkle {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sky i { animation: none; }
+}
+
+/* ---- Page tabs (in every page's top bar) ---- */
+.nav-tabs { display: flex; align-items: center; gap: 2px; flex: none; }
+.nav-tabs a {
+  padding: 4px 12px; border-radius: 999px; border: 1px solid transparent;
+  color: var(--muted); text-decoration: none; font-weight: 600; font-size: 13px; white-space: nowrap;
+  transition: color 0.15s, background 0.15s, box-shadow 0.15s;
+}
+.nav-tabs a:hover { color: var(--text); background: rgba(74, 163, 255, 0.08); }
+.nav-tabs a[aria-current] {
+  color: var(--text); background: var(--accent-dim); border-color: rgba(74, 163, 255, 0.5);
+  box-shadow: 0 0 14px rgba(74, 163, 255, 0.28);
+}
+.nav-tabs a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ---- Glass, links, primary buttons ---- */
+.glass {
+  background: var(--glass); border: 1px solid var(--glass-line); border-radius: 12px;
+  backdrop-filter: blur(10px);
+}
+.studio a:not(.button):not(.card):not(.brand) {
+  text-underline-offset: 3px; text-decoration-color: rgba(74, 163, 255, 0.45);
+}
+.studio a:not(.button):not(.card):not(.brand):hover { text-decoration-color: currentColor; }
+
+button.primary, a.button.primary {
+  background: linear-gradient(180deg, #6db8ff, #3b8ff0);
+  border-color: #6db8ff; color: #04101f;
+  box-shadow: 0 0 0 1px rgba(74, 163, 255, 0.25), 0 4px 16px rgba(74, 163, 255, 0.25);
+  transition: box-shadow 0.15s, filter 0.15s;
+}
+button.primary:hover:not(:disabled), a.button.primary:hover {
+  filter: brightness(1.08); box-shadow: var(--glow-strong);
+}
+button.primary:disabled { box-shadow: none; }

@@ -1,6 +1,7 @@
 # ASTRUM scenario — a geodetic ENU origin plus a fleet of aircraft with initial
 # conditions. `astrum-sim` loads this to spawn one ECS entity (each owning its own
-# JSBSim FDM) per `[[aircraft]]` entry. Copy to `config/scenario.toml` to customise.
+# JSBSim FDM) per `[[aircraft]]` entry. Copy to `config/scenario.toml` to
+# customise. Unknown keys are errors; units are SI (metres, m/s), angles degrees.
 
 [world]
 # Local-tangent ENU grid origin (WGS84). Every aircraft's ENU (X=E, Y=N, Z=U)
@@ -8,36 +9,67 @@
 # Cartesian coordinates stay small and well-conditioned.
 origin_lat_deg = 37.6188
 origin_lon_deg = -122.3756
-origin_alt_m = 0.0
+origin_alt_hae_m = 0.0          # height above the WGS84 ellipsoid
 
 [sim]
 # Fixed-step physics rate (Hz). Physics advances one deterministic step of
 # 1/rate_hz seconds per loop.
 rate_hz = 120.0
-# Optional: stop after this many simulated seconds (0 / omitted = run indefinitely).
+# Stop after this many simulated seconds (0 / omitted = run indefinitely).
 max_time_s = 0.0
-# true (default) throttles to ~real-time for live controllers; false runs as fast
-# as the host allows (batch / testing). Trajectory is identical either way.
-realtime = true
+# Wall-clock pace as a multiple of real time: 1 (default) for live controllers
+# and watching, 10 = ten times faster, 0 = as fast as the host allows
+# (astrum-sim --speed overrides). With external controllers, only `lockstep`
+# makes runs reproducible (commands otherwise land on whichever tick they arrive).
+speed = 1.0
+# Seed for gun dispersion and each aircraft's JSBSim random generator.
+seed = 0
+# Threads stepping the FDMs in parallel (astrum-sim --threads overrides; 0 = all
+# cores; capped at the fleet size). Each aircraft stays on one worker, and idle
+# workers spin briefly between unpaced ticks, so leave cores free on a busy host.
+# The result is identical for any value.
+threads = 1
+# A controller must keep commanding: an aircraft that received commands and then
+# gets none for this long switches to the failsafe hold (0 disables).
+command_lease_s = 0.5
+# lockstep = true makes the sim wait each tick for commands from every aircraft
+# marked `lockstep = true`, failing after lockstep_timeout_s.
+lockstep = false
+lockstep_timeout_s = 30.0
 
 # --- Fleet -------------------------------------------------------------------
-# One entity per entry. `id` is the Zenoh telemetry key / command target id and
-# must be unique. Initial conditions map to JSBSim `ic/*` properties.
+# `id` is the Zenoh key suffix / command target and must be unique. Known models:
+# c172x (trainer gains), f16 (fighter gains), F450 (multirotor). Any other model
+# needs `kind = "fixed-wing" | "multirotor"` and, if fixed-wing,
+# `autopilot_profile = "trainer" | "fighter"`. Fixed-wing aircraft are trimmed
+# at spawn (`trim = false` to skip) for steady flight at `climb_deg`
+# (flight-path angle, + = climbing): wings level, or a coordinated turn at
+# `bank_deg` (+ = right wing down). Both default 0 and must be strictly within
+# ±90. The trim is exact at spawn, but the F-16's flight controls roll an
+# uncommanded aircraft out of the turn (≈ 30° → 13° in 20 s while climbing);
+# steep banks may not trim (60° on the F-16 does not), and a failed trim is
+# fatal. An untrimmed aircraft (multirotor, `trim = false`) simply starts with
+# that velocity and roll.
+# `control_rate_hz` (default: every tick) publishes that aircraft's telemetry —
+# and, in lockstep, waits for its commands — at a lower rate that divides
+# rate_hz; the last command holds in between.
 
 [[aircraft]]
 id = 1
 model = "f16"
 lat_deg = 37.6188
 lon_deg = -122.3756
-alt_ft = 15000.0
+alt_hae_m = 4572.0
 heading_deg = 90.0
-airspeed_kts = 400.0
+tas_mps = 250.0                 # true airspeed (≈ 400 KCAS at this altitude)
+team = 0
 
 [[aircraft]]
 id = 2
 model = "f16"
 lat_deg = 37.6200
 lon_deg = -122.3700
-alt_ft = 16000.0
+alt_hae_m = 4877.0
 heading_deg = 180.0
-airspeed_kts = 420.0
+tas_mps = 260.0
+team = 0

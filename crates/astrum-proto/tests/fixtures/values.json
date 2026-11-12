@@ -1,0 +1,108 @@
+{
+  "_comment": "Canonical cross-language wire fixture values (schema v3). Each language encodes these into tests/fixtures/<kind>.<lang>.bin and every language's test decodes every file and compares against these values exactly. The event_* kinds use the shared event JSON shape. Regenerate the .bin files with scripts/wire-fixtures.sh after a schema change.",
+  "telemetry": {
+    "aircraft_id": 7,
+    "tick": 1234567890123,
+    "sim_time_s": 10288065.6875,
+    "lat_deg": 37.6188,
+    "lon_deg": -122.3756,
+    "alt_hae_m": 4572.25,
+    "pos_enu": { "e": 1234.5, "n": -6789.25, "u": 4572.125 },
+    "vel_enu": { "e": 120.5, "n": -30.25, "u": 2.0 },
+    "vel_ned": { "n": -30.0, "e": 120.0, "d": -2.5 },
+    "attitude": { "phi_rad": 0.5, "theta_rad": -0.125, "psi_rad": 1.75 },
+    "rates": { "p_rad_s": 0.25, "q_rad_s": -0.0625, "r_rad_s": 0.03125 },
+    "aero": { "alpha_rad": 0.0875, "beta_rad": -0.01, "nz_g": 3.5, "mach": 0.85 },
+    "tas_mps": 250.5,
+    "fault_flags": 3,
+    "vehicle_kind": "multirotor",
+    "control_mode": "failsafe",
+    "combat": { "team": 2, "hit_points": 62.5, "hit_points_max": 100.0, "alive": true, "ammo": 311 },
+    "control_period_s": 0.03125,
+    "command": {
+      "owner_epoch": 12297829382473034410,
+      "last_seq": 41,
+      "refusals": 4294967295,
+      "last_refusal": "not-owner",
+      "last_refused_epoch": 7
+    }
+  },
+  "command_raw": {
+    "target_id": 3,
+    "seq": 42,
+    "telemetry_tick": 1000,
+    "trigger": true,
+    "epoch": 12297829382473034410,
+    "control": { "raw": { "aileron": 0.25, "elevator": -0.5, "rudder": 0.125, "throttle": 0.75 } }
+  },
+  "command_autopilot": {
+    "target_id": 9,
+    "seq": 7,
+    "telemetry_tick": 5,
+    "trigger": false,
+    "epoch": 1,
+    "control": { "autopilot": { "heading_rad": 1.5, "alt_hae_m": 1500.0, "tas_mps": 120.0 } }
+  },
+  "command_multirotor": {
+    "target_id": 4,
+    "seq": 9,
+    "telemetry_tick": 33,
+    "trigger": false,
+    "epoch": 18446744073709551615,
+    "control": { "multirotor": { "roll_rate": 0.25, "pitch_rate": -0.5, "yaw_rate": 0.125, "collective": 0.4375 } }
+  },
+  "tick_end": { "tick": 1234567890123, "sim_time_s": 10288065.6875 },
+  "event_trigger_pressed": { "tick": 120, "sim_time_s": 1.0, "kind": "trigger-pressed", "aircraft_id": 2, "ammo": 300 },
+  "event_trigger_released": {
+    "tick": 1234567890123,
+    "sim_time_s": 10288065.6875,
+    "kind": "trigger-released",
+    "aircraft_id": 2,
+    "rounds_fired": 41,
+    "ammo": 259
+  },
+  "event_hit": {
+    "tick": 1234,
+    "sim_time_s": 10.28125,
+    "kind": "hit",
+    "shooter_id": 2,
+    "target_id": 1,
+    "damage": 2.5,
+    "hit_points": 97.5,
+    "pos_enu": [1234.5, -6789.25, 4572.125]
+  },
+  "event_kill": {
+    "tick": 4000,
+    "sim_time_s": 33.3125,
+    "kind": "kill",
+    "victim_id": 1,
+    "killer_id": 2,
+    "pos_enu": [-10.75, 20.5, 1499.0]
+  },
+  "event_kill_unknown": {
+    "tick": 17,
+    "sim_time_s": 0.140625,
+    "kind": "kill",
+    "victim_id": 4294967295,
+    "killer_id": null,
+    "pos_enu": [0.0, 0.0, 0.0]
+  },
+  "event_mode_change": {
+    "tick": 600,
+    "sim_time_s": 5.0,
+    "kind": "mode-change",
+    "aircraft_id": 3,
+    "from": "raw",
+    "to": "failsafe",
+    "reason": "lease-expired"
+  },
+  "event_controller_up": { "tick": 0, "sim_time_s": 0.0, "kind": "controller-up", "aircraft_id": 5 },
+  "event_controller_down": { "tick": 999, "sim_time_s": 8.3125, "kind": "controller-down", "aircraft_id": 7 },
+  "event_run_ended": {
+    "tick": 7200,
+    "sim_time_s": 60.0,
+    "kind": "run-ended",
+    "reason": "fatal",
+    "message": "aircraft 3: non-finite state (NaN airspeed) — stopping"
+  }
+}

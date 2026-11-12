@@ -3,6 +3,8 @@ name = "astrum-sim"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "ASTRUM headless Bevy ECS: the authoritative multi-aircraft state server."
 
 [lib]
@@ -13,14 +15,31 @@ path = "src/lib.rs"
 name = "astrum-sim"
 path = "src/main.rs"
 
+# ASTRUM's command line: `astrum run` / `sweep` / `list`, and the other tools
+# (see src/bin/astrum.rs and the `launch`, `sweep` and `catalog` modules).
+[[bin]]
+name = "astrum"
+path = "src/bin/astrum.rs"
+
 [dependencies]
-# Headless: no render/winit/audio. default-features = false keeps the GUI/GPU
-# feature stack (and its system-lib deps, absent in the container) out of the build.
+# Headless: no render/winit/audio, and no Bevy task pools: the tick is a strict
+# chain, and FDM stepping runs on the sim's own shard pool (`sim.threads`).
 bevy = { version = "0.19", default-features = false }
 astrum-fdm = { path = "../astrum-fdm" }
 astrum-geo = { path = "../astrum-geo" }
 astrum-net = { path = "../astrum-net" }
 astrum-proto = { path = "../astrum-proto" }
 clap = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+serde = { workspace = true }
+toml = { workspace = true }
+# In-process recording writes the `astrum-bag` MCAP format.
+astrum-bag = { path = "../astrum-bag" }
+# SIGINT/SIGTERM end a run cleanly (a recording is finished, not truncated).
+ctrlc = { workspace = true }
+# launch: signal child processes (SIGTERM), split controller commands, and
+# hand a live run's sim its scenario in a temporary file.
+libc = "0.2"
+shlex = "2"
+tempfile = "3"
+# Sweeps write each run's metrics as JSON (tests also pin outcomes' JSON shape).
+serde_json = { workspace = true }

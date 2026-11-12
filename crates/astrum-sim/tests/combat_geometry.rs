@@ -1,80 +1,107 @@
-//! Unit tests for the combat frame-geometry helpers
-//! (`astrum_sim::combat::geometry`). These lock the body→ENU attitude sign
-//! convention against the replay renderer's (ψ=0→North, +ψ→East, +θ→nose-up,
-//! +φ→right-wing-down) and the swept segment-distance used by the hit test.
-//! App-free, mirroring `tests/ballistics.rs`.
-//!
-//! Run:  `cargo test -p astrum-sim --test combat_geometry -- --nocapture`
+//! Frame and hit-test geometry: the body→NED attitude convention (ψ=0 North,
+//! +ψ East, +θ nose up, +φ right wing down), the local-level tilt away from the
+//! grid origin, and the relative-motion contact solver.
 
+use astrum_geo::{Enu, Geodetic, LocalFrame, Ned};
 use astrum_sim::combat::ballistics::DVec3;
-use astrum_sim::combat::geometry::{body_to_enu, boresight_enu, segment_point_dist_sq};
+use astrum_sim::combat::geometry::{
+    body_to_grid, body_to_ned, closest_approach, first_contact, grid_to_body, ned_to_body,
+};
 
-const EPS: f64 = 1e-12;
+fn ned(v: Ned) -> DVec3 {
+    DVec3::new(v.n, v.e, v.d)
+}
 
 fn close(a: DVec3, b: DVec3) -> bool {
     (a - b).length() < 1e-9
 }
 
 #[test]
-fn boresight_points_the_right_way() {
-    // Wings-level, ψ=0 → nose due North (+Y).
-    assert!(close(boresight_enu(0.0, 0.0, 0.0), DVec3::Y), "ψ=0 should face North");
-
-    // +ψ yaws toward East (+X).
-    let east = boresight_enu(0.0, 0.0, 90f64.to_radians());
-    assert!(close(east, DVec3::X), "ψ=+90° should face East, got {east:?}");
-
-    // +θ pitches the nose up (+U): facing North, 45° up.
-    let climb = boresight_enu(0.0, 45f64.to_radians(), 0.0);
-    assert!(climb.z > 0.0, "+θ should tilt the nose up, got u={}", climb.z);
-    assert!(climb.y > 0.0, "still generally northbound, got n={}", climb.y);
-    assert!((climb.z - 45f64.to_radians().sin()).abs() < 1e-9, "up = sinθ");
+fn nose_and_wing_point_the_right_way() {
+    assert!(close(ned(body_to_ned(0.0, 0.0, 0.0, DVec3::X)), DVec3::X), "ψ=0 faces North");
+    assert!(
+        close(ned(body_to_ned(0.0, 0.0, 90f64.to_radians(), DVec3::X)), DVec3::Y),
+        "+ψ faces East"
+    );
+    let climb = ned(body_to_ned(0.0, 30f64.to_radians(), 0.0, DVec3::X));
+    assert!((climb.z + 0.5).abs() < 1e-12, "+θ raises the nose (−Down)");
+    let wing = ned(body_to_ned(90f64.to_radians(), 0.0, 0.0, DVec3::Y));
+    assert!(close(wing, DVec3::Z), "+φ drops the right wing (+Down)");
 }
 
 #[test]
-fn body_axes_map_into_enu() {
-    // Wings-level facing North: starboard (+Y body) points East (+X world).
-    let stbd = body_to_enu(0.0, 0.0, 0.0, DVec3::Y);
-    assert!(close(stbd, DVec3::X), "level starboard should point East, got {stbd:?}");
-
-    // Roll +90° right: the right wing (starboard) now points straight Down.
-    let rolled = body_to_enu(90f64.to_radians(), 0.0, 0.0, DVec3::Y);
-    assert!(close(rolled, DVec3::new(0.0, 0.0, -1.0)), "+φ drops starboard down, got {rolled:?}");
-
-    // The rotation preserves length (it's an orthonormal DCM).
+fn combined_roll_and_pitch_compose_in_3_2_1_order() {
+    // Banked 60° right, pitched 20° up, heading 45°: the nose is still the
+    // pitch-only nose (roll is applied last), the wing is tilted by the roll.
+    let (phi, theta, psi) = (60f64.to_radians(), 20f64.to_radians(), 45f64.to_radians());
+    let nose = ned(body_to_ned(phi, theta, psi, DVec3::X));
+    let nose_no_roll = ned(body_to_ned(0.0, theta, psi, DVec3::X));
+    assert!(close(nose, nose_no_roll));
+    let wing = ned(body_to_ned(phi, theta, psi, DVec3::Y));
+    assert!((wing.z - phi.sin() * theta.cos()).abs() < 1e-12, "wing dips by sinφ·cosθ");
+    assert!(wing.dot(nose).abs() < 1e-12, "axes stay orthogonal");
+    // The inverse rotation undoes it.
     let v = DVec3::new(1.0, -2.0, 3.0);
-    let out = body_to_enu(0.3, -0.4, 1.1, v);
-    assert!((out.length() - v.length()).abs() < 1e-9, "body→ENU must preserve length");
+    let back = ned_to_body(phi, theta, psi, body_to_ned(phi, theta, psi, v));
+    assert!(close(back, v));
 }
 
 #[test]
-fn muzzle_offset_lies_along_the_boresight() {
-    // A purely-forward body offset must resolve to the boresight direction,
-    // scaled — the muzzle sits ahead of the aircraft on the nose vector.
-    let (phi, theta, psi) = (0.2, -0.15, 2.0);
-    let fwd = body_to_enu(phi, theta, psi, DVec3::new(4.0, 0.0, 0.0));
-    let bore = boresight_enu(phi, theta, psi);
-    assert!(close(fwd, bore * 4.0), "forward offset should be 4·boresight");
+fn body_to_grid_accounts_for_the_local_level_tilt() {
+    let frame = LocalFrame::new(Geodetic::from_degrees(40.0, -105.0, 0.0));
+    let origin = frame.origin();
+    // At the origin, level-east nose is grid east.
+    let at_origin = body_to_grid(&frame, &origin, 0.0, 0.0, 90f64.to_radians(), DVec3::X);
+    assert!(close(at_origin, DVec3::X));
+    // 50 km east, a level eastbound nose points ~0.45° below the grid horizon.
+    let far = frame.enu_to_geodetic(&Enu { e: 50_000.0, n: 0.0, u: 0.0 });
+    let tilted = body_to_grid(&frame, &far, 0.0, 0.0, 90f64.to_radians(), DVec3::X);
+    assert!(tilted.z < -0.007 && tilted.z > -0.009, "tilt {}", tilted.z);
+    let back = grid_to_body(&frame, &far, 0.0, 0.0, 90f64.to_radians(), tilted);
+    assert!(close(back, DVec3::X));
 }
 
 #[test]
-fn segment_distance_matches_geometry() {
-    let a = DVec3::new(0.0, 0.0, 0.0);
-    let b = DVec3::new(10.0, 0.0, 0.0);
-
-    // Point beside the middle of the segment: perpendicular distance.
-    let mid = segment_point_dist_sq(a, b, DVec3::new(5.0, 3.0, 0.0));
-    assert!((mid - 9.0).abs() < EPS, "perpendicular dist² should be 9, got {mid}");
-
-    // Point beyond an endpoint clamps to that endpoint, not the infinite line.
-    let past = segment_point_dist_sq(a, b, DVec3::new(20.0, 0.0, 0.0));
-    assert!((past - 100.0).abs() < EPS, "should clamp to endpoint b, got {past}");
-
-    // A point exactly on the segment has zero distance.
-    let on = segment_point_dist_sq(a, b, DVec3::new(4.0, 0.0, 0.0));
-    assert!(on < EPS, "on-segment point should be distance 0, got {on}");
-
-    // Degenerate (zero-length) segment falls back to point distance.
-    let degen = segment_point_dist_sq(a, a, DVec3::new(3.0, 4.0, 0.0));
-    assert!((degen - 25.0).abs() < EPS, "degenerate segment → point dist² 25, got {degen}");
+fn first_contact_solves_relative_motion() {
+    let r = 8.0;
+    let z = DVec3::ZERO;
+    // Already inside at the start of the step.
+    assert_eq!(
+        first_contact(z, DVec3::X, DVec3::new(3.0, 0.0, 0.0), DVec3::new(3.0, 0.0, 0.0), r),
+        Some(0.0)
+    );
+    // Head-on closure: contact when the gap first shrinks to r.
+    let s = first_contact(
+        z,
+        DVec3::new(10.0, 0.0, 0.0),
+        DVec3::new(20.0, 0.0, 0.0),
+        DVec3::new(18.0, 0.0, 0.0),
+        r,
+    )
+    .unwrap();
+    assert!((s - 1.0).abs() < 1e-12, "gap 20 → 8 after 12 m of closure, s={s}");
+    // Moving together in parallel never closes.
+    let v = DVec3::new(10.0, 0.0, 0.0);
+    assert_eq!(
+        first_contact(z, v, DVec3::new(0.0, 20.0, 0.0), DVec3::new(0.0, 20.0, 0.0) + v, r),
+        None
+    );
+    // Passing outside the radius misses; the closest approach reports where.
+    let (s, d) = closest_approach(
+        z,
+        DVec3::new(10.0, 0.0, 0.0),
+        DVec3::new(5.0, 9.0, 0.0),
+        DVec3::new(5.0, 9.0, 0.0),
+    );
+    assert!((s - 0.5).abs() < 1e-12 && (d - 9.0).abs() < 1e-12);
+    assert_eq!(
+        first_contact(
+            z,
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(5.0, 9.0, 0.0),
+            DVec3::new(5.0, 9.0, 0.0),
+            r
+        ),
+        None
+    );
 }

@@ -1,0 +1,23 @@
+# A leader flies a figure-eight; three F-16s each MPC-track their slot off its telemetry (decentralized).
+#
+#   astrum run config/demos/formation.toml --watch
+#
+# Aircraft 1 flies the `figure8` law (an 8 km x 4 km Gerono lemniscate at
+# 4572 m HAE, 120 m/s TAS); aircraft 2-4 each run the `formation` law
+# independently. At 100 m/s the F-16 at this altitude already flies a 30° turn at
+# ~16° alpha, and the follower on the inside of a turn (which slows down) runs
+# out of lift and sinks. The lobe-end turn radius is Ry²/Rx = 2 km, ~36° of bank
+# at 120 m/s for the leader (flown by the sim's f16 autopilot, which applies its
+# own bank limit). Followers on the outside of a turn need more bank than the
+# leader; they are capped at the f16's 60° / 24° (the runtime defaults, 25° /
+# 10°, suit the trainer), which bounds how tight the pattern can be. Shrink the
+# slots too to carve a tighter pattern. See config/scenario.formation.toml.
+
+base = "config/scenario.formation.toml"
+
+controllers = [
+  "python controllers/optimal/python/run.py --law=figure8 --id=1 --alt=4572 --speed=120 --fig-rx=8000 --fig-ry=4000",
+  "python controllers/optimal/python/run.py --law=formation --id=2 --leader=1 --slot=left --alt=4572 --max-bank-deg=60 --max-pitch-deg=24",
+  "python controllers/optimal/python/run.py --law=formation --id=3 --leader=1 --slot=right --alt=4572 --max-bank-deg=60 --max-pitch-deg=24",
+  "python controllers/optimal/python/run.py --law=formation --id=4 --leader=1 --slot=trail --alt=4572 --max-bank-deg=60 --max-pitch-deg=24",
+]

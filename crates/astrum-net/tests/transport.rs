@@ -1,259 +1,327 @@
-//! Zenoh transport integration tests over a single in-process session: command
-//! fan-in round-trips, telemetry delivery + per-aircraft key filtering, and the
-//! racing course/progress channels.
-//!
-//! A publisher and subscriber on one [`Session`] deliver locally and
-//! synchronously (Zenoh invokes same-session subscriber callbacks inline in the
-//! `put`), so these are deterministic; the short retry loops just guard against
-//! any residual scheduling lag.
+//! Zenoh transport behaviour over a single in-process session (a session's own
+//! publishers deliver to its own subscribers). Retry loops guard against residual
+//! declaration-propagation lag.
+
+use std::time::Duration;
 
 use astrum_net::{
-    CommandReceiver, CommandSender, RacePublisher, RaceSubscriber, Session, TelemetryPublisher,
-    TelemetrySubscriber,
+    fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, SampledTelemetry,
+    ScenarioServer, Selection, Session, TelemetryPublisher, TickPublisher, TickReceiver,
 };
-use astrum_proto::{
-    CommandMsg, Control, RaceCourseMsg, RaceGateSpec, RaceStateMsg, TelemetrySample,
-};
+use astrum_proto::{encode_command, Command, Control, RawActuators, Telemetry, TickEnd};
+use zenoh::Wait;
 
-fn sample(id: u32) -> TelemetrySample {
-    TelemetrySample {
-        aircraft_id: id,
-        sim_time_s: 1.0,
-        lat_deg: 37.6188,
-        lon_deg: -122.3756,
-        alt_m: 1524.0,
-        enu_e: 1.0,
-        enu_n: 2.0,
-        enu_u: 3.0,
-        vel_north_mps: 50.0,
-        vel_east_mps: 0.0,
-        vel_down_mps: 0.0,
-        phi_rad: 0.0,
-        theta_rad: 0.0,
-        psi_rad: 0.5,
-        airspeed_mps: 51.0,
-        health: 0,
-        vehicle_kind: astrum_proto::VehicleKind::FixedWing,
-    }
+fn sample(id: u32, tick: u64) -> Telemetry {
+    Telemetry { aircraft_id: id, tick, sim_time_s: tick as f64 / 120.0, ..Default::default() }
+}
+
+fn raw(a: f64) -> Control {
+    Control::Raw(RawActuators { aileron: a, elevator: 0.0, rudder: 0.0, throttle: 0.5 })
 }
 
 #[test]
-fn command_fan_in_roundtrip() {
+fn commands_arrive_in_order_with_increasing_seq_and_the_senders_epoch() {
     let session = Session::in_process().unwrap();
     let rx = CommandReceiver::bind(&session).unwrap();
-    let tx = CommandSender::connect(&session);
+    let mut tx = CommandSender::new(&session, 42).unwrap();
+    for k in 0..3 {
+        tx.send(raw(k as f64 / 10.0), k == 2, 100 + k).unwrap();
+    }
+    let mut got = Vec::new();
+    for _ in 0..1000 {
+        got.extend(rx.drain().into_iter().map(Result::unwrap));
+        if got.len() == 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(got.iter().map(|c| c.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(got.iter().map(|c| c.telemetry_tick).collect::<Vec<_>>(), vec![100, 101, 102]);
+    assert!(got[2].trigger && !got[0].trigger);
+    assert!(got.iter().all(|c| c.target_id == 42));
+    assert_ne!(tx.epoch(), 0);
+    assert!(got.iter().all(|c| c.epoch == tx.epoch()));
+}
 
-    let cmd = CommandMsg {
-        target_id: 42,
-        control: Control::Raw { aileron: 0.1, elevator: -0.2, rudder: 0.0, throttle: 0.8 },
+#[test]
+fn every_sender_gets_its_own_epoch() {
+    let session = Session::in_process().unwrap();
+    let a = CommandSender::new(&session, 1).unwrap();
+    let b = CommandSender::new(&session, 1).unwrap();
+    assert_ne!(a.epoch(), b.epoch());
+}
+
+#[test]
+fn command_whose_payload_disagrees_with_its_key_is_rejected() {
+    let session = Session::in_process().unwrap();
+    let rx = CommandReceiver::bind(&session).unwrap();
+    // Payload says aircraft 2, key says aircraft 1.
+    let forged = Command {
+        target_id: 2,
+        seq: 1,
+        telemetry_tick: 0,
+        trigger: false,
+        epoch: 1,
+        control: raw(0.0),
     };
-    tx.send(&cmd).unwrap();
-
-    // Only one command was sent, so retry-draining (without resending) yields
-    // exactly one copy once it lands.
-    let mut drained = Vec::new();
+    let mut got = Vec::new();
     for _ in 0..1000 {
-        drained = rx.drain();
-        if !drained.is_empty() {
+        session.raw().put(keys::command(1), encode_command(&forged)).wait().unwrap();
+        got = rx.drain();
+        if !got.is_empty() {
             break;
         }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(drained, vec![cmd]);
+    let err = got[0].clone().unwrap_err();
+    assert!(err.reason.contains("targets 2"), "{err}");
 }
 
 #[test]
-fn telemetry_delivery_roundtrip() {
+fn latest_telemetry_keeps_only_the_newest_sample_per_aircraft() {
     let session = Session::in_process().unwrap();
-    let pubr = TelemetryPublisher::new(&session);
-    let mut sub = TelemetrySubscriber::connect(&session).unwrap();
-    sub.subscribe(7).unwrap();
-
-    let s = sample(7);
-    let mut got = None;
+    let mut publisher = TelemetryPublisher::new(&session);
+    let mut fleet = LatestTelemetry::subscribe(&session, Selection::Fleet).unwrap();
+    // Establish the subscription, then publish a burst for two aircraft.
     for _ in 0..1000 {
-        pubr.publish(&s).unwrap();
-        if let Some(r) = sub.try_recv().unwrap() {
-            got = Some(r);
+        publisher.publish(&sample(1, 0)).unwrap();
+        if fleet.latest(1).is_some() {
             break;
         }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(got, Some(s));
-}
-
-#[test]
-fn telemetry_key_filter_excludes_others() {
-    let session = Session::in_process().unwrap();
-    let pubr = TelemetryPublisher::new(&session);
-    let mut sub = TelemetrySubscriber::connect(&session).unwrap();
-    sub.subscribe(7).unwrap();
-
-    // Publish for a different id; the key filter must exclude it. Establish the
-    // subscription first by confirming id 7 gets through.
-    let mine = sample(7);
-    let mut established = false;
+    for tick in 1..=50 {
+        publisher.publish(&sample(1, tick)).unwrap();
+        publisher.publish(&sample(2, tick)).unwrap();
+    }
+    fleet.wait(Duration::from_secs(1)).unwrap();
     for _ in 0..1000 {
-        pubr.publish(&mine).unwrap();
-        if sub.try_recv().unwrap().is_some() {
-            established = true;
+        if fleet.latest(1).map(|t| t.tick) == Some(50)
+            && fleet.latest(2).map(|t| t.tick) == Some(50)
+        {
             break;
         }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(established, "subscription never established");
-
-    // Drain any residual id-7 frames queued during establishment.
-    while sub.try_recv().unwrap().is_some() {}
-
-    // Now a burst for id 9 must not be delivered (key astrum/telemetry/9 does not
-    // match the subscription astrum/telemetry/7).
-    for _ in 0..50 {
-        pubr.publish(&sample(9)).unwrap();
-    }
-    assert!(sub.try_recv().unwrap().is_none());
-}
-
-// --- Racing task state -------------------------------------------------------
-
-fn race_course(drone_id: u32) -> RaceCourseMsg {
-    RaceCourseMsg {
-        drone_id,
-        seed: 7,
-        opening_m: 0.635,
-        bar_m: 0.0762,
-        gates: (0..6)
-            .map(|i| RaceGateSpec {
-                index: i,
-                center_e: i as f64,
-                center_n: i as f64 * 10.0,
-                center_u: 2.5,
-                yaw_rad: 0.1 * i as f64,
-            })
-            .collect(),
-    }
-}
-
-fn race_state(drone_id: u32, passed: u32) -> RaceStateMsg {
-    RaceStateMsg {
-        drone_id,
-        sim_time_s: passed as f64,
-        pending_gate: passed,
-        passed,
-        missed: 0,
-        gate_count: 6,
-        last_pass_s: 0.0,
-        finished: false,
-        outcome: astrum_proto::RaceOutcome::Running,
-    }
-}
-
-#[test]
-fn race_course_and_state_delivery_roundtrip() {
-    let session = Session::in_process().unwrap();
-    let pubr = RacePublisher::new(&session);
-    let mut sub = RaceSubscriber::connect(&session).unwrap();
-    sub.subscribe(1).unwrap();
-
-    let (course, state) = (race_course(1), race_state(1, 2));
-    let mut got_course = None;
-    let mut got_state = None;
-    for _ in 0..1000 {
-        pubr.publish_course(&course).unwrap();
-        pubr.publish_state(&state).unwrap();
-        got_course = got_course.or(sub.try_recv_course().unwrap());
-        got_state = got_state.or(sub.try_recv_state().unwrap());
-        if got_course.is_some() && got_state.is_some() {
-            break;
-        }
-    }
-    assert_eq!(got_course, Some(course));
-    assert_eq!(got_state, Some(state));
-}
-
-#[test]
-fn race_reads_are_latest_wins_not_a_queue() {
-    // Both racing channels carry *state*, so a backlog is staleness: a read must
-    // return the newest message and discard what it superseded. Publishing a
-    // strictly increasing sequence makes that observable.
-    let session = Session::in_process().unwrap();
-    let pubr = RacePublisher::new(&session);
-    let mut sub = RaceSubscriber::connect(&session).unwrap();
-    sub.subscribe(1).unwrap();
-
-    // Establish the subscription, then clear whatever landed while it came up.
-    let mut established = false;
-    for _ in 0..1000 {
-        pubr.publish_state(&race_state(1, 0)).unwrap();
-        if sub.try_recv_state().unwrap().is_some() {
-            established = true;
-            break;
-        }
-    }
-    assert!(established, "subscription never established");
-    while sub.try_recv_state().unwrap().is_some() {}
-
-    for passed in 1..=20 {
-        pubr.publish_state(&race_state(1, passed)).unwrap();
-    }
-    assert_eq!(sub.try_recv_state().unwrap().map(|s| s.passed), Some(20));
-    // The whole backlog is consumed, not just one entry off the front.
-    assert!(sub.try_recv_state().unwrap().is_none());
-}
-
-#[test]
-fn race_key_filter_excludes_other_drones() {
-    let session = Session::in_process().unwrap();
-    let pubr = RacePublisher::new(&session);
-    let mut sub = RaceSubscriber::connect(&session).unwrap();
-    sub.subscribe(1).unwrap();
-
-    let mut established = false;
-    for _ in 0..1000 {
-        pubr.publish_state(&race_state(1, 0)).unwrap();
-        if sub.try_recv_state().unwrap().is_some() {
-            established = true;
-            break;
-        }
-    }
-    assert!(established, "subscription never established");
-    while sub.try_recv_state().unwrap().is_some() {}
-    while sub.try_recv_course().unwrap().is_some() {}
-
-    for _ in 0..50 {
-        pubr.publish_state(&race_state(9, 3)).unwrap();
-        pubr.publish_course(&race_course(9)).unwrap();
-    }
-    assert!(sub.try_recv_state().unwrap().is_none(), "drone 9's state leaked into drone 1's read");
-    assert!(
-        sub.try_recv_course().unwrap().is_none(),
-        "drone 9's course leaked into drone 1's read"
+    let snap = fleet.snapshot();
+    assert_eq!(
+        snap.iter().map(|t| (t.aircraft_id, t.tick)).collect::<Vec<_>>(),
+        vec![(1, 50), (2, 50)]
     );
 }
 
 #[test]
-fn race_channels_are_independent() {
-    // The course and progress subscribers are separate declarations; a course
-    // publication must not satisfy a state read, or a controller would block on
-    // one channel while the other is live.
+fn aircraft_selection_excludes_other_ids() {
     let session = Session::in_process().unwrap();
-    let pubr = RacePublisher::new(&session);
-    let mut sub = RaceSubscriber::connect(&session).unwrap();
-    sub.subscribe_all().unwrap();
-
-    let mut got = None;
+    let mut publisher = TelemetryPublisher::new(&session);
+    let one = LatestTelemetry::subscribe(&session, Selection::Aircraft(1)).unwrap();
     for _ in 0..1000 {
-        pubr.publish_course(&race_course(4)).unwrap();
-        got = sub.try_recv_course().unwrap();
-        if got.is_some() {
+        publisher.publish(&sample(1, 1)).unwrap();
+        publisher.publish(&sample(10, 1)).unwrap();
+        if one.latest(1).is_some() {
             break;
         }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(got.is_some(), "subscribe_all did not receive a course");
-    assert!(sub.try_recv_state().unwrap().is_none(), "a course satisfied a state read");
+    assert!(one.latest(1).is_some());
+    assert!(one.latest(10).is_none(), "astrum/telemetry/1 must not match .../10");
 }
 
 #[test]
-fn race_reads_before_subscribing_are_an_error() {
+fn wait_times_out_without_new_samples() {
     let session = Session::in_process().unwrap();
-    let sub = RaceSubscriber::connect(&session).unwrap();
-    assert!(sub.try_recv_course().is_err());
-    assert!(sub.try_recv_state().is_err());
+    let mut sub = LatestTelemetry::subscribe(&session, Selection::Fleet).unwrap();
+    assert_eq!(sub.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+/// A fleet trail on `session` thinned to `period_s`, already receiving: it has
+/// seen tick 0 of every aircraft in `ids` (not yet taken).
+fn sampled(
+    session: &Session,
+    publisher: &mut TelemetryPublisher,
+    ids: &[u32],
+    period_s: f64,
+    cap: usize,
+) -> SampledTelemetry {
+    let mut sub = SampledTelemetry::subscribe(session, Selection::Fleet, period_s, cap).unwrap();
+    for _ in 0..1000 {
+        for &id in ids {
+            publisher.publish(&sample(id, 0)).unwrap();
+        }
+        if sub.wait(Duration::from_millis(1)).is_ok() {
+            break;
+        }
+    }
+    settle(&mut sub);
+    sub
+}
+
+/// Wait until `sub` has had no new sample for 50 ms: everything published has
+/// been delivered.
+fn settle(sub: &mut SampledTelemetry) {
+    while sub.wait(Duration::from_millis(50)).is_ok() {}
+}
+
+fn ticks(batch: &[Telemetry]) -> Vec<(u32, u64)> {
+    batch.iter().map(|t| (t.aircraft_id, t.tick)).collect()
+}
+
+#[test]
+fn sampled_telemetry_keeps_one_sample_per_period_of_sim_time_plus_the_newest() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    // 120 Hz ticks thinned to 30 Hz: every 4th tick.
+    let mut sub = sampled(&session, &mut publisher, &[1, 2], 1.0 / 30.0, 1000);
+    for tick in 1..=118 {
+        publisher.publish(&sample(2, tick)).unwrap();
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    // Ids ascending, each in time order; tick 118 is the newest, closer than a
+    // period to tick 116.
+    let every_4th = (0..=116).step_by(4).chain([118]);
+    let want: Vec<_> = every_4th.clone().map(|t| (1, t)).chain(every_4th.map(|t| (2, t))).collect();
+    assert_eq!(ticks(&sub.take()), want);
+
+    // Nothing new: each aircraft's newest again.
+    assert_eq!(ticks(&sub.take()), [(1, 118), (2, 118)]);
+    // The spacing carries on from the last sample taken, not from the grid.
+    for tick in 119..=128 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [(1, 122), (1, 126), (1, 128), (2, 118)]);
+    assert_eq!(sub.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+#[test]
+fn sampled_telemetry_halves_its_trail_at_the_cap_instead_of_dropping_the_oldest() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    // 120 Hz ticks thinned to 30 Hz (every 4th), at most 10 pending.
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 10);
+    for tick in 1..=400 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    let batch: Vec<u64> = sub.take().iter().map(|t| t.tick).collect();
+    // Newest-kept would be ticks 364..=400 only; halving covers the whole 400
+    // ticks, first sample to newest, within the cap...
+    assert!(batch.len() <= 10, "{batch:?}");
+    assert_eq!((batch.first(), batch.last()), (Some(&0), Some(&400)), "{batch:?}");
+    // ...at the period the cap forces: 4 ticks doubled four times is 64.
+    let widest = batch.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!((32..=65).contains(&widest), "gaps up to {widest} ticks in {batch:?}");
+    assert!(sub.capped() > 0);
+
+    // A take resets the period: the next stretch is thinned to every 4th tick
+    // again.
+    for tick in 401..=420 {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [404, 408, 412, 416, 420].map(|t| (1, t)));
+}
+
+#[test]
+fn halving_keeps_the_first_and_newest_samples_for_every_cap() {
+    // 400 ticks thinned to every 4th: 100 samples, far more than any cap here.
+    for cap in 1..=7usize {
+        let session = Session::in_process().unwrap();
+        let mut publisher = TelemetryPublisher::new(&session);
+        let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, cap);
+        for tick in 1..=400 {
+            publisher.publish(&sample(1, tick)).unwrap();
+        }
+        settle(&mut sub);
+        let batch: Vec<u64> = sub.take().iter().map(|t| t.tick).collect();
+        assert!(batch.len() <= cap, "cap {cap}: {batch:?}");
+        assert_eq!(batch.last(), Some(&400), "cap {cap}: {batch:?}");
+        // One sample can only be the newest; with room for two, the batch
+        // starts where the stretch did.
+        if cap >= 2 {
+            assert_eq!(batch.first(), Some(&0), "cap {cap}: {batch:?}");
+        }
+        assert!(batch.windows(2).all(|w| w[0] < w[1]), "cap {cap}: {batch:?}");
+    }
+}
+
+#[test]
+fn a_backwards_clock_starts_the_trail_over_at_the_base_period() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    // Cap 3: 60 ticks halve the trail several times; the new run's first 8
+    // ticks then thin at the base period again (every 4th), not the doubled one.
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 3);
+    for tick in (1..=60).chain(0..=8) {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [0, 4, 8].map(|t| (1, t)));
+}
+
+#[test]
+fn sampled_telemetry_drops_an_aircrafts_old_run_when_its_clock_goes_back() {
+    let session = Session::in_process().unwrap();
+    let mut publisher = TelemetryPublisher::new(&session);
+    let mut sub = sampled(&session, &mut publisher, &[1], 1.0 / 30.0, 1000);
+    for tick in (1..=40).chain(0..=8) {
+        publisher.publish(&sample(1, tick)).unwrap();
+    }
+    settle(&mut sub);
+    assert_eq!(ticks(&sub.take()), [(1, 0), (1, 4), (1, 8)]);
+}
+
+#[test]
+fn tick_receiver_returns_the_newest_tick_end() {
+    let session = Session::in_process().unwrap();
+    let publisher = TickPublisher::new(&session).unwrap();
+    let mut rx = TickReceiver::subscribe(&session).unwrap();
+    for _ in 0..1000 {
+        publisher.publish(&TickEnd { tick: 0, sim_time_s: 0.0 }).unwrap();
+        if rx.latest().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rx.wait(Duration::from_secs(1)).unwrap();
+    for tick in 1..=5 {
+        publisher.publish(&TickEnd { tick, sim_time_s: tick as f64 / 120.0 }).unwrap();
+    }
+    for _ in 0..1000 {
+        if rx.latest().map(|t| t.tick) == Some(5) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        rx.wait(Duration::from_secs(1)).unwrap(),
+        TickEnd { tick: 5, sim_time_s: 5.0 / 120.0 }
+    );
+    assert_eq!(rx.wait(Duration::from_millis(20)), Err(astrum_net::NetError::Timeout));
+}
+
+#[test]
+fn scenario_fetch_waits_for_a_server_that_appears_later() {
+    // A recorder that starts with the sim may ask before the sim has declared
+    // its queryable; the fetch must keep asking until its timeout.
+    let session = Session::in_process().unwrap();
+    let server = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            ScenarioServer::serve(&session, "[sim]\nrate_hz = 120.0\n".into()).unwrap()
+        })
+    };
+    let got = fetch_scenario(&session, Duration::from_secs(3)).unwrap();
+    let _server = server.join().unwrap();
+    assert_eq!(got.as_deref(), Some("[sim]\nrate_hz = 120.0\n"));
+}
+
+#[test]
+fn scenario_fetch_without_a_server_returns_none_after_the_timeout() {
+    let session = Session::in_process().unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(fetch_scenario(&session, Duration::from_millis(300)).unwrap(), None);
+    assert!(started.elapsed() >= Duration::from_millis(300));
 }

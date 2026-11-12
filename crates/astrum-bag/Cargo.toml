@@ -3,14 +3,15 @@ name = "astrum-bag"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "ASTRUM telemetry bag: record the telemetry stream and replay it as another Zenoh publisher."
+rust-version.workspace = true
+publish.workspace = true
+description = "ASTRUM MCAP bags: record the telemetry + command streams and replay telemetry as a sim stand-in."
 
 [lib]
 name = "astrum_bag"
 
-# `record` subscribes to live telemetry and writes a bag; `play` replays a bag
-# as a PUB, feeding any subscriber (controller / replay renderer) exactly as the
-# live sim would.
+# `record` subscribes to the live telemetry and command streams and writes an
+# MCAP bag; `play` republishes the bag's telemetry exactly as the live sim would.
 [[bin]]
 name = "astrum-bag-record"
 path = "src/bin/record.rs"
@@ -19,8 +20,22 @@ path = "src/bin/record.rs"
 name = "astrum-bag-play"
 path = "src/bin/play.rs"
 
+# `metrics` reduces a bag to its run metrics as JSON.
+[[bin]]
+name = "astrum-bag-metrics"
+path = "src/bin/metrics.rs"
+
 [dependencies]
 astrum-proto = { path = "../astrum-proto" }
 astrum-net = { path = "../astrum-net" }
-capnp = "0.21"
 clap = { workspace = true }
+# SIGTERM (docker stop) as well as SIGINT finishes the bag.
+ctrlc = { workspace = true }
+mcap = "0.26"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Reads the fleet's models from the recorded scenario.
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

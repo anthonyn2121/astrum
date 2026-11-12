@@ -1,304 +1,366 @@
-//! Embedded reinforcement-learning environment seam (design doc §8).
+//! The embedded, multi-agent environment seam (design doc §8): `reset` / `step`
+//! / `observe` over one headless sim, with no network. The PyO3 binding
+//! (`crates/astrum-env`) marshals this API; it is also usable straight from Rust.
 //!
-//! [`SimEnv`] wraps [`build_app`](crate::build_app) + [`App::update`] in a plain,
-//! **multi-agent** `reset` / `step` / `observe` API — the layer a Python binding
-//! (`crates/astrum-env`) marshals with zero Bevy knowledge. It carries no pyo3
-//! dependency on purpose, so it stays exercisable from `cargo test` and reusable
-//! straight from Rust (e.g. scripted-opponent rollouts or offline dataset bakes).
-//!
-//! # One `update()` == one tick
-//! Recall the sim has no `FixedUpdate`: exactly one physics step of `dt = 1/rate_hz`
-//! runs per [`App::update`]. So [`SimEnv::step`] is a single deterministic tick —
-//! apply this tick's actions, advance once, read the resulting state back.
-//!
-//! # What's in scope here (and what isn't)
-//! The env surfaces raw *state* — geometry, kinematics, HP, ammo — and the two
-//! episode flags (`terminated` / `truncated`). It deliberately computes **no
-//! reward** and does no obs normalisation or relative-geometry framing: those are
-//! policy/trainer concerns that live in Python (design doc §8), computed from the
-//! [`AgentObs`] fields. Keeping this layer a pure state in / state out mapping
-//! keeps it reusable across reward designs.
-//!
-//! # Parallelism model (hard constraint)
-//! JSBSim is process-global and not thread-safe (design doc §2.3/§8), so a single
-//! [`SimEnv`] owns one [`App`] on one thread and MUST NOT be shared across threads.
-//! Scale training with **separate processes** (Gymnasium `AsyncVectorEnv` /
-//! Stable-Baselines3 `SubprocVecEnv`), one `SimEnv` per worker — never OS threads.
-//! *Within* a process the env is inherently multi-agent (PettingZoo-style): the N
-//! aircraft of a scenario step together on one FDM-sequential app, which is what
-//! self-play / NvN needs. The Python binding enforces the single-thread rule at
-//! runtime with `#[pyclass(unsendable)]`.
+//! * Observations are the sim's own [`Telemetry`] samples — exactly what the
+//!   Zenoh bridge publishes — sorted by aircraft id.
+//! * Actions are commands applied through the same [`apply_command`] the bridge
+//!   uses (raw actuators, multirotor demands or autopilot targets, plus the
+//!   trigger), all from one controller epoch ([`ENV_EPOCH`]), so the ownership,
+//!   lease and failsafe rules are identical: an aircraft left out of `step`
+//!   keeps its last command until the scenario's `command_lease_s` expires,
+//!   then holds.
+//! * One `step` is one physics tick. The first observation (after construction
+//!   or `reset`) is at tick 1.
+//! * [`SimEnv::events`] are the events of the latest tick (hits, kills, mode
+//!   changes, ...), the same ones the bridge publishes on `astrum/events`.
+//! * [`SimEnv`] is `Send`: environments may be stepped from different threads
+//!   (JSBSim's construction race is handled inside `astrum-fdm`).
 
-use astrum_fdm::prop;
+use astrum_geo::{Geodetic, LocalFrame};
+use astrum_proto::{Command, Control, Event, Telemetry};
+use bevy::ecs::schedule::ScheduleLabel;
 use bevy::prelude::*;
 
-use crate::build_app;
-use crate::combat::components::{Dead, Gun, Health, Team, Trigger};
-use crate::components::{Aircraft, FdmInstance, GeoState};
-use crate::net::AutopilotState;
-use crate::scenario::Scenario;
+use crate::combat::ballistics::DVec3;
+use crate::combat::geometry::{body_to_grid, grid_to_body};
+use crate::combat::systems::engagement_decided;
+use crate::combat::{
+    gun_solution, Bullet, CombatParams, CombatRng, CombatState, Dead, Gun, GunSolution, Team,
+};
+use crate::components::{
+    AircraftIndex, AircraftState, FdmInstance, SimClock, SimParams, SimStatus, VehicleKind,
+    WorldFrame,
+};
+use crate::events::EventLog;
+use crate::net::{LastPublished, RefusalLog};
+use crate::pilot::{apply_command, Pilot};
+use crate::scenario::{Scenario, ScenarioError};
+use crate::systems::{grid_state, initial_components, reset_fdm, Diag, Pacer};
+use crate::{build_app, sim_params, team_count, world_frame, RunMode};
 
-/// One agent's control input for a tick. The four continuous channels are the
-/// normalised `fcs/*-cmd-norm` inputs (their *meaning* is vehicle-kind dependent —
-/// aerodynamic surfaces for fixed-wing, body-rate + collective demands for a
-/// multirotor — but the interface is identical). `fire` is the learned trigger
-/// (design doc §8): the policy decides when to shoot, it is not auto-aimed.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Action {
-    pub aileron: f64,
-    pub elevator: f64,
-    pub rudder: f64,
-    pub throttle: f64,
-    pub fire: bool,
-}
+/// The controller epoch of every command the env applies (the env is the only
+/// controller of its in-process sim).
+pub const ENV_EPOCH: u64 = 1;
 
-/// A single aircraft's observable state after a tick. Absolute/world-frame — the
-/// trainer derives relative geometry, a gun solution, and normalisation from these
-/// (design doc §8). Positions are ENU metres; velocity is local NED; attitude and
-/// body rates are radians / rad·s⁻¹.
+/// One agent's input for a tick.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct AgentObs {
-    pub id: u32,
-    pub team: u8,
-    /// `false` once the aircraft has been marked [`Dead`] (its FDM is frozen).
-    pub alive: bool,
-    /// ENU position (m): east, north, up.
-    pub pos_e: f64,
-    pub pos_n: f64,
-    pub pos_u: f64,
-    /// Local NED velocity (m/s): north, east, down.
-    pub vel_n: f64,
-    pub vel_e: f64,
-    pub vel_d: f64,
-    /// Attitude (rad): roll φ, pitch θ, yaw ψ.
-    pub phi: f64,
-    pub theta: f64,
-    pub psi: f64,
-    /// Body angular rates (rad/s): roll p, pitch q, yaw r.
-    pub p: f64,
-    pub q: f64,
-    pub r: f64,
-    /// Angle of attack α (rad) and sideslip β (rad) — stall/energy state the
-    /// trainer can't reconstruct from kinematics alone (design doc §8).
-    pub alpha_rad: f64,
-    pub beta_rad: f64,
-    /// Normal load factor Nz (g); ≈ +1 in level flight, the corner-speed signal.
-    pub nz_g: f64,
-    /// True airspeed (m/s).
-    pub airspeed_mps: f64,
-    /// Altitude above the ellipsoid (m).
-    pub alt_m: f64,
-    /// Remaining hit points.
-    pub health: f32,
-    /// Rounds remaining; `0` for unarmed aircraft (no [`Gun`]).
-    pub ammo: u16,
-    /// JSBSim sim time at this observation (s).
-    pub sim_time_s: f64,
+pub struct Action {
+    pub control: Control,
+    /// Gun trigger (armed aircraft only).
+    pub trigger: bool,
 }
 
-/// The episode-boundary flags returned alongside each step, mirroring the
-/// Gymnasium terminated/truncated split.
+/// Episode flags after a step (Gymnasium's terminated/truncated split).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepResult {
-    /// The engagement was *decided*: ≥ 2 teams started and ≤ 1 is still alive.
-    /// Matches [`crate::combat::systems::end_on_elimination`]'s predicate.
+    /// The engagement was decided: ≥ 2 teams started and ≤ 1 still has a living aircraft.
     pub terminated: bool,
-    /// The episode hit its time cap (`sim.max_time_s`). `false` when uncapped.
+    /// Sim time reached `sim.max_time_s` (never when uncapped).
     pub truncated: bool,
-    /// Sim time at the end of this step (s).
+    pub tick: u64,
     pub sim_time_s: f64,
 }
 
 impl StepResult {
-    /// Whether the episode is over for either reason.
     pub fn done(&self) -> bool {
         self.terminated || self.truncated
     }
 }
 
-/// Number of distinct teams in a scenario — the value `build_app` captures into
-/// `CombatState::initial_living_teams` to gate termination.
-fn count_teams(scenario: &Scenario) -> u8 {
-    let mut teams: Vec<u8> = scenario.aircraft.iter().map(|a| a.team).collect();
-    teams.sort_unstable();
-    teams.dedup();
-    teams.len() as u8
+/// Why an env call failed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EnvError {
+    Scenario(ScenarioError),
+    /// The sim hit a fatal error (an FDM failure); the env must be reset.
+    Sim(String),
+    UnknownAircraft(u32),
+    /// The command was refused (e.g. a non-finite autopilot target).
+    Refused {
+        id: u32,
+        reason: String,
+    },
 }
 
-/// Build a fresh app and pump one `update()` so `Startup` runs: `spawn_fleet`
-/// creates the entities and the first physics step settles JSBSim's trim. (Bevy
-/// runs the `Startup` schedule on the *first* `update()`, so there's no
-/// entities-present state before it.)
-fn fresh_app(scenario: &Scenario) -> App {
-    let mut app = build_app(scenario.clone());
-    app.update();
-    app
+impl std::fmt::Display for EnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnvError::Scenario(e) => write!(f, "{e}"),
+            EnvError::Sim(e) => write!(f, "simulation failed: {e}"),
+            EnvError::UnknownAircraft(id) => write!(f, "no aircraft {id}"),
+            EnvError::Refused { id, reason } => {
+                write!(f, "aircraft {id}: action refused: {reason}")
+            }
+        }
+    }
 }
 
-/// An embedded, multi-agent RL environment over one ASTRUM scenario. See the
-/// [module docs](self) for the parallelism constraint.
+impl std::error::Error for EnvError {}
+
+pub type Result<T, E = EnvError> = std::result::Result<T, E>;
+
+/// An embedded multi-agent environment over one scenario.
 pub struct SimEnv {
     scenario: Scenario,
-    app: App,
-    /// Teams present at spawn; termination only fires when this is ≥ 2.
-    initial_living_teams: u8,
-    /// `sim.max_time_s`; `0` means uncapped (never truncates).
-    max_time_s: f64,
+    world: World,
+    seq: u64,
+}
+
+fn run_tick(world: &mut World) {
+    world.run_schedule(Main.intern());
+    world.clear_trackers();
+}
+
+fn fatal(world: &World) -> Option<String> {
+    world.resource::<SimStatus>().fatal.clone()
+}
+
+/// Build a fresh world for `scenario` and run its first update (spawn + tick 1).
+fn fresh_world(scenario: &Scenario) -> Result<World> {
+    let mut app = build_app(scenario.clone(), RunMode::Embedded);
+    app.finish();
+    app.cleanup();
+    app.update();
+    let world = std::mem::take(app.world_mut());
+    match fatal(&world) {
+        Some(e) => Err(EnvError::Sim(e)),
+        None => Ok(world),
+    }
+}
+
+/// Whether `next` can reuse `current`'s loaded FDMs: same aircraft (ids, models,
+/// classes, order), rate and thread count. ICs, teams, health, ammo, seed and
+/// the world origin may all change.
+fn same_fleet(current: &Scenario, next: &Scenario) -> bool {
+    current.sim.rate_hz == next.sim.rate_hz
+        && current.sim.threads == next.sim.threads
+        && current.aircraft.len() == next.aircraft.len()
+        && current.aircraft.iter().zip(&next.aircraft).all(|(a, b)| {
+            a.id == b.id && a.model == b.model && a.class() == b.class() && a.lockstep == b.lockstep
+        })
+}
+
+/// Return every aircraft and resource to `scenario`'s initial state without
+/// reloading any model — equivalent to a fresh build, at a fraction of the cost.
+fn reset_world(world: &mut World, scenario: &Scenario) -> Result<()> {
+    let params = sim_params(scenario);
+    let frame = world_frame(scenario);
+    world.insert_resource(params);
+    world.insert_resource(frame);
+    world.insert_resource(SimClock::default());
+    world.insert_resource(SimStatus::default());
+    world.insert_resource(Diag::default());
+    world.insert_resource(Pacer::new(params.dt, params.speed));
+    world.insert_resource(CombatParams::default());
+    world.insert_resource(CombatRng::seeded(scenario.sim.seed));
+    world.insert_resource(CombatState { initial_living_teams: team_count(scenario) });
+    world.insert_resource(LastPublished::default());
+    world.insert_resource(RefusalLog::default());
+    world.insert_resource(EventLog::default());
+    world.insert_resource(scenario.clone());
+
+    let bullets: Vec<Entity> = world.query_filtered::<Entity, With<Bullet>>().iter(world).collect();
+    for b in bullets {
+        world.despawn(b);
+    }
+
+    let index = world.resource::<AircraftIndex>().0.clone();
+    for spec in &scenario.aircraft {
+        let class = spec.class().map_err(EnvError::Scenario)?;
+        let entity = index[&spec.id];
+        let mut ent = world.entity_mut(entity);
+        let mut inst = ent.get_mut::<FdmInstance>().expect("aircraft entities own an FDM");
+        let fdm = inst.fdm();
+        reset_fdm(fdm, spec, &class, scenario.sim.seed).map_err(EnvError::Sim)?;
+        let state = grid_state(&frame.0, fdm, None).map_err(|e| EnvError::Sim(e.to_string()))?;
+        let (team, health, trigger, pilot, armed) =
+            initial_components(spec, &class, params.rate_hz);
+        ent.insert((state, team, health, trigger, pilot));
+        ent.remove::<Dead>();
+        if let Some((gains, gun)) = armed {
+            ent.insert((gains, gun));
+        }
+    }
+    Ok(())
 }
 
 impl SimEnv {
-    /// Build an env from an in-memory scenario and put it in the reset state (the
-    /// fleet spawned and settled by one tick — see [`SimEnv::reset`]).
-    pub fn new(scenario: Scenario) -> Self {
-        let initial_living_teams = count_teams(&scenario);
-        let max_time_s = scenario.sim.max_time_s;
-        let app = fresh_app(&scenario);
-        SimEnv { scenario, app, initial_living_teams, max_time_s }
+    /// Build an env (validates the scenario) and run its first tick.
+    pub fn new(scenario: Scenario) -> Result<Self> {
+        scenario.validate().map_err(EnvError::Scenario)?;
+        let world = fresh_world(&scenario)?;
+        Ok(SimEnv { scenario, world, seq: 0 })
     }
 
-    /// Build an env from a scenario TOML string (the natural entry point for the
-    /// Python binding, which hands the config over as text).
-    pub fn from_toml_str(toml: &str) -> Result<Self, String> {
-        Ok(Self::new(Scenario::from_toml_str(toml)?))
+    pub fn from_toml_str(toml: &str) -> Result<Self> {
+        Self::new(Scenario::from_toml_str(toml).map_err(EnvError::Scenario)?)
     }
 
-    /// Rebuild the world from the original scenario and return the initial
-    /// observation. Fully deterministic — same scenario (and `sim.seed`) ⇒ same
-    /// start. One settling tick has run (fleet spawned + JSBSim trim), so the
-    /// initial obs is at `t = dt`, not `t = 0`.
-    pub fn reset(&mut self) -> Vec<AgentObs> {
-        self.app = fresh_app(&self.scenario);
-        self.observe()
+    pub fn scenario(&self) -> &Scenario {
+        &self.scenario
     }
 
-    /// Advance exactly one tick. `actions` is a slice of `(aircraft_id, Action)`;
-    /// each listed aircraft has its autopilot disengaged, its four `fcs/*-cmd-norm`
-    /// inputs written, and its trigger set for this tick. Aircraft not in the list
-    /// keep their previous commands (e.g. a scripted opponent driven elsewhere, or
-    /// an aircraft you intend to leave under its last command). Returns the fresh
-    /// observation and the episode flags.
-    pub fn step(&mut self, actions: &[(u32, Action)]) -> (Vec<AgentObs>, StepResult) {
-        self.apply_actions(actions);
-        self.app.update();
-        let obs = self.observe();
-        let result = self.step_result();
-        (obs, result)
+    /// The physics step (s).
+    pub fn dt(&self) -> f64 {
+        self.world.resource::<SimParams>().dt
     }
 
-    /// Sorted ids of every aircraft in the world.
-    pub fn agent_ids(&mut self) -> Vec<u32> {
-        let mut q = self.app.world_mut().query::<&Aircraft>();
-        let world = self.app.world();
-        let mut ids: Vec<u32> = q.iter(world).map(|a| a.id).collect();
+    /// The world grid observations are expressed in.
+    pub fn frame(&self) -> LocalFrame {
+        self.world.resource::<WorldFrame>().0
+    }
+
+    /// Sorted ids of every aircraft.
+    pub fn agent_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self.scenario.aircraft.iter().map(|a| a.id).collect();
         ids.sort_unstable();
         ids
     }
 
-    /// Observe every aircraft's current state, sorted by id (a stable per-agent
-    /// order for the trainer's fixed-width observation tensor).
-    // The observation genuinely reads eight components per aircraft (id, geo state,
-    // ENU transform, team, health, optional gun, alive marker, FDM for body rates);
-    // `type_complexity` is the usual Bevy-query false positive.
-    #[allow(clippy::type_complexity)]
-    pub fn observe(&mut self) -> Vec<AgentObs> {
-        let mut q = self.app.world_mut().query::<(
-            &Aircraft,
-            &GeoState,
-            &Transform,
-            &Team,
-            &Health,
-            Option<&Gun>,
-            Option<&Dead>,
-            &FdmInstance,
-        )>();
-        let world = self.app.world();
-        let mut obs: Vec<AgentObs> = q
-            .iter(world)
-            .map(|(ac, gs, tf, team, hp, gun, dead, inst)| {
-                let f = &inst.0;
-                AgentObs {
-                    id: ac.id,
-                    team: team.0,
-                    alive: dead.is_none(),
-                    pos_e: tf.translation.x as f64,
-                    pos_n: tf.translation.y as f64,
-                    pos_u: tf.translation.z as f64,
-                    vel_n: gs.vel_north_mps,
-                    vel_e: gs.vel_east_mps,
-                    vel_d: gs.vel_down_mps,
-                    phi: gs.phi_rad,
-                    theta: gs.theta_rad,
-                    psi: gs.psi_rad,
-                    p: f.get(prop::P_RAD_S),
-                    q: f.get(prop::Q_RAD_S),
-                    r: f.get(prop::R_RAD_S),
-                    alpha_rad: f.get(prop::ALPHA_RAD),
-                    beta_rad: f.get(prop::BETA_RAD),
-                    nz_g: f.get(prop::NZ_G),
-                    airspeed_mps: gs.airspeed_mps,
-                    alt_m: gs.alt_m,
-                    health: hp.hp,
-                    ammo: gun.map(|g| g.ammo).unwrap_or(0),
-                    sim_time_s: gs.sim_time_s,
-                }
-            })
-            .collect();
-        obs.sort_unstable_by_key(|o| o.id);
-        obs
+    /// Return to the initial state of `scenario` (default: the current one),
+    /// optionally overriding its seed. Reuses the loaded FDMs when the fleet is
+    /// unchanged; otherwise rebuilds. Deterministic: the same scenario and seed
+    /// reproduce the same episode bit for bit.
+    pub fn reset(
+        &mut self,
+        seed: Option<u64>,
+        scenario: Option<Scenario>,
+    ) -> Result<Vec<Telemetry>> {
+        let mut next = scenario.unwrap_or_else(|| self.scenario.clone());
+        if let Some(s) = seed {
+            next.sim.seed = s;
+        }
+        next.validate().map_err(EnvError::Scenario)?;
+        let reusable = same_fleet(&self.scenario, &next) && fatal(&self.world).is_none();
+        if reusable {
+            reset_world(&mut self.world, &next)?;
+            run_tick(&mut self.world);
+            if let Some(e) = fatal(&self.world) {
+                return Err(EnvError::Sim(e));
+            }
+        } else {
+            self.world = fresh_world(&next)?;
+        }
+        self.scenario = next;
+        // Every pilot starts unowned with no seq: number commands afresh, so a
+        // reset env reports the same command status as a fresh one.
+        self.seq = 0;
+        Ok(self.observe())
     }
 
-    /// Apply this tick's actions to the matching aircraft (see [`SimEnv::step`]).
-    // Four `&mut` components in the query trips `type_complexity`; the tuple is
-    // plain, so allow it.
-    #[allow(clippy::type_complexity)]
-    fn apply_actions(&mut self, actions: &[(u32, Action)]) {
-        if actions.is_empty() {
-            return;
+    /// Apply this tick's actions and advance one tick.
+    pub fn step(&mut self, actions: &[(u32, Action)]) -> Result<(Vec<Telemetry>, StepResult)> {
+        if let Some(e) = fatal(&self.world) {
+            return Err(EnvError::Sim(e));
         }
-        let mut q =
-            self.app
-                .world_mut()
-                .query::<(&Aircraft, &mut FdmInstance, &mut AutopilotState, &mut Trigger)>();
-        let world = self.app.world_mut();
-        for (ac, mut inst, mut ap, mut trig) in q.iter_mut(world) {
-            if let Some((_, a)) = actions.iter().find(|(id, _)| *id == ac.id) {
-                // Disengage the autopilot so `autopilot_step` won't overwrite the
-                // raw inputs (mirrors the `Control::Raw` path in `ingest_commands`).
-                ap.engaged = false;
-                let f = &mut inst.0;
-                f.set(prop::AILERON_CMD, a.aileron);
-                f.set(prop::ELEVATOR_CMD, a.elevator);
-                f.set(prop::RUDDER_CMD, a.rudder);
-                f.set(prop::THROTTLE_CMD, a.throttle);
-                trig.0 = a.fire;
+        let now = self.world.resource::<SimClock>().tick;
+        let lease = self.world.resource::<SimParams>().lease_ticks;
+        let index = self.world.resource::<AircraftIndex>().0.clone();
+        for (id, a) in actions {
+            let entity = *index.get(id).ok_or(EnvError::UnknownAircraft(*id))?;
+            self.seq += 1;
+            let cmd = Command {
+                target_id: *id,
+                seq: self.seq,
+                telemetry_tick: now,
+                trigger: a.trigger,
+                epoch: ENV_EPOCH,
+                control: a.control,
+            };
+            let mut ent = self.world.entity_mut(entity);
+            if ent.contains::<Dead>() {
+                continue; // a wreck takes no commands
+            }
+            let mut pilot = *ent.get::<Pilot>().expect("aircraft entities have a Pilot");
+            let kind = *ent.get::<VehicleKind>().expect("aircraft entities have a VehicleKind");
+            let mut trigger = ent.get::<crate::combat::Trigger>().copied();
+            apply_command(&mut pilot, trigger.as_mut(), kind, &cmd, now, lease)
+                .map_err(|e| EnvError::Refused { id: *id, reason: e.to_string() })?;
+            ent.insert(pilot);
+            if let Some(t) = trigger {
+                ent.insert(t);
             }
         }
+        run_tick(&mut self.world);
+        if let Some(e) = fatal(&self.world) {
+            return Err(EnvError::Sim(e));
+        }
+        Ok((self.observe(), self.step_result()))
     }
 
-    /// The episode flags for the current world state.
+    /// The latest tick's telemetry, sorted by id.
+    pub fn observe(&self) -> Vec<Telemetry> {
+        self.world.resource::<LastPublished>().0.clone()
+    }
+
+    /// The events of the latest tick (`step`, or the first tick of `reset`), in
+    /// the order they happened.
+    pub fn events(&self) -> &[Event] {
+        self.world.resource::<EventLog>().last()
+    }
+
     fn step_result(&mut self) -> StepResult {
-        let sim_time_s = self.sim_time();
-        let truncated = self.max_time_s > 0.0 && sim_time_s >= self.max_time_s;
-        let terminated = self.initial_living_teams >= 2 && self.living_team_count() <= 1;
-        StepResult { terminated, truncated, sim_time_s }
+        let params = *self.world.resource::<SimParams>();
+        let clock = *self.world.resource::<SimClock>();
+        let state = *self.world.resource::<CombatState>();
+        let mut living = self.world.query_filtered::<&Team, Without<Dead>>();
+        let terminated = engagement_decided(&state, living.iter(&self.world));
+        let sim_time_s = clock.time_s(&params);
+        StepResult {
+            terminated,
+            truncated: params.max_time_s > 0.0 && sim_time_s >= params.max_time_s,
+            tick: clock.tick,
+            sim_time_s,
+        }
     }
 
-    /// Number of teams with at least one living aircraft — the same predicate
-    /// `end_on_elimination` uses to decide the engagement.
-    fn living_team_count(&mut self) -> usize {
-        let mut q = self.app.world_mut().query_filtered::<&Team, (With<Health>, Without<Dead>)>();
-        let world = self.app.world();
-        let mut teams: Vec<u8> = q.iter(world).map(|t| t.0).collect();
-        teams.sort_unstable();
-        teams.dedup();
-        teams.len()
+    fn state_of(&self, id: u32) -> Result<(Entity, AircraftState)> {
+        let e = *self
+            .world
+            .resource::<AircraftIndex>()
+            .0
+            .get(&id)
+            .ok_or(EnvError::UnknownAircraft(id))?;
+        Ok((e, *self.world.get::<AircraftState>(e).expect("aircraft entities have a state")))
     }
 
-    /// Current sim time (s). All aircraft step together, so this is the max over
-    /// the fleet (a dead aircraft's clock is frozen at its time of death).
-    fn sim_time(&mut self) -> f64 {
-        let mut q = self.app.world_mut().query::<&GeoState>();
-        let world = self.app.world();
-        q.iter(world).map(|g| g.sim_time_s).fold(0.0_f64, f64::max)
+    /// The ballistic fire-control solution of `shooter` against `target`, or
+    /// `None` if the shooter is unarmed.
+    pub fn gun_solution(&self, shooter: u32, target: u32) -> Result<Option<GunSolution>> {
+        let (se, s) = self.state_of(shooter)?;
+        let (_, t) = self.state_of(target)?;
+        let Some(gun) = self.world.get::<Gun>(se) else { return Ok(None) };
+        let combat = self.world.resource::<CombatParams>();
+        Ok(Some(gun_solution(&self.frame(), &s, gun, combat, &t, self.dt())))
+    }
+
+    /// Rotate a body-axes vector of aircraft `id` into the world grid.
+    pub fn body_to_grid(&self, id: u32, v: [f64; 3]) -> Result<[f64; 3]> {
+        let (_, s) = self.state_of(id)?;
+        let at = Geodetic::from_degrees(s.fdm.lat_deg, s.fdm.lon_deg, s.fdm.alt_hae_m);
+        let r = body_to_grid(
+            &self.frame(),
+            &at,
+            s.fdm.phi_rad,
+            s.fdm.theta_rad,
+            s.fdm.psi_rad,
+            DVec3::from_array(v),
+        );
+        Ok(r.to_array())
+    }
+
+    /// Rotate a world-grid vector into the body axes of aircraft `id`.
+    pub fn grid_to_body(&self, id: u32, v: [f64; 3]) -> Result<[f64; 3]> {
+        let (_, s) = self.state_of(id)?;
+        let at = Geodetic::from_degrees(s.fdm.lat_deg, s.fdm.lon_deg, s.fdm.alt_hae_m);
+        let r = grid_to_body(
+            &self.frame(),
+            &at,
+            s.fdm.phi_rad,
+            s.fdm.theta_rad,
+            s.fdm.psi_rad,
+            DVec3::from_array(v),
+        );
+        Ok(r.to_array())
     }
 }

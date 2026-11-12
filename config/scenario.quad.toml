@@ -1,26 +1,23 @@
 # Bounded single-quadrotor scenario — ASTRUM's second vehicle class.
-# An F450 quad starts hovering at 100 m, heading east (90°). The demo controller
-# (in `autopilot` mode) commands the sim's built-in multirotor hover-hold to
-# climb to 130 m and yaw to 180°, so telemetry shows a 30 m climb + 90° yaw that
-# then holds. `kind` is inferred from the model (F450 → multirotor); state it
-# explicitly for a model ASTRUM doesn't recognise.
+# An F450 starts hovering at 100 m, heading east (90°). The demo controller (in
+# `autopilot` mode) commands the sim's built-in hover-hold to climb to 130 m and
+# yaw to 180°, then hold. `kind` is inferred from the model (F450 → multirotor).
 
 [world]
 origin_lat_deg = 44.7258
 origin_lon_deg = -93.0759
-origin_alt_m = 0.0
+origin_alt_hae_m = 0.0
 
 [sim]
 rate_hz = 120.0
 max_time_s = 40.0
-realtime = true
+speed = 1.0
 
 [[aircraft]]
 id = 1
 model = "F450"
-# kind = "multirotor"   # optional; inferred from model here
 lat_deg = 44.7258
 lon_deg = -93.0759
-alt_ft = 328.084          # 100 m
+alt_hae_m = 100.0
 heading_deg = 90.0
-airspeed_kts = 0.0        # a quad initialises at hover, not cruise
+tas_mps = 0.0             # a quad initialises at hover (not trimmed)

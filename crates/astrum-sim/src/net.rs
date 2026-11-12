@@ -1,319 +1,577 @@
-//! Zenoh bridge: telemetry out and commands in, plus the optional in-sim
-//! autopilot inner loop that services high-level [`Control::Autopilot`] targets.
+//! The Zenoh bridge: commands in (with optional lockstep), telemetry and tick
+//! ends out, and controller presence.
 //!
-//! The transport wrappers live in [`astrum_net`]. They're held as Bevy
-//! **`NonSend`** resources (the sim runs single-threaded under
-//! `ScheduleRunnerPlugin`); all three bridge systems take theirs as
-//! `Option<NonSend<..>>` and no-op when it's absent, so the physics-only
-//! `build_app` (and its tests) run unchanged without opening a session —
-//! networking is switched on purely by inserting the resources.
+//! Telemetry is assembled once per tick by [`publish_telemetry`] into
+//! [`LastPublished`] whether or not a publisher is installed — the RL env reads
+//! its observations from the same resource, so both front doors see identical
+//! state. The transport wrappers are `NonSend` resources ([`Bus`]); without
+//! them the bridge systems only assemble telemetry, so the physics-only app
+//! (tests, the embedded env) runs without a session.
+//!
+//! On a tick that published telemetry, [`publish_tick_end`] closes it with a
+//! `TickEnd` after the tick's events; every re-publish of a tick's telemetry
+//! (lockstep wait, pause) is followed by its `TickEnd` again.
 
-use astrum_fdm::{prop, Fdm, FT_TO_M};
-use astrum_net::{CommandReceiver, TelemetryPublisher};
-use astrum_proto::{Control, TelemetrySample};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, Instant};
+
+use astrum_bag::wall_clock_ns;
+use astrum_net::{
+    CommandReceiver, CommandReject, ControlServer, EventPublisher, Presence, PresenceWatcher,
+    Session, TelemetryPublisher, TickPublisher, MIN_SPEED,
+};
+use astrum_proto::{
+    encode_command, encode_telemetry, Aero, BodyRates, CombatStatus, Command, Euler, EventKind,
+    ModeReason, Ned, Telemetry, TickEnd,
+};
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-use crate::components::{Aircraft, FdmInstance, GeoState, VehicleKind};
+use crate::combat::{Dead, Gun, Health, Team, Trigger};
+use crate::components::{
+    Aircraft, AircraftIndex, AircraftState, SimClock, SimParams, SimStatus, VehicleKind,
+};
+use crate::control::Board;
+use crate::events::EventLog;
+use crate::pilot::{apply_command, enter_failsafe, Pilot, Refusal};
+use crate::record::TickRecorder;
+use crate::systems::StopRequested;
+use crate::RunMode;
 
-/// High-level autopilot targets for one aircraft, populated from
-/// [`Control::Autopilot`] commands. `engaged` is cleared the moment a raw
-/// actuator command arrives, so raw control always wins.
-#[derive(Component, Debug, Clone, Copy, Default)]
-pub struct AutopilotState {
-    pub engaged: bool,
-    pub heading_rad: f64,
-    pub alt_msl_m: f64,
-    pub airspeed_mps: f64,
+/// Put `app` on the bus: telemetry and events out, commands in, controller
+/// presence, and the control plane (`astrum/control/*`, `astrum/status`).
+pub fn connect(app: &mut App, session: &Session) -> astrum_net::Result<()> {
+    let receiver = CommandReceiver::bind(session)?;
+    let watcher = PresenceWatcher::watch(session)?;
+    let control = ControlServer::serve(session, MIN_SPEED)?;
+    let events = EventPublisher::new(session)?;
+    let tick = TickPublisher::new(session)?;
+    app.insert_resource(Board(control.board()));
+    app.insert_non_send(TelemetryPublisher::new(session));
+    app.insert_non_send(events);
+    app.insert_non_send(tick);
+    app.insert_non_send(receiver);
+    app.insert_non_send(watcher);
+    app.insert_non_send(control);
+    Ok(())
 }
 
-/// Drain queued commands and apply them to the targeted aircraft.
-///
-/// * [`Control::Raw`] → written straight to the `fcs/*-cmd-norm` inputs and
-///   disengages the autopilot (raw overrides).
-/// * [`Control::Autopilot`] → stored in [`AutopilotState`]; [`autopilot_step`]
-///   turns the targets into control deflections each tick.
-pub fn ingest_commands(
-    receiver: Option<NonSend<CommandReceiver>>,
-    mut q: Query<(&Aircraft, &mut FdmInstance, &mut AutopilotState)>,
+/// The transport the lockstep wait needs (all absent off the bus).
+#[derive(SystemParam)]
+pub struct Bus<'w> {
+    receiver: Option<NonSend<'w, CommandReceiver>>,
+    publisher: Option<NonSendMut<'w, TelemetryPublisher>>,
+    tick: Option<NonSend<'w, TickPublisher>>,
+    watcher: Option<NonSend<'w, PresenceWatcher>>,
+    board: Option<Res<'w, Board>>,
+}
+
+pub(crate) const RECORDING_FAILED: &str = "recording stopped: the bag writer failed";
+
+/// The telemetry of the latest tick, one sample per aircraft, sorted by id.
+#[derive(Resource, Debug, Clone, Default)]
+pub struct LastPublished(pub Vec<Telemetry>);
+
+/// The aircraft whose samples [`publish_telemetry`] put on the bus for the
+/// latest tick (ascending; empty off the bus or when none was due), and
+/// whether that tick's `TickEnd` is still to be sent.
+#[derive(Resource, Debug, Default)]
+pub struct TickPublication {
+    ids: Vec<u32>,
+    end_pending: bool,
+}
+
+/// A re-sent copy of a tick's sample: the tick's state, with the command status
+/// of `pilot` now, so refusals during a lockstep wait or a pause reach the
+/// controller without waiting for the next tick.
+pub(crate) fn refreshed(sample: &Telemetry, pilot: Option<&Pilot>) -> Telemetry {
+    let mut s = *sample;
+    if let Some(p) = pilot {
+        s.command = p.command_status();
+    }
+    s
+}
+
+/// Publish `TickEnd` for the current tick (after re-publishing its telemetry).
+pub(crate) fn send_tick_end(publisher: &TickPublisher, clock: &SimClock, params: &SimParams) {
+    let end = TickEnd { tick: clock.tick, sim_time_s: clock.time_s(params) };
+    if let Err(e) = publisher.publish(&end) {
+        eprintln!("[astrum-sim] tick end publish failed for tick {}: {e}", clock.tick);
+    }
+}
+
+/// Close a tick that published telemetry with its `TickEnd`, after the tick's
+/// events ([`crate::events::publish_events`] runs first).
+pub fn publish_tick_end(
+    publisher: Option<NonSend<TickPublisher>>,
+    clock: Res<SimClock>,
+    params: Res<SimParams>,
+    mut publication: ResMut<TickPublication>,
 ) {
-    let Some(receiver) = receiver else { return };
-    let commands = receiver.drain();
-    if commands.is_empty() {
+    if !std::mem::take(&mut publication.end_pending) {
         return;
     }
-    for cmd in commands {
-        for (ac, mut inst, mut ap) in &mut q {
-            if ac.id != cmd.target_id {
-                continue;
-            }
-            match cmd.control {
-                Control::Raw { aileron, elevator, rudder, throttle } => {
-                    ap.engaged = false;
-                    let f = &mut inst.0;
-                    f.set(prop::AILERON_CMD, aileron.clamp(-1.0, 1.0));
-                    f.set(prop::ELEVATOR_CMD, elevator.clamp(-1.0, 1.0));
-                    f.set(prop::RUDDER_CMD, rudder.clamp(-1.0, 1.0));
-                    f.set(prop::THROTTLE_CMD, throttle.clamp(0.0, 1.0));
-                }
-                Control::Autopilot { heading_rad, alt_msl_m, airspeed_mps } => {
-                    ap.engaged = true;
-                    ap.heading_rad = heading_rad;
-                    ap.alt_msl_m = alt_msl_m;
-                    ap.airspeed_mps = airspeed_mps;
-                }
-            }
+    if let Some(p) = publisher {
+        send_tick_end(&p, &clock, &params);
+    }
+}
+
+/// Command refusals since the last report, by aircraft id.
+#[derive(Resource, Debug, Default)]
+pub struct RefusalLog {
+    counts: HashMap<u32, u64>,
+    rejected_payloads: u64,
+    last_report: Option<Instant>,
+}
+
+impl RefusalLog {
+    fn refuse(&mut self, id: u32, why: &Refusal) {
+        let n = self.counts.entry(id).or_default();
+        if *n == 0 {
+            eprintln!("[astrum-sim] aircraft {id}: command refused: {why}");
         }
+        *n += 1;
     }
-}
 
-// --- Basic built-in autopilot -----------------------------------------------
-//
-// A convenience inner loop for high-level [`Control::Autopilot`] targets; the
-// primary control path is raw actuators, where the controller supplies its own
-// law. The law is vehicle-class specific ([`fixed_wing_autopilot`] /
-// [`multirotor_autopilot`]) because the four `fcs/*-cmd-norm` inputs mean
-// different things on each; [`autopilot_step`] dispatches on [`VehicleKind`].
-
-// Fixed-wing law: proportional bank-to-turn for heading, pitch-for-altitude,
-// throttle-for-airspeed. Signs measured from the c172x (`aileron+ → roll right`,
-// `elevator+ → nose down`). The *gains* are per-airframe ([`FixedWingGains`]) so
-// a fighter and a trainer can share the loop but not its authority.
-
-const DEG: f64 = std::f64::consts::PI / 180.0;
-
-/// Per-airframe gains for the built-in fixed-wing autopilot inner loop
-/// ([`fixed_wing_autopilot`]).
-///
-/// A trainer and a fighter want very different authority from the same law: a
-/// c172x flies shallow, gentle turns, while an f16 sustains high bank and must
-/// pull the extra load factor a hard turn needs just to hold altitude. Rather
-/// than bake one airframe's numbers into the loop, each entity carries its own
-/// gains, chosen from the model name at spawn ([`FixedWingGains::for_model`]).
-#[derive(Component, Debug, Clone, Copy)]
-pub struct FixedWingGains {
-    /// Bank limit (rad) — sets the minimum turn radius `V²/(g·tan φ)`.
-    pub max_roll_rad: f64,
-    /// Pitch limit (rad) for the altitude loop.
-    pub max_pitch_rad: f64,
-    /// Desired roll (rad) per heading error (rad).
-    pub k_hdg_to_roll: f64,
-    /// Aileron per roll error (rad).
-    pub k_roll_to_ail: f64,
-    /// Roll-rate damping (aileron per rad/s).
-    pub k_roll_rate: f64,
-    /// Desired pitch (rad) per altitude error (m).
-    pub k_alt_to_pitch: f64,
-    /// Nose-up pitch (rad) fed forward per unit load-factor excess (`1/cos φ − 1`)
-    /// to hold altitude in a bank without an integrator. Zero for airframes that
-    /// turn too gently to need it (the c172x).
-    pub k_turn_comp: f64,
-    /// Elevator per pitch error (rad).
-    pub k_pitch_to_elev: f64,
-    /// Pitch-rate damping (elevator per rad/s).
-    pub k_pitch_rate: f64,
-    /// Baseline throttle (fraction) around the trim airspeed.
-    pub throttle_trim: f64,
-    /// Throttle per airspeed error (m/s).
-    pub k_spd_to_thr: f64,
-}
-
-impl FixedWingGains {
-    /// Conservative trainer tuning (the historical defaults): 25° bank, 10°
-    /// pitch, no turn compensation. Used for the c172x and any model without a
-    /// dedicated profile.
-    pub const fn cessna() -> Self {
-        Self {
-            max_roll_rad: 25.0 * DEG,
-            max_pitch_rad: 10.0 * DEG,
-            k_hdg_to_roll: 1.2,
-            k_roll_to_ail: 1.5,
-            k_roll_rate: 0.3,
-            k_alt_to_pitch: 0.01,
-            k_turn_comp: 0.0,
-            k_pitch_to_elev: 2.0,
-            k_pitch_rate: 0.5,
-            throttle_trim: 0.6,
-            k_spd_to_thr: 0.02,
+    fn reject(&mut self, r: &CommandReject) {
+        if self.rejected_payloads == 0 {
+            eprintln!("[astrum-sim] {r}");
         }
+        self.rejected_payloads += 1;
     }
 
-    /// Fighter tuning (f16): 60° bank for far tighter turns, a snappier roll,
-    /// generous pitch authority, and a load-factor feedforward so altitude holds
-    /// through a sustained hard turn (the ~40° banks the tight figure-eight
-    /// demands pull ~1.3 g, so the pitch loop needs the headroom and the lead —
-    /// it holds altitude to ~75 m over the whole pattern).
-    pub const fn f16() -> Self {
-        Self {
-            max_roll_rad: 60.0 * DEG,
-            max_pitch_rad: 24.0 * DEG,
-            k_hdg_to_roll: 2.5,
-            k_roll_to_ail: 2.5,
-            k_roll_rate: 0.4,
-            k_alt_to_pitch: 0.02,
-            k_turn_comp: 0.14,
-            k_pitch_to_elev: 2.0,
-            k_pitch_rate: 0.5,
-            throttle_trim: 0.6,
-            k_spd_to_thr: 0.02,
+    /// Summarise repeated refusals at most once per second of wall time.
+    fn report(&mut self) {
+        let now = Instant::now();
+        if self.last_report.is_some_and(|t| now - t < Duration::from_secs(1)) {
+            return;
         }
-    }
-
-    /// Pick a gain set from the JSBSim model name; unknown models get [`cessna`](Self::cessna).
-    pub fn for_model(model: &str) -> Self {
-        match model {
-            "f16" => Self::f16(),
-            _ => Self::cessna(),
+        self.last_report = Some(now);
+        let mut ids: Vec<_> = self.counts.iter().filter(|(_, n)| **n > 1).collect();
+        ids.sort();
+        for (id, n) in ids {
+            eprintln!("[astrum-sim] aircraft {id}: {n} commands refused in the last interval");
         }
+        if self.rejected_payloads > 1 {
+            eprintln!(
+                "[astrum-sim] {} malformed command payloads rejected",
+                self.rejected_payloads
+            );
+        }
+        self.counts.clear();
+        self.rejected_payloads = 0;
     }
 }
 
-impl Default for FixedWingGains {
-    fn default() -> Self {
-        Self::cessna()
+/// Build one aircraft's telemetry sample; `dt` is the sim step (s).
+#[allow(clippy::too_many_arguments)]
+pub fn telemetry(
+    tick: u64,
+    sim_time_s: f64,
+    dt: f64,
+    ac: &Aircraft,
+    st: &AircraftState,
+    kind: &VehicleKind,
+    pilot: &Pilot,
+    team: &Team,
+    hp: &Health,
+    gun: Option<&Gun>,
+    dead: bool,
+) -> Telemetry {
+    let f = &st.fdm;
+    Telemetry {
+        aircraft_id: ac.id,
+        tick,
+        sim_time_s,
+        lat_deg: f.lat_deg,
+        lon_deg: f.lon_deg,
+        alt_hae_m: f.alt_hae_m,
+        pos_enu: st.pos_enu,
+        vel_enu: st.vel_enu,
+        vel_ned: Ned { n: f.vel_north_mps, e: f.vel_east_mps, d: f.vel_down_mps },
+        attitude: Euler { phi_rad: f.phi_rad, theta_rad: f.theta_rad, psi_rad: f.psi_rad },
+        rates: BodyRates { p_rad_s: f.p_rad_s, q_rad_s: f.q_rad_s, r_rad_s: f.r_rad_s },
+        aero: Aero { alpha_rad: f.alpha_rad, beta_rad: f.beta_rad, nz_g: f.nz_g, mach: f.mach },
+        tas_mps: f.tas_mps,
+        fault_flags: 0,
+        vehicle_kind: (*kind).into(),
+        control_mode: pilot.mode.control_mode(),
+        combat: CombatStatus {
+            team: team.0,
+            hit_points: hp.hp,
+            hit_points_max: hp.hp_max,
+            alive: !dead,
+            ammo: gun.map_or(0, |g| g.ammo),
+        },
+        control_period_s: pilot.control_period_ticks as f64 * dt,
+        command: pilot.command_status(),
     }
 }
 
-// Multirotor (F450) hover-hold. The FCS interface is a *rate* command:
-// `aileron/elevator/rudder` demand body roll/pitch/yaw rates (measured
-// +cmd → +rate, ≈0.75 rad/s per unit) and `throttle` is collective (measured
-// hover ≈ 0.44). We hold a level hover at the commanded heading and altitude:
-// an outer P loop drives roll/pitch attitude to zero and yaw to the target
-// heading (both as rate demands, with body-rate damping), and a PD loop on
-// altitude sets the collective. The `airspeed` target is meaningless for a
-// hovering rotorcraft and is ignored.
-const HOVER_COLLECTIVE: f64 = 0.44; // measured throttle that holds altitude
-const K_LEVEL_ATT: f64 = 2.5; // roll/pitch cmd per attitude error (rad)
-const K_LEVEL_RATE: f64 = 0.3; // roll/pitch-rate damping (cmd per rad/s)
-const K_HDG_TO_YAW: f64 = 1.5; // rudder (yaw-rate) cmd per heading error (rad)
-const K_YAW_RATE: f64 = 0.2; // yaw-rate damping (cmd per rad/s)
-const K_ALT_TO_COLL: f64 = 0.02; // collective per altitude error (m)
-const K_CLIMB_RATE: f64 = 0.05; // collective per climb rate (m/s)
+/// The components a telemetry sample is built from.
+pub type TelemetryQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Aircraft,
+        &'static AircraftState,
+        &'static VehicleKind,
+        &'static Pilot,
+        &'static Team,
+        &'static Health,
+        Option<&'static Gun>,
+        Has<Dead>,
+    ),
+>;
 
-/// Wrap an angle to `(-π, π]`.
-fn wrap_pi(a: f64) -> f64 {
-    use std::f64::consts::PI;
-    (a + PI).rem_euclid(2.0 * PI) - PI
-}
-
-/// Service engaged autopilots: convert targets to `fcs/*-cmd-norm` deflections.
-/// Runs before `step_fdm` so this tick integrates the fresh commands. The law
-/// used depends on the entity's [`VehicleKind`].
-pub fn autopilot_step(
-    mut q: Query<(&mut FdmInstance, &AutopilotState, &VehicleKind, Option<&FixedWingGains>)>,
+/// Assemble this tick's telemetry into [`LastPublished`] (every aircraft, every
+/// tick), record all of it, and publish the samples of aircraft whose control
+/// tick this is (`control_rate_hz`; default every tick), noting them in
+/// [`TickPublication`]. Each published or recorded sample is encoded once.
+#[allow(clippy::too_many_arguments)]
+pub fn publish_telemetry(
+    publisher: Option<NonSendMut<TelemetryPublisher>>,
+    recorder: Option<Res<TickRecorder>>,
+    params: Res<SimParams>,
+    clock: Res<SimClock>,
+    mut status: ResMut<SimStatus>,
+    mut last: ResMut<LastPublished>,
+    mut publication: ResMut<TickPublication>,
+    mut due: Local<Vec<(u32, bool)>>,
+    q: TelemetryQuery,
 ) {
-    for (mut inst, ap, kind, gains) in &mut q {
-        if !ap.engaged {
+    let t = clock.time_s(&params);
+    last.0.clear();
+    due.clear();
+    publication.ids.clear();
+    for (ac, st, kind, pilot, team, hp, gun, dead) in &q {
+        last.0.push(telemetry(clock.tick, t, params.dt, ac, st, kind, pilot, team, hp, gun, dead));
+        due.push((ac.id, pilot.due(clock.tick)));
+    }
+    last.0.sort_unstable_by_key(|s| s.aircraft_id);
+    due.sort_unstable_by_key(|(id, _)| *id);
+    let mut publisher = publisher;
+    if publisher.is_none() && recorder.is_none() {
+        return;
+    }
+    let log_time_ns = if recorder.is_some() { wall_clock_ns() } else { 0 };
+    for (s, &(_, due)) in last.0.iter().zip(due.iter()) {
+        let publish = due && publisher.is_some();
+        if !publish && recorder.is_none() {
             continue;
         }
-        match kind {
-            VehicleKind::FixedWing => {
-                fixed_wing_autopilot(&mut inst.0, ap, gains.copied().unwrap_or_default())
+        let payload = encode_telemetry(s);
+        let to_publish = match &recorder {
+            Some(r) => {
+                let keep = publish.then(|| payload.clone());
+                if !r.telemetry(s.aircraft_id, log_time_ns, s.sim_time_s, payload) {
+                    status.fatal.get_or_insert_with(|| RECORDING_FAILED.to_owned());
+                }
+                keep
             }
-            VehicleKind::Multirotor => multirotor_autopilot(&mut inst.0, ap),
-        }
-    }
-}
-
-/// Fixed-wing inner loop (see [`FixedWingGains`]).
-fn fixed_wing_autopilot(f: &mut Fdm, ap: &AutopilotState, g: FixedWingGains) {
-    let phi = f.get(prop::PHI_RAD);
-    let theta = f.get(prop::THETA_RAD);
-    let psi = f.get(prop::PSI_RAD);
-    let p = f.get(prop::P_RAD_S);
-    let qrate = f.get(prop::Q_RAD_S);
-    let alt = f.get(prop::ALT_SL_M);
-    let airspeed = f.get(prop::VT_FPS) * FT_TO_M;
-
-    // Heading → bank → aileron. aileron+ rolls right (φ+).
-    let hdg_err = wrap_pi(ap.heading_rad - psi);
-    let roll_target = (g.k_hdg_to_roll * hdg_err).clamp(-g.max_roll_rad, g.max_roll_rad);
-    let aileron = (g.k_roll_to_ail * (roll_target - phi) - g.k_roll_rate * p).clamp(-1.0, 1.0);
-
-    // Altitude → pitch → elevator, plus a load-factor feedforward: a coordinated
-    // turn at bank φ needs load factor n = 1/cos φ to hold altitude, so command
-    // extra nose-up proportional to the excess (n − 1). Without it the pure alt-
-    // error P term sags in a sustained hard turn. elevator+ pitches down (θ−), so
-    // a nose-up (positive) pitch error commands negative elevator; +q damping
-    // opposes nose-up rate.
-    let load_excess = (1.0 / phi.cos().abs() - 1.0).clamp(0.0, 2.0);
-    let pitch_target = (g.k_alt_to_pitch * (ap.alt_msl_m - alt) + g.k_turn_comp * load_excess)
-        .clamp(-g.max_pitch_rad, g.max_pitch_rad);
-    let elevator =
-        (-g.k_pitch_to_elev * (pitch_target - theta) + g.k_pitch_rate * qrate).clamp(-1.0, 1.0);
-
-    // Airspeed → throttle.
-    let throttle =
-        (g.throttle_trim + g.k_spd_to_thr * (ap.airspeed_mps - airspeed)).clamp(0.0, 1.0);
-
-    f.set(prop::AILERON_CMD, aileron);
-    f.set(prop::ELEVATOR_CMD, elevator);
-    f.set(prop::THROTTLE_CMD, throttle);
-}
-
-/// Multirotor hover-hold inner loop (see the `HOVER_*` / `K_*` constants above).
-fn multirotor_autopilot(f: &mut Fdm, ap: &AutopilotState) {
-    let phi = f.get(prop::PHI_RAD);
-    let theta = f.get(prop::THETA_RAD);
-    let psi = f.get(prop::PSI_RAD);
-    let p = f.get(prop::P_RAD_S);
-    let qrate = f.get(prop::Q_RAD_S);
-    let r = f.get(prop::R_RAD_S);
-    let alt = f.get(prop::ALT_SL_M);
-    let climb = -f.get(prop::V_DOWN_FPS) * FT_TO_M; // +up, m/s
-
-    // Level roll/pitch: aileron+ → +roll rate, elevator+ → +pitch rate, so a
-    // positive attitude commands a negative rate to return to level.
-    let aileron = (-K_LEVEL_ATT * phi - K_LEVEL_RATE * p).clamp(-1.0, 1.0);
-    let elevator = (-K_LEVEL_ATT * theta - K_LEVEL_RATE * qrate).clamp(-1.0, 1.0);
-
-    // Heading hold: rudder+ → +yaw rate → +ψ, so a positive heading error
-    // commands positive rudder; +r damping opposes the yaw rate.
-    let hdg_err = wrap_pi(ap.heading_rad - psi);
-    let rudder = (K_HDG_TO_YAW * hdg_err - K_YAW_RATE * r).clamp(-1.0, 1.0);
-
-    // Altitude hold via collective (PD: hover trim + P on altitude − D on climb).
-    let throttle = (HOVER_COLLECTIVE + K_ALT_TO_COLL * (ap.alt_msl_m - alt) - K_CLIMB_RATE * climb)
-        .clamp(0.0, 1.0);
-
-    f.set(prop::AILERON_CMD, aileron);
-    f.set(prop::ELEVATOR_CMD, elevator);
-    f.set(prop::RUDDER_CMD, rudder);
-    f.set(prop::THROTTLE_CMD, throttle);
-}
-
-/// Encode each aircraft's post-step state and publish it on the telemetry key
-/// `astrum/telemetry/<id>`. Runs after `sync_geo_transform`.
-pub fn publish_telemetry(
-    publisher: Option<NonSend<TelemetryPublisher>>,
-    q: Query<(&Aircraft, &GeoState, &Transform, &VehicleKind)>,
-) {
-    let Some(publisher) = publisher else { return };
-    for (ac, gs, tf, kind) in &q {
-        let sample = TelemetrySample {
-            aircraft_id: ac.id,
-            sim_time_s: gs.sim_time_s,
-            lat_deg: gs.lat_deg,
-            lon_deg: gs.lon_deg,
-            alt_m: gs.alt_m,
-            enu_e: tf.translation.x as f64,
-            enu_n: tf.translation.y as f64,
-            enu_u: tf.translation.z as f64,
-            vel_north_mps: gs.vel_north_mps,
-            vel_east_mps: gs.vel_east_mps,
-            vel_down_mps: gs.vel_down_mps,
-            phi_rad: gs.phi_rad,
-            theta_rad: gs.theta_rad,
-            psi_rad: gs.psi_rad,
-            airspeed_mps: gs.airspeed_mps,
-            health: 0,
-            vehicle_kind: match kind {
-                VehicleKind::FixedWing => astrum_proto::VehicleKind::FixedWing,
-                VehicleKind::Multirotor => astrum_proto::VehicleKind::Multirotor,
-            },
+            None => Some(payload),
         };
-        // A dropped telemetry frame is non-fatal — log once and keep flying.
-        if let Err(e) = publisher.publish(&sample) {
-            eprintln!("[astrum-sim] telemetry publish failed for aircraft {}: {e}", ac.id);
+        if let (Some(p), Some(payload)) = (publisher.as_mut(), to_publish) {
+            publication.ids.push(s.aircraft_id);
+            if let Err(e) = p.publish_raw(s.aircraft_id, payload) {
+                eprintln!(
+                    "[astrum-sim] telemetry publish failed for aircraft {}: {e}",
+                    s.aircraft_id
+                );
+            }
         }
     }
+    publication.end_pending = !publication.ids.is_empty();
+}
+
+/// Record a received command (as decoded) when recording.
+fn record_received(
+    recorder: Option<&TickRecorder>,
+    received: &Result<Command, CommandReject>,
+    status: &mut SimStatus,
+) {
+    if let (Some(r), Ok(cmd)) = (recorder, received) {
+        if !r.command(cmd.target_id, wall_clock_ns(), encode_command(cmd)) {
+            status.fatal.get_or_insert_with(|| RECORDING_FAILED.to_owned());
+        }
+    }
+}
+
+/// Which controllers are present, by the aircraft they fly, from their
+/// liveliness tokens (`astrum/alive/controller/<id>`). A controller that
+/// announces nothing never appears here; leases and lockstep timeouts still
+/// cover it.
+#[derive(Resource, Debug, Default)]
+pub struct Controllers {
+    tokens: BTreeMap<u32, u32>,
+    /// Aircraft whose last token went away, not yet acted on.
+    lost: Vec<u32>,
+}
+
+impl Controllers {
+    /// Aircraft with a controller present, ascending.
+    pub fn present(&self) -> Vec<u32> {
+        self.tokens.iter().filter(|(_, n)| **n > 0).map(|(id, _)| *id).collect()
+    }
+
+    fn apply(&mut self, changes: &[Presence], mode: RunMode, events: &mut EventLog) {
+        for change in changes {
+            match *change {
+                Presence::Up(id) => {
+                    let n = self.tokens.entry(id).or_default();
+                    *n += 1;
+                    if *n == 1 {
+                        events.push(EventKind::ControllerUp { aircraft_id: id });
+                        if mode == RunMode::Server {
+                            println!("[astrum-sim] controller for aircraft {id} connected");
+                        }
+                    }
+                }
+                Presence::Down(id) => {
+                    if let Some(n) = self.tokens.get_mut(&id).filter(|n| **n > 0) {
+                        *n -= 1;
+                        if *n == 0 {
+                            events.push(EventKind::ControllerDown { aircraft_id: id });
+                            self.lost.push(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Act on controllers that went away: a lockstep run fails at once (its result
+/// would otherwise hang on `lockstep_timeout_s`), any other commanded aircraft
+/// switches to the failsafe hold without waiting for its lease.
+pub fn track_controllers(
+    watcher: Option<NonSend<PresenceWatcher>>,
+    mode: Res<RunMode>,
+    index: Res<AircraftIndex>,
+    mut controllers: ResMut<Controllers>,
+    mut events: ResMut<EventLog>,
+    mut status: ResMut<SimStatus>,
+    mut q: Query<(&mut Pilot, Option<&mut Trigger>, &AircraftState), Without<Dead>>,
+) {
+    if let Some(w) = watcher {
+        controllers.apply(&w.drain(), *mode, &mut events);
+    }
+    for id in std::mem::take(&mut controllers.lost) {
+        let Some((mut pilot, trigger, state)) = index.0.get(&id).and_then(|e| q.get_mut(*e).ok())
+        else {
+            continue; // not one of ours, or a wreck
+        };
+        if pilot.lockstep {
+            status.fatal.get_or_insert_with(|| lost_lockstep(id));
+        } else if pilot.commanded() {
+            eprintln!("[astrum-sim] aircraft {id}: controller disconnected — failsafe hold");
+            let reason = ModeReason::ControllerLost;
+            enter_failsafe(&mut pilot, trigger.map(Mut::into_inner), state, reason);
+        }
+    }
+}
+
+fn lost_lockstep(id: u32) -> String {
+    format!("lockstep: the controller for aircraft {id} disconnected")
+}
+
+/// How often a lockstep wait re-sends the tick's telemetry, so a controller
+/// that subscribed late (or lost a sample) still gets the tick it must answer —
+/// and every other sample of that tick (a follower needs its leader's).
+const LOCKSTEP_REPUBLISH: Duration = Duration::from_millis(100);
+
+/// The components a command is applied to.
+type CommandQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Pilot, Option<&'static mut Trigger>, &'static VehicleKind, Has<Dead>),
+>;
+
+/// Apply one received command; returns the aircraft id and the telemetry tick
+/// it answered if it was applied.
+fn apply_received(
+    received: Result<Command, CommandReject>,
+    now: u64,
+    lease: Option<u64>,
+    index: &AircraftIndex,
+    q: &mut CommandQuery,
+    log: &mut RefusalLog,
+) -> Option<(u32, u64)> {
+    let cmd = match received {
+        Ok(c) => c,
+        Err(r) => {
+            log.reject(&r);
+            return None;
+        }
+    };
+    let found = index.0.get(&cmd.target_id).and_then(|e| q.get_mut(*e).ok());
+    let Some((mut pilot, trigger, kind, dead)) = found else {
+        log.refuse(cmd.target_id, &Refusal::UnknownAircraft { id: cmd.target_id });
+        return None;
+    };
+    if dead {
+        return None; // a wreck takes no commands
+    }
+    match apply_command(&mut pilot, trigger.map(|t| t.into_inner()), *kind, &cmd, now, lease) {
+        Ok(()) => Some((cmd.target_id, cmd.telemetry_tick)),
+        Err(why) => {
+            log.refuse(cmd.target_id, &why);
+            None
+        }
+    }
+}
+
+/// Commands that arrived while paused, for the next tick: the latest per
+/// aircraft and epoch (so a non-owner's command cannot displace the owner's).
+/// A paused sim keeps re-sending telemetry and controllers answer every copy,
+/// so the bus queue would otherwise grow for as long as the pause lasts (and,
+/// once full, stall Zenoh's receive path).
+#[derive(Resource, Debug, Default)]
+pub struct HeldCommands(Vec<Command>);
+
+/// While paused, take commands off the bus as they arrive (recorded and
+/// checked as usual), keeping the latest per aircraft and epoch for the next
+/// tick.
+pub fn hold_commands(
+    receiver: Option<NonSend<CommandReceiver>>,
+    recorder: Option<Res<TickRecorder>>,
+    mut held: ResMut<HeldCommands>,
+    mut status: ResMut<SimStatus>,
+    mut log: ResMut<RefusalLog>,
+) {
+    let Some(rx) = receiver else { return };
+    for r in rx.drain() {
+        record_received(recorder.as_deref(), &r, &mut status);
+        match r {
+            Ok(cmd) => {
+                held.0.retain(|c| (c.target_id, c.epoch) != (cmd.target_id, cmd.epoch));
+                held.0.push(cmd);
+            }
+            Err(reject) => log.reject(&reject),
+        }
+    }
+}
+
+/// How often a lockstep wait checks for controllers that went away.
+const LOCKSTEP_POLL: Duration = Duration::from_millis(20);
+
+/// Apply the commands held over a pause, then drain queued ones, in arrival
+/// order (the owner's latest command wins). In a lockstep scenario, then block
+/// until every living lockstep aircraft due a command this tick (see
+/// `control_rate_hz`) has an applied one answering it, re-sending the tick's
+/// telemetry (every sample it published) and its `TickEnd` while waiting. Too
+/// long a wait, or the controller of an awaited aircraft going away, is fatal;
+/// a stop request ends the wait.
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_commands(
+    mut bus: Bus,
+    recorder: Option<Res<TickRecorder>>,
+    stop: Option<Res<StopRequested>>,
+    mode: Res<RunMode>,
+    last: Res<LastPublished>,
+    publication: Res<TickPublication>,
+    params: Res<SimParams>,
+    clock: Res<SimClock>,
+    index: Res<AircraftIndex>,
+    mut controllers: ResMut<Controllers>,
+    mut events: ResMut<EventLog>,
+    mut status: ResMut<SimStatus>,
+    mut log: ResMut<RefusalLog>,
+    mut held: ResMut<HeldCommands>,
+    mut q: CommandQuery,
+) {
+    let Some(rx) = bus.receiver.as_deref() else { return };
+    let recorder = recorder.as_deref();
+    let now = clock.tick;
+    let lease = params.lease_ticks;
+    let mut answered: BTreeSet<u32> = BTreeSet::new();
+    if !held.0.is_empty() {
+        for cmd in held.0.drain(..) {
+            if let Some((id, tick)) = apply_received(Ok(cmd), now, lease, &index, &mut q, &mut log)
+            {
+                if tick == now {
+                    answered.insert(id);
+                }
+            }
+        }
+    }
+    for r in rx.drain() {
+        record_received(recorder, &r, &mut status);
+        if let Some((id, tick)) = apply_received(r, now, lease, &index, &mut q, &mut log) {
+            if tick == now {
+                answered.insert(id);
+            }
+        }
+    }
+
+    if params.lockstep {
+        let pending = |answered: &BTreeSet<u32>, q: &CommandQuery| {
+            index
+                .0
+                .iter()
+                .filter(|(id, e)| {
+                    q.get(**e).is_ok_and(|(p, _, _, dead)| p.lockstep && !dead && p.due(now))
+                        && !answered.contains(id)
+                })
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<u32>>()
+        };
+        let deadline = Instant::now() + Duration::from_secs_f64(params.lockstep_timeout_s);
+        let mut waiting = pending(&answered, &q);
+        let mut republished = Instant::now();
+        while !waiting.is_empty() {
+            if stop.as_ref().is_some_and(|s| s.requested()) {
+                return;
+            }
+            if let Some(w) = &bus.watcher {
+                controllers.apply(&w.drain(), *mode, &mut events);
+                if let Some(id) = controllers.lost.iter().find(|id| waiting.contains(id)) {
+                    status.fatal = Some(lost_lockstep(*id));
+                    return;
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                status.fatal = Some(format!(
+                    "lockstep: no command answering tick {now} from aircraft {waiting:?} within {:.1} s",
+                    params.lockstep_timeout_s
+                ));
+                return;
+            }
+            match rx.recv_timeout(left.min(LOCKSTEP_POLL)) {
+                Ok(r) => {
+                    record_received(recorder, &r, &mut status);
+                    if let Some((id, tick)) =
+                        apply_received(r, now, lease, &index, &mut q, &mut log)
+                    {
+                        if tick == now {
+                            answered.insert(id);
+                        }
+                    }
+                }
+                Err(astrum_net::NetError::Timeout) => {}
+                Err(e) => {
+                    status.fatal = Some(format!("lockstep: command intake failed: {e}"));
+                    return;
+                }
+            }
+            if republished.elapsed() >= LOCKSTEP_REPUBLISH {
+                republished = Instant::now();
+                if let Some(b) = &bus.board {
+                    b.show_waiting(&waiting);
+                }
+                if let Some(publisher) = bus.publisher.as_mut() {
+                    for s in last.0.iter().filter(|s| publication.ids.contains(&s.aircraft_id)) {
+                        let pilot = index.0.get(&s.aircraft_id).and_then(|e| q.get(*e).ok());
+                        let _ = publisher.publish(&refreshed(s, pilot.map(|(p, ..)| p)));
+                    }
+                    if let Some(t) = &bus.tick {
+                        send_tick_end(t, &clock, &params);
+                    }
+                }
+            }
+            waiting = pending(&answered, &q);
+        }
+    }
+    log.report();
 }
