@@ -6,8 +6,10 @@
 //! policy exists because seed 60 of the tighter envelope wedged at 11 of 12 gates.
 
 use astrum_race::course::{generate, Course, CourseError, CourseParams};
-use astrum_race::gate::{frame_radius_m, OPENING_M};
+use astrum_race::gate::{frame_radius_m, Gate, OPENING_M};
 use astrum_race::geom::{segment_point_dist_sq, segment_segment_dist_sq};
+use bevy::math::DVec3;
+use serde::{Deserialize, Serialize};
 
 /// Seeds swept by the property tests. Generation is pure arithmetic — no FDM, no
 /// world — so this whole sweep is a fraction of a second, and a rare wedge is worth
@@ -126,7 +128,7 @@ fn assert_flyable(c: &Course, p: &CourseParams) {
 
     // Orientation: each gate's normal bisects its legs, so the crossing angle is at
     // most half the turn — that is what makes a 120 deg turn flyable through a
-    // 0.7874 m hole.
+    // 1.016 m hole.
     let h = leg_headings(c);
     assert!(wrap_pi(c.gates[0].yaw_rad - h[0]).abs() < 1e-9, "gate 0 faces its outgoing leg");
     let last = c.len() - 1;
@@ -192,6 +194,26 @@ fn tighter_envelope_is_flyable_across_seeds() {
             (c.gates[0].yaw_rad.to_degrees() - 42.0).abs() < 1e-9,
             "the entry heading is fixed, not drawn"
         );
+    }
+}
+
+/// A crowded envelope: 16 gates in a 40 m bowl at the shipped clearances. The larger
+/// frame inflates the sampler's clearance sphere (`frame_radius_m()` is 0.826 m), so
+/// this is the envelope that would show the 40" gate making a course infeasible.
+#[test]
+fn crowded_envelope_is_flyable_across_seeds() {
+    let p = CourseParams {
+        gates: 16,
+        leg_min_m: 8.0,
+        leg_max_m: 20.0,
+        min_gate_gap_m: 6.0,
+        course_radius_m: 40.0,
+        ..CourseParams::default()
+    };
+    for seed in 0..SEEDS {
+        let c = generate(seed, &p).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert_flyable(&c, &p);
+        assert!(c.backtracks < p.max_backtracks, "seed {seed} nearly exhausted the budget");
     }
 }
 
@@ -309,7 +331,7 @@ fn contradictory_parameters_are_rejected() {
         ("inverted altitudes", CourseParams { alt_min_m: 5.0, alt_max_m: 2.0, ..base }),
         ("sill underground", CourseParams { alt_min_m: OPENING_M / 4.0, ..base }),
         ("negative clearance", CourseParams { min_leg_leg_gap_m: -1.0, ..base }),
-        ("gap wider than a leg", CourseParams { min_gate_gap_m: 12.0, ..base }),
+        ("gap wider than a leg", CourseParams { min_gate_gap_m: 20.0, ..base }),
         ("volume smaller than a leg", CourseParams { course_radius_m: 5.0, ..base }),
         ("no tries", CourseParams { tries_per_gate: 0, ..base }),
     ];
@@ -390,4 +412,100 @@ fn course_metrics_agree_with_the_gates() {
 
     let s = c.summary();
     assert!(s.contains("8 gates") && s.contains("seed 11"), "summary should say what it is: {s}");
+}
+
+/// Explicit gates are used verbatim — nothing is resampled, reordered or snapped —
+/// and only the provenance (seed, envelope) is carried alongside.
+#[test]
+fn explicit_gates_are_kept_verbatim() {
+    let p = CourseParams::default();
+    let sampled = generate(21, &p).unwrap();
+    let rebuilt = Course::from_gates(sampled.gates.clone(), 99, p).unwrap();
+    assert_eq!(rebuilt.gates, sampled.gates);
+    assert_eq!((rebuilt.seed, rebuilt.samples, rebuilt.backtracks), (99, 0, 0));
+    assert_eq!(rebuilt.params, p);
+
+    // A hand-built course the sampler would never draw is fine too: one gate, and gates
+    // stacked on top of each other (clearance is not from_gates' business).
+    let one = Course::from_gates(vec![Gate::new(0, DVec3::new(5.0, 6.0, 2.0), 0.3)], 0, p);
+    assert_eq!(one.unwrap().len(), 1);
+    let stacked = vec![
+        Gate::new(0, DVec3::new(0.0, 0.0, 2.0), 0.0),
+        Gate::new(1, DVec3::new(0.0, 0.5, 2.0), 0.0),
+    ];
+    let stacked = Course::from_gates(stacked, 0, p).unwrap();
+    assert!(stacked.validate_clearance(&p).is_err(), "gates 0.5 m apart break the clearance");
+    assert!(rebuilt.validate_clearance(&p).is_ok(), "a sampled course meets its own rules");
+}
+
+/// What `from_gates` refuses: an empty list, indices that are not the flight order
+/// (duplicates, gaps, swaps), non-finite poses, and a frame sunk into the ground.
+#[test]
+fn explicit_gates_are_validated() {
+    let p = CourseParams::default();
+    let g = |i: u32, c: DVec3, yaw: f64| Gate::new(i, c, yaw);
+    let at = |x: f64| DVec3::new(x, 0.0, 2.0);
+    let cases: [(&str, Vec<Gate>); 8] = [
+        ("empty", vec![]),
+        ("duplicate index", vec![g(0, at(0.0), 0.0), g(0, at(10.0), 0.0)]),
+        ("out of order", vec![g(1, at(0.0), 0.0), g(0, at(10.0), 0.0)]),
+        ("index gap", vec![g(0, at(0.0), 0.0), g(2, at(10.0), 0.0)]),
+        ("nan centre", vec![g(0, DVec3::new(f64::NAN, 0.0, 2.0), 0.0)]),
+        ("infinite centre", vec![g(0, DVec3::new(0.0, f64::INFINITY, 2.0), 0.0)]),
+        ("nan yaw", vec![g(0, at(0.0), f64::NAN)]),
+        ("sill underground", vec![g(0, DVec3::new(0.0, 0.0, OPENING_M / 2.0), 0.0)]),
+    ];
+    for (name, gates) in cases {
+        match Course::from_gates(gates, 0, p) {
+            Err(CourseError::Gates(_)) => {}
+            other => panic!("{name} should be a gate error, got {other:?}"),
+        }
+    }
+}
+
+/// One row of the scenario file's `[[course.gate]]` array, as C1 spells it.
+#[derive(Serialize, Deserialize)]
+struct GateRow {
+    index: u32,
+    east_m: f64,
+    north_m: f64,
+    up_m: f64,
+    yaw_rad: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GateDoc {
+    gate: Vec<GateRow>,
+}
+
+/// A gate pose survives the scenario TOML bit for bit: the recorded scenario is the
+/// course, so a replay must not drift by an ulp from what was flown.
+#[test]
+fn gate_poses_round_trip_through_toml_exactly() {
+    let mut gates = Vec::new();
+    for seed in [0u64, 7, 12_345] {
+        gates.extend(generate(seed, &CourseParams::default()).unwrap().gates);
+    }
+    let doc = GateDoc {
+        gate: gates
+            .iter()
+            .map(|g| GateRow {
+                index: g.index,
+                east_m: g.center.x,
+                north_m: g.center.y,
+                up_m: g.center.z,
+                yaw_rad: g.yaw_rad,
+            })
+            .collect(),
+    };
+    let text = toml::to_string(&doc).unwrap();
+    let back: GateDoc = toml::from_str(&text).unwrap();
+    assert_eq!(back.gate.len(), gates.len());
+    for (g, row) in gates.iter().zip(&back.gate) {
+        let rebuilt =
+            Gate::new(row.index, DVec3::new(row.east_m, row.north_m, row.up_m), row.yaw_rad);
+        assert_eq!(&rebuilt, g, "gate {} drifted through TOML", g.index);
+        assert_eq!(rebuilt.center.x.to_bits(), g.center.x.to_bits());
+        assert_eq!(rebuilt.yaw_rad.to_bits(), g.yaw_rad.to_bits());
+    }
 }

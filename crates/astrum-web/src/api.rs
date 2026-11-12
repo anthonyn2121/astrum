@@ -19,7 +19,7 @@
 //!   refuses; 503 when no sim is reachable.
 //! * **`GET /api/environments`** — every environment
 //!   ([`astrum_sim::catalog::Environment`]): id, name, description, locations,
-//!   sim defaults, models, metric ids.
+//!   sim defaults, models, metric ids (`empty` and `race`).
 //! * **`GET /api/models`** — the models ASTRUM has profiles for
 //!   ([`ModelEntry`](crate::catalogs::ModelEntry)): model, kind, autopilot
 //!   profile.
@@ -27,11 +27,20 @@
 //!   [`astrum_sim::controllers::ControllerSpec`] each).
 //! * **`GET /api/scenarios`** — every `config/scenario.<name>.toml`
 //!   ([`ScenarioEntry`](crate::catalogs::ScenarioEntry)): name, path, summary,
-//!   environment, error (invalid files are listed too), fleet.
+//!   environment (`race` for a scenario with a `[course]`, else `empty`), error
+//!   (invalid files are listed too), fleet.
 //! * **`GET /api/scenarios/<name>`** — one scenario in full
 //!   ([`ScenarioDoc`](crate::catalogs::ScenarioDoc)): 400 for a name that
 //!   cannot be a file name, 404 when there is none, 422 when the file is not a
-//!   valid scenario.
+//!   valid scenario. A race scenario's `course` is its [`CourseView`]
+//!   ([`crate::race`]) drawn from its own seed; `null` for any other scenario.
+//! * **`GET /api/scenarios/<name>/course?seed=N&gates=M`** — a race scenario's
+//!   course drawn from seed `N` (default: the scenario's own) with `M` gates
+//!   (2–64; default: the scenario's own) as a
+//!   [`CourseView`](crate::race::CourseView) (`{"seed", "opening_m", "bar_m",
+//!   "top_bar_m", "gates": [{"index", "east_m", "north_m", "up_m",
+//!   "yaw_rad"}]}`); 400 for a bad name or query or a scenario that is no
+//!   race, 404 when there is none, 422 when its course cannot be drawn.
 //! * **`PUT /api/scenarios/<name>`** — save a scenario as
 //!   `config/scenario.<name>.toml` ([`crate::scenarios`]): `{"scenario": {…},
 //!   "summary": "…", "overwrite": false}` → 201 (created) or 200 (replaced) with
@@ -47,8 +56,11 @@
 //!   `{"scenario": "<name>", "assignments": [...], "perturb": [...], "vary":
 //!   {"aircraft.<id>.offset.<axis>": [...]}, "samples", "sample_seed",
 //!   "min_separation_m", "min_alt_hae_m", "repeats", "max_time_s",
-//!   "run_timeout_s", "jobs", "check_trim"}` → 200 with its runs, their values
-//!   and the moving aircraft's starting positions; 400 for a bad request (the
+//!   "run_timeout_s", "jobs", "check_trim", "course_seed_mode", "gates"}` → 200 with its
+//!   runs (each row's `course_seed` too, for a race), their values and the
+//!   moving aircraft's starting positions; `course_seed_mode` (`"fixed"` |
+//!   `"randomize"`, race scenarios only) says whether every run flies the
+//!   scenario's course seed or run `r` flies that seed + `r`; 400 for a bad request (the
 //!   message names the key), 422 for a sweep the planner refuses, 400 for more
 //!   than 2000 runs.
 //! * **`PUT /api/sweeps/saved/<name>`** — save a sweep as
@@ -69,7 +81,8 @@
 //!   `POST /api/sweeps/plan`; it is written to `<runs-dir>/sweeps/<id>/` →
 //!   201 with its [`SweepView`](crate::sweepruns::SweepView); 400 for a bad
 //!   request, 409 while another sweep runs (the message names it), 422 for a
-//!   sweep that cannot fly (no `astrum-sim` for a process-mode sweep, too few
+//!   sweep that cannot fly (no `astrum-sim` — `astrum-race` for a race — for a
+//!   process-mode sweep, too few
 //!   ports, a failed trim check; nothing is written), 500 when it cannot be
 //!   written.
 //! * **`GET /api/sweeps/current`** — `{"sweep": SweepView | null}`: the latest
@@ -97,8 +110,11 @@
 //!   (the message names it) or an unsafe id, 404 for an unknown one.
 //! * **`POST /api/runs`** — start the live interactive run
 //!   ([`crate::runs`]): `{"scenario": "<name>" | {…}, "assignments":
-//!   [{"aircraft", "controller", "params"}], "speed", "max_time_s"}` → 201
-//!   [`RunView`](crate::runs::RunView); 400 for bad input (the message names
+//!   [{"aircraft", "controller", "params"}], "speed", "max_time_s", "seed",
+//!   "gates"}` (`seed`, `gates` (2–64): a race scenario's course seed and gate
+//!   count) → 201
+//!   [`RunView`](crate::runs::RunView) (a race flies `astrum-race` and the view
+//!   carries its `course`); 400 for bad input (the message names
 //!   the aircraft / parameter), 409 while a run is active, 422 for an invalid
 //!   scenario, 500 when it cannot start.
 //! * **`GET /api/runs/current`** — `{"run": RunView | null}`: the latest run
@@ -122,8 +138,8 @@ use std::time::Duration;
 use astrum_net::{fetch_status, send_control, ControlRequest, NetError, RunStatus, MIN_SPEED};
 use astrum_sim::catalog::environments;
 use axum::body::Bytes;
-use axum::extract::rejection::BytesRejection;
-use axum::extract::{Path, Request, State};
+use axum::extract::rejection::{BytesRejection, QueryRejection};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::header::{CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
@@ -156,6 +172,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/scenarios", get(scenarios))
         .route("/scenario-check", post(crate::scenarios::check))
         .route("/scenarios/{name}", get(scenario).put(crate::scenarios::save))
+        .route("/scenarios/{name}/course", get(course))
         .route("/sweeps/plan", post(crate::sweeps::plan))
         .route("/sweeps/saved", get(crate::sweeps::list))
         .route("/sweeps/saved/{name}", get(crate::sweeps::load).put(crate::sweeps::save))
@@ -200,15 +217,58 @@ async fn scenario(State(state): State<AppState>, Path(name): Path<String>) -> Re
     };
     match found {
         Ok(doc) => json(StatusCode::OK, &doc),
-        Err(e) => {
-            let status = match e {
-                ScenarioError::BadName(_) => StatusCode::BAD_REQUEST,
-                ScenarioError::NotFound(_) => StatusCode::NOT_FOUND,
-                ScenarioError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-                ScenarioError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            error(status, &e.to_string())
-        }
+        Err(e) => error(scenario_status(&e), &e.to_string()),
+    }
+}
+
+/// A `GET /api/scenarios/<name>/course` query.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CourseQuery {
+    seed: Option<u64>,
+    gates: Option<u32>,
+}
+
+/// `GET /api/scenarios/<name>/course?seed=N&gates=M`: the course a race scenario
+/// draws from seed `N` (default: its own seed) with `M` gates (default: its own;
+/// 2–64) as a [`CourseView`]; 400 for a bad
+/// name or query, or a scenario that is not a race; 404 when there is none; 422
+/// when the scenario or its course is invalid.
+async fn course(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    query: Result<Query<CourseQuery>, QueryRejection>,
+) -> Response {
+    let CourseQuery { seed, gates } = match query {
+        Ok(Query(q)) => q,
+        Err(rejection) => return error(rejection.status(), &rejection.body_text()),
+    };
+    if let Some(Err(why)) = gates.map(crate::race::check_gates) {
+        return error(StatusCode::BAD_REQUEST, &why);
+    }
+    let catalogs = state.catalogs.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let base = catalogs.base(&name)?;
+        let table = base
+            .course
+            .ok_or_else(|| ScenarioError::BadName(format!("scenario {name:?} is not a race")))?;
+        let table = crate::race::with_gates(&table, gates);
+        crate::race::course_view_of(&base.scenario, &table, seed).map_err(ScenarioError::Invalid)
+    })
+    .await;
+    match found {
+        Ok(Ok(view)) => json(StatusCode::OK, &view),
+        Ok(Err(e)) => error(scenario_status(&e), &e.to_string()),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn scenario_status(e: &ScenarioError) -> StatusCode {
+    match e {
+        ScenarioError::BadName(_) => StatusCode::BAD_REQUEST,
+        ScenarioError::NotFound(_) => StatusCode::NOT_FOUND,
+        ScenarioError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        ScenarioError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

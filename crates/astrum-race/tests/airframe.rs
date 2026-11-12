@@ -17,6 +17,7 @@ use astrum_race::airframe::{
     PROP_RADIUS_M, ROTOR_PLANE_M, SAMPLE_STEP_M, WIDTH_M,
 };
 use astrum_race::gate::{Gate, BAR_M, IN_TO_M, OPENING_M};
+use astrum_race::geom::Obb;
 use bevy::math::DVec3;
 
 /// A gate at the origin facing North, so gate-local `(x, y, z)` reads as
@@ -65,50 +66,75 @@ fn dimensions_come_from_the_jsbsim_model() {
     const { assert!(WIDTH_M / HEIGHT_M > 3.0) };
 }
 
-/// The two clearances the whole task hangs on, stated once: **10.9 cm** square to the
-/// opening, **4.1 cm** at the worst heading.
+/// The two clearances the whole task hangs on, stated once: **22.4 cm** square to the
+/// opening, **15.5 cm** at the worst heading.
 ///
 /// The second number is the one that sizes the gate. Its worst case is 45° of crab,
 /// where the drone presents a corner and reaches the tip circle rather than the half
-/// span — and the tip circle is what a 25" opening could not pass, which is why the
-/// opening is 31". Because 4.1 cm is positive, heading no longer constrains a pass
+/// span. Because 15.5 cm is positive, heading no longer constrains a pass
 /// (`a_gate_fits_at_any_heading`).
 ///
-/// This is also still why the hull is five parts rather than one shape:
-/// * a **box** across the tip circle presents its 0.402 m diagonal when crabbed, which
-///   the 31" opening does *not* clear — the box model would give back exactly what the
-///   enlargement bought;
-/// * a **sphere** on the CG now fits the opening, but it reaches the tip circle
-///   *downwards* too, where the airframe stops at the gear — 20 cm of fiction against
-///   the ground plane, five times the budget.
+/// The hull is still five parts rather than one shape, for accuracy rather than
+/// passability now that the opening is 40":
+/// * a **box** across the tip circle presents its 0.402 m diagonal when crabbed,
+///   which now fits the 0.508 m half-opening, but it claims 5.3 cm too much vertical
+///   reach when banked (`a_single_box_overclaims_banked_reach`);
+/// * a **sphere** on the CG reaches the tip circle *downwards* too, where the airframe
+///   stops at the gear — 20 cm of fiction against the ground plane, more than the whole
+///   worst-heading margin.
 #[test]
 fn the_drone_fits_the_opening_at_any_heading() {
     let half_opening = OPENING_M / 2.0;
     let clearance = half_opening - HALF_SPAN_M;
-    assert!((clearance - 0.10922).abs() < 1e-12, "clearance per side {clearance}");
+    assert!((clearance - 0.22352).abs() < 1e-12, "clearance per side {clearance}");
 
     // The worst heading: a corner leads, so the reach is the tip circle.
     let tip_circle = ARM_M * 2.0f64.sqrt() + PROP_RADIUS_M;
     assert!((tip_circle - 0.35287).abs() < 1e-5, "tip circle radius {tip_circle}");
     let crabbed = half_opening - tip_circle;
-    assert!((crabbed - 0.04083).abs() < 1e-5, "worst-heading clearance {crabbed}");
+    assert!((crabbed - 0.15513).abs() < 1e-5, "worst-heading clearance {crabbed}");
     assert!(crabbed > 0.0, "the opening has to pass the airframe at any heading");
-    // And it is worth more than the old 25" gate's best case, which is the test that
-    // says the new size is an improvement and not just a different number.
-    assert!(crabbed > 25.0 * IN_TO_M / 2.0 - HALF_SPAN_M, "worse than a square 25 in pass");
+    // And it is worth more than the previous 31" gate's *best* case, which is the test
+    // that says the new size is an improvement and not just a different number.
+    assert!(crabbed > 31.0 * IN_TO_M / 2.0 - HALF_SPAN_M, "worse than a square 31 in pass");
 
-    // Why not model the hull as one box: crabbed, its diagonal still does not fit.
+    // The crabbed box diagonal now fits too (it did not in a 31" gate)...
     let box_diagonal = HALF_SPAN_M * 2.0f64.sqrt();
     assert!((box_diagonal - 0.40232).abs() < 1e-5, "box diagonal {box_diagonal}");
-    assert!(box_diagonal > half_opening, "a single box would not fit a crabbed pass");
+    assert!(box_diagonal < half_opening, "a crabbed single box fits a 40 in opening");
 
-    // Why not model it as one sphere: it would reach the tip circle below the CG,
-    // where the airframe stops at the gear feet.
-    assert!(
-        tip_circle - GEAR_DEPTH_M > 4.0 * crabbed,
-        "a CG sphere's ground error ({:.3} m) must be the reason it is rejected",
-        tip_circle - GEAR_DEPTH_M
-    );
+    // ...so the reason a CG sphere is rejected is its error, not impassability: it
+    // reaches the tip circle below the CG, where the airframe stops at the gear feet,
+    // and that error exceeds the entire worst-heading margin.
+    let ground_error = tip_circle - GEAR_DEPTH_M;
+    assert!((ground_error - 0.20047).abs() < 1e-5, "sphere ground error {ground_error}");
+    assert!(ground_error > crabbed, "a CG sphere's ground error must dwarf the margin");
+}
+
+/// Why the hull is not one box either: banked, a single box over the airframe's half
+/// span claims more vertical reach than the airframe has above the CG — the direction
+/// that meets the top bar. Rolled 45 deg and pitched 30, an ordinary racing attitude:
+/// the box reaches 0.371 m, the hull 0.318 m, 5.3 cm of fiction against a 15.5 cm
+/// worst-heading margin.
+#[test]
+fn a_single_box_overclaims_banked_reach() {
+    let (phi, theta) = (45f64.to_radians(), 30f64.to_radians());
+    let hull = Hull::at(DVec3::ZERO, phi, theta, 0.0);
+    let hull_top = hull
+        .rotors
+        .iter()
+        .map(|c| c.z + hull.rotor_radius)
+        .fold(hull.core.center.z + hull.core.projection_radius(DVec3::Z), f64::max);
+    assert!((hull_top - 0.31834).abs() < 1e-5, "hull reach above the CG {hull_top}");
+
+    let one_box = Obb {
+        center: DVec3::ZERO,
+        axes: body_axes(phi, theta, 0.0),
+        half_extents: DVec3::new(HALF_SPAN_M, HALF_SPAN_M, HEIGHT_M / 2.0),
+    };
+    let box_top = one_box.projection_radius(DVec3::Z);
+    assert!((box_top - 0.37077).abs() < 1e-5, "box reach {box_top}");
+    assert!(box_top - hull_top > 0.05, "the box over-claims by {:.4} m", box_top - hull_top);
 }
 
 /// The body axes are an orthonormal triad that tracks the attitude, and it is
@@ -233,13 +259,13 @@ fn drifting_wide_strikes_an_upright() {
 }
 
 /// Riding high finds the top bar. What reaches it is a blade tip at the rotor plane,
-/// so the margin is the bar's underside less `ROTOR_PLANE_M + PROP_RADIUS_M` — 0.249 m,
-/// well under the 0.3937 m the opening looks like it offers.
+/// so the margin is the bar's underside less `ROTOR_PLANE_M + PROP_RADIUS_M` — 0.364 m,
+/// well under the 0.508 m the opening looks like it offers.
 #[test]
 fn riding_high_strikes_the_top_bar() {
     let g = north_gate();
     let headroom = OPENING_M / 2.0 - ROTOR_PLANE_M - PROP_RADIUS_M;
-    assert!((headroom - 0.24932).abs() < 1e-5, "headroom {headroom}");
+    assert!((headroom - 0.36362).abs() < 1e-5, "headroom {headroom}");
     assert!(level_pass_is_clean(&g, 0.0, headroom - 0.005), "just under the bar should be clean");
     assert!(!level_pass_is_clean(&g, 0.0, headroom + 0.005), "just into the bar should strike");
 }
@@ -250,15 +276,17 @@ fn riding_high_strikes_the_top_bar() {
 fn flying_under_a_gate_touches_nothing() {
     let g = north_gate();
     let below = -(OPENING_M / 2.0 + PROP_RADIUS_M + ROTOR_PLANE_M);
-    assert!((below + 0.53808).abs() < 1e-5, "sill clearance {below}");
+    assert!((below + 0.65238).abs() < 1e-5, "sill clearance {below}");
     // Right across the frame's width, including directly under both uprights.
     for i in -50..=50 {
         let right = f64::from(i) * 0.01;
         assert!(level_pass_is_clean(&g, right, below - 0.01), "under the frame at {right} hit");
     }
-    // And the reason that margin is not just the sill: pass 5 cm higher and a blade
-    // tip catches the bottom corner of an upright.
-    assert!(!level_pass_is_clean(&g, -0.24, below + 0.05));
+    // And the reason that margin is not just the sill: pass 5 cm higher with a rotor
+    // right under an upright (its centre under the upright's mid-line) and the blade
+    // catches the upright's bottom end.
+    let under_upright = -(OPENING_M / 2.0 + BAR_M / 2.0) + ARM_M;
+    assert!(!level_pass_is_clean(&g, under_upright, below + 0.05));
 }
 
 /// **Banking and pitching a centred drone through a gate is legal**, at every roll
@@ -266,10 +294,9 @@ fn flying_under_a_gate_touches_nothing() {
 ///
 /// This is where a single-box hull is least honest: rolled 45 deg and pitched 30, a box
 /// across the tip circle claims 0.371 m of vertical reach against the airframe's real
-/// 0.293 m. In the old 25" gate that 7.7 cm of fiction made every racing attitude a
-/// false crash outright; in a 31" gate it instead shrinks the vertical corridor at that
-/// attitude from 10.1 cm to 2.3 cm. Four rotor discs and a core is what keeps the
-/// corridor the size the hardware says it is.
+/// 0.318 m (`a_single_box_overclaims_banked_reach`). In a 40" gate that 5.3 cm of
+/// fiction shrinks the vertical corridor at that attitude from 19.0 cm to 13.7 cm. Four
+/// rotor discs and a core is what keeps the corridor the size the hardware says it is.
 #[test]
 fn banking_and_pitching_still_fit() {
     let g = north_gate();
@@ -305,8 +332,8 @@ fn banking_and_pitching_still_fit() {
     }
 }
 
-/// **A centred gate fits at any heading**, which is the property the 31" opening was
-/// chosen to buy and the reason it is not the 25" of the brief.
+/// **A centred gate fits at any heading**, which is the property the opening size was
+/// chosen to buy (first 31", now 40") and the reason it is not the 25" of the brief.
 ///
 /// In a 25" hole this test read the other way round: past ±13° of crab the drone
 /// presented its 0.706 m diagonal into a 0.635 m opening and clipped an upright. That
@@ -314,8 +341,8 @@ fn banking_and_pitching_still_fit() {
 /// bisected normal leaves a crossing up to 60° off — so a controller could be tracking
 /// a gate's centre perfectly and still be flown into it.
 ///
-/// The margin is not large: 4.1 cm at the worst heading against 10.9 cm square on, so
-/// heading still costs lateral corridor. It just no longer costs the whole of it.
+/// The margin: 15.5 cm at the worst heading against 22.4 cm square on, so heading
+/// still costs some lateral corridor, but little of it.
 #[test]
 fn a_gate_fits_at_any_heading() {
     let g = north_gate();
@@ -324,7 +351,7 @@ fn a_gate_fits_at_any_heading() {
     for crab_deg in (0..360).step_by(5) {
         assert!(
             flies_clean(&g, 0.0, 0.0, 0.0, 0.0, f64::from(crab_deg).to_radians()),
-            "{crab_deg} deg of crab should fit a 31 in opening"
+            "{crab_deg} deg of crab should fit a 40 in opening"
         );
     }
 

@@ -118,6 +118,25 @@ class FakeEvents : public EventSource {
   FakeClock& clock_;
 };
 
+// take_*() hand out each scripted message once, in order, then nothing.
+class FakeRace : public RaceSource {
+ public:
+  std::optional<RaceCourse> take_course() override { return pop(courses); }
+  std::optional<RaceState> take_state() override { return pop(states); }
+
+  std::deque<std::optional<RaceCourse>> courses;
+  std::deque<std::optional<RaceState>> states;
+
+ private:
+  template <class T>
+  static std::optional<T> pop(std::deque<std::optional<T>>& q) {
+    if (q.empty()) return std::nullopt;
+    const std::optional<T> out = q.front();
+    q.pop_front();
+    return out;
+  }
+};
+
 class RecordingSink : public CommandSink {
  public:
   std::uint64_t epoch() const override { return kEpoch; }
@@ -528,8 +547,38 @@ TEST(ControlLoop, FleetSnapshotOnlyForLawsThatNeedIt) {
   EXPECT_EQ(fleet.law.inputs.at(0).fleet.size(), 2U);
 }
 
+TEST(ControlLoop, RaceMessagesReachTheLawOnTheStepTheyArrivedAndNotOnRepeats) {
+  Harness h;
+  FakeRace race;
+  race.courses = {RaceCourse{5, 1.0, 0.1, 1.2, {}}, std::nullopt, std::nullopt};
+  race.states = {std::nullopt, RaceState{1, 1, 1, 0, 3, 0.5, 0.5, false, RaceOutcome::Running}};
+  h.options.race = &race;
+  h.telemetry.push(make_state(1));
+  h.telemetry.push(make_state(1));  // a lockstep resend does not step, nor take
+  h.telemetry.push(make_state(2));
+  h.telemetry.push(make_state(3));
+  h.run();
+  ASSERT_EQ(h.law.inputs.size(), 3U);
+  ASSERT_TRUE(h.law.inputs[0].race_course);
+  EXPECT_EQ(h.law.inputs[0].race_course->seed, 5U);
+  EXPECT_FALSE(h.law.inputs[0].race_state);
+  EXPECT_FALSE(h.law.inputs[1].race_course);
+  ASSERT_TRUE(h.law.inputs[1].race_state);
+  EXPECT_EQ(h.law.inputs[1].race_state->gate_count, 3U);
+  EXPECT_FALSE(h.law.inputs[2].race_course);
+  EXPECT_FALSE(h.law.inputs[2].race_state);
+
+  Harness plain;  // no race source: nothing is filled
+  plain.telemetry.push(make_state(1));
+  plain.run();
+  EXPECT_FALSE(plain.law.inputs.at(0).race_course);
+  EXPECT_FALSE(plain.law.wants_race());
+}
+
 TEST(Outcome, ExitCodes) {
   EXPECT_EQ(exit_code({OutcomeKind::RunEnded, EndReason::MaxTime, ""}), 0);
+  EXPECT_EQ(exit_code({OutcomeKind::RunEnded, EndReason::RaceComplete, ""}), 0);
+  EXPECT_EQ(exit_code({OutcomeKind::RunEnded, EndReason::Crashed, ""}), 0);
   EXPECT_EQ(exit_code({OutcomeKind::RunEnded, EndReason::Fatal, ""}), 1);
   EXPECT_EQ(exit_code({OutcomeKind::RunEnded, static_cast<EndReason>(9), ""}), 1);
   EXPECT_EQ(exit_code({OutcomeKind::TelemetryLost, std::nullopt, ""}), 1);

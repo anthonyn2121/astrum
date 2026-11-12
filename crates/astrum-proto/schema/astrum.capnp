@@ -10,6 +10,11 @@
 #                 targetId; the sim rejects mismatches)
 #   * Event     : sim --put--> astrum/events (one per event, in the order they happened)
 #   * TickEnd   : sim --put--> astrum/tick, after the tick's telemetry and events
+#   * Race      : a race run (astrum-race) additionally publishes, per aircraft,
+#                 astrum/race/course/<aircraftId> (RaceCourse, ~1 Hz and on the first
+#                 tick) and astrum/race/state/<aircraftId> (RaceState, every control
+#                 tick), both latest-value (CongestionControl::DROP); its race Events
+#                 (gatePassed, gateMissed, crashed) travel on astrum/events.
 #   * Scenario  : the sim answers `get astrum/scenario` with its scenario TOML (UTF-8 text)
 #   * Presence, control and status (astrum/alive/controller/<id>, astrum/control/*,
 #     astrum/status) carry no Cap'n Proto: a liveliness token and JSON / text replies.
@@ -220,6 +225,8 @@ enum EndReason {
   engagementDecided @1;   # at most one team still has a living aircraft
   fatal             @2;   # a fatal error; RunEnded.message says which
   stopped           @3;   # SIGINT / SIGTERM
+  raceComplete      @4;   # a race's aircraft passed every gate
+  crashed           @5;   # a race's aircraft crashed (Crashed event says how)
 }
 
 struct TriggerPressed {
@@ -264,6 +271,38 @@ struct RunEnded {
   message @1 :Text;   # the fatal error; empty otherwise
 }
 
+# How a race ended for an aircraft (or `running` while it has not).
+enum RaceOutcome {
+  running       @0;
+  complete      @1;   # every gate passed
+  crashedGround @2;   # hit the ground (or the hull touched it)
+  crashedGate   @3;   # hit a gate frame or bar
+  timedOut      @4;   # the race's time limit ran out
+  spawnFailed   @5;   # the start pose could not be set up
+}
+
+# The aircraft's centre of gravity crossed a gate's opening.
+struct GatePassed {
+  aircraftId @0 :UInt32;
+  gate       @1 :UInt32;    # RaceGate.index
+  offsetXM   @2 :Float64;   # CG position in the gate frame: along `right` ...
+  offsetYM   @3 :Float64;   # ... and along `up`, from the gate centre (m)
+}
+
+# The aircraft crossed a gate's plane outside its opening (or skipped it).
+struct GateMissed {
+  aircraftId @0 :UInt32;
+  gate       @1 :UInt32;
+}
+
+# The aircraft crashed. `gate` is the gate it hit (crashedGate) or the one it was
+# flying to; 0 otherwise.
+struct Crashed {
+  aircraftId @0 :UInt32;
+  outcome    @1 :RaceOutcome;
+  gate       @2 :UInt32;
+}
+
 # Something that happened, as opposed to the per-tick state in Telemetry. A
 # subscriber must ignore (skip) a kind it does not know.
 struct Event {
@@ -278,5 +317,42 @@ struct Event {
     controllerUp    @7 :UInt32;   # aircraft id whose controller connected (presence)
     controllerDown  @8 :UInt32;   # aircraft id whose controller went away
     runEnded        @9 :RunEnded;
+    gatePassed      @10 :GatePassed;   # race runs only
+    gateMissed      @11 :GateMissed;
+    crashed         @12 :Crashed;
   }
+}
+
+# One race gate. The gate-local basis is LEFT-handed (x = right = starboard of the
+# flight direction, y = up, z = normal = the flight direction), so a consumer must
+# use the explicit basis vectors below instead of deriving them from yawRad.
+struct RaceGate {
+  index  @0 :UInt32;    # 0-based order in the course
+  center @1 :Enu;       # world grid (m)
+  yawRad @2 :Float64;   # heading of `normal`, 0 = North, +East
+  normal @3 :Enu;       # unit vector through the opening in the flight direction
+  right  @4 :Enu;       # unit vector, starboard of the flight direction
+  up     @5 :Enu;       # unit vector, up
+}
+
+# A race course (astrum/race/course/<aircraftId>, ~1 Hz and on the first tick).
+struct RaceCourse {
+  seed     @0 :UInt64;    # the seed the gates came from
+  openingM @1 :Float64;   # square clear opening side
+  barM     @2 :Float64;   # frame stock width
+  topBarM  @3 :Float64;   # outer frame side (openingM + 2 barM)
+  gates    @4 :List(RaceGate);
+}
+
+# One aircraft's race progress (astrum/race/state/<aircraftId>, every control tick).
+struct RaceState {
+  aircraftId  @0 :UInt32;
+  pendingGate @1 :UInt32;    # index of the next gate to pass; gateCount once finished
+  passed      @2 :UInt32;
+  missed      @3 :UInt32;
+  gateCount   @4 :UInt32;
+  lastPassS   @5 :Float64;   # sim time of the last gate passed; 0 if none
+  simTimeS    @6 :Float64;
+  finished    @7 :Bool;      # no more gates will be scored (outcome != running)
+  outcome     @8 :RaceOutcome;
 }

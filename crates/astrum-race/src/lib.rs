@@ -1,53 +1,34 @@
-//! `astrum-race` — the ASTRUM drone-racing environment.
+//! `astrum-race` — the ASTRUM drone-racing environment, as a client of `astrum-sim`.
 //!
-//! A headless Bevy app (`MinimalPlugins`, no render/winit) in which a DJI F450
-//! quadrotor, flown by JSBSim, has to fly through a course of racing gates that is
-//! **randomized per seed** by the Monte-Carlo sampler in [`course`].
+//! A race is an ordinary `astrum-sim` scenario (one DJI F450, flown by JSBSim)
+//! plus a `[course]` table: a randomized course of racing gates, or explicit gates.
+//! [`build_race_app`] builds the sim's own app with [`astrum_sim::build_app`] — fleet
+//! spawn, FDM stepping, command ownership and leases, lockstep, telemetry, events,
+//! recording, pacing, the control plane — and adds the race systems to its tick
+//! through [`astrum_sim::TickSet`]. A controller flies a race exactly as it flies
+//! any multirotor: it sends `Multirotor` commands for the aircraft and reads the
+//! race's course and progress from `astrum/race/*`.
 //!
-//! This is a separate environment from the within-visual-range combat world in
-//! `astrum-sim`: it shares only the JSBSim wrapper (`astrum-fdm`) and the
-//! coordinate math (`astrum-geo`), and none of that crate's combat code.
-//!
-//! # Shape of the app
-//!
-//! * [`gate`] — the physical gate: a 37 x 3 in top bar on two 31 x 3 in uprights,
-//!   for a 31 in square opening, plus the local-frame geometry a flythrough test
-//!   needs.
-//! * [`airframe`] — how big the F450 actually is, taken from its JSBSim model, and
-//!   the five-part hull the crash test uses. There are **10.9 cm of clearance per
-//!   side** square to a gate and **4.1 cm** at the worst heading, which is what
-//!   decides how accurate that hull has to be.
+//! * [`gate`] — the physical gate and the local-frame geometry a flythrough test needs.
+//! * [`airframe`] — how big the F450 actually is, and the five-part hull the crash
+//!   test uses.
 //! * [`course`] — rejection sampling with backtracking that turns a seed into a
 //!   sequence of gates no leg threads and no two gates overlap.
-//! * [`scenario`] — the TOML document (`config/race.toml`): world origin, sim rate,
-//!   the drone, and the randomization envelope.
-//! * [`control`] — the F450's stabilising inner loop, and the
-//!   [`FlightCommand`](control::FlightCommand) an outer controller writes. The drone
-//!   launches holding station; **nothing here flies the course** — that is the next
-//!   piece of work, and it plugs in by writing `FlightCommand`.
-//! * [`systems`] — spawn, step, pose, gate scoring, crash detection, pacing, and
-//!   termination. A run ends in exactly one way — some system marks an
-//!   [`Outcome`](components::Outcome) on
-//!   [`RaceProgress`](components::RaceProgress) — and one system turns that into an
-//!   exit.
-//! * [`net`] — the optional Zenoh bridge: the drone's telemetry and the race's task
-//!   state out, actuator commands in, so a controller can be developed
-//!   off-process in any language. Off by default; [`net::install`] switches it on.
-//!
-//! Course generation happens in [`build_app`], *before* the app is standing, so an
-//! unsatisfiable envelope is an error the caller can see rather than a log line
-//! from inside a startup system.
+//! * [`scenario`] — the race scenario document, its resolution to a fixed course
+//!   ([`scenario::ResolvedRace`]) and the JSON course view the web API serves.
+//! * [`systems`] — crash detection, gate scoring, the time limit, the end of the run
+//!   and the publication of `RaceCourse`/`RaceState`.
+//! * [`net`] — puts the race's publisher on a Zenoh session.
 //!
 //! ```no_run
-//! let scenario = astrum_race::scenario::RaceScenario::load("config/race.toml")?;
-//! let mut app = astrum_race::build_app(scenario)?;
-//! app.run();
+//! let race = astrum_race::scenario::RaceScenario::load("config/scenario.race.toml")?.resolve(None)?;
+//! let mut app = astrum_race::build_race_app(race, astrum_sim::RunMode::Server);
+//! astrum_sim::run_to_exit(&mut app);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 pub mod airframe;
 pub mod components;
-pub mod control;
 pub mod course;
 pub mod gate;
 pub mod geom;
@@ -56,98 +37,38 @@ pub mod rng;
 pub mod scenario;
 pub mod systems;
 
-use bevy::app::ScheduleRunnerPlugin;
+use astrum_sim::components::SimStatus;
+use astrum_sim::{RunMode, TickSet};
 use bevy::prelude::*;
-use std::time::Duration;
 
-use astrum_geo::{Geodetic, LocalFrame};
-use components::{RaceCourse, RaceProgress, SimParams, WorldFrame};
-use control::stabilize;
-use course::{Course, CourseError};
-use net::{ingest_commands, publish_race, publish_telemetry};
-use scenario::RaceScenario;
-use systems::{
-    detect_crash, enforce_time_limit, pace, report_progress, spawn_course, spawn_drone, step_fdm,
-    stop_when_finished, sync_pose, track_gates, Diag, Pacer,
-};
+use components::{RaceCourse, RaceProgress};
+use scenario::ResolvedRace;
+use systems::{fail_spawn, log_course, publish_race, tick_systems};
 
-/// Draw the scenario's course: `sim.seed` against the `[course]` envelope.
-pub fn generate_course(scenario: &RaceScenario) -> Result<Course, CourseError> {
-    course::generate(scenario.sim.seed, &scenario.course)
-}
+pub use scenario::{course_view, is_race_scenario, CourseView, RaceScenario, RaceScenarioError};
 
-/// Build the racing app from a scenario, randomizing the course from its seed.
-pub fn build_app(scenario: RaceScenario) -> Result<App, CourseError> {
-    let course = generate_course(&scenario)?;
-    Ok(build_app_with_course(scenario, course))
-}
-
-/// Build the racing app on a course you already have (does not run it).
+/// Build the sim's app for a resolved race, with the race systems added (does not
+/// run it; put it on the bus with [`astrum_sim::net::connect`] and [`net::connect`]).
 ///
-/// Shared by the binary and the integration tests, which drive it with manual
-/// `update()` calls through the same [`Startup`] + [`Update`] schedule. Taking the
-/// course as an argument lets a test pin an exact track instead of a seed.
-pub fn build_app_with_course(scenario: RaceScenario, course: Course) -> App {
-    let rate = scenario.sim.rate_hz;
-    let dt = 1.0 / rate;
-    let params = SimParams {
-        rate_hz: rate,
-        dt,
-        max_time_s: scenario.sim.max_time_s,
-        realtime: scenario.sim.realtime,
-    };
-
-    let origin = Geodetic::from_degrees(
-        scenario.world.origin_lat_deg,
-        scenario.world.origin_lon_deg,
-        scenario.world.origin_alt_m,
-    );
-    let frame = WorldFrame(LocalFrame::new(origin));
-
-    println!(
-        "[astrum-race] ENU origin: {:.6}, {:.6} @ {:.1} m",
-        scenario.world.origin_lat_deg, scenario.world.origin_lon_deg, scenario.world.origin_alt_m
-    );
-
-    // Physics steps exactly once per runner loop; `pace` throttles the loop (Bevy's
-    // own sleep is a no-op in this headless configuration). Pacing changes
-    // wall-clock timing only, never the number of steps or their dt.
-    let mut app = App::new();
-    app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::ZERO)))
-        .insert_resource(scenario)
-        .insert_resource(params)
-        .insert_resource(frame)
-        .insert_resource(RaceCourse(course))
-        .insert_resource(RaceProgress::default())
-        .insert_resource(Diag::new())
-        .insert_resource(Pacer::new(dt, params.realtime))
-        // The course must exist before the drone, which starts on gate 0's approach.
-        .add_systems(Startup, (spawn_course, spawn_drone).chain())
+/// At startup, after the sim spawns the drone and before tick 0 is published, the
+/// course and the initial state go out. Every tick, after the step and before the
+/// telemetry: crash detection → gate scoring → the time limit → the end of the run →
+/// the publication of the state.
+pub fn build_race_app(race: ResolvedRace, mode: RunMode) -> App {
+    let aircraft_id = race.scenario.aircraft[0].id;
+    let mut app = astrum_sim::build_app(race.scenario, mode);
+    app.insert_resource(RaceCourse(race.course))
+        .insert_resource(RaceProgress::new(aircraft_id))
         .add_systems(
-            Update,
+            Startup,
             (
-                // Commands off the wire arrive before the loop that services them,
-                // the inner loop sets this tick's control inputs, then physics, then
-                // the pose it produced.
-                ingest_commands,
-                stabilize,
-                step_fdm,
-                sync_pose,
-                // Everything that can end the run, judged against that fresh pose, and
-                // all of it ahead of publishing so the wire always carries the outcome
-                // that ended the run. Crash detection is first: clipping a gate while
-                // the CG crosses inside the opening is a crash, not a pass.
-                detect_crash,
-                track_gates,
-                enforce_time_limit,
-                publish_telemetry,
-                publish_race,
-                report_progress,
-                // ...and one place the app actually exits.
-                stop_when_finished,
-                pace,
+                log_course,
+                publish_race.run_if(SimStatus::running),
+                fail_spawn.run_if(not(SimStatus::running)),
             )
-                .chain(),
-        );
+                .chain()
+                .in_set(TickSet::Spawned),
+        )
+        .add_systems(Update, tick_systems().in_set(TickSet::Stepped));
     app
 }

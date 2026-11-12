@@ -37,12 +37,12 @@ use astrum_bag::metrics::RunMetrics;
 use astrum_bag::BagReader;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::METRICS;
+use crate::catalog::{METRICS, RACE_METRICS};
 use crate::components::{SimClock, SimParams, SimStatus};
 use crate::perturb::{self, Axis, Group, Offset, Perturb};
 use crate::record;
 use crate::rng::SplitMix64;
-use crate::scenario::Scenario;
+use crate::scenario::{Scenario, ScenarioError};
 use crate::systems::StopRequested;
 use crate::trim;
 use crate::{build_app, run_to_exit, RunMode};
@@ -88,6 +88,14 @@ pub struct SweepFile {
     /// `$ASTRUM_ZENOH_CONNECT`), `{run}` (1-based), `{seed}`, `{param.<name>}`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controllers: Vec<String>,
+    /// Race sweeps only (the base has a `[course]`): how each run's course is
+    /// drawn. Unset: `fixed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course_seed_mode: Option<CourseSeedMode>,
+    /// Race sweeps only: how many gates every run's course has
+    /// (`course.gates`, [`MIN_GATES`]..=[`MAX_GATES`]), over the scenario's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gates: Option<u32>,
     /// Overrides applied to every run.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub set: BTreeMap<String, toml::Value>,
@@ -121,6 +129,8 @@ impl SweepFile {
             set: BTreeMap::new(),
             vary: BTreeMap::new(),
             perturb: Vec::new(),
+            course_seed_mode: None,
+            gates: None,
         }
     }
 
@@ -128,6 +138,86 @@ impl SweepFile {
     pub fn to_toml(&self) -> Result<String, SweepError> {
         toml::to_string(self).map_err(|e| err(format!("writing the sweep: {e}")))
     }
+}
+
+/// Fewest and most gates a race sweep may ask for.
+pub const MIN_GATES: u32 = 2;
+pub const MAX_GATES: u32 = 64;
+
+/// How a race sweep seeds each run's course. A grid point's base course seed is
+/// the base `[course]`'s `seed`, else the point's `sim.seed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CourseSeedMode {
+    /// Every run flies the base course seed: the same course, however `sim.seed`
+    /// varies between repeats.
+    Fixed,
+    /// Repeat `r` flies the base course seed + `r`: a new course each repeat.
+    Randomize,
+}
+
+/// A scenario as a sweep starts from it: what the sim flies and, for a race,
+/// its `[course]` table. astrum-sim keeps that table opaque and hands it to the
+/// race binary (`astrum-race`), which reads it; this crate never depends on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Base {
+    pub scenario: Scenario,
+    /// The `[course]` table of a race scenario.
+    pub course: Option<toml::Table>,
+}
+
+impl Base {
+    /// Read and validate a scenario file, with or without a `[course]`.
+    pub fn load(path: &Path) -> Result<Self, SweepError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| err(format!("reading scenario {}: {e}", path.display())))?;
+        Self::from_toml_str(&text).map_err(|e| err(e.to_string()))
+    }
+
+    /// Parse and validate scenario text; a `[course]` table is set aside and
+    /// must be a table whose `seed`, if any, is a non-negative integer.
+    pub fn from_toml_str(text: &str) -> Result<Self, ScenarioError> {
+        let mut table: toml::Table =
+            toml::from_str(text).map_err(|e| ScenarioError(format!("parsing scenario: {e}")))?;
+        let Some(course) = table.remove("course") else {
+            return Ok(Self { scenario: Scenario::from_toml_str(text)?, course: None });
+        };
+        let toml::Value::Table(course) = course else {
+            return Err(ScenarioError("parsing scenario: course must be a table".into()));
+        };
+        let scenario: Scenario = table
+            .try_into()
+            .map_err(|e: toml::de::Error| ScenarioError(format!("parsing scenario: {e}")))?;
+        scenario.validate()?;
+        let base = Self { scenario, course: Some(course) };
+        base.course_seed()?;
+        Ok(base)
+    }
+
+    /// The race course's own `seed`, when it sets one.
+    pub fn course_seed(&self) -> Result<Option<u64>, ScenarioError> {
+        match self.course.as_ref().and_then(|c| c.get("seed")) {
+            None => Ok(None),
+            Some(toml::Value::Integer(n)) if *n >= 0 => Ok(Some(*n as u64)),
+            Some(other) => Err(ScenarioError(format!(
+                "course.seed must be a non-negative integer, got {other}"
+            ))),
+        }
+    }
+
+    /// The scenario as TOML, `[course]` included.
+    pub fn to_toml(&self) -> String {
+        scenario_toml(&self.scenario, self.course.as_ref())
+    }
+}
+
+/// `scenario` as TOML, followed by the race's `[course]` table when there is one.
+pub fn scenario_toml(scenario: &Scenario, course: Option<&toml::Table>) -> String {
+    let Some(course) = course else { return scenario.to_toml() };
+    let mut table = toml::Table::try_from(scenario)
+        .unwrap_or_else(|e| unreachable!("a validated scenario always serialises: {e}"));
+    table.insert("course".to_owned(), toml::Value::Table(course.clone()));
+    toml::to_string(&table).unwrap_or_else(|e| unreachable!("a course table serialises: {e}"))
 }
 
 /// What a plan is for; the rules a run must meet differ.
@@ -158,6 +248,12 @@ pub struct Run {
     pub sample: Option<u64>,
     /// `param.<name>` values (from `set` and `vary`), for controller commands.
     pub params: BTreeMap<String, toml::Value>,
+    /// The seed of this run's course (race sweeps only), passed to `astrum-race`
+    /// as `--seed`.
+    pub course_seed: Option<u64>,
+    /// How many gates the course has, when the scenario's `[course]` (or the
+    /// sweep's `gates`) says; `None` leaves it to the course envelope.
+    pub gates: Option<u32>,
 }
 
 impl Run {
@@ -188,6 +284,9 @@ pub struct Sweep {
     pub value_keys: Vec<String>,
     pub runs: Vec<Run>,
     pub out: PathBuf,
+    /// The base's `[course]`, for a race sweep: every run flies the same
+    /// envelope, its course drawn from [`Run::course_seed`].
+    pub course: Option<toml::Table>,
 }
 
 /// An invalid sweep.
@@ -346,16 +445,26 @@ impl Sweep {
     /// Plan `file` for `purpose`, loading its `base`; `name` sets the default
     /// output directory (`runs/<name>`).
     pub fn plan(file: SweepFile, name: &str, purpose: Purpose) -> Result<Self, SweepError> {
-        let base = Scenario::load(&file.base)
+        let base = Base::load(&file.base)
             .map_err(|e| err(format!("base scenario {}: {e}", file.base.display())))?;
-        Self::plan_scenario(file, base, name, purpose)
+        Self::plan_base(file, base, name, purpose)
+    }
+
+    /// [`Self::plan_base`] of a plain (non-race) scenario.
+    pub fn plan_scenario(
+        file: SweepFile,
+        base: Scenario,
+        name: &str,
+        purpose: Purpose,
+    ) -> Result<Self, SweepError> {
+        Self::plan_base(file, Base { scenario: base, course: None }, name, purpose)
     }
 
     /// Plan `file` for `purpose` from an in-memory `base` (`file.base` is not
     /// read); otherwise exactly [`Self::plan`].
-    pub fn plan_scenario(
+    pub fn plan_base(
         file: SweepFile,
-        base: Scenario,
+        mut base: Base,
         name: &str,
         purpose: Purpose,
     ) -> Result<Self, SweepError> {
@@ -368,8 +477,27 @@ impl Sweep {
         if let Some((key, _)) = file.vary.iter().find(|(_, values)| values.is_empty()) {
             return Err(err(format!("vary.{key:?} has no values")));
         }
-        check_sampling(&file, &base)?;
-        let mut base_value = toml::Value::try_from(&base).map_err(|e| err(e.to_string()))?;
+        check_sampling(&file, &base.scenario)?;
+        check_course(&file, &base)?;
+        if let (Some(gates), Some(course)) = (file.gates, base.course.as_mut()) {
+            course.insert("gates".to_owned(), toml::Value::Integer(i64::from(gates)));
+        }
+        let gates = base
+            .course
+            .as_ref()
+            .and_then(|c| c.get("gates"))
+            .and_then(toml::Value::as_integer)
+            .and_then(|n| u32::try_from(n).ok());
+        // `Some(the course's own seed)` for a race, whose runs each draw one.
+        let course_base = base
+            .course
+            .is_some()
+            .then(|| base.course_seed())
+            .transpose()
+            .map_err(|e| err(e.to_string()))?;
+        let mode = file.course_seed_mode.unwrap_or(CourseSeedMode::Fixed);
+        let mut base_value =
+            toml::Value::try_from(&base.scenario).map_err(|e| err(e.to_string()))?;
         let mut base_overrides = Overrides::default();
         for (key, value) in &file.set {
             apply(&mut base_value, &mut base_overrides, key, value)?;
@@ -443,7 +571,14 @@ impl Sweep {
                     if let Some(speed) = speed {
                         scenario.sim.speed = speed;
                     }
-                    scenario.sim.seed = scenario.sim.seed.wrapping_add(r);
+                    let point_seed = scenario.sim.seed;
+                    scenario.sim.seed = point_seed.wrapping_add(r);
+                    let course_seed = course_base.map(|base_seed| match mode {
+                        CourseSeedMode::Fixed => base_seed.unwrap_or(point_seed),
+                        CourseSeedMode::Randomize => {
+                            base_seed.unwrap_or(point_seed).wrapping_add(r)
+                        }
+                    });
                     let index = runs.len();
                     let run = Run {
                         index,
@@ -451,6 +586,8 @@ impl Sweep {
                         values: values.clone(),
                         sample,
                         params: point.params.clone(),
+                        course_seed,
+                        gates,
                     };
                     check_run(&file, purpose, &run).map_err(|e| {
                         err(format!("run {} ({}): {e}", index + 1, describe(&value_keys, &values)))
@@ -460,12 +597,13 @@ impl Sweep {
             }
         }
         let out = file.out.clone().unwrap_or_else(|| Path::new("runs").join(name));
-        Ok(Self { file, value_keys, runs, out })
+        Ok(Self { file, value_keys, runs, out, course: base.course })
     }
 
-    /// Whether runs fly in-process (no external controllers).
+    /// Whether runs fly in-process: no external controllers, and not a race
+    /// (its runs are `astrum-race` processes; the sim has no embedded race).
     pub fn in_process(&self) -> bool {
-        self.file.controllers.is_empty()
+        self.file.controllers.is_empty() && self.course.is_none()
     }
 
     /// Runs at once: `jobs` (or the sweep file's), else one per core divided by
@@ -528,6 +666,43 @@ pub struct TrimCheck {
     /// Distinct aircraft builds trimmed.
     pub trims: usize,
     pub wall_s: f64,
+}
+
+/// A race base's rules: its start pose comes from the course, so offsets (which
+/// move the start pose) change nothing and are refused; `course_seed_mode` and
+/// `gates` are only for a race whose course is drawn.
+fn check_course(file: &SweepFile, base: &Base) -> Result<(), SweepError> {
+    if base.course.is_none() {
+        if file.course_seed_mode.is_some() {
+            return Err(err("course_seed_mode needs a race scenario (one with a [course])"));
+        }
+        if file.gates.is_some() {
+            return Err(err("gates needs a race scenario (one with a [course])"));
+        }
+        return Ok(());
+    }
+    if let Some(gates) = file.gates {
+        if !(MIN_GATES..=MAX_GATES).contains(&gates) {
+            return Err(err(format!("gates must be {MIN_GATES}..={MAX_GATES}, got {gates}")));
+        }
+        if base.course.as_ref().is_some_and(|c| c.contains_key("gate")) {
+            return Err(err("gates has no effect: the course lists its gates ([[course.gate]])"));
+        }
+    }
+    if file.course_seed_mode == Some(CourseSeedMode::Randomize)
+        && base.course.as_ref().is_some_and(|c| c.contains_key("gate"))
+    {
+        return Err(err(
+            "course_seed_mode = \"randomize\" needs a course drawn from a seed; this one \
+             lists its gates ([[course.gate]])",
+        ));
+    }
+    let offsets = |key: &String| key.contains(".offset.");
+    if !file.perturb.is_empty() || file.vary.keys().chain(file.set.keys()).any(offsets) {
+        return Err(err("a race starts from its course: aircraft offsets ([[perturb]], \
+             aircraft.<id>.offset.<axis>) change nothing there"));
+    }
+    Ok(())
 }
 
 /// The sampling keys' own rules and the `[[perturb]]` tables against `base`.
@@ -693,6 +868,9 @@ pub fn run_in_process(run: &Run, bag: &Path, stop: &StopRequested) -> Outcome {
         sim_time_s: None,
         wall_s: started.elapsed().as_secs_f64(),
     };
+    if run.course_seed.is_some() {
+        return failed("a race run flies as an astrum-race process, not in-process".into());
+    }
     let (recorder, recording) = match record::start(bag, &run.scenario.to_toml()) {
         Ok(r) => r,
         Err(e) => return failed(format!("recording: {e}")),
@@ -847,22 +1025,32 @@ fn metric_cell(v: Option<&serde_json::Value>) -> String {
 }
 
 /// Write `summary.csv` (via a temporary file, so a reader never sees half of
-/// it): one row per run in run order — status, seed, the sample (when the
-/// sweep samples), the `vary` values and drawn offsets, sim time, wall time,
-/// speed, the bag, then the fleet metrics ([`METRICS`], but for `sim_time_s`,
-/// a column already).
+/// it): one row per run in run order — status, seed, the course seed and gate count (race
+/// sweeps), the sample (when the sweep samples), the `vary` values and drawn
+/// offsets, sim time, wall time, speed, the bag, then the fleet metrics
+/// ([`METRICS`], and [`RACE_METRICS`] for a race; but for `sim_time_s`, a
+/// column already).
 fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Result<()> {
     let tmp = path.with_extension("csv.tmp");
     let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
     let sampled = sweep.file.samples > 0;
+    let race = sweep.course.is_some();
     let mut header = vec!["run".to_owned(), "status".into(), "seed".into()];
+    if race {
+        header.extend(["course_seed", "gates"].map(String::from));
+    }
     if sampled {
         header.push("sample".into());
     }
     header.extend(sweep.value_keys.iter().cloned());
     header.extend(["sim_time_s", "wall_s", "speed_x", "bag"].map(String::from));
-    let metric_ids: Vec<&str> =
-        METRICS.iter().copied().filter(|id| !header.iter().any(|h| h == id)).collect();
+    let race_ids: &[&str] = if race { RACE_METRICS } else { &[] };
+    let metric_ids: Vec<&str> = METRICS
+        .iter()
+        .chain(race_ids)
+        .copied()
+        .filter(|id| !header.iter().any(|h| h == id))
+        .collect();
     header.extend(metric_ids.iter().map(|id| id.to_string()));
     writeln!(f, "{}", header.iter().map(|h| csv_cell(h)).collect::<Vec<_>>().join(","))?;
     for (run, state) in sweep.runs.iter().zip(rows) {
@@ -881,6 +1069,10 @@ fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Resu
         };
         let (sim, wall) = (outcome.and_then(|o| o.sim_time_s), outcome.map(|o| o.wall_s));
         let mut row = vec![(run.index + 1).to_string(), status, run.scenario.sim.seed.to_string()];
+        if race {
+            row.push(run.course_seed.map_or(String::new(), |s| s.to_string()));
+            row.push(run.gates.map_or(String::new(), |g| g.to_string()));
+        }
         if sampled {
             row.push(run.sample.map_or(String::new(), |k| (k + 1).to_string()));
         }

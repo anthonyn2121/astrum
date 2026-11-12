@@ -7,7 +7,7 @@
 use astrum_race::geom::{
     obb_overlap, segment_point_dist_sq, segment_segment_dist_sq, sphere_overlaps_obb, Obb,
 };
-use astrum_race::rng::RaceRng;
+use astrum_race::rng::{SplitMix64, Uniform};
 use bevy::math::DVec3;
 
 fn d(sq: f64) -> f64 {
@@ -178,7 +178,7 @@ fn boxes_overlap_when_they_share_space_and_not_when_they_are_apart() {
 /// about axes.
 #[test]
 fn box_overlap_is_symmetric_and_never_misses_a_shared_point() {
-    let mut rng = RaceRng::seeded(20260908);
+    let mut rng = SplitMix64::seeded(20260908);
     let mut shared = 0;
     for _ in 0..2000 {
         let a = tilted(

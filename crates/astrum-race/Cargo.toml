@@ -3,7 +3,7 @@ name = "astrum-race"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "ASTRUM drone-racing environment: an F450 quadrotor and a Monte-Carlo randomized gate course."
+description = "ASTRUM drone-racing environment: gates, a Monte-Carlo course sampler, scoring and crash detection, run on astrum-sim."
 
 [lib]
 name = "astrum_race"
@@ -14,16 +14,20 @@ name = "astrum-race"
 path = "src/main.rs"
 
 [dependencies]
-# Headless, like the dogfight sim: no render/winit/audio, so the GUI/GPU feature
-# stack (and its system libs) stays out of the build.
+# Headless, like the sim: no render/winit/audio.
 bevy = { version = "0.19", default-features = false }
-# Shared infrastructure only — the JSBSim wrapper, the coordinate math, and the
-# wire/transport stack. None of these depend on `astrum-sim`, so this environment
-# still shares no code with its combat world.
-astrum-fdm = { path = "../astrum-fdm" }
+# A race is an astrum-sim scenario plus a `[course]`: the sim's app (fleet spawn,
+# FDM stepping, command ownership and lockstep, telemetry, recording, pacing) is
+# built by `astrum_sim::build_app`, and this crate adds the race systems to it.
+astrum-sim = { path = "../astrum-sim" }
 astrum-geo = { path = "../astrum-geo" }
 astrum-net = { path = "../astrum-net" }
 astrum-proto = { path = "../astrum-proto" }
 clap = { workspace = true }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+ctrlc = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+astrum-bag = { path = "../astrum-bag" }
+tempfile = "3"

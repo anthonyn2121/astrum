@@ -4,8 +4,19 @@
 //!
 //! Fleet metrics are named by their metric ids (`end_reason`, `sim_time_s`,
 //! `min_separation_m`, `min_alt_hae_m`, `max_bank_deg`, `max_nz_g`,
-//! `failsafe_entries`, `controller_losses`, `command_refusals`, `hits`, `kills`).
+//! `failsafe_entries`, `controller_losses`, `command_refusals`, `hits`, `kills`,
+//! and for race runs `gates_passed`, `gates_missed`, `race_time_s`, `race_outcome`).
 //! An extreme over no samples is `None`, a count over no events 0.
+//!
+//! **Race metrics** come from the `gate-passed`, `gate-missed` and `crashed`
+//! events plus the `run-ended` event, and are `None` for a run that is not a
+//! race (a bag whose recorded scenario has no `[course]` table and that holds
+//! no race event). `race_time_s` is the sim time of the last gate passed (the
+//! completion time of a finished course), `None` if no gate was passed;
+//! `race_outcome` is the `crashed` event's outcome (`crashed-ground`,
+//! `crashed-gate`, `timed-out`, `spawn-failed`), else `complete` if the run
+//! ended with `race-complete` and `timed-out` if it ended at `max-time`; `None`
+//! while the race has not ended.
 //!
 //! **Samples.** Only samples of living aircraft (`combat.alive`) feed the
 //! extremes and the separation; the final state is the aircraft's last sample
@@ -32,7 +43,9 @@
 
 use std::collections::BTreeMap;
 
-use astrum_proto::{decode_event, decode_telemetry, ControlMode, EventKind, Telemetry};
+use astrum_proto::{
+    decode_event, decode_telemetry, ControlMode, EndReason, EventKind, RaceOutcome, Telemetry,
+};
 use serde::Serialize;
 
 use crate::{aircraft_models, BagReader, Result, TopicKind};
@@ -42,7 +55,7 @@ use crate::{aircraft_models, BagReader, Result, TopicKind};
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunMetrics {
     /// The `run-ended` event's reason (`max-time`, `engagement-decided`,
-    /// `fatal`, `stopped`); `None` if the bag has no `run-ended` event.
+    /// `fatal`, `stopped`, `race-complete`, `crashed`); `None` if the bag has no `run-ended` event.
     pub end_reason: Option<String>,
     /// The `run-ended` event's message (the fatal error; empty otherwise).
     pub end_message: Option<String>,
@@ -72,6 +85,14 @@ pub struct RunMetrics {
     pub hits: u32,
     /// `kill` events.
     pub kills: u32,
+    /// `gate-passed` events; `None` for a run that is not a race.
+    pub gates_passed: Option<u32>,
+    /// `gate-missed` events; `None` for a run that is not a race.
+    pub gates_missed: Option<u32>,
+    /// Sim time of the last `gate-passed` event (s).
+    pub race_time_s: Option<f64>,
+    /// How the race ended (see the [module docs](self)).
+    pub race_outcome: Option<String>,
     /// Telemetry and event payloads that did not decode (or whose aircraft id
     /// disagrees with their topic), skipped.
     pub rejected: u64,
@@ -188,9 +209,18 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
         command_refusals: 0,
         hits: 0,
         kills: 0,
+        gates_passed: None,
+        gates_missed: None,
+        race_time_s: None,
+        race_outcome: None,
         rejected: 0,
         aircraft: Vec::new(),
     };
+
+    // Race metrics are reported for a race scenario even when no gate event happened.
+    let mut race = bag.scenario().is_some_and(has_course_table);
+    let mut crash: Option<RaceOutcome> = None;
+    let mut ended: Option<EndReason> = None;
 
     for msg in bag.messages()? {
         match TopicKind::of(&msg.topic) {
@@ -229,6 +259,20 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
                     EventKind::RunEnded { reason, message } => {
                         m.end_reason = Some(reason.name().to_owned());
                         m.end_message = Some(message);
+                        ended = Some(reason);
+                    }
+                    EventKind::GatePassed { .. } => {
+                        race = true;
+                        *m.gates_passed.get_or_insert(0) += 1;
+                        m.race_time_s = Some(e.sim_time_s);
+                    }
+                    EventKind::GateMissed { .. } => {
+                        race = true;
+                        *m.gates_missed.get_or_insert(0) += 1;
+                    }
+                    EventKind::Crashed { outcome, .. } => {
+                        race = true;
+                        crash = Some(outcome);
                     }
                     _ => {}
                 },
@@ -236,6 +280,18 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
             },
             Some(TopicKind::Command(_)) | None => {}
         }
+    }
+
+    if race {
+        m.gates_passed.get_or_insert(0);
+        m.gates_missed.get_or_insert(0);
+        m.race_outcome = crash
+            .or(match ended {
+                Some(EndReason::RaceComplete) => Some(RaceOutcome::Complete),
+                Some(EndReason::MaxTime) => Some(RaceOutcome::TimedOut),
+                _ => None,
+            })
+            .map(|o| o.name().to_owned());
     }
 
     let mut closest: Option<Closest> = None;
@@ -289,6 +345,13 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
     m.max_bank_deg = fleet.max_bank_deg;
     m.max_nz_g = fleet.max_nz_g;
     Ok(m)
+}
+
+/// Whether a scenario TOML has a `[course]` table (a race scenario).
+fn has_course_table(scenario_toml: &str) -> bool {
+    scenario_toml
+        .parse::<toml::Table>()
+        .is_ok_and(|t| t.get("course").is_some_and(toml::Value::is_table))
 }
 
 /// `psi` as a heading in [0, 360) deg (`rem_euclid` rounds a tiny negative up to 360).

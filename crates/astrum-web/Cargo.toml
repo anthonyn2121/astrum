@@ -27,6 +27,8 @@ astrum-net = { path = "../astrum-net" }
 astrum-bag = { path = "../astrum-bag" }
 # The studio's catalogs (scenarios, environments, controllers) and, later, runs.
 astrum-sim = { path = "../astrum-sim" }
+# Race scenarios: their validation, courses and the `astrum-race` binary the studio launches.
+astrum-race = { path = "../astrum-race" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

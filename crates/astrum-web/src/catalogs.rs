@@ -15,15 +15,20 @@ use astrum_sim::catalog::summary;
 use astrum_sim::components::{AutopilotProfile, VehicleKind};
 use astrum_sim::controllers::{ControllerCatalog, ControllerError};
 use astrum_sim::scenario::{Scenario, KNOWN_MODELS};
+use astrum_sim::sweep::Base;
 use serde::Serialize;
 
 use crate::api::safe_name;
+use crate::race::{self, CourseView};
 
 /// The controller catalog's file name inside the config directory.
 pub const CONTROLLERS_FILE: &str = "controllers.toml";
 
-/// The environment of every scenario until a scenario can name its own.
+/// The environment of every scenario without a `[course]`.
 pub const DEFAULT_ENVIRONMENT: &str = "empty";
+
+/// The environment of a race scenario (one with a `[course]`).
+pub const RACE_ENVIRONMENT: &str = "race";
 
 /// Longest scenario summary, in characters.
 const SUMMARY_MAX_CHARS: usize = 200;
@@ -67,6 +72,8 @@ pub struct ScenarioEntry {
     pub error: Option<String>,
     /// The fleet, sorted by id; empty when the file is invalid.
     pub aircraft: Vec<AircraftEntry>,
+    /// A race scenario's gate count; `None` for any other scenario.
+    pub gates: Option<usize>,
 }
 
 /// One scenario in full.
@@ -80,6 +87,9 @@ pub struct ScenarioDoc {
     /// leave it out of the file), sorted by id.
     pub fleet: Vec<AircraftEntry>,
     pub scenario: Scenario,
+    /// A race scenario's course, drawn from the scenario's own seed
+    /// (`course.seed`, else `sim.seed`); `null` for any other scenario.
+    pub course: Option<CourseView>,
 }
 
 /// Why [`Catalogs::scenario`] has no scenario to give.
@@ -174,8 +184,35 @@ impl Catalogs {
         Ok(entries)
     }
 
-    /// The scenario saved as `scenario.<name>.toml`.
+    /// The scenario saved as `scenario.<name>.toml`, with its course.
     pub fn scenario(&self, name: &str) -> Result<ScenarioDoc, ScenarioError> {
+        let (base, path, text) = self.read_base(name)?;
+        let course = match &base.course {
+            Some(_) => Some(
+                race::course_view(&text, None)
+                    .map_err(|e| ScenarioError::Invalid(format!("{}: {e}", path.display())))?,
+            ),
+            None => None,
+        };
+        Ok(ScenarioDoc {
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            summary: summary(&text),
+            environment: environment_of(&base),
+            fleet: fleet(&base.scenario),
+            scenario: base.scenario,
+            course,
+        })
+    }
+
+    /// The scenario saved as `scenario.<name>.toml`, as a run or sweep starts
+    /// from it: the scenario and, for a race, its `[course]` table.
+    pub fn base(&self, name: &str) -> Result<Base, ScenarioError> {
+        self.read_base(name).map(|(base, ..)| base)
+    }
+
+    /// The validated scenario file `name`, its path and its text.
+    fn read_base(&self, name: &str) -> Result<(Base, PathBuf, String), ScenarioError> {
         let path = self.scenario_path(name).map_err(ScenarioError::BadName)?;
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -184,16 +221,9 @@ impl Catalogs {
             }
             Err(e) => return Err(ScenarioError::Io(format!("reading {}: {e}", path.display()))),
         };
-        let scenario = Scenario::from_toml_str(&text)
+        let base = parse_base(&text)
             .map_err(|e| ScenarioError::Invalid(format!("{}: {e}", path.display())))?;
-        Ok(ScenarioDoc {
-            name: name.to_owned(),
-            path: path.display().to_string(),
-            summary: summary(&text),
-            environment: DEFAULT_ENVIRONMENT,
-            fleet: fleet(&scenario),
-            scenario,
-        })
+        Ok((base, path, text))
     }
 
     /// Save `scenario` as `scenario.<name>.toml`, preceded by a `# <summary>`
@@ -242,18 +272,46 @@ impl Catalogs {
 /// The listing entry of the scenario file `path`, named `name`.
 fn scenario_entry(path: &Path, name: String) -> io::Result<ScenarioEntry> {
     let text = std::fs::read_to_string(path)?;
-    let (error, aircraft) = match Scenario::from_toml_str(&text) {
-        Ok(scenario) => (None, fleet(&scenario)),
-        Err(e) => (Some(e.to_string()), Vec::new()),
+    let (error, aircraft, environment, gates) = match parse_base(&text) {
+        Ok(base) => {
+            let gates = base
+                .course
+                .as_ref()
+                .and_then(|_| race::course_view(&text, None).ok())
+                .map(|c| c.gates.len());
+            (None, fleet(&base.scenario), environment_of(&base), gates)
+        }
+        Err(e) => (Some(e), Vec::new(), DEFAULT_ENVIRONMENT, None),
     };
     Ok(ScenarioEntry {
         name,
         path: path.display().to_string(),
         summary: summary(&text),
-        environment: DEFAULT_ENVIRONMENT,
+        environment,
         error,
         aircraft,
+        gates,
     })
+}
+
+/// Parse and validate a scenario file: the scenario and, for a race, its
+/// `[course]` (checked by `astrum-race`, which flies it). The error is the
+/// message to show.
+fn parse_base(text: &str) -> Result<Base, String> {
+    let base = Base::from_toml_str(text).map_err(|e| e.to_string())?;
+    if base.course.is_some() {
+        race::validate(text)?;
+    }
+    Ok(base)
+}
+
+/// The environment a scenario belongs to.
+fn environment_of(base: &Base) -> &'static str {
+    if base.course.is_some() {
+        RACE_ENVIRONMENT
+    } else {
+        DEFAULT_ENVIRONMENT
+    }
 }
 
 /// `<name>` of a `scenario.<name>.toml` path whose name is [`safe_name`].

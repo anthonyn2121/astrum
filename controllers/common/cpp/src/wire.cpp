@@ -227,6 +227,21 @@ Event to_event(wire::Event::Reader e) {
                             std::string(message.begin(), message.size())};
       break;
     }
+    case wire::Event::Kind::GATE_PASSED: {
+      const auto v = kind.getGatePassed();
+      out.detail = GatePassed{v.getAircraftId(), v.getGate(), v.getOffsetXM(), v.getOffsetYM()};
+      break;
+    }
+    case wire::Event::Kind::GATE_MISSED: {
+      const auto v = kind.getGateMissed();
+      out.detail = GateMissed{v.getAircraftId(), v.getGate()};
+      break;
+    }
+    case wire::Event::Kind::CRASHED: {
+      const auto v = kind.getCrashed();
+      out.detail = Crashed{v.getAircraftId(), enum_cast<RaceOutcome>(v.getOutcome()), v.getGate()};
+      break;
+    }
     default:
       throw std::runtime_error("unknown event kind " +
                                std::to_string(static_cast<unsigned>(kind.which())));
@@ -235,6 +250,27 @@ Event to_event(wire::Event::Reader e) {
 }
 
 TickEnd to_tick_end(wire::TickEnd::Reader t) { return TickEnd{t.getTick(), t.getSimTimeS()}; }
+
+RaceCourse to_race_course(wire::RaceCourse::Reader c) {
+  RaceCourse out;
+  out.seed = c.getSeed();
+  out.opening_m = c.getOpeningM();
+  out.bar_m = c.getBarM();
+  out.top_bar_m = c.getTopBarM();
+  const auto gates = c.getGates();
+  out.gates.reserve(gates.size());
+  for (const auto g : gates) {
+    out.gates.push_back(RaceGate{g.getIndex(), to_enu(g.getCenter()), g.getYawRad(),
+                                 to_enu(g.getNormal()), to_enu(g.getRight()), to_enu(g.getUp())});
+  }
+  return out;
+}
+
+RaceState to_race_state(wire::RaceState::Reader s) {
+  return RaceState{s.getAircraftId(), s.getPendingGate(), s.getPassed(),
+                   s.getMissed(),     s.getGateCount(),   s.getLastPassS(),
+                   s.getSimTimeS(),   s.getFinished(),    enum_cast<RaceOutcome>(s.getOutcome())};
+}
 
 void set_enu(wire::Enu::Builder b, const Enu& v) {
   b.setE(v.e);
@@ -312,8 +348,30 @@ std::string to_string(EndReason reason) {
       return "fatal";
     case EndReason::Stopped:
       return "stopped";
+    case EndReason::RaceComplete:
+      return "race-complete";
+    case EndReason::Crashed:
+      return "crashed";
   }
   return unknown(static_cast<std::uint16_t>(reason));
+}
+
+std::string to_string(RaceOutcome outcome) {
+  switch (outcome) {
+    case RaceOutcome::Running:
+      return "running";
+    case RaceOutcome::Complete:
+      return "complete";
+    case RaceOutcome::CrashedGround:
+      return "crashed-ground";
+    case RaceOutcome::CrashedGate:
+      return "crashed-gate";
+    case RaceOutcome::TimedOut:
+      return "timed-out";
+    case RaceOutcome::SpawnFailed:
+      return "spawn-failed";
+  }
+  return unknown(static_cast<std::uint16_t>(outcome));
 }
 
 Decoded<VehicleState> decode_telemetry(std::span<const std::uint8_t> bytes) noexcept {
@@ -330,6 +388,14 @@ Decoded<Event> decode_event(std::span<const std::uint8_t> bytes) noexcept {
 
 Decoded<TickEnd> decode_tick_end(std::span<const std::uint8_t> bytes) noexcept {
   return decode_flat<TickEnd, wire::TickEnd>(bytes, to_tick_end);
+}
+
+Decoded<RaceCourse> decode_race_course(std::span<const std::uint8_t> bytes) noexcept {
+  return decode_flat<RaceCourse, wire::RaceCourse>(bytes, to_race_course);
+}
+
+Decoded<RaceState> decode_race_state(std::span<const std::uint8_t> bytes) noexcept {
+  return decode_flat<RaceState, wire::RaceState>(bytes, to_race_state);
 }
 
 std::vector<std::uint8_t> encode_telemetry(const VehicleState& s) {
@@ -466,11 +532,26 @@ std::vector<std::uint8_t> encode_event(const Event& e) {
           kind.setControllerUp(v.aircraft_id);
         } else if constexpr (std::is_same_v<T, ControllerDown>) {
           kind.setControllerDown(v.aircraft_id);
-        } else {
-          static_assert(std::is_same_v<T, RunEnded>);
+        } else if constexpr (std::is_same_v<T, RunEnded>) {
           auto b = kind.initRunEnded();
           b.setReason(enum_cast<wire::EndReason>(v.reason));
           b.setMessage(capnp::Text::Reader(v.message.data(), v.message.size()));
+        } else if constexpr (std::is_same_v<T, GatePassed>) {
+          auto b = kind.initGatePassed();
+          b.setAircraftId(v.aircraft_id);
+          b.setGate(v.gate);
+          b.setOffsetXM(v.offset_x_m);
+          b.setOffsetYM(v.offset_y_m);
+        } else if constexpr (std::is_same_v<T, GateMissed>) {
+          auto b = kind.initGateMissed();
+          b.setAircraftId(v.aircraft_id);
+          b.setGate(v.gate);
+        } else {
+          static_assert(std::is_same_v<T, Crashed>);
+          auto b = kind.initCrashed();
+          b.setAircraftId(v.aircraft_id);
+          b.setOutcome(enum_cast<wire::RaceOutcome>(v.outcome));
+          b.setGate(v.gate);
         }
       },
       e.detail);
@@ -482,6 +563,42 @@ std::vector<std::uint8_t> encode_tick_end(const TickEnd& tick_end) {
   auto t = message.initRoot<wire::TickEnd>();
   t.setTick(tick_end.tick);
   t.setSimTimeS(tick_end.sim_time_s);
+  return to_bytes(message);
+}
+
+std::vector<std::uint8_t> encode_race_course(const RaceCourse& c) {
+  capnp::MallocMessageBuilder message;
+  auto b = message.initRoot<wire::RaceCourse>();
+  b.setSeed(c.seed);
+  b.setOpeningM(c.opening_m);
+  b.setBarM(c.bar_m);
+  b.setTopBarM(c.top_bar_m);
+  auto gates = b.initGates(static_cast<unsigned>(c.gates.size()));
+  for (std::size_t i = 0; i < c.gates.size(); ++i) {
+    const RaceGate& g = c.gates[i];
+    auto w = gates[static_cast<unsigned>(i)];
+    w.setIndex(g.index);
+    set_enu(w.initCenter(), g.center);
+    w.setYawRad(g.yaw_rad);
+    set_enu(w.initNormal(), g.normal);
+    set_enu(w.initRight(), g.right);
+    set_enu(w.initUp(), g.up);
+  }
+  return to_bytes(message);
+}
+
+std::vector<std::uint8_t> encode_race_state(const RaceState& s) {
+  capnp::MallocMessageBuilder message;
+  auto b = message.initRoot<wire::RaceState>();
+  b.setAircraftId(s.aircraft_id);
+  b.setPendingGate(s.pending_gate);
+  b.setPassed(s.passed);
+  b.setMissed(s.missed);
+  b.setGateCount(s.gate_count);
+  b.setLastPassS(s.last_pass_s);
+  b.setSimTimeS(s.sim_time_s);
+  b.setFinished(s.finished);
+  b.setOutcome(enum_cast<wire::RaceOutcome>(s.outcome));
   return to_bytes(message);
 }
 

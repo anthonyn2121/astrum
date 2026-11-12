@@ -5,7 +5,14 @@ current. Event fixtures compare in the shared JSON shape (``Event.as_dict``)."""
 import os
 
 import pytest
-from astrum_client.wire import decode_command, decode_event, decode_telemetry, decode_tick_end
+from astrum_client.wire import (
+    decode_command,
+    decode_event,
+    decode_race_course,
+    decode_race_state,
+    decode_telemetry,
+    decode_tick_end,
+)
 from astrum_client.wire_fixture import (
     COMMAND_KINDS,
     EVENT_KINDS,
@@ -14,6 +21,8 @@ from astrum_client.wire_fixture import (
     default_fixtures_dir,
     encode_kind,
     expected_command,
+    expected_race_course,
+    expected_race_state,
     expected_telemetry,
     expected_tick_end,
     load_values,
@@ -45,6 +54,10 @@ def test_fixture_decodes_to_values(kind, lang):
         assert decode_telemetry(payload) == expected_telemetry(VALUES[kind])
     elif kind == "tick_end":
         assert decode_tick_end(payload) == expected_tick_end(VALUES[kind])
+    elif kind == "race_course":
+        assert decode_race_course(payload) == expected_race_course(VALUES[kind])
+    elif kind == "race_state":
+        assert decode_race_state(payload) == expected_race_state(VALUES[kind])
     else:
         assert kind in COMMAND_KINDS
         assert decode_command(payload) == expected_command(VALUES[kind])

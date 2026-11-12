@@ -1,31 +1,33 @@
-//! Gate hardware and geometry: the 37x3" / 31x3" frame, its local frame, and the
+//! Gate hardware and geometry: the 46x3" / 40x3" frame, its local frame, and the
 //! opening test a flythrough is scored with.
 
 use astrum_race::gate::{
-    frame_radius_m, Gate, BAR_M, IN_TO_M, OPENING_M, OUTER_HEIGHT_M, OUTER_WIDTH_M, TOP_BAR_M,
-    UPRIGHT_M,
+    frame_radius_m, Gate, BAR_IN, BAR_M, IN_TO_M, OPENING_IN, OPENING_M, OUTER_HEIGHT_M,
+    OUTER_WIDTH_M, TOP_BAR_M, UPRIGHT_M,
 };
 use bevy::math::DVec3;
 
-/// The gate's dimensions, and the identity that makes them consistent: the 37" top
-/// bar is the 31" opening plus both 3" uprights.
+/// The gate's dimensions, and the identity that makes them consistent: the 46" top
+/// bar is the 40" opening plus both 3" uprights, all derived from the one
+/// `OPENING_IN` constant.
 ///
-/// The opening is 31" and not the brief's 25" on purpose — `gate.rs` records why, and
-/// `airframe.rs` holds the clearances it buys.
+/// The literals below are the guard against someone retyping a constant: each
+/// is the inch figure converted by hand.
 #[test]
 fn frame_dimensions_are_self_consistent() {
-    assert!((OPENING_M - 0.7874).abs() < 1e-12, "31 in opening = 0.7874 m, got {OPENING_M}");
+    assert_eq!(OPENING_IN, 40.0);
+    assert_eq!(BAR_IN, 3.0);
+    assert!((OPENING_M - 1.016).abs() < 1e-12, "40 in opening = 1.016 m, got {OPENING_M}");
     assert!((BAR_M - 0.0762).abs() < 1e-12, "3 in stock = 0.0762 m, got {BAR_M}");
-    assert!((TOP_BAR_M - 0.9398).abs() < 1e-12, "37 in top bar = 0.9398 m, got {TOP_BAR_M}");
+    assert!((TOP_BAR_M - 1.1684).abs() < 1e-12, "46 in top bar = 1.1684 m, got {TOP_BAR_M}");
     assert_eq!(UPRIGHT_M, OPENING_M, "the uprights' length is the opening's height");
 
-    // The identity: 37" = 31" + 2 x 3".
-    assert!(
-        (TOP_BAR_M - (OPENING_M + 2.0 * BAR_M)).abs() < 1e-12,
-        "top bar must span the opening plus both uprights"
-    );
+    // The identity: 46" = 40" + 2 x 3". The constants are derived from OPENING_IN, so
+    // this holds exactly, not just to a tolerance.
+    assert_eq!(TOP_BAR_M, OPENING_M + 2.0 * BAR_M, "top bar spans the opening plus both uprights");
+    assert!((TOP_BAR_M - 46.0 * IN_TO_M).abs() < 1e-12);
     assert_eq!(OUTER_WIDTH_M, TOP_BAR_M);
-    assert!((OUTER_HEIGHT_M - 34.0 * IN_TO_M).abs() < 1e-12, "outer height = 31 in + 3 in");
+    assert!((OUTER_HEIGHT_M - 43.0 * IN_TO_M).abs() < 1e-12, "outer height = 40 in + 3 in");
 }
 
 /// The gate's axes are an orthonormal basis with the normal on the commanded heading
@@ -83,7 +85,7 @@ fn local_and_world_round_trip() {
     assert!((g.to_local(g.center + DVec3::Z) - DVec3::Y).length() < 1e-12);
 }
 
-/// The opening is a 31" square about the centre: inside is inside, and a hair
+/// The opening is a 40" square about the centre: inside is inside, and a hair
 /// outside either edge is not.
 #[test]
 fn opening_contains_only_the_hole() {
@@ -102,7 +104,7 @@ fn opening_contains_only_the_hole() {
     assert!((g.sill_m() - (g.center.z - h)).abs() < 1e-12);
 }
 
-/// The four opening corners are a 31" square in the gate's plane.
+/// The four opening corners are a 40" square in the gate's plane.
 #[test]
 fn opening_corners_form_the_square() {
     let g = Gate::new(1, DVec3::new(4.0, 4.0, 2.5), -0.8);
@@ -123,7 +125,7 @@ fn opening_corners_form_the_square() {
 }
 
 /// The three bars sit *around* the opening, never in it, and add up to the assembled
-/// frame: two 31" uprights flanking the hole, a 37" bar across the top.
+/// frame: two 40" uprights flanking the hole, a 46" bar across the top.
 #[test]
 fn bars_surround_the_opening_without_blocking_it() {
     let g = Gate::new(0, DVec3::new(0.0, 0.0, 2.0), 0.9);
@@ -151,26 +153,26 @@ fn bars_surround_the_opening_without_blocking_it() {
         }
     }
 
-    // Left and right uprights: 3" thick, 31" tall, flanking the hole.
+    // Left and right uprights: 3" thick, 40" tall, flanking the hole.
     let (left, right, top) = (bars[0], bars[1], bars[2]);
     assert!((left.center.x + (h + BAR_M / 2.0)).abs() < 1e-12, "left upright hugs the opening");
     assert!((right.center.x - (h + BAR_M / 2.0)).abs() < 1e-12, "right upright hugs the opening");
     for up in [left, right] {
         assert!((2.0 * up.half_extents.x - BAR_M).abs() < 1e-12, "3 in thick");
-        assert!((2.0 * up.half_extents.y - UPRIGHT_M).abs() < 1e-12, "31 in tall");
+        assert!((2.0 * up.half_extents.y - UPRIGHT_M).abs() < 1e-12, "40 in tall");
     }
-    // Top bar: 37" across, 3" deep, resting on the uprights above the hole.
-    assert!((2.0 * top.half_extents.x - TOP_BAR_M).abs() < 1e-12, "37 in across");
+    // Top bar: 46" across, 3" deep, resting on the uprights above the hole.
+    assert!((2.0 * top.half_extents.x - TOP_BAR_M).abs() < 1e-12, "46 in across");
     assert!((2.0 * top.half_extents.y - BAR_M).abs() < 1e-12, "3 in thick");
     assert!((top.center.y - (h + BAR_M / 2.0)).abs() < 1e-12, "sits directly on the opening");
     // It spans exactly the uprights' outer faces.
     assert!((top.half_extents.x - (right.center.x + right.half_extents.x)).abs() < 1e-12);
 
-    // Overall envelope: 37" wide, 34" tall, all above the sill.
+    // Overall envelope: 46" wide, 43" tall, all above the sill.
     let lowest = bars.iter().map(|b| b.center.y - b.half_extents.y).fold(f64::MAX, f64::min);
     let highest = bars.iter().map(|b| b.center.y + b.half_extents.y).fold(f64::MIN, f64::max);
     assert!((lowest + h).abs() < 1e-12, "the frame bottoms out at the sill");
-    assert!((highest - lowest - OUTER_HEIGHT_M).abs() < 1e-12, "34 in tall overall");
+    assert!((highest - lowest - OUTER_HEIGHT_M).abs() < 1e-12, "43 in tall overall");
 }
 
 /// The bounding sphere the course sampler keeps legs out of really does contain
@@ -201,6 +203,10 @@ fn frame_radius_bounds_the_hardware() {
         }
     }
     assert!(worst > 0.9 * r, "radius {r:.4} m should be snug: worst corner {worst:.4} m");
+    // And the number itself: hypot(23 in, 20 in + 3 in) — the top-bar corner, 23" out
+    // and 23" up from the opening's centre.
+    assert!((r - 23.0 * IN_TO_M * 2f64.sqrt()).abs() < 1e-12, "frame radius {r}");
+    assert!((r - 0.826_183_563_1).abs() < 1e-9, "frame radius {r}");
 }
 
 /// The Bevy transform places the gate where the gate says it is, with the sim's yaw

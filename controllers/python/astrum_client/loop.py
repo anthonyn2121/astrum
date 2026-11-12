@@ -109,7 +109,13 @@ class Outcome:
         return f"{text}: {self.detail}" if self.detail else text
 
 
-_CLEAN_ENDS = (EndReason.MAX_TIME, EndReason.ENGAGEMENT_DECIDED, EndReason.STOPPED)
+_CLEAN_ENDS = (
+    EndReason.MAX_TIME,
+    EndReason.ENGAGEMENT_DECIDED,
+    EndReason.STOPPED,
+    EndReason.RACE_COMPLETE,
+    EndReason.CRASHED,
+)
 
 
 def exit_code(outcome: Outcome) -> int:

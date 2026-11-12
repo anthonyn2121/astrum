@@ -18,7 +18,7 @@
 //! doubling-back course that intersects itself. The parameters fall into three
 //! groups:
 //!
-//! * **Flyability** — [`leg_min_m`]/[`leg_max_m`] keep gates 8–20 m apart so the
+//! * **Flyability** — [`leg_min_m`]/[`leg_max_m`] keep gates 15–30 m apart so the
 //!   drone has room to line up; [`max_turn_deg`] caps the heading change at a gate
 //!   (under 120°, so with the gate's normal bisecting the turn no crossing is more
 //!   than 60° off the normal); [`max_climb_deg`] caps the flight-path angle.
@@ -50,17 +50,17 @@
 use std::fmt;
 
 use bevy::math::DVec3;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::gate::{frame_radius_m, Gate, OPENING_M};
 use crate::geom::{segment_point_dist_sq, segment_segment_dist_sq};
-use crate::rng::RaceRng;
+use crate::rng::{SplitMix64, Uniform};
 
 /// The randomization envelope: what the sampler is allowed to draw.
 ///
 /// Deserialized from the scenario's `[course]` table; every field has a default, so
 /// an absent table is a valid (and reasonable) course.
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CourseParams {
     /// How many gates to place.
@@ -99,18 +99,18 @@ impl Default for CourseParams {
     fn default() -> Self {
         Self {
             gates: 8,
-            leg_min_m: 8.0,
-            leg_max_m: 20.0,
+            leg_min_m: 15.0,
+            leg_max_m: 30.0,
             max_turn_deg: 120.0,
             max_climb_deg: 20.0,
-            // 1.5 m centre leaves the 0.7874 m opening's sill ~1.1 m off the deck:
+            // 1.5 m centre leaves the 1.016 m opening's sill ~1.0 m off the deck:
             // clear of ground effect, low enough to stay a racing gate.
             alt_min_m: 1.5,
             alt_max_m: 4.0,
-            min_gate_gap_m: 6.0,
+            min_gate_gap_m: 10.0,
             min_leg_gate_gap_m: 1.5,
             min_leg_leg_gap_m: 2.0,
-            course_radius_m: 60.0,
+            course_radius_m: 100.0,
             tries_per_gate: 200,
             max_backtracks: 200,
             start_heading_deg: 0.0,
@@ -175,12 +175,15 @@ pub enum CourseError {
     /// The parameters are legal but the sampler could not satisfy them — typically
     /// too many gates for the volume, or clearances too wide for the leg lengths.
     Infeasible { placed: usize, wanted: u32, samples: u32, backtracks: u32 },
+    /// An explicit gate list was rejected; see [`Course::from_gates`].
+    Gates(String),
 }
 
 impl fmt::Display for CourseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CourseError::Params(m) => write!(f, "invalid course parameters: {m}"),
+            CourseError::Gates(m) => write!(f, "invalid course gates: {m}"),
             CourseError::Infeasible { placed, wanted, samples, backtracks } => write!(
                 f,
                 "course infeasible: placed {placed}/{wanted} gates after {samples} samples \
@@ -209,6 +212,64 @@ pub struct Course {
 }
 
 impl Course {
+    /// A course from gates given explicitly: used verbatim, nothing is sampled.
+    ///
+    /// This is what makes a recorded race replayable independent of the generator
+    /// version: the bag stores the gates, and this rebuilds the course from them.
+    /// `seed` and `params` are carried as provenance only (`samples` and `backtracks`
+    /// are `0`: nothing was drawn).
+    ///
+    /// Rejected: an empty list, a gate whose `index` is not its position (so
+    /// duplicates and out-of-order lists both fail), a non-finite centre or yaw, and
+    /// a sill at or below the ground. The sampler's *clearance* rules are deliberately
+    /// not imposed — a hand-built course may stack gates however it likes; call
+    /// [`Course::validate_clearance`] to ask.
+    pub fn from_gates(
+        gates: Vec<Gate>,
+        seed: u64,
+        params: CourseParams,
+    ) -> Result<Course, CourseError> {
+        let bad = |m: String| Err(CourseError::Gates(m));
+        if gates.is_empty() {
+            return bad("a course needs at least one gate".to_string());
+        }
+        for (i, g) in gates.iter().enumerate() {
+            if g.index as usize != i {
+                return bad(format!(
+                    "gate at position {i} has index {} (indices must be 0, 1, 2, ... in flight order)",
+                    g.index
+                ));
+            }
+            if !(g.center.is_finite() && g.yaw_rad.is_finite()) {
+                return bad(format!("gate {i} has a non-finite centre or yaw"));
+            }
+            if g.sill_m() <= 0.0 {
+                return bad(format!(
+                    "gate {i} sill is at {:.3} m: the frame would be underground",
+                    g.sill_m()
+                ));
+            }
+        }
+        Ok(Course { gates, seed, params, samples: 0, backtracks: 0 })
+    }
+
+    /// Apply the sampler's clearance rules (gate gap, leg-to-frame, leg-to-leg) to
+    /// this course against `params`, reporting the first gate that breaks one.
+    ///
+    /// The flight-volume radius is *not* checked: the sampler measures it from gate 0
+    /// at the origin, which an explicit course need not respect.
+    pub fn validate_clearance(&self, params: &CourseParams) -> Result<(), CourseError> {
+        let centers: Vec<DVec3> = self.gates.iter().map(|g| g.center).collect();
+        for i in 1..centers.len() {
+            if !clearance_ok(centers[i], &centers[..i], params) {
+                return Err(CourseError::Gates(format!(
+                    "gate {i} (or the leg into it) breaks a clearance rule"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Number of gates.
     pub fn len(&self) -> usize {
         self.gates.len()
@@ -315,7 +376,7 @@ fn heading_vec(heading: f64) -> DVec3 {
 pub fn generate(seed: u64, params: &CourseParams) -> Result<Course, CourseError> {
     params.validate()?;
 
-    let mut rng = RaceRng::seeded(seed);
+    let mut rng = SplitMix64::seeded(seed);
     let max_turn = params.max_turn_deg.to_radians();
     let sin_climb_max = params.max_climb_deg.to_radians().sin();
     let start_heading = params.start_heading_deg.to_radians();
@@ -401,18 +462,20 @@ pub fn generate(seed: u64, params: &CourseParams) -> Result<Course, CourseError>
     Ok(Course { gates: orient(&centers, &headings), seed, params: *params, samples, backtracks })
 }
 
-/// Every clearance rule, applied to one candidate centre. `centers` holds the gates
+/// Every placement rule, applied to one candidate centre. `centers` holds the gates
 /// already placed; the new leg runs from the last of them to `cand`.
 fn accepts(cand: DVec3, centers: &[DVec3], params: &CourseParams) -> bool {
+    // Inside the flight volume. Gate 0 is the axis; a leg between two points inside
+    // a disc stays inside it, so testing centres is enough.
+    cand.x.hypot(cand.y) <= params.course_radius_m && clearance_ok(cand, centers, params)
+}
+
+/// The clearance rules alone (everything but the flight volume): gate centres stay
+/// apart, and the new leg neither grazes a frame nor crosses a non-adjacent leg.
+fn clearance_ok(cand: DVec3, centers: &[DVec3], params: &CourseParams) -> bool {
     let n = centers.len();
     let last = centers[n - 1];
     let frame_clear_sq = (frame_radius_m() + params.min_leg_gate_gap_m).powi(2);
-
-    // Inside the flight volume. Gate 0 is the axis; a leg between two points inside
-    // a disc stays inside it, so testing centres is enough.
-    if cand.x.hypot(cand.y) > params.course_radius_m {
-        return false;
-    }
 
     // Gate centres stay apart.
     let gap_sq = params.min_gate_gap_m * params.min_gate_gap_m;

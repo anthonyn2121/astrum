@@ -7,7 +7,7 @@ use astrum_bag::metrics::{compute, RunMetrics};
 use astrum_bag::{BagReader, BagWriter};
 use astrum_proto::{
     encode_event, encode_telemetry, CombatStatus, CommandStatus, ControlMode, EndReason, Enu,
-    Euler, Event, EventKind, ModeReason, Telemetry,
+    Euler, Event, EventKind, ModeReason, RaceOutcome, Telemetry,
 };
 
 const RATE_HZ: f64 = 120.0;
@@ -201,6 +201,74 @@ fn hits_kills_and_end_come_from_events() {
     assert_eq!(ended.end_message.as_deref(), Some(""));
 }
 
+const RACE_SCENARIO: &str = "[world]\norigin_lat_deg = 37.6\n\n[[aircraft]]\nid = 1\n\
+                             model = \"F450\"\n\n[course]\ngates = 3\n";
+
+fn passed(tick: u64, gate: u32) -> Item {
+    ev(event(
+        tick,
+        EventKind::GatePassed { aircraft_id: 1, gate, offset_x_m: 0.0, offset_y_m: 0.0 },
+    ))
+}
+
+fn run_ended(tick: u64, reason: EndReason) -> Item {
+    ev(event(tick, EventKind::RunEnded { reason, message: String::new() }))
+}
+
+#[test]
+fn a_completed_race_reports_its_gates_time_and_outcome() {
+    let items = vec![
+        passed(120, 0),
+        ev(event(150, EventKind::GateMissed { aircraft_id: 1, gate: 1 })),
+        passed(240, 2),
+        run_ended(240, EndReason::RaceComplete),
+    ];
+    let m = metrics_of(Some(RACE_SCENARIO), &items);
+    assert_eq!((m.gates_passed, m.gates_missed), (Some(2), Some(1)));
+    assert_eq!(m.race_time_s, Some(240.0 / RATE_HZ));
+    assert_eq!(m.race_outcome.as_deref(), Some("complete"));
+    assert_eq!(m.end_reason.as_deref(), Some("race-complete"));
+}
+
+#[test]
+fn a_crash_names_its_outcome_whatever_ends_the_run() {
+    let crash = |outcome| ev(event(300, EventKind::Crashed { aircraft_id: 1, outcome, gate: 2 }));
+    let items =
+        vec![passed(120, 0), crash(RaceOutcome::CrashedGate), run_ended(300, EndReason::Crashed)];
+    let m = metrics_of(Some(RACE_SCENARIO), &items);
+    assert_eq!((m.gates_passed, m.gates_missed), (Some(1), Some(0)));
+    assert_eq!(m.race_time_s, Some(120.0 / RATE_HZ));
+    assert_eq!(m.race_outcome.as_deref(), Some("crashed-gate"));
+
+    let ground = metrics_of(None, &[crash(RaceOutcome::CrashedGround)]);
+    assert_eq!(ground.race_outcome.as_deref(), Some("crashed-ground"), "no scenario needed");
+    assert_eq!((ground.gates_passed, ground.race_time_s), (Some(0), None));
+}
+
+#[test]
+fn a_race_that_runs_out_of_time_or_is_unfinished_says_so() {
+    let timed_out = metrics_of(Some(RACE_SCENARIO), &[run_ended(9, EndReason::MaxTime)]);
+    assert_eq!(timed_out.race_outcome.as_deref(), Some("timed-out"));
+    assert_eq!((timed_out.gates_passed, timed_out.gates_missed), (Some(0), Some(0)));
+    assert_eq!(timed_out.race_time_s, None);
+
+    let unfinished = metrics_of(Some(RACE_SCENARIO), &[passed(5, 0)]);
+    assert_eq!(unfinished.race_outcome, None);
+    assert_eq!(unfinished.gates_passed, Some(1));
+}
+
+#[test]
+fn a_run_that_is_not_a_race_has_no_race_metrics() {
+    let items = vec![run_ended(9, EndReason::MaxTime)];
+    for scenario in [None, Some("[[aircraft]]\nid = 1\nmodel = \"f16\"\n")] {
+        let m = metrics_of(scenario, &items);
+        assert_eq!(
+            (m.gates_passed, m.gates_missed, m.race_time_s, m.race_outcome),
+            (None, None, None, None)
+        );
+    }
+}
+
 #[test]
 fn an_empty_bag_has_no_extremes_and_zero_counts() {
     let m = metrics_of(None, &[]);
@@ -370,11 +438,18 @@ fn json_uses_the_metric_ids() {
         "command_refusals",
         "hits",
         "kills",
+        "gates_passed",
+        "gates_missed",
+        "race_time_s",
+        "race_outcome",
         "rejected",
         "aircraft",
     ];
     fleet.sort_unstable();
     assert_eq!(keys(&json), fleet);
+    for id in ["gates_passed", "gates_missed", "race_time_s", "race_outcome"] {
+        assert!(json[id].is_null(), "{id}: null for a run that is not a race");
+    }
 
     let aircraft = &json["aircraft"][0];
     let mut per = vec![

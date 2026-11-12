@@ -5,15 +5,17 @@
 use std::path::PathBuf;
 
 use astrum_proto::{
-    decode_command, decode_event, decode_telemetry, decode_tick_end, encode_command, encode_event,
+    decode_command, decode_event, decode_race_course, decode_race_state, decode_telemetry,
+    decode_tick_end, encode_command, encode_event, encode_race_course, encode_race_state,
     encode_telemetry, encode_tick_end, Aero, AutopilotTargets, BodyRates, CombatStatus, Command,
     CommandStatus, Control, ControlMode, EndReason, Enu, Euler, Event, EventKind, ModeReason,
-    MultirotorRaw, Ned, RawActuators, Refusal, Telemetry, TickEnd, VehicleKind,
+    MultirotorRaw, Ned, RaceCourse, RaceGate, RaceOutcome, RaceState, RawActuators, Refusal,
+    Telemetry, TickEnd, VehicleKind,
 };
 use serde_json::Value;
 
 /// Every fixture kind; each is encoded by every language in [`LANGS`].
-pub const KINDS: [&str; 14] = [
+pub const KINDS: [&str; 21] = [
     "telemetry",
     "command_raw",
     "command_autopilot",
@@ -28,6 +30,13 @@ pub const KINDS: [&str; 14] = [
     "event_controller_up",
     "event_controller_down",
     "event_run_ended",
+    "event_run_ended_race_complete",
+    "event_run_ended_crashed",
+    "event_gate_passed",
+    "event_gate_missed",
+    "event_crashed",
+    "race_course",
+    "race_state",
 ];
 pub const LANGS: [&str; 3] = ["rust", "cpp", "python"];
 
@@ -37,6 +46,8 @@ pub fn encode(values: &Value, kind: &str) -> Vec<u8> {
     match kind {
         "telemetry" => encode_telemetry(&telemetry(v)),
         "tick_end" => encode_tick_end(&tick_end(v)),
+        "race_course" => encode_race_course(&race_course(v)),
+        "race_state" => encode_race_state(&race_state(v)),
         k if k.starts_with("command_") => encode_command(&command(v)),
         k if k.starts_with("event_") => encode_event(&event(v)),
         other => panic!("unknown fixture kind {other:?}"),
@@ -59,6 +70,8 @@ pub fn check(values: &Value, kind: &str, bytes: &[u8]) -> Result<(), String> {
     match kind {
         "telemetry" => cmp(decode_telemetry(bytes), telemetry(v)),
         "tick_end" => cmp(decode_tick_end(bytes), tick_end(v)),
+        "race_course" => cmp(decode_race_course(bytes), race_course(v)),
+        "race_state" => cmp(decode_race_state(bytes), race_state(v)),
         k if k.starts_with("command_") => cmp(decode_command(bytes), command(v)),
         k if k.starts_with("event_") => cmp(decode_event(bytes), event(v)),
         other => panic!("unknown fixture kind {other:?}"),
@@ -248,9 +261,63 @@ fn refusal(v: &Value, k: &str) -> Refusal {
 }
 
 fn end_reason(v: &Value, k: &str) -> EndReason {
-    let all =
-        [EndReason::MaxTime, EndReason::EngagementDecided, EndReason::Fatal, EndReason::Stopped];
+    let all = [
+        EndReason::MaxTime,
+        EndReason::EngagementDecided,
+        EndReason::Fatal,
+        EndReason::Stopped,
+        EndReason::RaceComplete,
+        EndReason::Crashed,
+    ];
     named(&all, EndReason::name, v, k)
+}
+
+fn race_outcome(v: &Value, k: &str) -> RaceOutcome {
+    let all = [
+        RaceOutcome::Running,
+        RaceOutcome::Complete,
+        RaceOutcome::CrashedGround,
+        RaceOutcome::CrashedGate,
+        RaceOutcome::TimedOut,
+        RaceOutcome::SpawnFailed,
+    ];
+    named(&all, RaceOutcome::name, v, k)
+}
+
+pub fn race_course(v: &Value) -> RaceCourse {
+    RaceCourse {
+        seed: u(v, "seed"),
+        opening_m: f(v, "opening_m"),
+        bar_m: f(v, "bar_m"),
+        top_bar_m: f(v, "top_bar_m"),
+        gates: v["gates"]
+            .as_array()
+            .expect("gates must be an array")
+            .iter()
+            .map(|g| RaceGate {
+                index: id(g, "index"),
+                center: enu(&g["center"]),
+                yaw_rad: f(g, "yaw_rad"),
+                normal: enu(&g["normal"]),
+                right: enu(&g["right"]),
+                up: enu(&g["up"]),
+            })
+            .collect(),
+    }
+}
+
+pub fn race_state(v: &Value) -> RaceState {
+    RaceState {
+        aircraft_id: id(v, "aircraft_id"),
+        pending_gate: id(v, "pending_gate"),
+        passed: id(v, "passed"),
+        missed: id(v, "missed"),
+        gate_count: id(v, "gate_count"),
+        last_pass_s: f(v, "last_pass_s"),
+        sim_time_s: f(v, "sim_time_s"),
+        finished: v["finished"].as_bool().expect("finished must be a bool"),
+        outcome: race_outcome(v, "outcome"),
+    }
 }
 
 /// An event in the shared JSON shape (`{"tick", "sim_time_s", "kind", ...}`).
@@ -288,6 +355,20 @@ pub fn event(v: &Value) -> Event {
         "run-ended" => EventKind::RunEnded {
             reason: end_reason(v, "reason"),
             message: s(v, "message").to_owned(),
+        },
+        "gate-passed" => EventKind::GatePassed {
+            aircraft_id: id(v, "aircraft_id"),
+            gate: id(v, "gate"),
+            offset_x_m: f(v, "offset_x_m"),
+            offset_y_m: f(v, "offset_y_m"),
+        },
+        "gate-missed" => {
+            EventKind::GateMissed { aircraft_id: id(v, "aircraft_id"), gate: id(v, "gate") }
+        }
+        "crashed" => EventKind::Crashed {
+            aircraft_id: id(v, "aircraft_id"),
+            outcome: race_outcome(v, "outcome"),
+            gate: id(v, "gate"),
         },
         other => panic!("bad event kind {other:?}"),
     };

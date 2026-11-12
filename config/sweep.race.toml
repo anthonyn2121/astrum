@@ -1,0 +1,37 @@
+# Race sweep: ten drone-racing runs, each on its own course. The C++ autopilot
+# holds the F450 at gate height, so this is the baseline a racing controller has
+# to beat (no gate is flown through, every run times out at 30 s); point
+# `controllers` at the racing controller to score it over ten tracks. Each run is
+# an `astrum-race` process on its own Zenoh endpoint (exported to the controller
+# as $ASTRUM_ZENOH_CONNECT), in lockstep and as fast as possible.
+#
+# `course_seed_mode` picks each run's course:
+#   "randomize"  run r flies course seed (base seed + r): a new track per repeat
+#   "fixed"      every run flies the base seed: the same track; `sim.seed`
+#                (the sim's other randomness) still moves with the repeat
+# The base seed is the scenario's `course.seed`, else its `sim.seed` (1). `gates`
+# sets every run's gate count; leave it out to keep the scenario's.
+#
+#   astrum sweep config/sweep.race.toml
+#   astrum sweep config/sweep.race.toml --dry-run   # the runs and their course seeds
+#
+# Results: runs/sweep.race/summary.csv — `seed`, `course_seed`, the fleet metrics
+# and the race's (gates_passed, gates_missed, race_time_s, race_outcome) — plus
+# per run its scenario (.toml), bag (.mcap) and the sim's and controller's logs.
+# A race sweep has no in-process mode, and a drone's start comes from its course,
+# so aircraft offsets (`[[perturb]]`, `aircraft.<id>.offset.<axis>`) are refused.
+
+base = "config/scenario.race.toml"
+repeats = 10
+course_seed_mode = "randomize"
+gates = 12              # gates per course (2..=64), over the scenario's own; the
+                        # course stays ~500 m long, so more gates means shorter legs
+
+controllers = [
+  "build/controllers/cpp/astrum-controller --law autopilot --id 1 --heading 0 --alt 2.5 --speed 0",
+]
+
+[set]
+"sim.max_time_s" = 30.0
+"sim.lockstep" = true
+"aircraft.1.lockstep" = true

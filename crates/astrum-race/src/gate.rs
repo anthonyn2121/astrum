@@ -3,47 +3,49 @@
 //!
 //! # Hardware
 //!
-//! One gate is three pieces of 3-inch stock: two 31-inch uprights carrying a
-//! 37-inch top bar. That arithmetic is the whole gate —
+//! One gate is three pieces of 3-inch stock: two uprights as tall as the opening
+//! carrying a top bar as wide as the opening plus both uprights. Everything derives
+//! from **one** number, [`OPENING_IN`] (40 in), and the stock width [`BAR_IN`]:
 //!
 //! ```text
-//!            <------------- 37" ------------->         top bar (37 x 3)
+//!            <------------ 46" ------------->         top bar (46 x 3)
 //!           +----------------------------------+  --+
 //!           |###                            ###|    | 3"
 //!           |###                            ###|  --+
 //!           |###                            ###|
-//!           |###          31" x 31"         ###|    upright (31 x 3)
-//!           |###          opening           ###|    31" tall
+//!           |###          40" x 40"         ###|    upright (40 x 3)
+//!           |###          opening           ###|    40" tall
 //!           |###                            ###|
 //!           |###                            ###|
 //!           +###----------------------------###+  --- sill (open below)
-//!            <3">        <-- 31" -->
+//!            <3">        <-- 40" -->
 //! ```
 //!
-//! — because `37" = 31" + 2 x 3"`: the top bar spans the opening plus both
-//! uprights, so the opening comes out 31 inches square. Dimensions are converted
-//! from inches, which is what makes that identity exact.
+//! — the top bar is `OPENING + 2 x BAR` because it spans the opening plus both
+//! uprights, and the uprights are `OPENING` long because they set its height. Those
+//! are computed, never typed twice, so resizing the gate is a one-constant change.
+//! Dimensions are converted from inches, which is what makes the identity exact.
 //!
 //! Note the frame is **not** symmetric about the opening's centre: there is a bar
 //! above but nothing below, so the lowest hardware is the sill, at the bottom of
 //! the opening.
 //!
-//! # Why 31 inches and not the 25 the brief asked for
+//! # Why 40 inches
 //!
-//! The opening was widened from 25" (0.635 m) on 2026-09-08, because 25" makes the
-//! course unflyable for this airframe rather than merely difficult. An F450 is
-//! 0.56896 m across its prop tips but **0.7057 m corner to corner**, and it is the
-//! corner that a gate sees whenever the drone is not square to the opening. In a
-//! 0.635 m hole that capped the approach at ±13° of crab — while the sampler is
-//! allowed a 120° turn, whose bisected normal leaves a crossing up to 60° off. The
-//! geometry and the envelope contradicted each other.
+//! The opening has been resized twice, each time because of the airframe's corners.
+//! An F450 is 0.56896 m across its prop tips but **0.7057 m corner to corner**, and
+//! it is the corner that a gate sees whenever the drone is not square to the opening.
+//! 25" (0.635 m) capped the approach at ±13° of crab, while the sampler is allowed a
+//! 120° turn whose bisected normal leaves a crossing up to 60° off. 27.78" is the exact
+//! threshold at which heading stops mattering (the worst case is 45° of crab, reaching
+//! `ARM_M·√2 + PROP_RADIUS_M = 0.35287 m`); 31" cleared it, but with only 4.08 cm to
+//! spare at the worst heading — too thin for a controller that is merely good, so a
+//! decent run still scored as a crash.
 //!
-//! 27.78" is the exact threshold at which heading stops mattering (the worst case is
-//! 45° of crab, reaching `ARM_M·√2 + PROP_RADIUS_M = 0.35287 m`). 31" is the first
-//! whole inch above it whose *worst-heading* margin, 4.08 cm, beats the 3.30 cm the
-//! 25" gate offered only when perfectly square. Square on, the margin is now 10.92 cm
-//! and the headroom 24.93 cm. See `crates/astrum-race/tests/airframe.rs`, which holds
-//! all of those numbers as assertions.
+//! At 40" the worst-heading margin is 15.51 cm (22.35 cm square on) and the headroom
+//! under the top bar is 36.36 cm. See `crates/astrum-race/tests/airframe.rs`, which
+//! holds all of those numbers as assertions, and `docs/racing-environment-design.md`
+//! §2 for the full table.
 //!
 //! # Pose
 //!
@@ -57,7 +59,10 @@
 //! flight direction), `y` = up, `z` = along the normal (positive downstream). Because
 //! `x` is starboard, that triple is **left**-handed, like a camera's — the
 //! right-handed cycle is `(normal, up, right)`. Nothing here takes a cross product in
-//! local coordinates, but anything that starts to should know which it is.
+//! local coordinates, but anything that starts to should know which it is. The
+//! world-ENU vectors of that basis are [`Gate::normal`], [`Gate::right`] and
+//! [`Gate::up`]; consumers that need the basis on the wire (renderers, controllers)
+//! should send those rather than re-derive the handedness from the yaw.
 
 use bevy::math::DVec3;
 use bevy::prelude::{Component, Quat, Transform};
@@ -67,15 +72,20 @@ use crate::geom::Obb;
 /// Inches to metres, exactly.
 pub const IN_TO_M: f64 = 0.0254;
 
-/// Side of the square opening: 31 in (~79 cm). See the module docs for why 31 and
-/// not the brief's 25.
-pub const OPENING_M: f64 = 31.0 * IN_TO_M;
-/// Frame stock width and depth: 3 in (~7 cm).
-pub const BAR_M: f64 = 3.0 * IN_TO_M;
-/// Length of the top bar: 37 in (~94 cm) — the opening plus both uprights.
-pub const TOP_BAR_M: f64 = 37.0 * IN_TO_M;
-/// Length of each upright: 31 in (~79 cm) — it sets the opening's height.
-pub const UPRIGHT_M: f64 = 31.0 * IN_TO_M;
+/// Side of the square opening, in inches — **the** gate-size constant: every other
+/// dimension below is derived from it and [`BAR_IN`]. See the module docs for why 40.
+pub const OPENING_IN: f64 = 40.0;
+/// Frame stock width and depth, in inches.
+pub const BAR_IN: f64 = 3.0;
+
+/// Side of the square opening: 40 in (1.016 m).
+pub const OPENING_M: f64 = OPENING_IN * IN_TO_M;
+/// Frame stock width and depth: 3 in (7.62 cm).
+pub const BAR_M: f64 = BAR_IN * IN_TO_M;
+/// Length of the top bar: the opening plus both uprights (46 in).
+pub const TOP_BAR_M: f64 = OPENING_M + 2.0 * BAR_M;
+/// Length of each upright: it sets the opening's height (40 in).
+pub const UPRIGHT_M: f64 = OPENING_M;
 
 /// Overall width of the assembled frame (the top bar spans it).
 pub const OUTER_WIDTH_M: f64 = TOP_BAR_M;
@@ -199,12 +209,12 @@ impl Gate {
     }
 
     /// The three pieces of hardware, gate-local: left upright, right upright, top
-    /// bar. Each is 3 in thick and 3 in deep.
+    /// bar. Each is `BAR_IN` thick and deep.
     pub fn bars(&self) -> [Bar; 3] {
         let h = self.half_opening_m();
         let t = BAR_M / 2.0;
         // Uprights flank the opening and span its full height; the top bar sits on
-        // them, overhanging by exactly one bar width on each side (37" = 31" + 2x3").
+        // them, overhanging by exactly one bar width on each side (top = opening + 2 bars).
         let upright = DVec3::new(t, UPRIGHT_M / 2.0, t);
         let top = DVec3::new(TOP_BAR_M / 2.0, t, t);
         [

@@ -26,39 +26,35 @@
 //!
 //! # Why the hull is five parts and not one box
 //!
-//! A gate's opening is 0.3937 m from centre to edge and the F450 is 0.28448 m from
-//! CG to blade tip, so a square pass has **10.9 cm of clearance per side** — but at
-//! the worst heading a corner reaches 0.35287 m and the margin falls to **4.1 cm**.
-//! That worst-heading figure is the budget a collision model has to be accurate
-//! inside, and neither obvious single shape is:
+//! A gate's opening is 0.508 m from centre to edge and the F450 is 0.28448 m from
+//! CG to blade tip, so a square pass has **22.4 cm of clearance per side** — and at
+//! the worst heading, where a corner reaches 0.35287 m, **15.5 cm**. Neither obvious
+//! single shape is accurate to a small fraction of that:
 //!
 //! * A **single box** across the tip circle is exact head-on, but its corners are
-//!   empty air on a real quad. Yawed 45° it presents its diagonal,
-//!   `HALF_SPAN_M·√2 = 0.40232 m` — wider than the half-opening, so a crabbed pass
-//!   would still be a crash. That is precisely what widening the gate to 31" was
-//!   meant to fix (see [`crate::gate`]), so the box model would hand the whole
-//!   enlargement straight back. It is wrong vertically too: rolled 45° and pitched
-//!   30°, an ordinary racing attitude, it claims 0.371 m of reach where the airframe
-//!   has 0.293 m.
+//!   empty air on a real quad. It is wrong vertically when the drone banks: rolled 45°
+//!   and pitched 30°, an ordinary racing attitude, it claims 0.371 m of reach where
+//!   the airframe reaches 0.318 m above the CG — 5.3 cm of fiction, a third of the
+//!   worst-heading margin. (Its crabbed diagonal, `HALF_SPAN_M·√2 = 0.40232 m`, no
+//!   longer exceeds the half-opening as it did in a 31" gate, so it would stop making
+//!   the course impassable; it would still be a false crash a few centimetres wide.)
 //! * A **sphere** on the CG needs the tip circle, `0.1651·√2 + 0.11938 = 0.35287 m`.
-//!   It does now fit the opening, with the same 4.1 cm as the real airframe's worst
-//!   heading, so it no longer makes the course impassable — but it is round, and the
-//!   airframe is not. It reaches 0.35287 m *below* the CG where the gear reaches
-//!   0.1524 m, so a drone hovering 0.30 m up would be called a ground crash; and it
-//!   cuts the headroom under a top bar from 24.9 cm to 4.1 cm. Both errors are five
-//!   times the budget.
+//!   It is round and the airframe is not: it reaches 0.35287 m *below* the CG where the
+//!   gear reaches 0.1524 m, so a drone hovering 0.30 m up would be called a ground
+//!   crash (20 cm of error against a 15.5 cm budget); and it cuts the headroom under a
+//!   top bar from 36.4 cm to 15.5 cm.
 //!
 //! So the hull is what the model actually describes: **four rotor discs and a centre
 //! section**. Each rotor is a sphere of blade radius on its motor — exact in the
-//! lateral direction that binds, and fat only in body `z`, where a gate has 0.787 m
+//! lateral direction that binds, and fat only in body `z`, where a gate has 1.016 m
 //! of height to give. The centre section is a box over the gear footprint, from the
 //! feet up to the rotor plane, which is the only structure the model declares away
 //! from the rotors. Between them, along the ±x and ±y body directions, the hull has
 //! notches — and so does an F450, whose arms run out on the diagonals.
 //!
 //! The one place this is still conservative is a prop modelled as a ball rather than
-//! a disc: at compound attitudes that reads up to 2.5 cm fat. Being 2.5 cm cautious
-//! is a defensible way to spend a 4.1 cm budget; being 7.7 cm wrong is not.
+//! a disc: at compound attitudes that reads up to 2.5 cm fat, against a 15.5 cm
+//! worst-heading budget.
 
 use bevy::math::DVec3;
 
@@ -99,7 +95,7 @@ pub const HEIGHT_M: f64 = GEAR_DEPTH_M + ROTOR_PLANE_M;
 ///
 /// A once-per-tick test must not let the drone teleport through a gate: at 20 m/s a
 /// 120 Hz tick covers 0.17 m, which is more than the 0.0762 m of frame stock. Rather
-/// than inflate the hull to cover the whole step — 8 cm at that speed, twice the
+/// than inflate the hull to cover the whole step — 8 cm at that speed, half the
 /// worst-heading clearance budget — [`crate::systems::detect_crash`] subdivides the
 /// step and tests the true hull at each sample.
 ///

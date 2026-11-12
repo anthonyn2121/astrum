@@ -5,10 +5,10 @@
 //   astrum-wire-fixture verify <dir>   decode every <dir>/<kind>.<lang>.bin present and
 //                                      compare it exactly to values.json
 //
-// A kind is a values.json key: telemetry, command_* (Command), tick_end, event_*
-// (Event, in the shared event JSON shape: enums as kebab-case names, pos_enu [e, n, u],
-// killer_id null = unknown); lang in {rust, cpp, python}. `verify` turns each decoded
-// value back into that JSON shape and diffs it against values.json, so a field that is
+// A kind is a values.json key: telemetry, command_* (Command), tick_end, race_course,
+// race_state, event_* (Event, in the shared event JSON shape: enums as kebab-case names,
+// pos_enu [e, n, u], killer_id null = unknown); lang in {rust, cpp, python}. `verify` turns each
+// decoded value back into that JSON shape and diffs it against values.json, so a field that is
 // dropped, renamed or mis-decoded shows up by its path. It runs as the ctest
 // `wire_fixtures`; exit status 0 = every present file matches.
 
@@ -169,6 +169,32 @@ TickEnd tick_end_from(const json& v) {
   return TickEnd{unsigned_at<std::uint64_t>(v, "tick"), number_at(v, "sim_time_s")};
 }
 
+RaceCourse race_course_from(const json& v) {
+  RaceCourse c;
+  c.seed = unsigned_at<std::uint64_t>(v, "seed");
+  c.opening_m = number_at(v, "opening_m");
+  c.bar_m = number_at(v, "bar_m");
+  c.top_bar_m = number_at(v, "top_bar_m");
+  for (const json& g : v.at("gates")) {
+    c.gates.push_back(RaceGate{unsigned_at<std::uint32_t>(g, "index"), enu_object(g.at("center")),
+                               number_at(g, "yaw_rad"), enu_object(g.at("normal")),
+                               enu_object(g.at("right")), enu_object(g.at("up"))});
+  }
+  return c;
+}
+
+RaceState race_state_from(const json& v) {
+  return RaceState{unsigned_at<std::uint32_t>(v, "aircraft_id"),
+                   unsigned_at<std::uint32_t>(v, "pending_gate"),
+                   unsigned_at<std::uint32_t>(v, "passed"),
+                   unsigned_at<std::uint32_t>(v, "missed"),
+                   unsigned_at<std::uint32_t>(v, "gate_count"),
+                   number_at(v, "last_pass_s"),
+                   number_at(v, "sim_time_s"),
+                   bool_at(v, "finished"),
+                   enum_at<RaceOutcome>(v, "outcome", 6)};
+}
+
 Event event_from(const json& v) {
   Event e;
   e.tick = unsigned_at<std::uint64_t>(v, "tick");
@@ -201,7 +227,18 @@ Event event_from(const json& v) {
   } else if (kind == "controller-down") {
     e.detail = ControllerDown{unsigned_at<std::uint32_t>(v, "aircraft_id")};
   } else if (kind == "run-ended") {
-    e.detail = RunEnded{enum_at<EndReason>(v, "reason", 4), string_at(v, "message")};
+    e.detail = RunEnded{enum_at<EndReason>(v, "reason", 6), string_at(v, "message")};
+  } else if (kind == "gate-passed") {
+    e.detail = GatePassed{unsigned_at<std::uint32_t>(v, "aircraft_id"),
+                          unsigned_at<std::uint32_t>(v, "gate"), number_at(v, "offset_x_m"),
+                          number_at(v, "offset_y_m")};
+  } else if (kind == "gate-missed") {
+    e.detail = GateMissed{unsigned_at<std::uint32_t>(v, "aircraft_id"),
+                          unsigned_at<std::uint32_t>(v, "gate")};
+  } else if (kind == "crashed") {
+    e.detail =
+        Crashed{unsigned_at<std::uint32_t>(v, "aircraft_id"), enum_at<RaceOutcome>(v, "outcome", 6),
+                unsigned_at<std::uint32_t>(v, "gate")};
   } else {
     throw std::runtime_error("bad event kind '" + kind + "'");
   }
@@ -276,6 +313,37 @@ json to_json(const TickEnd& t) { return json{{"tick", t.tick}, {"sim_time_s", t.
 
 json enu_json(const Enu& v) { return json::array({v.e, v.n, v.u}); }
 
+json enu_object_json(const Enu& v) { return json{{"e", v.e}, {"n", v.n}, {"u", v.u}}; }
+
+json to_json(const RaceCourse& c) {
+  json gates = json::array();
+  for (const RaceGate& g : c.gates) {
+    gates.push_back(json{{"index", g.index},
+                         {"center", enu_object_json(g.center)},
+                         {"yaw_rad", g.yaw_rad},
+                         {"normal", enu_object_json(g.normal)},
+                         {"right", enu_object_json(g.right)},
+                         {"up", enu_object_json(g.up)}});
+  }
+  return json{{"seed", c.seed},
+              {"opening_m", c.opening_m},
+              {"bar_m", c.bar_m},
+              {"top_bar_m", c.top_bar_m},
+              {"gates", std::move(gates)}};
+}
+
+json to_json(const RaceState& s) {
+  return json{{"aircraft_id", s.aircraft_id},
+              {"pending_gate", s.pending_gate},
+              {"passed", s.passed},
+              {"missed", s.missed},
+              {"gate_count", s.gate_count},
+              {"last_pass_s", s.last_pass_s},
+              {"sim_time_s", s.sim_time_s},
+              {"finished", s.finished},
+              {"outcome", to_string(s.outcome)}};
+}
+
 json to_json(const Event& e) {
   json out{{"tick", e.tick}, {"sim_time_s", e.sim_time_s}};
   std::visit(
@@ -314,10 +382,26 @@ json to_json(const Event& e) {
         } else if constexpr (std::is_same_v<T, ControllerDown>) {
           out["kind"] = "controller-down";
           out["aircraft_id"] = d.aircraft_id;
-        } else {
+        } else if constexpr (std::is_same_v<T, RunEnded>) {
           out["kind"] = "run-ended";
           out["reason"] = to_string(d.reason);
           out["message"] = d.message;
+        } else if constexpr (std::is_same_v<T, GatePassed>) {
+          out["kind"] = "gate-passed";
+          out["aircraft_id"] = d.aircraft_id;
+          out["gate"] = d.gate;
+          out["offset_x_m"] = d.offset_x_m;
+          out["offset_y_m"] = d.offset_y_m;
+        } else if constexpr (std::is_same_v<T, GateMissed>) {
+          out["kind"] = "gate-missed";
+          out["aircraft_id"] = d.aircraft_id;
+          out["gate"] = d.gate;
+        } else {
+          static_assert(std::is_same_v<T, Crashed>);
+          out["kind"] = "crashed";
+          out["aircraft_id"] = d.aircraft_id;
+          out["outcome"] = to_string(d.outcome);
+          out["gate"] = d.gate;
         }
       },
       e.detail);
@@ -326,11 +410,13 @@ json to_json(const Event& e) {
 
 // --- kinds ------------------------------------------------------------------------------
 
-enum class Type { Telemetry, Command, TickEnd, Event };
+enum class Type { Telemetry, Command, TickEnd, RaceCourse, RaceState, Event };
 
 Type type_of(const std::string& kind) {
   if (kind == "telemetry") return Type::Telemetry;
   if (kind == "tick_end") return Type::TickEnd;
+  if (kind == "race_course") return Type::RaceCourse;
+  if (kind == "race_state") return Type::RaceState;
   if (kind.rfind("command_", 0) == 0) return Type::Command;
   if (kind.rfind("event_", 0) == 0) return Type::Event;
   throw std::runtime_error("values.json kind '" + kind + "' has no known message type");
@@ -354,6 +440,10 @@ std::vector<std::uint8_t> encode(const std::string& kind, const json& value) {
       return encode_command(command_from(value));
     case Type::TickEnd:
       return encode_tick_end(tick_end_from(value));
+    case Type::RaceCourse:
+      return encode_race_course(race_course_from(value));
+    case Type::RaceState:
+      return encode_race_state(race_state_from(value));
     case Type::Event:
       return encode_event(event_from(value));
   }
@@ -375,6 +465,10 @@ json decode(const std::string& kind, const std::vector<std::uint8_t>& bytes) {
       return decoded_json(decode_command(bytes));
     case Type::TickEnd:
       return decoded_json(decode_tick_end(bytes));
+    case Type::RaceCourse:
+      return decoded_json(decode_race_course(bytes));
+    case Type::RaceState:
+      return decoded_json(decode_race_state(bytes));
     case Type::Event:
       return decoded_json(decode_event(bytes));
   }

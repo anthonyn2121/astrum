@@ -32,12 +32,16 @@ Decoded<VehicleState> decode_telemetry(std::span<const std::uint8_t> bytes) noex
 Decoded<Command> decode_command(std::span<const std::uint8_t> bytes) noexcept;
 Decoded<Event> decode_event(std::span<const std::uint8_t> bytes) noexcept;
 Decoded<TickEnd> decode_tick_end(std::span<const std::uint8_t> bytes) noexcept;
+Decoded<RaceCourse> decode_race_course(std::span<const std::uint8_t> bytes) noexcept;
+Decoded<RaceState> decode_race_state(std::span<const std::uint8_t> bytes) noexcept;
 
 // Encode as a flat Cap'n Proto message (the bytes that go in a Zenoh payload).
 std::vector<std::uint8_t> encode_telemetry(const VehicleState& state);
 std::vector<std::uint8_t> encode_command(const Command& command);
 std::vector<std::uint8_t> encode_event(const Event& event);
 std::vector<std::uint8_t> encode_tick_end(const TickEnd& tick_end);
+std::vector<std::uint8_t> encode_race_course(const RaceCourse& course);
+std::vector<std::uint8_t> encode_race_state(const RaceState& state);
 
 }  // namespace astrum
 

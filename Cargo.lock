@@ -233,13 +233,16 @@ dependencies = [
 name = "astrum-race"
 version = "0.1.0"
 dependencies = [
- "astrum-fdm",
+ "astrum-bag",
  "astrum-geo",
  "astrum-net",
  "astrum-proto",
+ "astrum-sim",
  "bevy",
  "clap",
+ "ctrlc",
  "serde",
+ "tempfile",
  "toml",
 ]
 
@@ -270,6 +273,7 @@ dependencies = [
  "astrum-bag",
  "astrum-net",
  "astrum-proto",
+ "astrum-race",
  "astrum-sim",
  "axum",
  "clap",

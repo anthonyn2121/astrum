@@ -1,6 +1,6 @@
 """ASTRUM wire format (schema v3) for Python: decode untrusted ``Telemetry``,
-``Event`` and ``TickEnd`` payloads into plain dataclasses and encode ``Command``
-messages. The names match controllers/README.md ("Names") and the Rust mirror.
+``Event``, ``TickEnd``, ``RaceCourse`` and ``RaceState`` payloads into plain
+dataclasses and encode ``Command`` messages. The names match controllers/README.md ("Names") and the Rust mirror.
 
 The schema ships inside this package (``astrum_client/astrum.capnp``) and is
 loaded once, lazily, on the first codec call; every codec function takes only
@@ -75,6 +75,20 @@ class EndReason(enum.IntEnum):
     ENGAGEMENT_DECIDED = 1
     FATAL = 2
     STOPPED = 3
+    RACE_COMPLETE = 4
+    CRASHED = 5
+
+
+class RaceOutcome(enum.IntEnum):
+    """``astrum.capnp`` ``RaceOutcome`` ordinals: how a race ended for an aircraft
+    (unknown values stay raw ``int``)."""
+
+    RUNNING = 0
+    COMPLETE = 1
+    CRASHED_GROUND = 2
+    CRASHED_GATE = 3
+    TIMED_OUT = 4
+    SPAWN_FAILED = 5
 
 
 class Refusal(enum.IntEnum):
@@ -264,6 +278,45 @@ class TickEnd:
 Vec3 = tuple[float, float, float]
 
 
+@dataclass(frozen=True)
+class RaceGate:
+    """One race gate. The gate-local basis is left-handed (x = right, y = up,
+    z = normal), so use the explicit ``normal`` / ``right`` / ``up`` unit vectors."""
+
+    index: int
+    center: Vec3  # world grid (m)
+    yaw_rad: float  # heading of ``normal``, 0 = North, +East
+    normal: Vec3
+    right: Vec3
+    up: Vec3
+
+
+@dataclass(frozen=True)
+class RaceCourse:
+    """A race course (``astrum/race/course/<id>``)."""
+
+    seed: int
+    opening_m: float  # square clear opening side
+    bar_m: float  # frame stock width
+    top_bar_m: float  # outer frame side (opening_m + 2 bar_m)
+    gates: tuple[RaceGate, ...]
+
+
+@dataclass(frozen=True)
+class RaceState:
+    """One aircraft's race progress (``astrum/race/state/<id>``)."""
+
+    aircraft_id: int
+    pending_gate: int  # next gate to pass; gate_count once finished
+    passed: int
+    missed: int
+    gate_count: int
+    last_pass_s: float  # sim time of the last gate passed; 0 if none
+    sim_time_s: float
+    finished: bool  # no more gates will be scored (outcome != RUNNING)
+    outcome: RaceOutcome | int
+
+
 def _kebab(camel: str) -> str:
     """Schema union member name -> event kind name (``triggerPressed`` -> ``trigger-pressed``)."""
     return re.sub(r"(?<!^)(?=[A-Z])", "-", camel).lower()
@@ -336,6 +389,37 @@ class RunEnded:
     message: str  # the fatal error; empty otherwise
 
 
+@dataclass(frozen=True)
+class GatePassed:
+    """Race: ``aircraft_id``'s CG crossed gate ``gate``'s opening at (``offset_x_m``
+    along the gate's ``right``, ``offset_y_m`` along its ``up``) from the centre."""
+
+    WIRE: ClassVar[str] = "gatePassed"
+    aircraft_id: int
+    gate: int
+    offset_x_m: float
+    offset_y_m: float
+
+
+@dataclass(frozen=True)
+class GateMissed:
+    """Race: ``aircraft_id`` crossed gate ``gate``'s plane outside its opening."""
+
+    WIRE: ClassVar[str] = "gateMissed"
+    aircraft_id: int
+    gate: int
+
+
+@dataclass(frozen=True)
+class Crashed:
+    """Race: ``aircraft_id`` crashed; ``gate`` is the gate it hit or was flying to."""
+
+    WIRE: ClassVar[str] = "crashed"
+    aircraft_id: int
+    outcome: RaceOutcome | int
+    gate: int
+
+
 EventDetail = (
     TriggerPressed
     | TriggerReleased
@@ -345,6 +429,9 @@ EventDetail = (
     | ControllerUp
     | ControllerDown
     | RunEnded
+    | GatePassed
+    | GateMissed
+    | Crashed
 )
 
 _DETAIL_BY_KIND = {_kebab(c.WIRE): c for c in get_args(EventDetail)}
@@ -378,6 +465,10 @@ class Event:
         elif isinstance(d, RunEnded):
             out["reason"] = enum_name(d.reason)
             out["message"] = d.message
+        elif isinstance(d, Crashed):
+            out["aircraft_id"] = d.aircraft_id
+            out["outcome"] = enum_name(d.outcome)
+            out["gate"] = d.gate
         else:
             for k, v in vars(d).items():
                 out[k] = list(v) if k == "pos_enu" else v
@@ -399,6 +490,8 @@ class Event:
             )
         elif detail_cls is RunEnded:
             detail = RunEnded(enum_member(EndReason, d["reason"]), d["message"])
+        elif detail_cls is Crashed:
+            detail = Crashed(d["aircraft_id"], enum_member(RaceOutcome, d["outcome"]), d["gate"])
         else:
             kw = {f.name: d[f.name] for f in fields(detail_cls)}
             if "pos_enu" in kw:
@@ -561,6 +654,15 @@ def _decode_detail(k) -> EventDetail:
     if which == "runEnded":
         w = k.runEnded
         return RunEnded(_known(EndReason, w.reason), w.message)
+    if which == "gatePassed":
+        w = k.gatePassed
+        return GatePassed(w.aircraftId, w.gate, w.offsetXM, w.offsetYM)
+    if which == "gateMissed":
+        w = k.gateMissed
+        return GateMissed(w.aircraftId, w.gate)
+    if which == "crashed":
+        w = k.crashed
+        return Crashed(w.aircraftId, _known(RaceOutcome, w.outcome), w.gate)
     raise DecodeError(f"unknown Event.kind variant {which!r}")
 
 
@@ -574,6 +676,49 @@ def decode_event(payload: bytes) -> Event:
         raise
     except Exception as e:
         raise DecodeError(f"bad Event payload: {e}") from e
+
+
+def decode_race_course(payload: bytes) -> RaceCourse:
+    """Decode one untrusted ``RaceCourse`` payload; raises :class:`DecodeError`."""
+    try:
+        with _reader("RaceCourse", payload) as c:
+            gates = tuple(
+                RaceGate(
+                    g.index,
+                    _enu(g.center),
+                    g.yawRad,
+                    _enu(g.normal),
+                    _enu(g.right),
+                    _enu(g.up),
+                )
+                for g in c.gates
+            )
+            return RaceCourse(c.seed, c.openingM, c.barM, c.topBarM, gates)
+    except DecodeError:
+        raise
+    except Exception as e:
+        raise DecodeError(f"bad RaceCourse payload: {e}") from e
+
+
+def decode_race_state(payload: bytes) -> RaceState:
+    """Decode one untrusted ``RaceState`` payload; raises :class:`DecodeError`."""
+    try:
+        with _reader("RaceState", payload) as s:
+            return RaceState(
+                s.aircraftId,
+                s.pendingGate,
+                s.passed,
+                s.missed,
+                s.gateCount,
+                s.lastPassS,
+                s.simTimeS,
+                s.finished,
+                _known(RaceOutcome, s.outcome),
+            )
+    except DecodeError:
+        raise
+    except Exception as e:
+        raise DecodeError(f"bad RaceState payload: {e}") from e
 
 
 def encode_command(cmd: Command) -> bytes:
@@ -657,6 +802,37 @@ def encode_tick_end(t: TickEnd) -> bytes:
     return m.to_bytes()
 
 
+def encode_race_course(c: RaceCourse) -> bytes:
+    """Encode a :class:`RaceCourse` (fixtures and tests; the race sim is its only publisher)."""
+    m = _schema().RaceCourse.new_message()
+    m.seed = c.seed
+    m.openingM, m.barM, m.topBarM = c.opening_m, c.bar_m, c.top_bar_m
+    gates = m.init("gates", len(c.gates))
+    for w, g in zip(gates, c.gates, strict=True):
+        w.index = g.index
+        w.center.e, w.center.n, w.center.u = g.center
+        w.yawRad = g.yaw_rad
+        w.normal.e, w.normal.n, w.normal.u = g.normal
+        w.right.e, w.right.n, w.right.u = g.right
+        w.up.e, w.up.n, w.up.u = g.up
+    return m.to_bytes()
+
+
+def encode_race_state(s: RaceState) -> bytes:
+    """Encode a :class:`RaceState` (fixtures and tests; the race sim is its only publisher)."""
+    m = _schema().RaceState.new_message()
+    m.aircraftId = s.aircraft_id
+    m.pendingGate = s.pending_gate
+    m.passed = s.passed
+    m.missed = s.missed
+    m.gateCount = s.gate_count
+    m.lastPassS = s.last_pass_s
+    m.simTimeS = s.sim_time_s
+    m.finished = s.finished
+    m.outcome = int(s.outcome)
+    return m.to_bytes()
+
+
 def encode_event(ev: Event) -> bytes:
     """Encode an :class:`Event` (fixtures and tests; the sim is the only real
     event publisher). Enum fields must be members, not raw ordinals."""
@@ -695,6 +871,17 @@ def encode_event(ev: Event) -> bytes:
     elif isinstance(d, RunEnded):
         w.reason = EndReason(d.reason).value
         w.message = d.message
+    elif isinstance(d, GatePassed):
+        w.aircraftId, w.gate, w.offsetXM, w.offsetYM = (
+            d.aircraft_id,
+            d.gate,
+            d.offset_x_m,
+            d.offset_y_m,
+        )
+    elif isinstance(d, GateMissed):
+        w.aircraftId, w.gate = d.aircraft_id, d.gate
+    elif isinstance(d, Crashed):
+        w.aircraftId, w.outcome, w.gate = d.aircraft_id, RaceOutcome(d.outcome).value, d.gate
     else:
         raise TypeError(f"not an EventDetail: {d!r}")
     return m.to_bytes()

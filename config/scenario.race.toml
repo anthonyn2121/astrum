@@ -1,0 +1,92 @@
+# Drone-racing scenario — ASTRUM's racing environment (`astrum-race`).
+#
+# An ordinary astrum-sim scenario (an F450 quad flown over the bus like any
+# multirotor) plus a `[course]`: a randomized track of racing gates. The drone
+# starts lined up `start_behind_m` upstream of gate 0, hovering; a controller
+# flies it with `Multirotor` commands and reads the gates from
+# `astrum/race/course/<id>` (progress on `astrum/race/state/<id>`).
+#
+#   make race                      fly it (listens for a controller)
+#   make race-course SEED=7        print the course a seed draws
+#   cargo run -p astrum-race -- config/scenario.race.toml --seed 7 --dump-course
+#
+# The course seed is `course.seed` if set, else `sim.seed`; `--seed` overrides
+# both. The same seed is the same course. `astrum-race --record` stores the
+# *resolved* scenario (every gate explicit as `[[course.gate]]`), so a recording
+# replays on any build.
+
+[world]
+origin_lat_deg = 44.7258
+origin_lon_deg = -93.0759
+origin_alt_hae_m = 0.0    # must be 0: the ENU origin plane is the ground, so gate heights are AGL
+
+[sim]
+rate_hz = 120.0
+max_time_s = 300.0        # a ~500 m course at a ~4 m/s cruise is a couple of minutes
+speed = 1.0               # real time; 0 = as fast as the host allows
+seed = 1                  # the course seed unless [course] sets one
+# lockstep = true         # reproducible runs: the sim waits for the controller each tick
+# command_lease_s = 0.5   # no command for this long -> the sim holds the hover
+
+# The race's drone. Its start pose is overwritten from the course (upstream of
+# gate 0, on its centreline, at its height, facing along it); these values only
+# satisfy the scenario schema.
+[[aircraft]]
+id = 1
+model = "F450"            # kind is inferred: F450 -> multirotor
+lat_deg = 44.7258
+lon_deg = -93.0759
+alt_hae_m = 2.0
+heading_deg = 0.0
+tas_mps = 0.0
+# lockstep = true         # with sim.lockstep: wait for this aircraft's commands each tick
+
+# The randomization envelope. Every field is optional; these are the defaults,
+# spelled out because they are what keeps a sampled track physically flyable.
+[course]
+gates = 8                 # how many gates to sample (2..64): `--gates N` / the web UI change it
+length_m = 500.0          # target total length of the legs (3-D). From it, and the gate
+                          # count, every limit below that is commented out is derived:
+                          #   leg_min_m = 0.7*L/(gates-1), leg_max_m = 1.3*L/(gates-1),
+                          #   course_radius_m = max(0.5*L, 100)
+                          # so changing `gates` keeps the course ~500 m and changes the
+                          # leg length. Uncomment a line to state it yourself (it wins);
+                          # remove length_m for the plain envelope (legs 15-30, radius 100).
+# seed = 1                # course seed (default: sim.seed)
+start_behind_m = 10.0     # launch this far up gate 0's approach
+
+# Flyability: how far apart gates are, and how hard the course may turn or climb.
+# leg_min_m = 15.0        # gate-to-gate, 3-D (derived from length_m while that is set)
+# leg_max_m = 30.0
+max_turn_deg = 120.0      # heading change at a gate; its normal bisects the turn,
+                          # so no crossing is worse than 60 deg off the opening --
+                          # and the opening passes the airframe at any heading
+max_climb_deg = 20.0      # flight-path angle of a leg, up or down
+
+# Containment: the flight volume. alt_min_m must keep the gate sill (half an
+# opening below the centre) off the ground.
+alt_min_m = 1.5
+alt_max_m = 4.0
+# course_radius_m = 100.0 # horizontal radius about gate 0 (derived from length_m)
+
+# Non-overlap: what makes a track topologically flyable instead of a knot.
+min_gate_gap_m = 10.0     # between gate centres
+min_leg_gate_gap_m = 1.5  # from a leg to a frame it is *not* flying through
+min_leg_leg_gap_m = 2.0   # between non-adjacent legs
+
+# Sampler budget. Raise these before loosening the limits above if a dense course
+# comes back infeasible.
+tries_per_gate = 200
+max_backtracks = 200
+
+start_heading_deg = 0.0   # the entry leg's heading (0 = North), fixed across seeds
+
+# Explicit gates instead of sampling: give a `[[course.gate]]` per gate (index in
+# flight order, the centre of the opening in ENU metres, the heading of the
+# normal in radians). They are used verbatim; --seed is then an error.
+# [[course.gate]]
+# index = 0
+# east_m = 0.0
+# north_m = 20.0
+# up_m = 2.0
+# yaw_rad = 0.0

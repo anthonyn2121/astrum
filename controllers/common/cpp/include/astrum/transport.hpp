@@ -13,6 +13,8 @@
 //   EventSubscriber      astrum/events as a FIFO (unknown kinds skipped), plus — only
 //                        when asked for (a needs_fleet law) — the newest astrum/tick
 //                        (TickEnd)
+//   RaceSubscriber       astrum/race/course/<id> and astrum/race/state/<id> (a race run's
+//                        gates and progress): latest-value, decoded on the caller's thread
 //
 // One Session carries any number of subscribers and publishers (several aircraft per
 // process); it must outlive them. Every piece is non-copyable and non-movable (the Zenoh
@@ -55,6 +57,7 @@ class Session {
   friend class TelemetrySubscriber;
   friend class CommandPublisher;
   friend class EventSubscriber;
+  friend class RaceSubscriber;
 };
 
 // Which aircraft a TelemetrySubscriber follows: one id, or every aircraft.
@@ -112,6 +115,24 @@ class EventSubscriber : public EventSource {
   // The newest TickEnd received, if any.
   std::optional<TickEnd> tick_end() const;
   // Event / TickEnd payloads skipped so far (malformed, or a kind this build lacks).
+  std::uint64_t decode_errors() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+class RaceSubscriber : public RaceSource {
+ public:
+  RaceSubscriber(Session& session, std::uint32_t aircraft_id, Logger log = stderr_logger("astrum"));
+  ~RaceSubscriber() override;
+  RaceSubscriber(const RaceSubscriber&) = delete;
+  RaceSubscriber& operator=(const RaceSubscriber&) = delete;
+
+  std::optional<RaceCourse> take_course() override;
+  std::optional<RaceState> take_state() override;
+
+  // Race payloads skipped so far (malformed, or naming another aircraft).
   std::uint64_t decode_errors() const;
 
  private:

@@ -235,7 +235,7 @@ the caller owns the `Children` registry (the CLI's second Ctrl-C kills it) and e
 flag. `LiveRun::stop`/`kill`/drop act on that run only; the spec's shared `stop` stops every run
 sharing it. `start` (on failure), `wait` and drop block until the run's processes are reaped —
 call them from a blocking thread in async code. `astrum_sim::catalog` classifies files for
-`astrum list`, finds JSBSim models (`jsbsim_models`) and defines the environments (`empty`).
+`astrum list`, finds JSBSim models (`jsbsim_models`) and defines the environments (`empty`, `race`).
 
 Sweeps are the `astrum_sim::sweep` library, the CLI only prints: `Sweep::plan` (or
 `plan_scenario` from an in-memory base `Scenario`) expands the grid, draws the `[[perturb]]`
@@ -301,6 +301,18 @@ stability-augmentation loop engaged (`fcs/ScasEngage = 1`); spawn does this auto
 `lockstep = true` on the aircraft they fly: the sim waits each tick for a command answering the
 last published tick (republishing that telemetry every 100 ms while waiting). Without lockstep a
 command lands on whichever tick it arrives.
+
+**Race scenarios.** A drone-racing scenario (`config/scenario.race.toml`) is an ordinary scenario
+— exactly one F450, `world.origin_alt_hae_m = 0` — plus a `[course]` table: the randomization
+envelope, an optional `seed` (default `sim.seed`; the sim's own RNG is untouched) and
+`start_behind_m`, or explicit `[[course.gate]]` used verbatim. The `astrum-race` binary (a
+client of `astrum-sim`; design in `docs/racing-environment-design.md`) takes the sim's flags plus
+`--seed N` (course seed override), `--gates N` and `--dump-course`; it overwrites the drone's start
+pose from the course and records/serves the *resolved* scenario (every gate explicit), so a bag
+replays whatever the sampler becomes. `make race-course SEED=7` prints a course, `make race` runs
+one (a controller flies it with `Multirotor` commands and reads `astrum/race/course|state/<id>`),
+`make race-offline [BAG=run.mcap]` flies without a transport. Its tests live in
+`crates/astrum-race/tests/`.
 
 **Adding a scenario field.** Add it to `Sim` / `World` / `AircraftSpec` in
 `crates/astrum-sim/src/scenario.rs` with a serde default (or `Option`) so existing scenarios still
@@ -468,6 +480,7 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 | `src/catalogs.rs` | the environments, model profiles, controller catalog and scenario listing |
 | `src/export.rs` | `ExportDoc`: decodes a bag's telemetry and events into the renderer's shapes |
 | `src/lib.rs` | the shared JSON shapes (`FrameJson`, `EventJson`) and message builders |
+| `src/race.rs` | race scenarios: validation, the `CourseView` of a seed, the course of a recorded scenario |
 | `src/runs.rs` | `Runs`: the one live interactive run (`/api/runs`) and its monitor |
 | `src/scenarios.rs` | `PUT /api/scenarios/<name>` and `POST /api/scenario-check` |
 | `src/server.rs` | the HTTP service: telemetry WebSocket, `/api`, tile proxy, static files |
@@ -500,9 +513,17 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 - `astrum-web` stops the active run when told to shut down (`Runs::close`), and waits for it after serving (`Runs::shutdown`).
 - Tests (`tests/runs.rs`) fly a shell-script stand-in sim and the real one, which must be built first (`cargo build -p astrum-sim`; or set `ASTRUM_SKIP_REAL_SIM=1`).
 
+**Races in the studio.** A race scenario is an ordinary scenario file plus a `[course]` table (`config/scenario.race.toml`); `astrum-race` reads it. `astrum-sim` keeps the table opaque (`sweep::Base`: the scenario and its `[course]`; `sweep::scenario_toml` writes them back; no dependency on `astrum-race`), `astrum-web` asks `astrum-race` (`src/race.rs`: `RaceScenario::from_toml_str`, `course_view`) whether it is valid and what course a seed draws.
+
+- Listing and `GET /api/scenarios/<name>`: `environment` is `race` for a scenario with a `[course]`, and the doc's `course` is its `CourseView` from the scenario's own seed (`course.seed`, else `sim.seed`). `GET /api/scenarios/<name>/course?seed=N&gates=M` previews another seed and gate count (`CourseView.length_m` is the course's length). `GET /api/environments` has `race` (F450 only, a race's `[sim]` defaults, the field's origin, `METRICS` + `RACE_METRICS`).
+- Runs: `POST /api/runs` takes `seed` (the course seed) and `gates` (2–64; written into the run's `[course]` as `gates = N`, so the file the race binary reads and the `RunView.course` agree), flies `--race` (`ASTRUM_RACE_BIN`, default next to `astrum-web`) instead of the sim, and the `RunView` carries the `course`. A scenario's `[[course.gate]]` are flown as they are: a `seed` there is refused (the race binary refuses it too).
+- Replays: `ExportMeta.course` is the course the bag's recorded scenario lists (the resolved scenario `astrum-race --record` writes has every gate explicit).
+- Sweeps: `course_seed_mode` (`fixed` | `randomize`) is a `SweepFile` key, so a saved race sweep round-trips and `astrum sweep` runs it (`LiveSpec.course` appends the `[course]` to each run's scenario and passes `--seed`; `astrum` picks the `astrum-race` binary for a race base). `gates` (a `SweepFile` key, 2–64) sets every run's gate count the same way. Every run's course seed (`Run::course_seed`) and gate count (`Run::gates`, when the scenario or sweep sets one) are in the plan rows and in `summary.csv`, with `RACE_METRICS` columns. A race sweep is always process-mode (`Sweep::in_process` is false) and refuses offsets (`vary`, `[[perturb]]`): the start pose comes from the course.
+- Tests (`tests/race.rs`) fly a shell-script stand-in `astrum-race`, plus the real binary (`cargo build -p astrum-race` first; `ASTRUM_RACE_BIN` points elsewhere; `ASTRUM_SKIP_REAL_SIM=1` skips it).
+
 **Web sweeps** (`crates/astrum-web/src/sweepruns.rs`): `SweepRuns` owns the one web sweep, as `Runs` owns the live run, and is independent of it.
 
-- A start resolves the request (`sweeps::resolve`), plans it with `Sweep::plan_scenario`, refuses what `astrum sweep` refuses (no `astrum-sim`, too few ports, a failed `check_trim`), and only then creates `<runs-dir>/sweeps/<id>/`.
+- A start resolves the request (`sweeps::resolve`), plans it with `Sweep::plan_base`, refuses what `astrum sweep` refuses (no `astrum-sim` — `astrum-race` for a race —, too few ports, a failed `check_trim`, a race course that cannot be drawn), and only then creates `<runs-dir>/sweeps/<id>/`.
 - A supervisor thread runs `sweep::execute` with `run_in_process` or `launch::run_processes`, exactly as the CLI does. Its `on_event` updates the in-memory run states.
 - `meta.json` is rewritten atomically when the sweep ends, before the record says so.
 - A sweep that the disk says is `running` but no server owns reads back as `interrupted`.
@@ -514,7 +535,7 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 **Tests.** The real-sim tests in `tests/runs.rs` and `tests/sweepruns.rs` need `cargo build -p astrum-sim` first (they fly that binary; `ASTRUM_SIM_BIN` points them elsewhere):
 
 ```bash
-cargo build -p astrum-sim                                    # once, before the astrum-web tests
+cargo build -p astrum-sim -p astrum-race                     # once, before the astrum-web tests
 cargo test -p astrum-web --locked                            # every astrum-web test
 ASTRUM_SKIP_REAL_SIM=1 cargo test -p astrum-web --locked     # skip the real-sim tests
 ```
@@ -523,6 +544,7 @@ ASTRUM_SKIP_REAL_SIM=1 cargo test -p astrum-web --locked     # skip the real-sim
 
 - `make dev` builds the image if it is missing or out of date, starts the `dev` container (the checkout is bind-mounted at `/workspace`) and opens a shell in it. Each further `make dev` opens another shell in the same container.
 - Inside it, `astrum web` serves the studio (`/` is the home page) and the viewer on one port. `astrum run config/scenario.example.toml --watch` starts a sim, its bridge and the viewer as well.
+- `astrum web` launches the `astrum-sim` and `astrum-race` binaries that sit next to it and does **not** rebuild them: building only `astrum-web` leaves a stale `astrum-race` that rejects newer scenario fields (e.g. `unknown field length_m`). Build them together: `cargo build --release -p astrum-web -p astrum-sim -p astrum-race` (or `--workspace`).
 - `docker-compose.yml` sets `ASTRUM_WEB_BIND=0.0.0.0:8080` and `ASTRUM_WEB_ROOT=/workspace/web` in the container, and publishes `127.0.0.1:7447` (Zenoh) and `127.0.0.1:8080` (HTTP and WebSocket) on the host.
 - Zenoh has no authentication here: anyone who can reach 7447 can command aircraft.
 
@@ -624,7 +646,8 @@ its staging directory for `PYTHONPATH`; `make test-python` does that and runs it
 
 ## 8. Cap'n Proto wire quick reference
 
-The schema (`crates/astrum-proto/schema/astrum.capnp`, v3) defines four messages:
+The schema (`crates/astrum-proto/schema/astrum.capnp`, v3) defines four messages (plus two for
+race runs, below):
 - **`Telemetry`** — sim → subscribers (`astrum/telemetry/<id>`; the id is in the key). Geodetic
   position (HAE), world-grid `enu` + `velEnu`, local-level `velNed`, attitude, `tasMps`,
   `faultFlags`, `vehicleKind`, `tick`, `bodyRates`, `aero`, `combat`, `controlMode`,
@@ -634,10 +657,17 @@ The schema (`crates/astrum-proto/schema/astrum.capnp`, v3) defines four messages
   collective, *or* high-level **`autopilot`** targets (heading, HAE altitude, TAS), plus `epoch`,
   `seq`, `telemetryTick` and `trigger`.
 - **`Event`** — sim → subscribers (`astrum/events`); `tick`, `simTimeS` and a `kind` union
-  (trigger pressed / released, hit, kill, mode change, controller up / down, run ended). See the
-  README's "Events".
+  (trigger pressed / released, hit, kill, mode change, controller up / down, run ended, and for
+  race runs gate passed / gate missed / crashed). See the README's "Events".
 - **`TickEnd`** — sim → subscribers (`astrum/tick`); `tick`, `simTimeS`, sent after the tick's
   telemetry and events.
+- **`RaceCourse`** / **`RaceState`** — race runs only, sim → subscribers, latest-value like
+  telemetry: `astrum/race/course/<id>` (`seed`, gate `openingM` / `barM` / `topBarM`, and each
+  `RaceGate`'s centre, `yawRad` and explicit `normal` / `right` / `up` unit vectors — the
+  gate-local basis is left-handed, so never derive it from the yaw; ~1 Hz and on the first tick)
+  and `astrum/race/state/<id>` (pending gate, passed / missed counts, last pass time,
+  `RaceOutcome`; every control tick). They are live-only: a bag keeps the gate events and the
+  scenario TOML (whose explicit `[[course.gate]]` rebuild the course), not these topics.
 
 Recordings are MCAP files (one channel per Zenoh key, raw payload bytes); there is no
 recording message in the schema.

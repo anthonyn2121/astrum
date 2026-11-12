@@ -143,8 +143,23 @@ pub const RUNS_CONNECT: &str = "tcp/127.0.0.1:1";
 /// (`--connect` = [`RUNS_CONNECT`]); also the run manager, for shutting it
 /// down.
 pub fn app_with_runs(tmp: &Path, bridge: Bridge, catalogs: Catalogs, sim: &Path) -> (Router, Runs) {
-    let cfg =
-        RunsConfig { dir: tmp.join("runs"), sim: sim.to_owned(), connect: RUNS_CONNECT.into() };
+    app_with_race_runs(tmp, bridge, catalogs, sim, &tmp.join("no-astrum-race"))
+}
+
+/// [`app_with_runs`], race scenarios flown by `race` (a stand-in `astrum-race`).
+pub fn app_with_race_runs(
+    tmp: &Path,
+    bridge: Bridge,
+    catalogs: Catalogs,
+    sim: &Path,
+    race: &Path,
+) -> (Router, Runs) {
+    let cfg = RunsConfig {
+        dir: tmp.join("runs"),
+        sim: sim.to_owned(),
+        race: race.to_owned(),
+        connect: RUNS_CONNECT.into(),
+    };
     let runs = Runs::new(cfg, bridge.clone());
     (build_with(tmp, bridge, &[], catalogs, runs.clone(), default_sweeps(tmp)), runs)
 }
@@ -154,6 +169,7 @@ fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs)
     let cfg = RunsConfig {
         dir: tmp.join("runs"),
         sim: tmp.join("no-astrum-sim"),
+        race: tmp.join("no-astrum-race"),
         connect: RUNS_CONNECT.into(),
     };
     let runs = Runs::new(cfg, bridge.clone());
@@ -162,10 +178,17 @@ fn build(tmp: &Path, bridge: Bridge, allowed_hosts: &[&str], catalogs: Catalogs)
 
 /// The sweep runner of a test tree: sweeps under `<tmp>/runs/sweeps`, process
 /// mode flying `sim` with run N on `base_port + N - 1`.
-fn sweep_runs(tmp: &Path, sim: &Path, base_port: u16, stop_grace: Duration) -> SweepRuns {
+fn sweep_runs(
+    tmp: &Path,
+    sim: &Path,
+    race: &Path,
+    base_port: u16,
+    stop_grace: Duration,
+) -> SweepRuns {
     let cfg = SweepRunsConfig {
         dir: tmp.join("runs").join("sweeps"),
         sim: sim.to_owned(),
+        race: race.to_owned(),
         base_port,
         stop_grace,
     };
@@ -174,7 +197,7 @@ fn sweep_runs(tmp: &Path, sim: &Path, base_port: u16, stop_grace: Duration) -> S
 
 /// [`sweep_runs`] for tests that fly no sweep.
 fn default_sweeps(tmp: &Path) -> SweepRuns {
-    sweep_runs(tmp, &tmp.join("no-astrum-sim"), 27500, STOP_GRACE)
+    sweep_runs(tmp, &tmp.join("no-astrum-sim"), &tmp.join("no-astrum-race"), 27500, STOP_GRACE)
 }
 
 /// [`app`] over `catalogs` whose web sweeps fly `sim` (process mode) on ports
@@ -188,10 +211,31 @@ pub fn app_with_sweeps(
     base_port: u16,
     stop_grace: Duration,
 ) -> (Router, SweepRuns) {
-    let sweeps = sweep_runs(tmp, sim, base_port, stop_grace);
+    app_with_race_sweeps(
+        tmp,
+        bridge,
+        catalogs,
+        (sim, &tmp.join("no-astrum-race")),
+        base_port,
+        stop_grace,
+    )
+}
+
+/// [`app_with_sweeps`], race scenarios flown by `bins.1` (a stand-in
+/// `astrum-race`) and the others by `bins.0`.
+pub fn app_with_race_sweeps(
+    tmp: &Path,
+    bridge: Bridge,
+    catalogs: Catalogs,
+    bins: (&Path, &Path),
+    base_port: u16,
+    stop_grace: Duration,
+) -> (Router, SweepRuns) {
+    let sweeps = sweep_runs(tmp, bins.0, bins.1, base_port, stop_grace);
     let cfg = RunsConfig {
         dir: tmp.join("runs"),
         sim: tmp.join("no-astrum-sim"),
+        race: tmp.join("no-astrum-race"),
         connect: RUNS_CONNECT.into(),
     };
     let runs = Runs::new(cfg, bridge.clone());
@@ -233,4 +277,23 @@ pub fn repo_config() -> std::path::PathBuf {
 /// [`Catalogs`] over [`repo_config`].
 pub fn repo_catalogs() -> Catalogs {
     Catalogs::load(repo_config()).unwrap()
+}
+
+/// A race scenario file: the F450's start pose is overwritten from the course
+/// (so these values only satisfy the scenario schema), `course.gates` = 4.
+pub const RACE_SCENARIO: &str = "# A four-gate race. Second sentence.\n\
+    [world]\norigin_lat_deg = 44.7258\norigin_lon_deg = -93.0759\norigin_alt_hae_m = 0.0\n\
+    [sim]\nrate_hz = 120.0\nmax_time_s = 60.0\nseed = 5\n\
+    [[aircraft]]\nid = 1\nmodel = \"F450\"\nlat_deg = 44.7258\nlon_deg = -93.0759\n\
+    alt_hae_m = 2.0\nheading_deg = 0.0\ntas_mps = 0.0\n\
+    [course]\ngates = 4\n";
+
+/// A config directory (a temp copy of the repository's controller catalog)
+/// holding the race scenario [`RACE_SCENARIO`] as `scenario.race.toml`.
+pub fn race_config(root: &Path) -> std::path::PathBuf {
+    let dir = root.join("config");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(repo_config().join("controllers.toml"), dir.join("controllers.toml")).unwrap();
+    std::fs::write(dir.join("scenario.race.toml"), RACE_SCENARIO).unwrap();
+    dir
 }

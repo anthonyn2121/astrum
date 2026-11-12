@@ -134,11 +134,15 @@ async fn the_bundled_scenarios_are_all_valid_studio_scenarios() {
     let (status, list) = get(&app, "/api/scenarios").await;
     assert_eq!(status, StatusCode::OK);
     let list = list.as_array().unwrap();
-    for name in ["demo", "example", "formation", "quad", "smoke"] {
+    for name in ["demo", "example", "formation", "quad", "race", "smoke"] {
         let entry = list.iter().find(|s| s["name"] == name).unwrap_or_else(|| panic!("{name}"));
         assert_eq!(entry["error"], Value::Null, "{name}");
         assert!(!entry["aircraft"].as_array().unwrap().is_empty(), "{name}");
+        assert_eq!(entry["environment"], if name == "race" { "race" } else { "empty" }, "{name}");
     }
+    let (status, doc) = get(&app, "/api/scenarios/race").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert!(!doc["course"]["gates"].as_array().unwrap().is_empty(), "{doc}");
 }
 
 #[tokio::test]
@@ -148,10 +152,27 @@ async fn environments_models_and_controllers_describe_what_can_be_flown() {
 
     let (status, envs) = get(&app, "/api/environments").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(envs.as_array().unwrap().len(), 1);
-    assert_eq!(envs[0]["id"], "empty");
+    let ids: Vec<&str> =
+        envs.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["empty", "race"]);
     assert_eq!(envs[0]["sim"]["rate_hz"], 120.0);
     assert!(!envs[0]["locations"].as_array().unwrap().is_empty());
+    fn metrics(e: &Value) -> Vec<&str> {
+        e["metrics"].as_array().unwrap().iter().map(|m| m.as_str().unwrap()).collect()
+    }
+    assert!(!metrics(&envs[0]).contains(&"gates_passed"));
+    // The race environment: the F450 only, a race's `[sim]`, its field's origin, and the
+    // race metrics on top of the fleet's.
+    let race = &envs[1];
+    assert_eq!(race["models"], json!(["F450"]));
+    assert_eq!(race["sim"]["max_time_s"], 120.0);
+    assert_eq!(race["sim"]["speed"], 1.0);
+    assert_eq!(race["locations"].as_array().unwrap().len(), 1);
+    assert_eq!(race["locations"][0]["origin_lat_deg"], 44.7258);
+    assert_eq!(race["locations"][0]["origin_lon_deg"], -93.0759);
+    for id in ["end_reason", "gates_passed", "gates_missed", "race_time_s", "race_outcome"] {
+        assert!(metrics(race).contains(&id), "{id}");
+    }
 
     let (status, models) = get(&app, "/api/models").await;
     assert_eq!(status, StatusCode::OK);
@@ -226,4 +247,89 @@ fn save_scenario_writes_the_file_it_names_and_refuses_what_it_cannot_write() {
     assert!(matches!(e, SaveError::Io(_)), "{e}");
     assert!(!dir.join(".scenario.dir.toml.tmp").exists());
     assert!(!dir.join(".scenario.solo.toml.tmp").exists());
+}
+
+#[tokio::test]
+async fn a_race_scenario_is_listed_in_the_race_environment_and_comes_back_with_its_course() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalogs = Catalogs::load(common::race_config(tmp.path())).unwrap();
+    let dir = tmp.path().join("config");
+    std::fs::write(dir.join("scenario.solo.toml"), ONE_SHIP).unwrap();
+    std::fs::write(
+        dir.join("scenario.badrace.toml"),
+        common::RACE_SCENARIO.replace("gates = 4", "gates = 0"),
+    )
+    .unwrap();
+    let app = common::app_with_catalogs(tmp.path(), Bridge::new(config()), catalogs);
+
+    let (status, list) = get(&app, "/api/scenarios").await;
+    assert_eq!(status, StatusCode::OK);
+    let race = list.as_array().unwrap().iter().find(|s| s["name"] == "race").unwrap();
+    assert_eq!(race["environment"], "race");
+    assert_eq!(race["error"], Value::Null);
+    assert_eq!(race["summary"], "A four-gate race.");
+    assert_eq!(
+        race["aircraft"],
+        json!([{"id": 1, "model": "F450", "kind": "multirotor", "team": 0}])
+    );
+    // A course the race binary would refuse is an invalid scenario, listed with its reason.
+    let bad = list.as_array().unwrap().iter().find(|s| s["name"] == "badrace").unwrap();
+    assert!(bad["error"].as_str().unwrap().contains("gates"), "{bad}");
+
+    let (status, doc) = get(&app, "/api/scenarios/race").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["environment"], "race");
+    assert_eq!(doc["scenario"]["sim"]["seed"], 5);
+    let course = &doc["course"];
+    // `sim.seed` is the course seed unless `[course]` sets one.
+    assert_eq!(course["seed"], 5);
+    assert_eq!(course["gates"].as_array().unwrap().len(), 4);
+    for (k, gate) in course["gates"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(gate["index"], k);
+        for key in ["east_m", "north_m", "up_m", "yaw_rad"] {
+            assert!(gate[key].is_f64(), "gate {k} {key}: {gate}");
+        }
+    }
+    for key in ["opening_m", "bar_m", "top_bar_m"] {
+        assert!(course[key].as_f64().unwrap() > 0.0, "{key}");
+    }
+    let (status, bad) = get(&app, "/api/scenarios/badrace").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+
+    let (status, pair) = get(&app, "/api/scenarios/solo").await;
+    assert_eq!(status, StatusCode::OK, "{pair}");
+    assert_eq!(pair["environment"], "empty");
+    assert_eq!(pair["course"], Value::Null);
+}
+
+#[tokio::test]
+async fn the_course_endpoint_draws_a_race_scenarios_course_from_a_seed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalogs = Catalogs::load(common::race_config(tmp.path())).unwrap();
+    std::fs::write(tmp.path().join("config/scenario.solo.toml"), ONE_SHIP).unwrap();
+    let app = common::app_with_catalogs(tmp.path(), Bridge::new(config()), catalogs);
+
+    let (status, own) = get(&app, "/api/scenarios/race/course").await;
+    assert_eq!(status, StatusCode::OK, "{own}");
+    let (_, doc) = get(&app, "/api/scenarios/race").await;
+    assert_eq!(own, doc["course"]);
+
+    let (status, seven) = get(&app, "/api/scenarios/race/course?seed=7").await;
+    assert_eq!(status, StatusCode::OK, "{seven}");
+    assert_eq!(seven["seed"], 7);
+    let (_, again) = get(&app, "/api/scenarios/race/course?seed=7").await;
+    assert_eq!(seven, again, "a seed is a course");
+    assert_ne!(seven["gates"], own["gates"], "another seed is another course");
+
+    for (uri, status, needle) in [
+        ("/api/scenarios/solo/course", StatusCode::BAD_REQUEST, "not a race"),
+        ("/api/scenarios/missing/course", StatusCode::NOT_FOUND, "missing"),
+        ("/api/scenarios/race/course?seed=x", StatusCode::BAD_REQUEST, "seed"),
+        ("/api/scenarios/race/course?seed=-1", StatusCode::BAD_REQUEST, "seed"),
+        ("/api/scenarios/race/course?bogus=1", StatusCode::BAD_REQUEST, "bogus"),
+    ] {
+        let (got, body) = get(&app, uri).await;
+        assert_eq!(got, status, "{uri}: {body}");
+        assert!(body["error"].as_str().unwrap().contains(needle), "{uri}: {body}");
+    }
 }

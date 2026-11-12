@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use astrum_sim::perturb::{Axis, Perturb};
 use astrum_sim::scenario::{AircraftSpec, Scenario};
-use astrum_sim::sweep::{Purpose, Sweep, SweepFile, TrimCheck};
+use astrum_sim::sweep::{Base, CourseSeedMode, Purpose, Sweep, SweepFile, TrimCheck};
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path as UrlPath, State};
@@ -79,6 +79,14 @@ pub struct SweepRequest {
     /// Also trim every aircraft of every run (the library's `check_trim`).
     #[serde(default)]
     pub check_trim: bool,
+    /// A race scenario's courses: `fixed` (every run flies the scenario's course
+    /// seed) or `randomize` (repeat `r` flies that seed + `r`). Unset: `fixed`.
+    /// Only for a race scenario.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course_seed_mode: Option<CourseSeedMode>,
+    /// A race scenario's gate count in every run (2–64), over its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gates: Option<u32>,
 }
 
 /// Why a request cannot become a sweep file.
@@ -96,8 +104,8 @@ pub enum SweepInputError {
 /// A request as the sweep file `astrum sweep` reads.
 #[derive(Debug, Clone)]
 pub struct Resolved {
-    /// The saved base, untouched.
-    pub scenario: Scenario,
+    /// The saved base, untouched: its scenario and, for a race, its `[course]`.
+    pub base: Base,
     pub file: SweepFile,
     /// Each assignment as the run flies it: every catalog parameter, defaults filled in.
     pub assignments: Vec<Assignment>,
@@ -153,19 +161,31 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
             req.max_time_s
         )));
     }
-    let doc = catalogs.scenario(&req.scenario).map_err(|e| match &e {
+    let base = catalogs.base(&req.scenario).map_err(|e| match &e {
         ScenarioError::BadName(_) | ScenarioError::NotFound(_) => {
             SweepInputError::BadRequest(format!("scenario: {e}"))
         }
         ScenarioError::Invalid(_) => SweepInputError::Invalid(e.to_string()),
         ScenarioError::Io(_) => SweepInputError::Io(e.to_string()),
     })?;
+    if base.course.is_none() {
+        let set =
+            [(req.course_seed_mode.is_some(), "course_seed_mode"), (req.gates.is_some(), "gates")];
+        if let Some((_, key)) = set.into_iter().find(|(set, _)| *set) {
+            return Err(SweepInputError::BadRequest(format!(
+                "{key} is for a race scenario; this one has no [course]"
+            )));
+        }
+    }
+    if let Some(gates) = req.gates {
+        crate::race::check_gates(gates).map_err(SweepInputError::BadRequest)?;
+    }
     for key in req.vary.keys() {
-        check_vary_key(key, &doc.scenario).map_err(SweepInputError::BadRequest)?;
+        check_vary_key(key, &base.scenario).map_err(SweepInputError::BadRequest)?;
     }
     // `assign` checks the assignments on a copy; the sweep's own `set` below
     // carries the lockstep flags it would set.
-    let mut checked = doc.scenario.clone();
+    let mut checked = base.scenario.clone();
     let (controllers, assignments) = assign(&mut checked, &req.assignments, catalogs.controllers())
         .map_err(SweepInputError::BadRequest)?;
     check_programs(&assignments, catalogs.controllers()).map_err(SweepInputError::BadRequest)?;
@@ -177,7 +197,7 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         ("sim.max_time_s".to_owned(), toml::Value::Float(req.max_time_s)),
         ("sim.lockstep".to_owned(), toml::Value::Boolean(!controlled.is_empty())),
     ]);
-    for a in &doc.scenario.aircraft {
+    for a in &base.scenario.aircraft {
         set.insert(
             format!("aircraft.{}.lockstep", a.id),
             toml::Value::Boolean(controlled.contains(&a.id)),
@@ -188,9 +208,9 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         .iter()
         .map(|(key, values)| (key.clone(), values.iter().map(|&v| toml::Value::Float(v)).collect()))
         .collect();
-    let base = catalogs.scenario_path(&req.scenario).map_err(SweepInputError::BadRequest)?;
+    let base_path = catalogs.scenario_path(&req.scenario).map_err(SweepInputError::BadRequest)?;
     let file = SweepFile {
-        base,
+        base: base_path,
         repeats: req.repeats,
         jobs: req.jobs,
         speed: None,
@@ -201,11 +221,13 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         min_separation_m: req.min_separation_m,
         min_alt_hae_m: req.min_alt_hae_m,
         controllers,
+        course_seed_mode: req.course_seed_mode,
+        gates: req.gates,
         set,
         vary,
         perturb: req.perturb.clone(),
     };
-    Ok(Resolved { scenario: doc.scenario, file, assignments })
+    Ok(Resolved { base, file, assignments })
 }
 
 /// Why a request is refused: its status and the message the reply carries.
@@ -235,8 +257,32 @@ fn bad(msg: String) -> Refusal {
 /// Resolve and plan `req`: the sweep the library makes of its file.
 fn plan_request(req: &SweepRequest, catalogs: &Catalogs) -> Result<Sweep, Refusal> {
     let resolved = resolve(req, catalogs)?;
-    Sweep::plan_scenario(resolved.file, resolved.scenario, &req.scenario, Purpose::Sweep)
-        .map_err(|e| Refusal(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+    let sweep = Sweep::plan_base(resolved.file, resolved.base, &req.scenario, Purpose::Sweep)
+        .map_err(|e| Refusal(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    check_courses(&sweep).map_err(|e| Refusal(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(sweep)
+}
+
+/// A race sweep's courses must all be drawable: one per distinct course seed
+/// is drawn (a course that lists its gates, once), so an envelope too tight for
+/// some seed fails here (422), naming the first run that flies it, not
+/// mid-sweep.
+pub fn check_courses(sweep: &Sweep) -> Result<(), String> {
+    let Some(course) = &sweep.course else { return Ok(()) };
+    if crate::race::has_explicit_gates(course) {
+        return crate::race::course_view_of(&sweep.runs[0].scenario, course, None)
+            .map(|_| ())
+            .map_err(|e| format!("course: {e}"));
+    }
+    let mut drawn = BTreeSet::new();
+    for run in &sweep.runs {
+        let Some(seed) = run.course_seed else { continue };
+        if drawn.insert(seed) {
+            crate::race::course_view_of(&run.scenario, course, Some(seed))
+                .map_err(|e| format!("run {} (course seed {seed}): {e}", run.index + 1))?;
+        }
+    }
+    Ok(())
 }
 
 /// A `POST /api/sweeps/plan` reply: what the sweep would fly.
@@ -257,6 +303,11 @@ struct RowView {
     run: usize,
     seed: u64,
     sample: Option<u64>,
+    /// The seed of the run's course (race sweeps); `null` otherwise.
+    course_seed: Option<u64>,
+    /// The course's gate count, when the scenario or the request sets it
+    /// (race sweeps); `null` otherwise.
+    gates: Option<u32>,
     values: BTreeMap<String, Value>,
 }
 
@@ -334,6 +385,8 @@ impl PlanView {
                 run: run.index + 1,
                 seed: run.scenario.sim.seed,
                 sample: run.sample.map(|k| k + 1),
+                course_seed: run.course_seed,
+                gates: run.gates,
                 values: sweep
                     .value_keys
                     .iter()
@@ -564,6 +617,8 @@ fn first_difference(disk: &SweepFile, planned: &SweepFile) -> Option<&'static st
         ("min_separation_m", disk.min_separation_m == planned.min_separation_m),
         ("min_alt_hae_m", disk.min_alt_hae_m == planned.min_alt_hae_m),
         ("perturb", disk.perturb == planned.perturb),
+        ("course_seed_mode", disk.course_seed_mode == planned.course_seed_mode),
+        ("gates", disk.gates == planned.gates),
     ]
     .into_iter()
     .find(|(_, same)| !same)
@@ -625,6 +680,8 @@ fn read_saved(catalogs: &Catalogs, name: &str) -> Result<SavedSweep, Refusal> {
         run_timeout_s: file.run_timeout_s,
         jobs: file.jobs,
         check_trim: false,
+        course_seed_mode: file.course_seed_mode,
+        gates: file.gates,
     };
     let cannot_edit = |why: &str| {
         unprocessable(format!(

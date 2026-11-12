@@ -57,7 +57,7 @@ use crate::catalogs::Catalogs;
 use crate::export::export_bag;
 use crate::runs::{new_run_dir, now_ms, utc_stamp};
 use crate::server::AppState;
-use crate::sweeps::{resolve, SweepInputError, SweepRequest};
+use crate::sweeps::{check_courses, resolve, SweepInputError, SweepRequest};
 use crate::ExportDoc;
 
 /// Longest sweep id, in characters.
@@ -88,6 +88,8 @@ pub struct SweepRunsConfig {
     pub dir: PathBuf,
     /// The `astrum-sim` binary process-mode runs fly on.
     pub sim: PathBuf,
+    /// The `astrum-race` binary a race sweep's runs fly on.
+    pub race: PathBuf,
     /// Run N (1-based) of a process-mode sweep listens on
     /// `tcp/127.0.0.1:<base_port + N - 1>`.
     pub base_port: u16,
@@ -449,9 +451,9 @@ impl SweepRuns {
     fn start_blocking(&self, req: SweepRequest, catalogs: &Catalogs) -> Result<SweepView, Refusal> {
         admit(&self.lock())?;
         let resolved = resolve(&req, catalogs)?;
-        let sweep =
-            Sweep::plan_scenario(resolved.file, resolved.scenario, &req.scenario, Purpose::Sweep)
-                .map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+        let sweep = Sweep::plan_base(resolved.file, resolved.base, &req.scenario, Purpose::Sweep)
+            .map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+        check_courses(&sweep).map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
         let _starting = self.begin()?;
         self.launch(&req, sweep)
     }
@@ -470,13 +472,18 @@ impl SweepRuns {
     /// sweep on disk and not in memory.
     fn launch(&self, req: &SweepRequest, mut sweep: Sweep) -> Result<SweepView, Refusal> {
         let cfg = &self.0.cfg;
+        let (bin_name, bin) = if sweep.course.is_some() {
+            ("astrum-race", cfg.race.clone())
+        } else {
+            ("astrum-sim", cfg.sim.clone())
+        };
         if !sweep.in_process() {
-            if !cfg.sim.exists() {
+            if !bin.exists() {
                 return Err(refuse(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!(
-                        "no astrum-sim at {} (build it: cargo build -p astrum-sim)",
-                        cfg.sim.display()
+                        "no {bin_name} at {} (build it: cargo build -p {bin_name})",
+                        bin.display()
                     ),
                 ));
             }
@@ -579,7 +586,7 @@ impl SweepRuns {
             sweep,
             stop,
             children: self.0.children.clone(),
-            sim: cfg.sim.clone(),
+            sim: bin,
             base_port: cfg.base_port,
             done: done_tx,
         };

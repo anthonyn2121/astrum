@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::scenario::Scenario;
-use crate::sweep::{parse_stopped_line, Outcome, Run, Status, Sweep};
+use crate::sweep::{parse_stopped_line, scenario_toml, Outcome, Run, Status, Sweep};
 use crate::systems::StopRequested;
 
 /// How long processes get to exit after a stop before they are killed.
@@ -558,13 +558,27 @@ pub struct Companion {
     pub announce: Option<String>,
 }
 
+/// What makes a run a race: the scenario's `[course]` table, written after the
+/// scenario for the race binary, and the seed that binary draws the course from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CourseLaunch {
+    pub table: toml::Table,
+    /// Passed as `--seed`; `None`: the race binary's own rule (`course.seed`,
+    /// else `sim.seed`). Not passed when the table lists its gates
+    /// (`[[course.gate]]`): the binary refuses a seed that would do nothing.
+    pub seed: Option<u64>,
+}
+
 /// Everything one [`LiveRun`] starts.
 #[derive(Clone)]
 pub struct LiveSpec {
-    /// The `astrum-sim` binary.
+    /// The `astrum-sim` binary (`astrum-race` for a race, see `course`).
     pub sim: PathBuf,
     /// The complete scenario the sim flies.
     pub scenario: Scenario,
+    /// A race: its `[course]` is appended to the scenario file and its seed
+    /// passed to the binary. `sim` must then be `astrum-race`.
+    pub course: Option<CourseLaunch>,
     /// Where to write the scenario for the sim (kept); `None`: a temporary
     /// file, removed when the run ends.
     pub scenario_file: Option<PathBuf>,
@@ -630,9 +644,10 @@ impl LiveRun {
     /// the grace period).
     pub fn start(spec: LiveSpec, children: &Children) -> Result<Self, StartError> {
         let started = Instant::now();
+        let scenario_text = scenario_toml(&spec.scenario, spec.course.as_ref().map(|c| &c.table));
         let (scenario_path, temp) = match &spec.scenario_file {
             Some(path) => {
-                std::fs::write(path, spec.scenario.to_toml())
+                std::fs::write(path, &scenario_text)
                     .map_err(|e| StartError::Setup(format!("writing {}: {e}", path.display())))?;
                 (path.clone(), None)
             }
@@ -643,7 +658,7 @@ impl LiveRun {
                     .suffix(".toml")
                     .tempfile_in(&dir)
                     .map_err(|e| StartError::Setup(format!("writing {}: {e}", dir.display())))?;
-                temp.write_all(spec.scenario.to_toml().as_bytes()).map_err(|e| {
+                temp.write_all(scenario_text.as_bytes()).map_err(|e| {
                     StartError::Setup(format!("writing {}: {e}", temp.path().display()))
                 })?;
                 (temp.path().to_owned(), Some(temp))
@@ -654,6 +669,11 @@ impl LiveRun {
 
         let mut sim_cmd = Command::new(&spec.sim);
         sim_cmd.arg(&scenario_path).args(["--listen", &spec.listen]);
+        if let Some(course) = spec.course.as_ref().filter(|c| !c.table.contains_key("gate")) {
+            if let Some(seed) = course.seed {
+                sim_cmd.arg("--seed").arg(seed.to_string());
+            }
+        }
         if let Some(bag) = &spec.record {
             sim_cmd.arg("--record").arg(bag);
         }
@@ -812,7 +832,7 @@ pub struct ProcessCtx<'a> {
     pub sweep: &'a Sweep,
     /// The sweep's output directory: every run's scenario, bag and logs.
     pub out: &'a Path,
-    /// The `astrum-sim` binary.
+    /// The `astrum-sim` binary; `astrum-race` for a race sweep ([`Sweep::course`]).
     pub sim: &'a Path,
     /// Run N listens on `tcp/127.0.0.1:<base_port + N - 1>`.
     pub base_port: u16,
@@ -831,6 +851,7 @@ pub fn run_processes(ctx: &ProcessCtx, run: &Run) -> Outcome {
     let spec = LiveSpec {
         sim: ctx.sim.to_owned(),
         scenario: run.scenario.clone(),
+        course: ctx.sweep.course.clone().map(|table| CourseLaunch { table, seed: run.course_seed }),
         scenario_file: Some(ctx.out.join(format!("{stem}.toml"))),
         record: Some(ctx.out.join(format!("{stem}.mcap"))),
         companions: Vec::new(),

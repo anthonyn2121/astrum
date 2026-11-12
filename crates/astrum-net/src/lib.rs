@@ -20,6 +20,10 @@
 //! * **Tick end** — after a tick's telemetry and events the sim publishes one
 //!   [`TickEnd`] on `astrum/tick` ([`TickPublisher`]); [`TickReceiver`] keeps
 //!   the newest.
+//! * **Race** — a race run publishes each aircraft's [`RaceCourse`] on
+//!   `astrum/race/course/<id>` and its [`RaceState`] on `astrum/race/state/<id>`
+//!   ([`RacePublisher`], latest-value QoS); [`RaceSubscriber`] hands out the newest
+//!   of each. Its gate events travel on `astrum/events`.
 //! * **Scenario** — the sim answers `get astrum/scenario` with its scenario TOML
 //!   ([`ScenarioServer`] / [`fetch_scenario`]), so recorders can embed it.
 //! * **Presence** — a controller announces itself with a liveliness token
@@ -66,10 +70,13 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use astrum_proto::{
-    decode_command, decode_event, decode_telemetry, decode_tick_end, encode_command,
-    encode_telemetry, encode_tick_end,
+    decode_command, decode_event, decode_race_course, decode_race_state, decode_telemetry,
+    decode_tick_end, encode_command, encode_race_course, encode_race_state, encode_telemetry,
+    encode_tick_end,
 };
-pub use astrum_proto::{Command, Control, Event, EventKind, Telemetry, TickEnd};
+pub use astrum_proto::{
+    Command, Control, Event, EventKind, RaceCourse, RaceState, Telemetry, TickEnd,
+};
 use zenoh::handlers::FifoChannelHandler;
 use zenoh::pubsub::{Publisher, Subscriber};
 use zenoh::query::Queryable;
@@ -106,6 +113,10 @@ pub mod keys {
     pub const CONTROL_ALL: &str = "astrum/control/*";
     /// The sim's run status as JSON (queryable).
     pub const STATUS: &str = "astrum/status";
+    /// `astrum/race/course/<id>`: the race course aircraft `<id>` flies.
+    pub const RACE_COURSE_PREFIX: &str = "astrum/race/course";
+    /// `astrum/race/state/<id>`: aircraft `<id>`'s race progress.
+    pub const RACE_STATE_PREFIX: &str = "astrum/race/state";
 
     pub fn telemetry(id: u32) -> String {
         format!("{TELEMETRY_PREFIX}/{id}")
@@ -117,6 +128,14 @@ pub mod keys {
 
     pub fn alive(id: u32) -> String {
         format!("{ALIVE_PREFIX}/{id}")
+    }
+
+    pub fn race_course(id: u32) -> String {
+        format!("{RACE_COURSE_PREFIX}/{id}")
+    }
+
+    pub fn race_state(id: u32) -> String {
+        format!("{RACE_STATE_PREFIX}/{id}")
     }
 
     /// The id in `<prefix>/<id>`, or `None` if `key` is not of that form.
@@ -958,6 +977,110 @@ impl TickReceiver {
         }
         self.seen_generation = st.generation;
         Ok(st.latest.expect("a generation bump stores a tick end"))
+    }
+}
+
+// --- Race -----------------------------------------------------------------------
+
+/// Sim-side publisher of one aircraft's race messages: [`RaceCourse`] on
+/// `astrum/race/course/<id>` and [`RaceState`] on `astrum/race/state/<id>`. Both are
+/// latest-value state (the ASTRUM [`qos`]: drop, express, `InteractiveHigh`).
+pub struct RacePublisher {
+    course: Publisher<'static>,
+    state: Publisher<'static>,
+}
+
+impl RacePublisher {
+    pub fn new(session: &Session, aircraft_id: u32) -> Result<Self> {
+        Ok(Self {
+            course: session.declare_publisher(keys::race_course(aircraft_id))?,
+            state: session.declare_publisher(keys::race_state(aircraft_id))?,
+        })
+    }
+
+    pub fn publish_course(&self, c: &RaceCourse) -> Result<()> {
+        self.course.put(encode_race_course(c)).wait().map_err(zerr)
+    }
+
+    pub fn publish_state(&self, s: &RaceState) -> Result<()> {
+        self.state.put(encode_race_state(s)).wait().map_err(zerr)
+    }
+}
+
+/// The newest decoded message of one race stream, until taken.
+struct Latest<T> {
+    value: Mutex<LatestValue<T>>,
+}
+
+struct LatestValue<T> {
+    value: Option<T>,
+    decode_errors: u64,
+}
+
+impl<T: Send + 'static> Latest<T> {
+    /// Subscribe to `key`, decoding each payload on Zenoh's receive thread.
+    fn subscribe(
+        session: &Session,
+        key: String,
+        decode: fn(&[u8]) -> Result<T, astrum_proto::DecodeError>,
+    ) -> Result<(Arc<Self>, Subscriber<()>)> {
+        let shared =
+            Arc::new(Self { value: Mutex::new(LatestValue { value: None, decode_errors: 0 }) });
+        let sink = Arc::clone(&shared);
+        let sub = session
+            .z
+            .declare_subscriber(key)
+            .callback(move |sample: Sample| {
+                let decoded = decode(&sample.payload().to_bytes());
+                let mut slot = sink.state();
+                match decoded {
+                    Ok(v) => slot.value = Some(v),
+                    Err(_) => slot.decode_errors += 1,
+                }
+            })
+            .wait()
+            .map_err(zerr)?;
+        Ok((shared, sub))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, LatestValue<T>> {
+        self.value.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn take(&self) -> Option<T> {
+        self.state().value.take()
+    }
+}
+
+/// Subscriber of one aircraft's race messages. Each `try_recv_*` returns the newest
+/// message that arrived since the previous call (latest wins), else `None`.
+pub struct RaceSubscriber {
+    course: Arc<Latest<RaceCourse>>,
+    state: Arc<Latest<RaceState>>,
+    _course_sub: Subscriber<()>,
+    _state_sub: Subscriber<()>,
+}
+
+impl RaceSubscriber {
+    pub fn new(session: &Session, aircraft_id: u32) -> Result<Self> {
+        let (course, _course_sub) =
+            Latest::subscribe(session, keys::race_course(aircraft_id), decode_race_course)?;
+        let (state, _state_sub) =
+            Latest::subscribe(session, keys::race_state(aircraft_id), decode_race_state)?;
+        Ok(Self { course, state, _course_sub, _state_sub })
+    }
+
+    pub fn try_recv_course(&self) -> Option<RaceCourse> {
+        self.course.take()
+    }
+
+    pub fn try_recv_state(&self) -> Option<RaceState> {
+        self.state.take()
+    }
+
+    /// Race payloads (course and state) that failed to decode so far.
+    pub fn decode_errors(&self) -> u64 {
+        self.course.state().decode_errors + self.state.state().decode_errors
     }
 }
 

@@ -1,48 +1,70 @@
-//! `astrum-race` binary entrypoint.
+//! `astrum-race` binary: load a race scenario, fix its course, and run it as an
+//! `astrum-sim` run — the Zenoh bridge (telemetry out, commands in, controller
+//! presence, the control plane, the scenario queryable), optional recording to an
+//! MCAP bag, signals ending the run cleanly — plus the race's own course and state
+//! on `astrum/race/*`. Every startup failure is fatal.
 //!
-//! Loads a race scenario, randomizes the gate course from its seed, and either
-//! prints the course (`--dump-course`) or flies it, serving telemetry + race state
-//! over Zenoh and taking commands back. All the app-building and system logic lives
-//! in the `astrum_race` library, where the integration tests exercise it; this file
-//! is only the process wiring: scenario load, session open, `run()`.
+//! The scenario served and recorded is the *resolved* one: every gate explicit, the
+//! course seed spelled out (see `ResolvedRace::to_toml`).
 
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::atomic::Ordering;
 
-use astrum_net::Session;
+use astrum_net::{ScenarioServer, Session};
 use astrum_race::course::Course;
-use astrum_race::scenario::RaceScenario;
-use astrum_race::{build_app_with_course, generate_course};
-use bevy::prelude::App;
+use astrum_race::{build_race_app, RaceScenario};
+use astrum_sim::components::{SimClock, SimParams};
+use astrum_sim::sweep::stopped_line;
+use astrum_sim::systems::StopRequested;
+use astrum_sim::{record, run_to_exit, RunMode};
+use bevy::prelude::*;
 use clap::Parser;
 
-/// Headless drone-racing environment: an F450 quadrotor and a Monte-Carlo
-/// randomized gate course.
+/// Headless drone-racing environment: an F450 quadrotor, a gate course, and the
+/// astrum-sim bus.
 #[derive(Parser)]
 #[command(name = "astrum-race", version, about)]
 struct Cli {
-    /// Race scenario TOML (world origin, sim rate, drone, course envelope).
-    #[arg(env = "ASTRUM_RACE_SCENARIO", default_value = "config/race.toml")]
+    /// Race scenario TOML (an astrum-sim scenario plus a `[course]` table).
+    #[arg(env = "ASTRUM_SCENARIO", default_value = "config/scenario.race.toml")]
     scenario: PathBuf,
 
-    /// Override `sim.seed` — a different seed is a different course.
+    /// Zenoh endpoint to listen on.
+    #[arg(long, env = "ASTRUM_ZENOH_LISTEN", default_value_t = astrum_net::DEFAULT_LISTEN_ENDPOINT.to_string())]
+    listen: String,
+
+    /// Course seed, overriding `course.seed` / `sim.seed`: a different seed is a
+    /// different course. Not valid with explicit `[[course.gate]]`.
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Override `course.gates`.
+    /// Override `course.gates` (the number of sampled gates).
     #[arg(long)]
     gates: Option<u32>,
 
-    /// Print the sampled course and exit, without touching JSBSim. Handy for
-    /// eyeballing what a seed draws, and for feeding a track to a renderer.
+    /// Print the course and exit, without touching JSBSim or the network. Handy for
+    /// eyeballing what a seed draws.
     #[arg(long)]
     dump_course: bool,
 
-    /// Zenoh endpoint to listen on: telemetry + race state out, commands in.
-    #[arg(long, env = "ASTRUM_RACE_LISTEN", default_value_t = astrum_net::DEFAULT_LISTEN_ENDPOINT.to_string())]
-    listen: String,
+    /// FDM stepping threads, overriding `sim.threads` (0 = all cores).
+    #[arg(long, env = "ASTRUM_THREADS")]
+    threads: Option<usize>,
 
-    /// Run with no transport at all — physics only, nothing published, no port
-    /// bound. Useful when the combat sim already holds the default endpoint.
+    /// Pace as a multiple of real time, overriding `sim.speed` (1 = real time,
+    /// 0 = as fast as the host allows).
+    #[arg(long, env = "ASTRUM_SPEED")]
+    speed: Option<f64>,
+
+    /// Record every tick's telemetry, the commands received and the events
+    /// (gates passed, crashes, the end) to this MCAP bag, with the resolved
+    /// scenario as its metadata.
+    #[arg(long, env = "ASTRUM_RECORD")]
+    record: Option<PathBuf>,
+
+    /// Run with no transport at all: nothing published, no port bound (a recording
+    /// still works). For physics-only runs.
     #[arg(long)]
     no_net: bool,
 }
@@ -74,54 +96,130 @@ fn dump(course: &Course) {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut scenario = match RaceScenario::load(&cli.scenario) {
-        Ok(s) => s,
+    let mut race = match RaceScenario::load(&cli.scenario) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("[astrum-race] scenario error: {e}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
-    if let Some(seed) = cli.seed {
-        scenario.sim.seed = seed;
+    if let Some(n) = cli.threads {
+        race.sim.sim.threads = n;
+    }
+    if let Some(speed) = cli.speed {
+        race.sim.sim.speed = speed;
     }
     if let Some(gates) = cli.gates {
-        scenario.course.gates = gates;
+        if !race.course.gates.is_empty() {
+            eprintln!(
+                "[astrum-race] --gates has no effect on a scenario with explicit [[course.gate]]"
+            );
+            return ExitCode::FAILURE;
+        }
+        race.course.params.gates = gates;
     }
-
-    let course = match generate_course(&scenario) {
-        Ok(c) => c,
+    let resolved = match race.course.validate().and_then(|()| {
+        race.sim.validate()?;
+        race.resolve(cli.seed)
+    }) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("[astrum-race] {e}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
-
     if cli.dump_course {
-        dump(&course);
-        return;
+        dump(&resolved.course);
+        return ExitCode::SUCCESS;
     }
 
-    let mut app = build_app_with_course(scenario, course);
-    if !cli.no_net {
-        install_net(&mut app, &cli.listen);
-    }
-    app.run();
-}
-
-/// Open the Zenoh session on `listen` and activate the bridge systems.
-///
-/// A failure to open is logged, not fatal: the environment still flies, just with
-/// nothing published and no commands accepted. That matters because the default
-/// endpoint is the *same* one `astrum-sim` listens on — running a race alongside a
-/// combat sim degrades to a silent race rather than an exit.
-fn install_net(app: &mut App, listen: &str) {
-    match Session::listen(listen) {
-        Ok(session) => {
-            println!("[astrum-race] zenoh session listening: {listen}");
-            astrum_race::net::install(app, &session);
+    let scenario_toml = resolved.to_toml();
+    let session = if cli.no_net {
+        None
+    } else {
+        match Session::listen(&cli.listen) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("[astrum-race] zenoh listen {} failed: {e}", cli.listen);
+                return ExitCode::FAILURE;
+            }
         }
-        Err(e) => eprintln!("[astrum-race] zenoh listen {listen} failed: {e} — flying offline"),
+    };
+    let recording = match &cli.record {
+        Some(path) => match record::start(path, &scenario_toml) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("[astrum-race] cannot record to {}: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let stop = StopRequested::default();
+    let flag = stop.0.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        if flag.swap(true, Ordering::Relaxed) {
+            std::process::exit(130); // second signal: give up on a clean exit
+        }
+    }) {
+        eprintln!("[astrum-race] cannot install the signal handler: {e}");
+        return ExitCode::FAILURE;
     }
+    let speed = resolved.scenario.sim.speed;
+    let mut app = build_race_app(resolved, RunMode::Server);
+    let _scenario_server = match &session {
+        Some(session) => {
+            let served = ScenarioServer::serve(session, scenario_toml).and_then(|server| {
+                astrum_sim::net::connect(&mut app, session)?;
+                astrum_race::net::connect(&mut app, session)?;
+                Ok(server)
+            });
+            match served {
+                Ok(server) => {
+                    println!("[astrum-race] zenoh session listening: {}", cli.listen);
+                    Some(server)
+                }
+                Err(e) => {
+                    eprintln!("[astrum-race] zenoh setup failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+    match speed {
+        s if s > 0.0 => println!("[astrum-race] pace: {s}× real time"),
+        _ => println!("[astrum-race] pace: unpaced (as fast as possible)"),
+    }
+    app.insert_resource(stop);
+    let (recorder, recording) = recording.unzip();
+    if let Some(r) = recorder {
+        app.insert_resource(r);
+    }
+    let started = std::time::Instant::now();
+    let mut code = match run_to_exit(&mut app) {
+        AppExit::Success => ExitCode::SUCCESS,
+        AppExit::Error(code) => ExitCode::from(code.get()),
+    };
+    let sim_s = app.world().resource::<SimClock>().time_s(app.world().resource::<SimParams>());
+    let wall_s = started.elapsed().as_secs_f64();
+    println!("{}", stopped_line(app.world().resource::<SimClock>().tick, sim_s, wall_s));
+    // Dropping the app drops the recorder, closing the queue `finish` waits on.
+    drop(app);
+    if let Some(recording) = recording {
+        let path = recording.path().display().to_string();
+        match recording.finish() {
+            Ok(s) => println!(
+                "[astrum-race] recorded {} telemetry, {} command, {} event messages → {path}",
+                s.telemetry, s.commands, s.events
+            ),
+            Err(e) => {
+                eprintln!("[astrum-race] recording {path} failed: {e}");
+                code = ExitCode::FAILURE;
+            }
+        }
+    }
+    code
 }

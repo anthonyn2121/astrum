@@ -12,11 +12,12 @@ use std::sync::Mutex;
 
 use astrum_bag::{BagReader, TopicKind};
 use astrum_geo::{Geodetic, LocalFrame};
-use astrum_sim::catalog::METRICS;
+use astrum_sim::catalog::{METRICS, RACE_METRICS};
 use astrum_sim::perturb::{self, Axis, Group, Offset};
 use astrum_sim::scenario::Scenario;
 use astrum_sim::sweep::{
-    execute, run_in_process, Outcome, Purpose, RunEvent, Status, Sweep, SweepFile,
+    execute, run_in_process, scenario_toml, Base, CourseSeedMode, Outcome, Purpose, RunEvent,
+    Status, Sweep, SweepFile,
 };
 use astrum_sim::systems::StopRequested;
 
@@ -752,4 +753,215 @@ fn an_earlier_sweeps_bag_never_passes_for_a_run_that_recorded_none() {
     let end_reason = rows[0].iter().position(|h| h == "end_reason").unwrap();
     assert!(rows[1][1].starts_with("failed"), "{:?}", rows[1]);
     assert!(rows[1][end_reason..].iter().all(String::is_empty), "{:?}", rows[1]);
+}
+
+// --- Race sweeps -----------------------------------------------------------------
+
+/// [`BASE`] with a `[course]` (the race binary draws a course from it; this
+/// crate only carries it).
+fn race_base(course: &str) -> String {
+    format!("{BASE}\n[course]\n{course}")
+}
+
+#[test]
+fn a_scenario_file_with_a_course_is_split_and_written_back() {
+    let text = race_base("gates = 4\nseed = 9\n[[course.gate]]\nindex = 0\n");
+    let base = Base::from_toml_str(&text).unwrap();
+    assert_eq!(base.scenario, Scenario::from_toml_str(BASE).unwrap());
+    let course = base.course.as_ref().unwrap();
+    assert_eq!(course["gates"].as_integer(), Some(4));
+    assert_eq!(course["gate"].as_array().unwrap().len(), 1);
+    assert_eq!(base.course_seed().unwrap(), Some(9));
+    // The text reads back as the same base; a plain scenario has none.
+    assert_eq!(Base::from_toml_str(&base.to_toml()).unwrap(), base);
+    assert_eq!(scenario_toml(&base.scenario, None), base.scenario.to_toml());
+    let plain = Base::from_toml_str(BASE).unwrap();
+    assert_eq!((plain.course, plain.scenario.sim.seed), (None, 40));
+
+    for (course, needle) in [
+        ("seed = -1\n", "course.seed must be a non-negative integer"),
+        ("seed = \"x\"\n", "course.seed must be a non-negative integer"),
+    ] {
+        let e = Base::from_toml_str(&race_base(course)).unwrap_err().to_string();
+        assert!(e.contains(needle), "{e}");
+    }
+    let e = Base::from_toml_str(&format!("course = 3\n{BASE}")).unwrap_err().to_string();
+    assert!(e.contains("course must be a table"), "{e}");
+    // Anything else unknown is still an error: only `[course]` is set aside.
+    let e = Base::from_toml_str(&format!("{BASE}\n[extra]\nx = 1\n")).unwrap_err().to_string();
+    assert!(e.contains("extra"), "{e}");
+}
+
+fn race_seeds(sweep: &Sweep) -> Vec<(u64, Option<u64>)> {
+    sweep.runs.iter().map(|r| (r.scenario.sim.seed, r.course_seed)).collect()
+}
+
+#[test]
+fn a_race_sweeps_course_seed_is_fixed_or_moves_with_the_repeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let course_from_sim_seed = race_base("gates = 4\n");
+    let fixed = plan_on(dir.path(), &course_from_sim_seed, "repeats = 3").unwrap();
+    // No `course.seed`: the base `sim.seed` (40) is the course seed in every run, while
+    // `sim.seed` itself moves with the repeat.
+    assert_eq!(
+        race_seeds(&fixed),
+        [(40, Some(40)), (41, Some(40)), (42, Some(40))],
+        "fixed is the default"
+    );
+    let explicit =
+        plan_on(dir.path(), &course_from_sim_seed, "repeats = 3\ncourse_seed_mode = \"fixed\"")
+            .unwrap();
+    assert_eq!(race_seeds(&explicit), race_seeds(&fixed));
+    let random =
+        plan_on(dir.path(), &course_from_sim_seed, "repeats = 3\ncourse_seed_mode = \"randomize\"")
+            .unwrap();
+    assert_eq!(race_seeds(&random), [(40, Some(40)), (41, Some(41)), (42, Some(42))]);
+
+    // `course.seed` is the base course seed when there is one, whatever `sim.seed` is.
+    let own = race_base("gates = 4\nseed = 7\n");
+    let fixed = plan_on(dir.path(), &own, "repeats = 2").unwrap();
+    assert_eq!(race_seeds(&fixed), [(40, Some(7)), (41, Some(7))]);
+    let random =
+        plan_on(dir.path(), &own, "repeats = 2\ncourse_seed_mode = \"randomize\"").unwrap();
+    assert_eq!(race_seeds(&random), [(40, Some(7)), (41, Some(8))]);
+
+    // A grid point's `sim.seed` is its base course seed (a seed per point, a course per seed).
+    let by_point = plan_on(
+        dir.path(),
+        &course_from_sim_seed,
+        "repeats = 2\ncourse_seed_mode = \"randomize\"\n[vary]\n\"sim.seed\" = [100, 200]",
+    )
+    .unwrap();
+    assert_eq!(
+        race_seeds(&by_point),
+        [(100, Some(100)), (101, Some(101)), (200, Some(200)), (201, Some(201))]
+    );
+    // An ordinary scenario has no course seed.
+    let plain = plan(dir.path(), "repeats = 2").unwrap();
+    assert_eq!(race_seeds(&plain), [(40, None), (41, None)]);
+    assert!(plain.course.is_none() && plain.in_process());
+}
+
+#[test]
+fn a_race_sweep_flies_as_processes_and_refuses_what_a_course_makes_meaningless() {
+    let dir = tempfile::tempdir().unwrap();
+    let race = race_base("gates = 4\n");
+    let sweep = plan_on(dir.path(), &race, "").unwrap();
+    assert!(!sweep.in_process(), "no controllers, yet a race has no in-process executor");
+    assert_eq!(sweep.course.as_ref().unwrap()["gates"].as_integer(), Some(4));
+    let stop = StopRequested::default();
+    let outcome = run_in_process(&sweep.runs[0], Path::new("unused.mcap"), &stop);
+    let Status::Failed(why) = outcome.status else { panic!("{outcome:?}") };
+    assert!(why.contains("astrum-race process"), "{why}");
+
+    let offsets = "a race starts from its course";
+    for (body, needle) in [
+        ("[vary]\n\"aircraft.7.offset.east_m\" = [0.0, 1.0]", offsets),
+        ("[set]\n\"aircraft.7.offset.east_m\" = 1.0", offsets),
+        ("samples = 2\n[[perturb]]\naircraft = [7]\nup_m = { uniform = 1.0 }", offsets),
+    ] {
+        let e = plan_on(dir.path(), &race, body).unwrap_err();
+        assert!(e.contains(needle), "{body}: {e}");
+    }
+    let e = plan_on(dir.path(), BASE, "course_seed_mode = \"fixed\"").unwrap_err();
+    assert!(e.contains("needs a race scenario"), "{e}");
+    let gated = race_base("[[course.gate]]\nindex = 0\n");
+    let e = plan_on(dir.path(), &gated, "course_seed_mode = \"randomize\"").unwrap_err();
+    assert!(e.contains("lists its gates"), "{e}");
+    plan_on(dir.path(), &gated, "course_seed_mode = \"fixed\"").unwrap();
+    // `speed`-less sweeps with a controller: a race needs lockstep like any run.
+    let e = plan_on(dir.path(), &race, "controllers = [\"x\"]").unwrap_err();
+    assert!(e.contains("lockstep"), "{e}");
+}
+
+#[test]
+fn the_course_seed_mode_round_trips_through_the_sweep_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut file = SweepFile::for_scenario(base_file(dir.path(), &race_base("gates = 4\n")).into());
+    file.course_seed_mode = Some(CourseSeedMode::Randomize);
+    let text = file.to_toml().unwrap();
+    assert!(text.contains("course_seed_mode = \"randomize\""), "{text}");
+    assert_eq!(toml::from_str::<SweepFile>(&text).unwrap(), file);
+    file.course_seed_mode = None;
+    assert!(!file.to_toml().unwrap().contains("course_seed_mode"));
+}
+
+fn header_of(summary: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(summary).unwrap();
+    text.lines().next().unwrap().split(',').map(str::to_owned).collect()
+}
+
+#[test]
+fn the_summary_of_a_race_sweep_has_the_course_seed_and_the_race_metrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let stop = StopRequested::default();
+    let finished = |_: &_| Outcome { status: Status::Ok, sim_time_s: Some(1.0), wall_s: 0.1 };
+    let mut race = plan_on(
+        dir.path(),
+        &race_base("gates = 4\n"),
+        "repeats = 2\ncourse_seed_mode = \"randomize\"",
+    )
+    .unwrap();
+    race.out = dir.path().join("race-out");
+    execute(&race, 1, &stop, |_| {}, finished).unwrap();
+    let mut want: Vec<&str> = vec![
+        "run",
+        "status",
+        "seed",
+        "course_seed",
+        "gates",
+        "sim_time_s",
+        "wall_s",
+        "speed_x",
+        "bag",
+    ];
+    want.extend(METRICS.iter().filter(|id| **id != "sim_time_s"));
+    want.extend(RACE_METRICS);
+    assert_eq!(header_of(&race.out.join("summary.csv")), want);
+    let rows = std::fs::read_to_string(race.out.join("summary.csv")).unwrap();
+    let cells: Vec<Vec<&str>> = rows.lines().skip(1).map(|l| l.split(',').collect()).collect();
+    assert_eq!(
+        cells.iter().map(|c| (c[2], c[3], c[4])).collect::<Vec<_>>(),
+        [("40", "40", "4"), ("41", "41", "4")]
+    );
+
+    // An ordinary sweep's summary is unchanged: no course seed, no race metrics.
+    let mut plain = plan(dir.path(), "repeats = 2").unwrap();
+    plain.out = dir.path().join("plain-out");
+    execute(&plain, 1, &stop, |_| {}, finished).unwrap();
+    let header = header_of(&plain.out.join("summary.csv"));
+    assert!(!header.iter().any(|h| h == "course_seed" || h == "gates_passed"), "{header:?}");
+}
+
+#[test]
+fn a_race_sweeps_gate_count_overrides_the_scenarios_and_reaches_every_runs_course() {
+    let dir = tempfile::tempdir().unwrap();
+    let race = race_base("gates = 4\n");
+    let from_scenario = plan_on(dir.path(), &race, "repeats = 2").unwrap();
+    assert_eq!(from_scenario.runs.iter().map(|r| r.gates).collect::<Vec<_>>(), [Some(4); 2]);
+    let sweep = plan_on(dir.path(), &race, "repeats = 2\ngates = 12").unwrap();
+    assert_eq!(sweep.runs.iter().map(|r| r.gates).collect::<Vec<_>>(), [Some(12); 2]);
+    // The course table every run is written with says so.
+    assert_eq!(sweep.course.as_ref().unwrap()["gates"].as_integer(), Some(12));
+    // A scenario that leaves the count to the envelope has none to report.
+    let open = plan_on(dir.path(), &race_base("seed = 3\n"), "").unwrap();
+    assert_eq!(open.runs[0].gates, None);
+    let set = plan_on(dir.path(), &race_base("seed = 3\n"), "gates = 2").unwrap();
+    assert_eq!(set.runs[0].gates, Some(2));
+
+    for (body, needle) in [("gates = 1", "gates must be 2..=64, got 1"), ("gates = 65", "got 65")] {
+        let e = plan_on(dir.path(), &race, body).unwrap_err();
+        assert!(e.contains(needle), "{body}: {e}");
+    }
+    let e = plan_on(dir.path(), BASE, "gates = 4").unwrap_err();
+    assert!(e.contains("gates needs a race scenario"), "{e}");
+    let e =
+        plan_on(dir.path(), &race_base("[[course.gate]]\nindex = 0\n"), "gates = 4").unwrap_err();
+    assert!(e.contains("lists its gates"), "{e}");
+
+    let mut file = SweepFile::for_scenario(base_file(dir.path(), &race).into());
+    file.gates = Some(12);
+    let text = file.to_toml().unwrap();
+    assert!(text.contains("gates = 12"), "{text}");
+    assert_eq!(toml::from_str::<SweepFile>(&text).unwrap(), file);
 }

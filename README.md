@@ -331,7 +331,10 @@ embedded env.
 | `kill` | `victim_id`, `killer_id` (shooter of the last hit; `null` if none), `pos_enu` | an aircraft is destroyed |
 | `mode-change` | `aircraft_id`, `from`, `to` (control modes), `reason` (`command`, `lease-expired`, `controller-lost`) | an aircraft's `controlMode` changes |
 | `controller-up` / `controller-down` | `aircraft_id` | a controller's presence token appears / goes away |
-| `run-ended` | `reason` (`max-time`, `engagement-decided`, `fatal`, `stopped`), `message` (the fatal error) | the run ends (binary and sweep runs, not the embedded env) |
+| `run-ended` | `reason` (`max-time`, `engagement-decided`, `fatal`, `stopped`, `race-complete`, `crashed`), `message` (the fatal error) | the run ends (binary and sweep runs, not the embedded env) |
+| `gate-passed` | `aircraft_id`, `gate`, `offset_x_m`, `offset_y_m` (the CG's position in the gate's `right` / `up` axes) | a race aircraft's CG crosses a gate's opening (race runs only) |
+| `gate-missed` | `aircraft_id`, `gate` | a race aircraft crosses a gate's plane outside its opening, or skips it |
+| `crashed` | `aircraft_id`, `outcome` (`crashed-ground`, `crashed-gate`, `timed-out`, `spawn-failed`), `gate` (the gate hit, or the one it was flying to) | a race aircraft crashes or its race otherwise fails |
 
 Every event carries `tick` and `sim_time_s`: the tick is the `Telemetry.tick` that first shows it,
 so a kill lines up with the first frame in which the victim is dead (while paused, the current

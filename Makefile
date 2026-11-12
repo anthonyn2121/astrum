@@ -20,7 +20,7 @@ export UID GID
 
 .DEFAULT_GOAL := help
 .PHONY: help dev build down ps clean verify fmt fmt-check lint test test-rust test-cpp \
-        test-python wire-fixtures deny bench smoke ci
+        test-python wire-fixtures deny bench smoke race race-course race-offline ci
 
 # Run a bash script: in place inside the dev container, else in a fresh one
 # (no TTY): $(IN) '<bash script>'.
@@ -37,6 +37,12 @@ HOST_ONLY = $(if $(filter 1,$(ASTRUM_DEV)),$(error make $@ runs on the host, not
 # Hand-written sources from git (see scripts/sources.sh), NUL-separated.
 CPP_FILES = bash scripts/sources.sh cpp
 PY_FILES = bash scripts/sources.sh py
+
+# The race scenario `make race*` runs, and (optionally) the course seed and the
+# bag to record, and the gate count: `make race-course SEED=7 GATES=12`,
+# `make race-offline BAG=run.mcap`.
+RACE ?= config/scenario.race.toml
+RACE_RUN = cargo run --release --locked -q -p astrum-race -- $(RACE) $(if $(SEED),--seed $(SEED)) $(if $(GATES),--gates $(GATES))
 
 # The C++ controllers' single CMake project (controllers/CMakeLists.txt).
 CMAKE_CONTROLLERS = cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release
@@ -127,6 +133,15 @@ bench: ## Headless sim throughput (µs/tick, × real time) for fixed fleets and 
 
 smoke: ## Fly every demo (config/demos/*.toml) in lockstep, as fast as possible; fails on the first failing one
 	$(IN) 'bash scripts/smoke.sh'
+
+race: ## Run the race scenario (RACE=, SEED=, GATES=): listens on the bus for a controller, like astrum-sim
+	$(IN) '$(RACE_RUN)'
+
+race-course: ## Print the gates a course seed draws (RACE=, SEED=, GATES=); touches neither JSBSim nor the network
+	$(IN) '$(RACE_RUN) --dump-course'
+
+race-offline: ## Fly the race with no transport, as fast as possible (RACE=, SEED=, GATES=, BAG= to record an MCAP bag)
+	$(IN) '$(RACE_RUN) --no-net --speed 0 $(if $(BAG),--record $(BAG))'
 
 ci: fmt-check lint test deny ## Full gate: fmt-check + lint + all tests + deny (fails on any failure)
 

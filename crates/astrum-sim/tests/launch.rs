@@ -18,8 +18,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use astrum_sim::launch::{
-    connect_endpoint, numbered, run_processes, Children, Companion, ControllerCmd, LiveRun,
-    LiveSpec, Log, LogLine, LogStream, ProcessCtx, StartError,
+    connect_endpoint, numbered, run_processes, Children, Companion, ControllerCmd, CourseLaunch,
+    LiveRun, LiveSpec, Log, LogLine, LogStream, ProcessCtx, StartError,
 };
 use astrum_sim::scenario::Scenario;
 use astrum_sim::sweep::{execute, Outcome, Purpose, RunEvent, Status, Sweep, SweepFile};
@@ -52,6 +52,7 @@ fn spec(sim: PathBuf, log: Log) -> LiveSpec {
     LiveSpec {
         sim,
         scenario: common::single_ship(),
+        course: None,
         scenario_file: None,
         listen: "tcp/0.0.0.0:27600".into(),
         record: None,
@@ -676,4 +677,87 @@ fn astrum_run_stopped_by_ctrl_c_stops_the_sim_cleanly_and_exits_130() {
              [astrum] stopped: {f}: stop requested\n"
         )
     );
+}
+
+fn course_table(text: &str) -> toml::Table {
+    toml::from_str(text).unwrap()
+}
+
+#[test]
+fn a_race_run_writes_the_course_after_the_scenario_and_passes_its_seed() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let sim = script(dir.path(), "race", &format!("echo \"args $@\"\n{STOPPED}"));
+    for (course, seed, seed_arg) in [
+        ("gates = 4", Some(7), " --seed 7"),
+        ("gates = 4", None, ""),
+        // A course that lists its gates is flown as it is: a seed would do nothing.
+        ("[[gate]]\nindex = 0", Some(7), ""),
+    ] {
+        let file = dir.path().join("scenario.toml");
+        let (log, rx) = channel();
+        let mut spec = spec(sim.clone(), log);
+        spec.scenario_file = Some(file.clone());
+        spec.course = Some(CourseLaunch { table: course_table(course), seed });
+        let outcome = LiveRun::start(spec, &Children::new()).unwrap().wait();
+        assert_eq!(outcome.status, Status::Ok);
+        let lines: Vec<String> = rx.try_iter().map(|l| l.line).collect();
+        assert_eq!(
+            lines[0],
+            format!("args {} --listen tcp/0.0.0.0:27600{seed_arg}", file.display()),
+            "{lines:?}"
+        );
+        // The scenario the sim reads, then the `[course]` table, in one file.
+        let written: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(written["course"], toml::Value::Table(course_table(course)));
+        assert_eq!(
+            written["sim"]["rate_hz"],
+            common::single_ship().to_toml().parse::<toml::Table>().unwrap()["sim"]["rate_hz"]
+        );
+        assert_eq!(written["aircraft"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn a_process_mode_race_sweep_run_gets_its_course_and_course_seed() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut scenario = common::single_ship();
+    scenario.sim.max_time_s = 1.0;
+    scenario.sim.seed = 40;
+    let base = dir.path().join("base.toml");
+    std::fs::write(&base, format!("{}\n[course]\ngates = 4\n", scenario.to_toml())).unwrap();
+    let mut file = SweepFile::for_scenario(base);
+    file.repeats = 2;
+    file.speed = Some(1.0);
+    file.course_seed_mode = Some(astrum_sim::sweep::CourseSeedMode::Randomize);
+    file.controllers = vec!["echo ctl {endpoint}".into()];
+    let sweep = Sweep::plan(file, "t", Purpose::Sweep).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let race = script(dir.path(), "race", &format!("echo \"args $@\"\n{STOPPED}"));
+    let stop = StopRequested::default();
+    let children = Children::new();
+    let ctx = ProcessCtx {
+        sweep: &sweep,
+        out: &out,
+        sim: &race,
+        base_port: 27640,
+        stop: &stop,
+        children: &children,
+    };
+    assert_eq!(run_processes(&ctx, &sweep.runs[1]).status, Status::Ok);
+    let log = std::fs::read_to_string(out.join("run-0002.sim.log")).unwrap();
+    let o = out.display();
+    assert!(
+        log.starts_with(&format!(
+            "args {o}/run-0002.toml --listen tcp/127.0.0.1:27641 --seed 41 --record {o}/run-0002.mcap\n"
+        )),
+        "{log}"
+    );
+    let written: toml::Table =
+        toml::from_str(&std::fs::read_to_string(out.join("run-0002.toml")).unwrap()).unwrap();
+    assert_eq!(written["course"]["gates"].as_integer(), Some(4));
+    assert_eq!(written["sim"]["seed"].as_integer(), Some(41));
 }

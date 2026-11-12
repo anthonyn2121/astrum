@@ -332,6 +332,21 @@ fn event_dict<'py>(py: Python<'py>, e: &Event) -> PyResult<Bound<'py, PyDict>> {
             d.set_item("reason", reason.name())?;
             d.set_item("message", message)?;
         }
+        EventKind::GatePassed { aircraft_id, gate, offset_x_m, offset_y_m } => {
+            d.set_item("aircraft_id", aircraft_id)?;
+            d.set_item("gate", gate)?;
+            d.set_item("offset_x_m", offset_x_m)?;
+            d.set_item("offset_y_m", offset_y_m)?;
+        }
+        EventKind::GateMissed { aircraft_id, gate } => {
+            d.set_item("aircraft_id", aircraft_id)?;
+            d.set_item("gate", gate)?;
+        }
+        EventKind::Crashed { aircraft_id, outcome, gate } => {
+            d.set_item("aircraft_id", aircraft_id)?;
+            d.set_item("outcome", outcome.name())?;
+            d.set_item("gate", gate)?;
+        }
     }
     Ok(d)
 }

@@ -28,9 +28,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use astrum_bag::BagReader;
 use astrum_net::{speed_ok, MIN_SPEED};
-use astrum_sim::launch::{Children, ControllerCmd, LiveRun, LiveSpec, Log, LogLine, LogStream};
+use astrum_sim::launch::{
+    Children, ControllerCmd, CourseLaunch, LiveRun, LiveSpec, Log, LogLine, LogStream,
+};
 use astrum_sim::scenario::Scenario;
-use astrum_sim::sweep::Outcome;
+use astrum_sim::sweep::{Base, Outcome};
 use astrum_sim::systems::StopRequested;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -48,6 +50,7 @@ use crate::assign::{
 use crate::bridge::Bridge;
 use crate::catalogs::Catalogs;
 use crate::export::export_bag;
+use crate::race::{self, CourseView};
 use crate::server::AppState;
 
 /// Most log lines kept for the current run (the oldest go first).
@@ -70,6 +73,8 @@ pub struct RunsConfig {
     pub dir: PathBuf,
     /// The `astrum-sim` binary.
     pub sim: PathBuf,
+    /// The `astrum-race` binary race scenarios fly on.
+    pub race: PathBuf,
     /// The server's `--connect` endpoint: the bridge re-attaches there once a
     /// run it was attached to has finished.
     pub connect: String,
@@ -110,6 +115,8 @@ pub struct RunView {
     pub dir: String,
     /// Its recording.
     pub bag: String,
+    /// The course a race run flies; `null` for any other run.
+    pub course: Option<CourseView>,
 }
 
 /// One line of the current run's output.
@@ -259,12 +266,19 @@ struct StartBody {
     speed: Option<f64>,
     /// Sim-time limit override (s, 0 = until stopped); default: the scenario's.
     max_time_s: Option<f64>,
+    /// A race scenario's course seed, over its own.
+    seed: Option<u64>,
+    /// A race scenario's gate count (2–64), over its own.
+    gates: Option<u32>,
 }
 
 /// What a checked request flies.
 struct Plan {
     name: Option<String>,
     scenario: Scenario,
+    /// A race: its `[course]` table and the drawn course (whose seed the race
+    /// binary is given).
+    race: Option<(toml::Table, CourseView)>,
     /// Named by their aircraft: "aircraft 1's controller", source "aircraft 1".
     controllers: Vec<ControllerCmd>,
     assignments: Vec<Assignment>,
@@ -404,8 +418,12 @@ impl Runs {
             }
         };
         let spec = LiveSpec {
-            sim: self.0.cfg.sim.clone(),
+            sim: if plan.race.is_some() { self.0.cfg.race.clone() } else { self.0.cfg.sim.clone() },
             scenario: plan.scenario.clone(),
+            course: plan
+                .race
+                .as_ref()
+                .map(|(table, view)| CourseLaunch { table: table.clone(), seed: Some(view.seed) }),
             scenario_file: Some(dir.join(SCENARIO_FILE)),
             listen,
             record: Some(bag.clone()),
@@ -464,6 +482,7 @@ impl Runs {
             outcome: None,
             dir: dir.display().to_string(),
             bag: bag.display().to_string(),
+            course: plan.race.map(|(_, view)| view),
         };
         {
             let mut state = self.lock();
@@ -592,11 +611,24 @@ fn write_metrics(dir: &Path) -> Result<(), String> {
 
 /// Resolve the scenario, apply the overrides and check the assignments.
 fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
-    let (name, mut scenario) = scenario_input(body.scenario, catalogs).map_err(|e| match e {
+    let (name, base) = scenario_input(body.scenario, catalogs).map_err(|e| match e {
         InputError::Bad(why) => RunError::BadRequest(why),
         InputError::Invalid(why) => RunError::InvalidScenario(why),
         InputError::Io(why) => RunError::Failed(why),
     })?;
+    let Base { mut scenario, course } = base;
+    if course.is_none() {
+        for (set, key) in [(body.seed.is_some(), "seed"), (body.gates.is_some(), "gates")] {
+            if set {
+                return Err(RunError::BadRequest(format!(
+                    "{key} is for a race scenario; this scenario has no [course]"
+                )));
+            }
+        }
+    }
+    if let Some(gates) = body.gates {
+        race::check_gates(gates).map_err(RunError::BadRequest)?;
+    }
     if let Some(speed) = body.speed {
         if !speed_ok(speed, MIN_SPEED) {
             return Err(RunError::BadRequest(format!(
@@ -629,7 +661,21 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
             source: format!("aircraft {}", a.aircraft),
         })
         .collect();
-    Ok(Plan { name, scenario, controllers, assignments })
+    let race = course
+        .map(|table| {
+            if (body.seed.is_some() || body.gates.is_some()) && race::has_explicit_gates(&table) {
+                return Err(RunError::BadRequest(
+                    "seed and gates have no effect: the course lists its gates ([[course.gate]])"
+                        .into(),
+                ));
+            }
+            let table = race::with_gates(&table, body.gates);
+            let view = race::course_view_of(&scenario, &table, body.seed)
+                .map_err(|e| RunError::InvalidScenario(format!("course: {e}")))?;
+            Ok((table, view))
+        })
+        .transpose()?;
+    Ok(Plan { name, scenario, race, controllers, assignments })
 }
 
 /// Create `<root>/<stamp>-<name>` (or `…-2`, `…-3`, … if taken), cut to a
