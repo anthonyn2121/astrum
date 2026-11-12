@@ -84,7 +84,8 @@ fn shipped_catalog_has_every_program_law() {
             "py-lqr",
             "py-mpc",
             "py-figure8",
-            "py-formation"
+            "py-formation",
+            "cpp-minsnap"
         ]
     );
     assert!(cat.get("py-formation").unwrap().needs_fleet);
@@ -171,8 +172,12 @@ fn shipped_kinds_and_targets() {
         .filter(|e| e.flies(VehicleKind::Multirotor))
         .map(|e| e.id.as_str())
         .collect();
-    assert_eq!(multirotor, ["cpp-autopilot", "py-autopilot"]);
-    assert!(cat.entries().iter().all(|e| e.flies(VehicleKind::FixedWing)));
+    assert_eq!(multirotor, ["cpp-autopilot", "py-autopilot", "cpp-minsnap"]);
+    // Every law flies a fixed-wing except the race controller, which is multirotor only.
+    assert!(cat
+        .entries()
+        .iter()
+        .all(|e| e.flies(VehicleKind::FixedWing) == (e.id != "cpp-minsnap")));
     let hold = cat.get("py-hold").unwrap();
     let target = |n: &str| hold.params.iter().find(|p| p.name == n).unwrap().target;
     assert_eq!(target("heading"), Some(ParamTarget::HeadingDeg));

@@ -9,6 +9,7 @@
 #                  plus the cross-language wire-fixture tool and the tests
 #   cpp            astrum-controller: the hold / autopilot laws
 #   optimal/cpp    astrum-optimal-controller: the LQR / MPC laws (ASTRUM_BUILD_OPTIMAL)
+#   minsnap        astrum-minsnap-controller: the min-snap race controller (multirotor)
 #
 # Build + test (inside the dev image):
 #   cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release
@@ -63,6 +64,7 @@ endfunction()
 
 add_subdirectory(common/cpp)
 add_subdirectory(cpp)
+add_subdirectory(minsnap)
 if(ASTRUM_BUILD_OPTIMAL)
   add_subdirectory(optimal/cpp)
 endif()

@@ -655,3 +655,180 @@ unit = "s"
 type = "number"
 default = 0.5
 min = 0.01
+
+[[controller]]
+id = "cpp-minsnap"
+name = "C++ min-snap race"
+description = "Minimum-snap trajectory through the gates of a race scenario, tracked with a geometric SO(3) controller on raw rate and collective demands (C++, multirotor)."
+command = ["build/controllers/minsnap/astrum-minsnap-controller", "--law", "minsnap"]
+id_flag = "--id"
+kinds = ["multirotor"]
+needs_fleet = false
+
+[[controller.param]]
+name = "cruise"
+flag = "--cruise-mps"
+label = "Cruise speed"
+unit = "m/s"
+type = "number"
+default = 6.0
+min = 0.5
+max = 20.0
+
+[[controller.param]]
+name = "time-scale"
+flag = "--time-scale"
+label = "Time scale (>1 = slower)"
+unit = "x"
+type = "number"
+default = 1.0
+min = 0.5
+max = 10.0
+
+[[controller.param]]
+name = "max-speed"
+flag = "--max-speed-mps"
+label = "Max speed"
+unit = "m/s"
+type = "number"
+default = 10.0
+min = 0.5
+max = 30.0
+
+[[controller.param]]
+name = "max-accel"
+flag = "--max-accel-mps2"
+label = "Max acceleration"
+unit = "m/s^2"
+type = "number"
+default = 8.0
+min = 0.5
+max = 30.0
+
+[[controller.param]]
+name = "max-rate"
+flag = "--max-rate"
+label = "Max roll/pitch rate"
+unit = "rad/s"
+type = "number"
+default = 0.7
+min = 0.05
+max = 3.0
+
+[[controller.param]]
+name = "max-yaw-rate"
+flag = "--max-yaw-rate"
+label = "Max yaw rate between gates"
+unit = "rad/s"
+type = "number"
+default = 0.8
+min = 0.05
+max = 3.0
+
+[[controller.param]]
+name = "approach"
+flag = "--approach-m"
+label = "Gate approach offset"
+unit = "m"
+type = "number"
+default = 1.0
+min = 0.3
+max = 5.0
+
+[[controller.param]]
+name = "hull-radius"
+flag = "--hull-radius-m"
+label = "Hull clearance (frames)"
+unit = "m"
+type = "number"
+default = 0.353
+min = 0.1
+max = 1.0
+
+[[controller.param]]
+name = "cross-radius"
+flag = "--cross-radius-m"
+label = "Hull clearance (crossed gate)"
+unit = "m"
+type = "number"
+default = 0.285
+min = 0.1
+max = 1.0
+
+[[controller.param]]
+name = "hover-collective"
+flag = "--hover-collective"
+label = "Hover collective"
+type = "number"
+default = 0.44
+min = 0.1
+max = 0.95
+
+[[controller.param]]
+name = "rate-gain"
+flag = "--rate-gain"
+label = "Body rate per full demand"
+unit = "rad/s"
+type = "number"
+default = 0.75
+min = 0.1
+max = 5.0
+
+[[controller.param]]
+name = "kp"
+flag = "--kp"
+label = "Position gain"
+unit = "1/s^2"
+type = "number"
+default = 9.0
+min = 0.1
+max = 100.0
+
+[[controller.param]]
+name = "kv"
+flag = "--kv"
+label = "Velocity gain"
+unit = "1/s"
+type = "number"
+default = 5.5
+min = 0.1
+max = 50.0
+
+[[controller.param]]
+name = "ki"
+flag = "--ki"
+label = "Position integral gain"
+unit = "1/s^3"
+type = "number"
+default = 1.5
+min = 0.0
+max = 20.0
+
+[[controller.param]]
+name = "k-att"
+flag = "--k-att"
+label = "Roll/pitch attitude gain"
+unit = "1/s"
+type = "number"
+default = 8.0
+min = 0.1
+max = 50.0
+
+[[controller.param]]
+name = "k-yaw"
+flag = "--k-yaw"
+label = "Yaw attitude gain"
+unit = "1/s"
+type = "number"
+default = 3.0
+min = 0.1
+max = 50.0
+
+[[controller.param]]
+name = "horizon-gates"
+flag = "--horizon-gates"
+label = "Gates per plan"
+type = "integer"
+default = 16
+min = 2
+max = 64
