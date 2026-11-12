@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use astrum_sim::perturb::{Axis, Perturb};
 use astrum_sim::scenario::{AircraftSpec, Scenario};
-use astrum_sim::sweep::{Base, CourseSeedMode, Purpose, Sweep, SweepFile, TrimCheck};
+use astrum_sim::sweep::{
+    with_opponents, Base, CourseSeedMode, Purpose, Sweep, SweepFile, TrimCheck,
+};
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path as UrlPath, State};
@@ -87,6 +89,10 @@ pub struct SweepRequest {
     /// A race scenario's gate count in every run (2–64), over its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gates: Option<u32>,
+    /// A race scenario's opponents in every run (0–7): copies of aircraft 1 with
+    /// ids 2.., racing the same course.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opponents: Option<u32>,
 }
 
 /// Why a request cannot become a sweep file.
@@ -169,8 +175,11 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         ScenarioError::Io(_) => SweepInputError::Io(e.to_string()),
     })?;
     if base.course.is_none() {
-        let set =
-            [(req.course_seed_mode.is_some(), "course_seed_mode"), (req.gates.is_some(), "gates")];
+        let set = [
+            (req.course_seed_mode.is_some(), "course_seed_mode"),
+            (req.gates.is_some(), "gates"),
+            (req.opponents.is_some(), "opponents"),
+        ];
         if let Some((_, key)) = set.into_iter().find(|(set, _)| *set) {
             return Err(SweepInputError::BadRequest(format!(
                 "{key} is for a race scenario; this one has no [course]"
@@ -180,12 +189,15 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
     if let Some(gates) = req.gates {
         crate::race::check_gates(gates).map_err(SweepInputError::BadRequest)?;
     }
+    // The fleet every run flies: the scenario's, and the opponents it is given.
+    let fleet = with_opponents(&base.scenario, req.opponents.unwrap_or(0))
+        .map_err(SweepInputError::BadRequest)?;
     for key in req.vary.keys() {
         check_vary_key(key, &base.scenario).map_err(SweepInputError::BadRequest)?;
     }
     // `assign` checks the assignments on a copy; the sweep's own `set` below
     // carries the lockstep flags it would set.
-    let mut checked = base.scenario.clone();
+    let mut checked = fleet.clone();
     let (controllers, assignments) = assign(&mut checked, &req.assignments, catalogs.controllers())
         .map_err(SweepInputError::BadRequest)?;
     check_programs(&assignments, catalogs.controllers()).map_err(SweepInputError::BadRequest)?;
@@ -197,7 +209,7 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         ("sim.max_time_s".to_owned(), toml::Value::Float(req.max_time_s)),
         ("sim.lockstep".to_owned(), toml::Value::Boolean(!controlled.is_empty())),
     ]);
-    for a in &base.scenario.aircraft {
+    for a in &fleet.aircraft {
         set.insert(
             format!("aircraft.{}.lockstep", a.id),
             toml::Value::Boolean(controlled.contains(&a.id)),
@@ -223,6 +235,7 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         controllers,
         course_seed_mode: req.course_seed_mode,
         gates: req.gates,
+        opponents: req.opponents,
         set,
         vary,
         perturb: req.perturb.clone(),
@@ -308,6 +321,9 @@ struct RowView {
     /// The course's gate count, when the scenario or the request sets it
     /// (race sweeps); `null` otherwise.
     gates: Option<u32>,
+    /// Opponents flown against aircraft 1 (race sweeps: the fleet's size − 1);
+    /// `null` otherwise.
+    opponents: Option<usize>,
     values: BTreeMap<String, Value>,
 }
 
@@ -387,6 +403,7 @@ impl PlanView {
                 sample: run.sample.map(|k| k + 1),
                 course_seed: run.course_seed,
                 gates: run.gates,
+                opponents: sweep.course.is_some().then(|| run.scenario.aircraft.len() - 1),
                 values: sweep
                     .value_keys
                     .iter()
@@ -619,6 +636,7 @@ fn first_difference(disk: &SweepFile, planned: &SweepFile) -> Option<&'static st
         ("perturb", disk.perturb == planned.perturb),
         ("course_seed_mode", disk.course_seed_mode == planned.course_seed_mode),
         ("gates", disk.gates == planned.gates),
+        ("opponents", disk.opponents == planned.opponents),
     ]
     .into_iter()
     .find(|(_, same)| !same)
@@ -682,6 +700,7 @@ fn read_saved(catalogs: &Catalogs, name: &str) -> Result<SavedSweep, Refusal> {
         check_trim: false,
         course_seed_mode: file.course_seed_mode,
         gates: file.gates,
+        opponents: file.opponents,
     };
     let cannot_edit = |why: &str| {
         unprocessable(format!(

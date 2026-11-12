@@ -5,18 +5,35 @@
 //! Fleet metrics are named by their metric ids (`end_reason`, `sim_time_s`,
 //! `min_separation_m`, `min_alt_hae_m`, `max_bank_deg`, `max_nz_g`,
 //! `failsafe_entries`, `controller_losses`, `command_refusals`, `hits`, `kills`,
-//! and for race runs `gates_passed`, `gates_missed`, `race_time_s`, `race_outcome`).
-//! An extreme over no samples is `None`, a count over no events 0.
+//! and for race runs `gates_passed`, `gates_missed`, `race_time_s`, `race_outcome`,
+//! `race_winner`). An extreme over no samples is `None`, a count over no events 0.
 //!
 //! **Race metrics** come from the `gate-passed`, `gate-missed` and `crashed`
-//! events plus the `run-ended` event, and are `None` for a run that is not a
-//! race (a bag whose recorded scenario has no `[course]` table and that holds
-//! no race event). `race_time_s` is the sim time of the last gate passed (the
-//! completion time of a finished course), `None` if no gate was passed;
-//! `race_outcome` is the `crashed` event's outcome (`crashed-ground`,
-//! `crashed-gate`, `timed-out`, `spawn-failed`), else `complete` if the run
-//! ended with `race-complete` and `timed-out` if it ended at `max-time`; `None`
-//! while the race has not ended.
+//! events plus the `run-ended` event and the recorded scenario, and are `None`
+//! for a run that is not a race (a bag whose recorded scenario has no `[course]`
+//! table and that holds no race event). A race may have several aircraft on the
+//! same gates; each is judged on its own ([`RaceResult`], `race`, ordered by
+//! aircraft id; every `[[aircraft]]` of the scenario and every aircraft with a
+//! race event has one):
+//!
+//! * `gates_passed` / `gates_missed` count its `gate-passed` / `gate-missed` events;
+//! * `race_time_s` is the sim time of its last gate passed (its finish time when it
+//!   completed the course), `None` if it passed none;
+//! * `race_outcome` is its `crashed` event's outcome (`crashed-ground`, `crashed-gate`,
+//!   `timed-out`, `spawn-failed`), else `complete` if it passed every gate of the course
+//!   (the scenario's explicit `[[course.gate]]`, else its `course.gates`; for a lone
+//!   aircraft a `race-complete` run end also counts), else `timed-out` if the run ended at
+//!   `max-time`; `None` while it has not finished;
+//! * `place` is the 1-based rank: aircraft that completed the course first, by
+//!   `race_time_s` ascending; then the rest by `gates_passed` descending, then by
+//!   `race_time_s` ascending (an aircraft that passed none ranks last); remaining ties
+//!   go to the lower aircraft id, so places are distinct.
+//!
+//! `race_winner` is the aircraft id of place 1 if it completed the course, else `None`.
+//! The fleet-level `gates_passed` / `gates_missed` are totals over all aircraft,
+//! `race_time_s` the sim time of the last gate passed by any aircraft, and
+//! `race_outcome` the outcome of the aircraft in place 1; for a one-aircraft race
+//! all four are simply that aircraft's.
 //!
 //! **Samples.** Only samples of living aircraft (`combat.alive`) feed the
 //! extremes and the separation; the final state is the aircraft's last sample
@@ -89,15 +106,32 @@ pub struct RunMetrics {
     pub gates_passed: Option<u32>,
     /// `gate-missed` events; `None` for a run that is not a race.
     pub gates_missed: Option<u32>,
-    /// Sim time of the last `gate-passed` event (s).
+    /// Sim time of the last `gate-passed` event of any aircraft (s).
     pub race_time_s: Option<f64>,
-    /// How the race ended (see the [module docs](self)).
+    /// How the race ended for the aircraft in place 1 (see the [module docs](self)).
     pub race_outcome: Option<String>,
+    /// Each race aircraft's result, by aircraft id; `None` for a run that is not a race.
+    pub race: Option<Vec<RaceResult>>,
+    /// The aircraft that won the race: place 1, if it completed the course.
+    pub race_winner: Option<u32>,
     /// Telemetry and event payloads that did not decode (or whose aircraft id
     /// disagrees with their topic), skipped.
     pub rejected: u64,
     /// Every aircraft with telemetry in the bag, by id.
     pub aircraft: Vec<AircraftMetrics>,
+}
+
+/// One race aircraft's result (see the [module docs](self)).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RaceResult {
+    pub aircraft: u32,
+    pub gates_passed: u32,
+    pub gates_missed: u32,
+    /// Sim time of its last gate passed (s): its finish time when it completed the course.
+    pub race_time_s: Option<f64>,
+    pub race_outcome: Option<String>,
+    /// 1-based rank among the race's aircraft.
+    pub place: u32,
 }
 
 /// One aircraft's metrics.
@@ -213,13 +247,15 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
         gates_missed: None,
         race_time_s: None,
         race_outcome: None,
+        race: None,
+        race_winner: None,
         rejected: 0,
         aircraft: Vec::new(),
     };
 
     // Race metrics are reported for a race scenario even when no gate event happened.
     let mut race = bag.scenario().is_some_and(has_course_table);
-    let mut crash: Option<RaceOutcome> = None;
+    let mut racers: BTreeMap<u32, Racer> = BTreeMap::new();
     let mut ended: Option<EndReason> = None;
 
     for msg in bag.messages()? {
@@ -261,18 +297,21 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
                         m.end_message = Some(message);
                         ended = Some(reason);
                     }
-                    EventKind::GatePassed { .. } => {
+                    EventKind::GatePassed { aircraft_id, .. } => {
                         race = true;
-                        *m.gates_passed.get_or_insert(0) += 1;
-                        m.race_time_s = Some(e.sim_time_s);
+                        let r = racers.entry(aircraft_id).or_default();
+                        r.passed += 1;
+                        r.last_pass_s = Some(e.sim_time_s);
+                        let t = e.sim_time_s;
+                        m.race_time_s = Some(m.race_time_s.map_or(t, |last| last.max(t)));
                     }
-                    EventKind::GateMissed { .. } => {
+                    EventKind::GateMissed { aircraft_id, .. } => {
                         race = true;
-                        *m.gates_missed.get_or_insert(0) += 1;
+                        racers.entry(aircraft_id).or_default().missed += 1;
                     }
-                    EventKind::Crashed { outcome, .. } => {
+                    EventKind::Crashed { aircraft_id, outcome, .. } => {
                         race = true;
-                        crash = Some(outcome);
+                        racers.entry(aircraft_id).or_default().crash = Some(outcome);
                     }
                     _ => {}
                 },
@@ -283,15 +322,19 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
     }
 
     if race {
-        m.gates_passed.get_or_insert(0);
-        m.gates_missed.get_or_insert(0);
-        m.race_outcome = crash
-            .or(match ended {
-                Some(EndReason::RaceComplete) => Some(RaceOutcome::Complete),
-                Some(EndReason::MaxTime) => Some(RaceOutcome::TimedOut),
-                _ => None,
-            })
-            .map(|o| o.name().to_owned());
+        let scenario = bag.scenario();
+        for a in scenario.map(aircraft_models).unwrap_or_default() {
+            racers.entry(a.id).or_default();
+        }
+        let results = rank(&racers, scenario.and_then(gate_count), ended);
+        m.gates_passed = Some(results.iter().map(|r| r.gates_passed).sum());
+        m.gates_missed = Some(results.iter().map(|r| r.gates_missed).sum());
+        if let Some(first) = results.iter().find(|r| r.place == 1) {
+            m.race_outcome = first.race_outcome.clone();
+            m.race_winner = (first.race_outcome.as_deref() == Some(RaceOutcome::Complete.name()))
+                .then_some(first.aircraft);
+        }
+        m.race = Some(results);
     }
 
     let mut closest: Option<Closest> = None;
@@ -345,6 +388,79 @@ pub fn compute(bag: &BagReader) -> Result<RunMetrics> {
     m.max_bank_deg = fleet.max_bank_deg;
     m.max_nz_g = fleet.max_nz_g;
     Ok(m)
+}
+
+/// One race aircraft's tally from the events.
+#[derive(Default)]
+struct Racer {
+    passed: u32,
+    missed: u32,
+    last_pass_s: Option<f64>,
+    crash: Option<RaceOutcome>,
+}
+
+/// The gates of the recorded course: its explicit `[[course.gate]]`, else `course.gates`.
+fn gate_count(scenario_toml: &str) -> Option<u32> {
+    let table = scenario_toml.parse::<toml::Table>().ok()?;
+    let course = table.get("course")?.as_table()?;
+    let explicit = course.get("gate").and_then(toml::Value::as_array).map_or(0, Vec::len);
+    let n = if explicit > 0 {
+        explicit as i64
+    } else {
+        course.get("gates").and_then(toml::Value::as_integer)?
+    };
+    u32::try_from(n).ok().filter(|n| *n > 0)
+}
+
+/// Every aircraft's result with its place (see the [module docs](self)), by aircraft id.
+fn rank(
+    racers: &BTreeMap<u32, Racer>,
+    gates: Option<u32>,
+    ended: Option<EndReason>,
+) -> Vec<RaceResult> {
+    let lone = racers.len() == 1;
+    let outcome = |r: &Racer| {
+        r.crash.or_else(|| {
+            let done = gates.is_some_and(|n| r.passed >= n)
+                || (lone && ended == Some(EndReason::RaceComplete));
+            if done {
+                Some(RaceOutcome::Complete)
+            } else if ended == Some(EndReason::MaxTime) {
+                Some(RaceOutcome::TimedOut)
+            } else {
+                None
+            }
+        })
+    };
+    let mut results: Vec<(RaceResult, bool)> = racers
+        .iter()
+        .map(|(id, r)| {
+            let outcome = outcome(r);
+            let result = RaceResult {
+                aircraft: *id,
+                gates_passed: r.passed,
+                gates_missed: r.missed,
+                race_time_s: r.last_pass_s,
+                race_outcome: outcome.map(|o| o.name().to_owned()),
+                place: 0,
+            };
+            (result, outcome == Some(RaceOutcome::Complete))
+        })
+        .collect();
+    // Completed first, then more gates, then the earlier last pass (none: last), then id.
+    let mut order: Vec<usize> = (0..results.len()).collect();
+    order.sort_by(|&a, &b| {
+        let ((ra, done_a), (rb, done_b)) = (&results[a], &results[b]);
+        let time = |r: &RaceResult| r.race_time_s.unwrap_or(f64::INFINITY);
+        done_b
+            .cmp(done_a)
+            .then(rb.gates_passed.cmp(&ra.gates_passed).then(time(ra).total_cmp(&time(rb))))
+            .then(ra.aircraft.cmp(&rb.aircraft))
+    });
+    for (place, i) in order.into_iter().enumerate() {
+        results[i].0.place = place as u32 + 1;
+    }
+    results.into_iter().map(|(r, _)| r).collect()
 }
 
 /// Whether a scenario TOML has a `[course]` table (a race scenario).

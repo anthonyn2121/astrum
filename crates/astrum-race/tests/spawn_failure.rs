@@ -7,7 +7,6 @@ mod common;
 
 use astrum_proto::RaceOutcome;
 use astrum_race::build_race_app;
-use astrum_race::components::RaceProgress;
 use astrum_race::scenario::RaceScenario;
 use astrum_sim::components::SimStatus;
 use astrum_sim::RunMode;
@@ -25,6 +24,6 @@ fn a_drone_that_cannot_spawn_stops_the_run_at_once() {
     app.update();
 
     assert!(app.world().resource::<SimStatus>().fatal.is_some(), "the sim reports the failure");
-    assert_eq!(app.world().resource::<RaceProgress>().outcome, RaceOutcome::SpawnFailed);
+    assert_eq!(common::progress(&app).outcome, RaceOutcome::SpawnFailed);
     assert!(matches!(app.should_exit(), Some(AppExit::Error(_))), "and the run does not go on");
 }

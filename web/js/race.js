@@ -70,3 +70,44 @@ export function pendingGateAt(events, t, aircraftId, gateCount) {
   }
   return Math.min(pending, gateCount);
 }
+
+// The race standings at sim time `t`, from the store's events (sorted by time):
+// one row per aircraft in `ids`, in place order, and whether the run has ended.
+// A row is { id, passed, total, finished, finishT, crashed, outcome, lastPassT,
+// place }: `passed` counts distinct gates passed (`gate-passed`; a miss does not
+// count), `finished` is every gate passed (`finishT`: the time of the last
+// pass), `crashed` a `crashed` event (`outcome`: its RaceOutcome name).
+// Places follow the sim's rule: the finishers by finish time, then the rest by
+// gates passed (more first) and, on a tie, by the time of their last pass
+// (earlier first), then by id. `winner` is the aircraft id in first place if it
+// finished, else null; it is only meaningful once `ended` (a `run-ended` event
+// at or before `t`).
+export function raceStandings(events, t, ids, gateCount) {
+  const rows = new Map(ids.map((id) => [id, {
+    id, passed: new Set(), total: gateCount, finished: false, finishT: null,
+    crashed: false, outcome: null, lastPassT: null, place: 0,
+  }]));
+  let ended = false;
+  for (const e of events) {
+    if (e.t > t) break;
+    if (e.kind === "run-ended") { ended = true; continue; }
+    const row = rows.get(e.aircraft_id);
+    if (!row) continue;
+    if (e.kind === "gate-passed" && Number.isInteger(e.gate)) {
+      row.passed.add(e.gate);
+      row.lastPassT = e.t;
+      if (row.passed.size >= gateCount && !row.finished) { row.finished = true; row.finishT = e.t; }
+    } else if (e.kind === "crashed") {
+      row.crashed = true;
+      row.outcome = e.outcome ?? null;
+    }
+  }
+  const out = [...rows.values()].map((r) => ({ ...r, passed: r.passed.size }));
+  out.sort((a, b) => {
+    if (a.finished !== b.finished) return a.finished ? -1 : 1;
+    if (a.finished) return a.finishT - b.finishT || a.id - b.id;
+    return b.passed - a.passed || (a.lastPassT ?? Infinity) - (b.lastPassT ?? Infinity) || a.id - b.id;
+  });
+  out.forEach((r, i) => { r.place = i + 1; });
+  return { rows: out, ended, winner: out.length && out[0].finished ? out[0].id : null };
+}

@@ -24,6 +24,8 @@ import { VariationForm } from "./variation.js";
 import { StartCloud } from "./startcloud.js";
 
 const PLAN_DEBOUNCE_MS = 400;
+const OPPONENT_CONTROLLER = "cpp-minsnap"; // a new opponent's controller until another is picked
+const OPPONENTS_MAX = 7;
 const PLAN_ROWS = 20;        // the plan table's rows; the rest is counted
 const DEFAULT_MAX_TIME_S = 60;
 const ACTIVE_POLL_MS = 2000;
@@ -37,6 +39,7 @@ const el = {
   maxTime: $("maxTime"), maxTimeError: $("maxTimeError"), repeats: $("repeats"), repeatsError: $("repeatsError"),
   jobs: $("jobs"), jobsError: $("jobsError"), runTimeout: $("runTimeout"), runTimeoutError: $("runTimeoutError"),
   variationRace: $("variationRace"), courseSection: $("courseSection"), courseMode: $("courseMode"), courseModeHint: $("courseModeHint"),
+  courseOpponents: $("courseOpponents"), courseOpponentsError: $("courseOpponentsError"), opponentsField: $("opponentsField"),
   courseGates: $("courseGates"), courseGatesHint: $("courseGatesHint"), courseGatesError: $("courseGatesError"),
   planNote: $("planNote"), planBusy: $("planBusy"), planError: $("planError"), planBody: $("planBody"),
   planSummary: $("planSummary"), planTrim: $("planTrim"), planWrap: $("planWrap"), planTable: $("planTable"),
@@ -111,6 +114,14 @@ function onPick(entry, doc, error) {
   el.courseGates.value = own ?? ""; // ...and the scenario's own gate count
   el.courseGatesHint.textContent = own != null ? `the scenario's own count is ${own}` : "";
   showError(el.courseGatesError, "");
+  // Opponents are clones of the scenario's aircraft: for a scenario with one.
+  el.opponentsField.hidden = !isRace() || doc.scenario.aircraft.length !== 1;
+  el.courseOpponents.value = "0";
+  showError(el.courseOpponentsError, "");
+  // A race that lists several drones: each races, by default.
+  if (isRace() && doc.scenario.aircraft.length > 1) {
+    for (const a of doc.scenario.aircraft) form.setController(a.id, OPPONENT_CONTROLLER, true);
+  }
   syncCourse();
   el.startPanel.hidden = !doc || isRace(); // a race starts where its course says, not where the scenario's aircraft is
   clearPlan();
@@ -145,6 +156,17 @@ function courseGates() {
   const bad = raw === "" || !Number.isInteger(x) || x < 2 || x > 64;
   showError(el.courseGatesError, bad ? "must be a whole number from 2 to 64" : "");
   el.courseGates.setAttribute("aria-invalid", String(bad));
+  return bad ? undefined : x;
+}
+
+// The Opponents setting: 0 to 7, or undefined after showing why it is refused.
+// Its rows join the controller form as the number changes.
+function opponents() {
+  const raw = el.courseOpponents.value.trim();
+  const x = Number(raw);
+  const bad = raw === "" || !Number.isInteger(x) || x < 0 || x > OPPONENTS_MAX;
+  showError(el.courseOpponentsError, bad ? `must be a whole number from 0 to ${OPPONENTS_MAX}` : "");
+  el.courseOpponents.setAttribute("aria-invalid", String(bad));
   return bad ? undefined : x;
 }
 
@@ -188,7 +210,8 @@ function buildRequest() {
   const settings = runSettings();
   const fields = variation.fields();
   const gates = isRace() ? courseGates() : null;
-  if (!ok || !fields || !settings || gates === undefined) return null;
+  const rivals = isRace() && !el.opponentsField.hidden ? opponents() : 0;
+  if (!ok || !fields || !settings || gates === undefined || rivals === undefined) return null;
   return {
     scenario: state.scenario.name,
     assignments,
@@ -197,6 +220,7 @@ function buildRequest() {
     ...(isRace() ? { course_seed_mode: el.courseMode.value } : {}),
     // The scenario's own gate count is what a sweep without one flies: send only another.
     ...(gates != null && gates !== state.doc.course?.gates.length ? { gates } : {}),
+    ...(rivals > 0 ? { opponents: rivals } : {}),
   };
 }
 
@@ -329,6 +353,7 @@ function renderPlan(plan) {
   // A race sweep's rows also say which course (seed) each run flies.
   const withCourse = plan.rows.some((r) => r.course_seed != null);
   const withGates = plan.rows.some((r) => r.gates != null);
+  const withOpponents = plan.rows.some((r) => r.opponents != null);
   const shown = plan.rows.slice(0, PLAN_ROWS);
   el.planTable.replaceChildren(
     h("thead", {}, h("tr", {},
@@ -337,6 +362,7 @@ function renderPlan(plan) {
       withSample ? h("th", { text: "sample" }) : null,
       withCourse ? h("th", { text: "course seed" }) : null,
       withGates ? h("th", { text: "gates" }) : null,
+      withOpponents ? h("th", { text: "opponents" }) : null,
       ...plan.keys.map((k) => h("th", { text: k })))),
     h("tbody", {}, ...shown.map((r) => h("tr", {},
       h("td", { text: String(r.run) }),
@@ -344,6 +370,7 @@ function renderPlan(plan) {
       withSample ? h("td", { text: r.sample == null ? "" : String(r.sample) }) : null,
       withCourse ? h("td", { text: r.course_seed == null ? "" : String(r.course_seed) }) : null,
       withGates ? h("td", { text: r.gates == null ? "" : String(r.gates) }) : null,
+      withOpponents ? h("td", { text: r.opponents == null ? "" : String(r.opponents) }) : null,
       ...plan.keys.map((k) => h("td", { text: formatValue(r.values[k]) }))))));
   el.planWrap.hidden = false;
   const more = plan.rows.length - shown.length;
@@ -462,6 +489,10 @@ async function openSweep(name) {
     opening = null;
   }
   if (!picked || token !== state.openTok) return; // the picker says why
+  if (request.opponents != null) {
+    el.courseOpponents.value = String(request.opponents);
+    form.setOpponents(request.opponents, null); // before the assignments name their rows
+  }
   showError(el.fleetError, form.setAssignments(request.assignments).join("; "));
   variation.setFields(request);
   el.courseMode.value = request.course_seed_mode ?? "fixed";
@@ -630,6 +661,12 @@ el.form.addEventListener("change", changed); // any edit: the scenario, controll
 el.form.addEventListener("input", changed); // typing re-plans after the debounce, not only on blur
 el.form.addEventListener("submit", (e) => e.preventDefault());
 el.courseMode.addEventListener("change", syncCourse);
+el.courseOpponents.addEventListener("input", () => {
+  const n = opponents();
+  if (el.opponentsField.hidden || n === undefined) return;
+  form.setOpponents(n, OPPONENT_CONTROLLER);
+  if (n > 0) form.setController(1, OPPONENT_CONTROLLER, true); // a duel: the first drone races too
+});
 el.checkTrims.addEventListener("click", () => {
   const request = buildRequest();
   if (!request) {

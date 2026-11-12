@@ -32,7 +32,7 @@ use astrum_sim::launch::{
     Children, ControllerCmd, CourseLaunch, LiveRun, LiveSpec, Log, LogLine, LogStream,
 };
 use astrum_sim::scenario::Scenario;
-use astrum_sim::sweep::{Base, Outcome};
+use astrum_sim::sweep::{with_opponents, Base, Outcome};
 use astrum_sim::systems::StopRequested;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -117,6 +117,11 @@ pub struct RunView {
     pub bag: String,
     /// The course a race run flies; `null` for any other run.
     pub course: Option<CourseView>,
+    /// A race run's results once it has finished (`null` before, and for any
+    /// other run): `{"winner": <aircraft id | null>, "aircraft": [{"aircraft",
+    /// "gates_passed", "gates_missed", "race_time_s", "race_outcome", "place"}…]}`,
+    /// the `race_winner` and `race` of its [`astrum_bag::metrics::RunMetrics`].
+    pub race: Option<Value>,
 }
 
 /// One line of the current run's output.
@@ -270,6 +275,9 @@ struct StartBody {
     seed: Option<u64>,
     /// A race scenario's gate count (2–64), over its own.
     gates: Option<u32>,
+    /// Opponents flown against aircraft 1 on the same course (0–7): copies of
+    /// aircraft 1 with ids 2.., in a race scenario only.
+    opponents: Option<u32>,
 }
 
 /// What a checked request flies.
@@ -483,6 +491,7 @@ impl Runs {
             dir: dir.display().to_string(),
             bag: bag.display().to_string(),
             course: plan.race.map(|(_, view)| view),
+            race: None,
         };
         {
             let mut state = self.lock();
@@ -516,16 +525,18 @@ impl Runs {
     /// run, then mark the run finished — so whoever sees `finished` also sees
     /// the bridge back home.
     fn finish(&self, id: &str, dir: &Path, outcome: Outcome, done: &watch::Sender<bool>) {
+        let mut race = None;
         if dir.join(BAG_FILE).is_file() {
-            if let Err(why) = write_metrics(dir) {
-                self.push_log(
+            match write_metrics(dir) {
+                Ok(metrics) => race = race_results(&metrics),
+                Err(why) => self.push_log(
                     id,
                     LogLine {
                         source: "astrum".into(),
                         stream: LogStream::Stderr,
                         line: format!("metrics: {why}"),
                     },
-                );
+                ),
             }
         }
         let bridge_run =
@@ -537,6 +548,7 @@ impl Runs {
             record.view.state = RunState::Finished;
             record.view.finished_at_ms = Some(now_ms());
             record.view.outcome = Some(outcome);
+            record.view.race = race;
         }
         done.send_replace(true);
     }
@@ -593,20 +605,33 @@ impl Runs {
     }
 }
 
+/// A race recording's results as [`RunView::race`] shows them: the metrics'
+/// per-aircraft `race` and `race_winner`; `None` for any other recording.
+fn race_results(metrics: &Value) -> Option<Value> {
+    let aircraft = metrics.get("race").filter(|race| race.is_array())?;
+    Some(serde_json::json!({
+        "winner": metrics.get("race_winner").cloned().unwrap_or(Value::Null),
+        "aircraft": aircraft,
+    }))
+}
+
 /// Compute the bag's metrics into `<dir>/metrics.json` (temp file + rename,
-/// so a reader never sees half of it).
-fn write_metrics(dir: &Path) -> Result<(), String> {
+/// so a reader never sees half of it); the metrics as JSON.
+fn write_metrics(dir: &Path) -> Result<Value, String> {
     let bag = dir.join(BAG_FILE);
     let reader = BagReader::open(&bag).map_err(|e| format!("{}: {e}", bag.display()))?;
     let metrics =
         astrum_bag::metrics::compute(&reader).map_err(|e| format!("{}: {e}", bag.display()))?;
-    let bytes = serde_json::to_vec_pretty(&metrics)
+    let json = serde_json::to_value(&metrics)
+        .unwrap_or_else(|e| unreachable!("metrics serialisation failed: {e}"));
+    let bytes = serde_json::to_vec_pretty(&json)
         .unwrap_or_else(|e| unreachable!("metrics serialisation failed: {e}"));
     let path = dir.join(METRICS_FILE);
     let temp = dir.join(format!(".{METRICS_FILE}.tmp"));
     std::fs::write(&temp, bytes)
         .and_then(|()| std::fs::rename(&temp, &path))
-        .map_err(|e| format!("writing {}: {e}", path.display()))
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(json)
 }
 
 /// Resolve the scenario, apply the overrides and check the assignments.
@@ -618,7 +643,11 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
     })?;
     let Base { mut scenario, course } = base;
     if course.is_none() {
-        for (set, key) in [(body.seed.is_some(), "seed"), (body.gates.is_some(), "gates")] {
+        for (set, key) in [
+            (body.seed.is_some(), "seed"),
+            (body.gates.is_some(), "gates"),
+            (body.opponents.is_some(), "opponents"),
+        ] {
             if set {
                 return Err(RunError::BadRequest(format!(
                     "{key} is for a race scenario; this scenario has no [course]"
@@ -628,6 +657,9 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
     }
     if let Some(gates) = body.gates {
         race::check_gates(gates).map_err(RunError::BadRequest)?;
+    }
+    if let Some(opponents) = body.opponents {
+        scenario = with_opponents(&scenario, opponents).map_err(RunError::BadRequest)?;
     }
     if let Some(speed) = body.speed {
         if !speed_ok(speed, MIN_SPEED) {

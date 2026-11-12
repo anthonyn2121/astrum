@@ -303,7 +303,7 @@ last published tick (republishing that telemetry every 100 ms while waiting). Wi
 command lands on whichever tick it arrives.
 
 **Race scenarios.** A drone-racing scenario (`config/scenario.race.toml`) is an ordinary scenario
-— exactly one F450, `world.origin_alt_hae_m = 0` — plus a `[course]` table: the randomization
+— one to eight F450s (`config/scenario.duel.toml` has two: same course, each drone scored on its own, ghosts to each other, start grid `[course].grid_spacing_m`), `world.origin_alt_hae_m = 0` — plus a `[course]` table: the randomization
 envelope, an optional `seed` (default `sim.seed`; the sim's own RNG is untouched) and
 `start_behind_m`, or explicit `[[course.gate]]` used verbatim. The `astrum-race` binary (a
 client of `astrum-sim`; design in `docs/racing-environment-design.md`) takes the sim's flags plus
@@ -519,6 +519,7 @@ astrum export recordings/session.mcap --out out.json  # MCAP → astrum-replay (
 - Runs: `POST /api/runs` takes `seed` (the course seed) and `gates` (2–64; written into the run's `[course]` as `gates = N`, so the file the race binary reads and the `RunView.course` agree), flies `--race` (`ASTRUM_RACE_BIN`, default next to `astrum-web`) instead of the sim, and the `RunView` carries the `course`. A scenario's `[[course.gate]]` are flown as they are: a `seed` there is refused (the race binary refuses it too).
 - Replays: `ExportMeta.course` is the course the bag's recorded scenario lists (the resolved scenario `astrum-race --record` writes has every gate explicit).
 - Sweeps: `course_seed_mode` (`fixed` | `randomize`) is a `SweepFile` key, so a saved race sweep round-trips and `astrum sweep` runs it (`LiveSpec.course` appends the `[course]` to each run's scenario and passes `--seed`; `astrum` picks the `astrum-race` binary for a race base). `gates` (a `SweepFile` key, 2–64) sets every run's gate count the same way. Every run's course seed (`Run::course_seed`) and gate count (`Run::gates`, when the scenario or sweep sets one) are in the plan rows and in `summary.csv`, with `RACE_METRICS` columns. A race sweep is always process-mode (`Sweep::in_process` is false) and refuses offsets (`vary`, `[[perturb]]`): the start pose comes from the course.
+- Opponents: `opponents` (0–7; `POST /api/runs`, the sweep request and `SweepFile.opponents`) adds copies of aircraft 1 as ids 2.. (`sweep::with_opponents`) before the run launches, so assignments name them like any aircraft; a scenario may also list several drones itself (`config/scenario.duel.toml`). `RunView.race` and the metrics' `race` / `race_winner` carry each drone's results; a multi-drone race sweep's `summary.csv` adds `a<id>_gates_passed`, `a<id>_race_time_s`, `a<id>_place` per aircraft and `race_winner`.
 - Tests (`tests/race.rs`) fly a shell-script stand-in `astrum-race`, plus the real binary (`cargo build -p astrum-race` first; `ASTRUM_RACE_BIN` points elsewhere; `ASTRUM_SKIP_REAL_SIM=1` skips it).
 
 **Web sweeps** (`crates/astrum-web/src/sweepruns.rs`): `SweepRuns` owns the one web sweep, as `Runs` owns the live run, and is independent of it.

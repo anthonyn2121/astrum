@@ -7,7 +7,6 @@ mod common;
 use astrum_bag::BagReader;
 use astrum_geo::Enu;
 use astrum_proto::{decode_event, EndReason, EventKind, RaceOutcome};
-use astrum_race::components::RaceProgress;
 use astrum_race::course::{generate, CourseParams};
 use astrum_race::gate::{BAR_M, OPENING_M, TOP_BAR_M};
 use astrum_race::scenario::RaceScenario;
@@ -16,7 +15,7 @@ use astrum_sim::components::AircraftState;
 use astrum_sim::{record, run_to_exit, world_frame, RunMode};
 use bevy::math::DVec3;
 use bevy::prelude::*;
-use common::{fdm_guard, flat_course, scenario_toml};
+use common::{fdm_guard, flat_course, progress, scenario_toml};
 
 fn resolve(toml: &str, seed: Option<u64>) -> astrum_race::scenario::ResolvedRace {
     RaceScenario::from_toml_str(toml).unwrap().resolve(seed).unwrap()
@@ -162,7 +161,7 @@ fn a_scenario_for_other_gates_is_refused() {
     assert!(err.to_string().contains("opening_m"), "{err}");
 }
 
-/// A race flies one F450 on the ground-level origin, and nothing else.
+/// A race flies F450s on the ground-level origin, and nothing else.
 #[test]
 fn only_the_race_airframe_is_accepted() {
     let toml = scenario_toml("", "", "gates = 3");
@@ -170,8 +169,14 @@ fn only_the_race_airframe_is_accepted() {
     assert!(RaceScenario::from_toml_str(&c172).is_err());
     let raised = toml.replace("origin_alt_hae_m = 0.0", "origin_alt_hae_m = 5.0");
     assert!(RaceScenario::from_toml_str(&raised).is_err());
-    let two = format!("{toml}\n[[aircraft]]\nid = 2\nmodel = \"F450\"\nlat_deg = 44.7\nlon_deg = -93.0\nalt_hae_m = 5.0\nheading_deg = 0.0\ntas_mps = 0.0\n");
-    assert!(RaceScenario::from_toml_str(&two).is_err());
+    // Several are fine (a duel), up to eight, as long as every one is an F450.
+    let ids = |n: u32| common::scenario_toml_n(&(1..=n).collect::<Vec<_>>(), "", "", "gates = 3");
+    assert!(RaceScenario::from_toml_str(&ids(8)).is_ok());
+    assert!(RaceScenario::from_toml_str(&ids(9)).is_err(), "nine drones is too many");
+    let mixed = ids(2).replacen("\"F450\"", "\"c172x\"", 1);
+    assert!(RaceScenario::from_toml_str(&mixed).is_err(), "a duel of F450s only");
+    let twins = ids(2).replacen("id = 2", "id = 1", 1);
+    assert!(RaceScenario::from_toml_str(&twins).is_err(), "unique ids");
 }
 
 /// Startup spawns the drone through the sim's own fleet spawn: upstream of gate 0, on
@@ -191,7 +196,7 @@ fn the_app_spawns_the_drone_on_the_approach() {
     let along = offset.dot(first.normal());
     assert!((along + 10.0).abs() < 0.5, "10 m upstream, got {along:.2}");
     assert!((offset - along * first.normal()).length() < 0.5, "on the centreline");
-    let p = *app.world().resource::<RaceProgress>();
+    let p = progress(&app);
     assert_eq!((p.passed, p.missed, p.next_gate), (0, 0, 0));
     assert_eq!(p.outcome, RaceOutcome::Running);
 }
@@ -213,7 +218,7 @@ fn a_recorded_run_carries_the_resolved_course_and_ends_on_the_time_limit() {
     let mut app = build_race_app(race, RunMode::Batch);
     app.insert_resource(recorder);
     assert!(matches!(run_to_exit(&mut app), AppExit::Success));
-    let p = *app.world().resource::<RaceProgress>();
+    let p = progress(&app);
     drop(app);
     let stats = recording.finish().unwrap();
 

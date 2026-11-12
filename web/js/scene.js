@@ -772,10 +772,12 @@ export class Scene {
   // ghosts share the body's Color objects), trail, drop line and foot ring.
   _colorize(a, team) {
     const sky = this._daylight;
-    if (a.colorTeam === team && a.colorSky === sky) return;
+    const race = !!this._course; // a race: one hue per aircraft
+    if (a.colorTeam === team && a.colorSky === sky && a.colorRace === race) return;
     a.colorTeam = team;
     a.colorSky = sky;
-    const color = aircraftColor(a.kind, a.group.userData.id, team, sky, _col);
+    a.colorRace = race;
+    const color = aircraftColor(a.kind, a.group.userData.id, team, sky, _col, race);
     tintAircraft(a.group, color);
     a.trail.line.material.color.copy(color);
     a.drop.material.color.copy(color);

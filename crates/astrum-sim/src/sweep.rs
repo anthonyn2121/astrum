@@ -25,7 +25,7 @@
 //! those limits reject is redrawn, so a redrawn sample also depends on every
 //! grid point.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,12 @@ pub struct SweepFile {
     /// (`course.gates`, [`MIN_GATES`]..=[`MAX_GATES`]), over the scenario's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gates: Option<u32>,
+    /// Race sweeps only: opponents flown against aircraft 1 on the same course,
+    /// `0..=`[`MAX_OPPONENTS`]: copies of aircraft 1 with ids 2..=1+n
+    /// ([`with_opponents`]). Poses are the race's to set, so the copies need no
+    /// pose of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opponents: Option<u32>,
     /// Overrides applied to every run.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub set: BTreeMap<String, toml::Value>,
@@ -131,6 +137,7 @@ impl SweepFile {
             perturb: Vec::new(),
             course_seed_mode: None,
             gates: None,
+            opponents: None,
         }
     }
 
@@ -143,6 +150,40 @@ impl SweepFile {
 /// Fewest and most gates a race sweep may ask for.
 pub const MIN_GATES: u32 = 2;
 pub const MAX_GATES: u32 = 64;
+/// Most opponents a race may add to aircraft 1 (8 drones in all).
+pub const MAX_OPPONENTS: u32 = 7;
+
+/// `scenario` with `opponents` copies of aircraft 1 added, as ids 2..=1+n (a
+/// race starts every drone from its course, so the copies need no pose of
+/// their own). An error when there is no aircraft 1, an id is taken, or `n` is
+/// over [`MAX_OPPONENTS`]; 0 adds nothing.
+pub fn with_opponents(scenario: &Scenario, opponents: u32) -> Result<Scenario, String> {
+    if opponents > MAX_OPPONENTS {
+        return Err(format!("opponents must be 0..={MAX_OPPONENTS}, got {opponents}"));
+    }
+    let mut out = scenario.clone();
+    if opponents == 0 {
+        return Ok(out);
+    }
+    let lead = scenario
+        .aircraft
+        .iter()
+        .find(|a| a.id == 1)
+        .ok_or("opponents are copies of aircraft 1, which the scenario does not have")?;
+    for id in 2..=1 + opponents {
+        if scenario.aircraft.iter().any(|a| a.id == id) {
+            return Err(format!(
+                "opponents would be aircraft 2..={}, but the scenario already has aircraft {id}",
+                1 + opponents
+            ));
+        }
+        let mut copy = lead.clone();
+        copy.id = id;
+        out.aircraft.push(copy);
+    }
+    out.validate().map_err(|e| e.to_string())?;
+    Ok(out)
+}
 
 /// How a race sweep seeds each run's course. A grid point's base course seed is
 /// the base `[course]`'s `seed`, else the point's `sim.seed`.
@@ -479,6 +520,9 @@ impl Sweep {
         }
         check_sampling(&file, &base.scenario)?;
         check_course(&file, &base)?;
+        if let Some(opponents) = file.opponents {
+            base.scenario = with_opponents(&base.scenario, opponents).map_err(err)?;
+        }
         if let (Some(gates), Some(course)) = (file.gates, base.course.as_mut()) {
             course.insert("gates".to_owned(), toml::Value::Integer(i64::from(gates)));
         }
@@ -678,6 +722,9 @@ fn check_course(file: &SweepFile, base: &Base) -> Result<(), SweepError> {
         }
         if file.gates.is_some() {
             return Err(err("gates needs a race scenario (one with a [course])"));
+        }
+        if file.opponents.is_some() {
+            return Err(err("opponents needs a race scenario (one with a [course])"));
         }
         return Ok(());
     }
@@ -1024,12 +1071,29 @@ fn metric_cell(v: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// The per-aircraft result columns of a race with several drones: the
+/// `RunMetrics.race` entry's field, and what it is.
+const PER_AIRCRAFT: [&str; 3] = ["gates_passed", "race_time_s", "place"];
+
+/// The aircraft ids of a race sweep that flies several drones in some run
+/// (sorted); empty for any other sweep.
+fn race_fleet(sweep: &Sweep) -> Vec<u32> {
+    if sweep.course.is_none() || sweep.runs.iter().all(|r| r.scenario.aircraft.len() < 2) {
+        return Vec::new();
+    }
+    let ids: BTreeSet<u32> =
+        sweep.runs.iter().flat_map(|r| r.scenario.aircraft.iter().map(|a| a.id)).collect();
+    ids.into_iter().collect()
+}
+
 /// Write `summary.csv` (via a temporary file, so a reader never sees half of
 /// it): one row per run in run order — status, seed, the course seed and gate count (race
 /// sweeps), the sample (when the sweep samples), the `vary` values and drawn
 /// offsets, sim time, wall time, speed, the bag, then the fleet metrics
 /// ([`METRICS`], and [`RACE_METRICS`] for a race; but for `sim_time_s`, a
-/// column already).
+/// column already). A race that flies several drones adds each one's
+/// `a<id>_gates_passed`, `a<id>_race_time_s` and `a<id>_place` and then
+/// `race_winner`, from the metrics' `race` and `race_winner`.
 fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Result<()> {
     let tmp = path.with_extension("csv.tmp");
     let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -1052,6 +1116,14 @@ fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Resu
         .filter(|id| !header.iter().any(|h| h == id))
         .collect();
     header.extend(metric_ids.iter().map(|id| id.to_string()));
+    // A race with several drones: each one's result, then who won.
+    let fleet = race_fleet(sweep);
+    for id in &fleet {
+        header.extend(PER_AIRCRAFT.map(|field| format!("a{id}_{field}")));
+    }
+    if !fleet.is_empty() {
+        header.push("race_winner".into());
+    }
     writeln!(f, "{}", header.iter().map(|h| csv_cell(h)).collect::<Vec<_>>().join(","))?;
     for (run, state) in sweep.runs.iter().zip(rows) {
         let (status, outcome, metrics) = match state {
@@ -1089,6 +1161,18 @@ fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Resu
         row.extend(
             metric_ids.iter().map(|id| metric_cell(metrics.as_ref().and_then(|m| m.get(id)))),
         );
+        for id in &fleet {
+            let result = metrics.as_ref().and_then(|m| {
+                m.get("race")?
+                    .as_array()?
+                    .iter()
+                    .find(|r| r["aircraft"].as_u64() == Some(u64::from(*id)))
+            });
+            row.extend(PER_AIRCRAFT.map(|field| metric_cell(result.and_then(|r| r.get(field)))));
+        }
+        if !fleet.is_empty() {
+            row.push(metric_cell(metrics.as_ref().and_then(|m| m.get("race_winner"))));
+        }
         writeln!(f, "{}", row.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(","))?;
     }
     f.flush()?;

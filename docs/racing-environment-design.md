@@ -286,7 +286,7 @@ miss as `GateMissed`.
 ## 4b. The airframe, and how a run ends
 
 `airframe.rs`, `systems.rs::detect_crash`. A run ends in exactly one way: some system
-writes a `RaceOutcome` onto `RaceProgress` via `finish()`, and the sim's own end-of-run
+writes a `RaceOutcome` onto a drone's `RaceProgress` via `finish()`, and the sim's own end-of-run
 machinery (§5) turns that into the app's single `AppExit` and its `EndReason`.
 
 | `RaceOutcome` | Set by | Meaning |
@@ -382,8 +382,8 @@ touches nothing.
 ## 5. The app
 
 `build_race_app(ResolvedRace, RunMode)` is two lines of idea: build the sim's own app
-with `astrum_sim::build_app`, then add the race's resources (`RaceCourse`,
-`RaceProgress`) and systems. Nothing about flying, commanding or publishing the drone is
+with `astrum_sim::build_app`, then add the race's resources (`RaceCourse`, and `Race` — one
+`RaceProgress` per drone) and systems. Nothing about flying, commanding or publishing the drone is
 re-implemented — the spawn, the FDM step, command ownership and the lease, lockstep,
 pause/step, telemetry, events, recording, pacing and the control plane are the sim's.
 
@@ -397,7 +397,7 @@ pause/step, telemetry, events, recording, pacing and the control plane are the s
 The race's tick, `systems::tick_systems()`, is one chain in `Stepped`:
 
 ```
-detect_crash → track_gates → time_limit → end_race → publish_race
+detect_crash → track_gates → time_limit → end_race → freeze_crashed → publish_race
 ```
 
 The order is the invariant. Everything that can end the race is judged against the pose
@@ -409,20 +409,23 @@ pushed are stamped and published with the tick's telemetry by the sim's `publish
 Because `Stepped` sits before `publish_telemetry`, a lockstep controller always sees a
 tick's `RaceState` before it sees that tick's telemetry.
 
-Startup (`Spawned`): log the course, publish `RaceCourse` and the initial `RaceState` (so a
-controller already listening has the course with tick 0), and — if the sim could not spawn
-the drone — mark the race `SpawnFailed` (the sim itself ends the run as `Fatal`).
+Startup (`Spawned`): log the course, publish each drone's `RaceCourse` and initial `RaceState`
+(so a controller already listening has the course with tick 0), and — if the sim could not
+spawn the fleet — mark every drone `SpawnFailed` (the sim itself ends the run as `Fatal`).
 
 How a race ends:
 
-| Race outcome | Run ends as (`EndReason`) | By |
+A drone's outcome ends the *run* only when every drone's race is over (§8b; for one drone that
+is the same moment):
+
+| Every drone's race is over, and… | Run ends as (`EndReason`) | By |
 | --- | --- | --- |
-| `Complete` | `RaceComplete` | `end_race` |
-| `CrashedGround` / `CrashedGate` | `Crashed` | `end_race` |
-| `TimedOut` | `MaxTime` | the sim's `stop_at_max_time`; `time_limit` marks the outcome in the same tick |
+| at least one `Complete` | `RaceComplete` | `end_race` |
+| all `CrashedGround` / `CrashedGate` | `Crashed` | `end_race` |
+| otherwise — `TimedOut` (`sim.max_time_s`) | `MaxTime` | the sim's `stop_at_max_time`; `time_limit` marks the drones' outcome in the same tick |
 | `SpawnFailed` | `Fatal` | the sim's `exit_on_fatal` |
 
-In `RunMode::Embedded` (tests, an RL env) nothing exits: the caller reads `RaceProgress`.
+In `RunMode::Embedded` (tests, an RL env) nothing exits: the caller reads `Race`.
 Once the race is decided the scoring systems stand down (first writer wins) but the sim
 keeps stepping until the caller stops it.
 
@@ -488,7 +491,7 @@ message instead of hard-coding them.
 
 `outcome` is the one thing a controller cannot work out for itself: it has the course and the
 telemetry but not the airframe's hull, so without it a crashed drone looks exactly like one
-whose telemetry stopped. `RaceOutcome` is the single type that `RaceProgress` holds and the
+whose telemetry stopped. `RaceOutcome` is the single type that each drone's `RaceProgress` holds and the
 wire carries, so the two cannot drift; a subscriber's build that does not know a value
 decodes it as `Unknown`.
 
@@ -505,8 +508,8 @@ late-joiner replay and the normal case is a controller started after the sim.
 
 ## 8. Scenario, CLI, recording
 
-A race scenario is an ordinary `astrum-sim` scenario (`[world]`, `[sim]`, exactly one
-`[[aircraft]]` — the F450) plus a `[course]` table. `RaceScenario::from_toml_str` strips
+A race scenario is an ordinary `astrum-sim` scenario (`[world]`, `[sim]`, one to eight
+`[[aircraft]]` — all F450s, unique ids; §8b) plus a `[course]` table. `RaceScenario::from_toml_str` strips
 `[course]` and deserializes the rest as `astrum_sim::scenario::Scenario`, so every sim
 table, default and validation rule (including `deny_unknown_fields`) is the sim's. The shipped
 `config/scenario.race.toml` spells the whole envelope out with a comment per limit; the
@@ -517,7 +520,8 @@ table, default and validation rule (including `deny_unknown_fields`) is the sim'
 | Key | Meaning |
 | --- | --- |
 | `seed` | course seed; default `sim.seed`; `--seed` overrides both. It is **not** the sim's RNG: `sim.seed` still seeds JSBSim's noise, so a sweep can hold the course and vary the rest |
-| `start_behind_m` | the drone starts this far (default 10 m) upstream of gate 0, on its centreline, at its height, facing along it — the aircraft's lat/lon/alt/heading are **overwritten** from the course |
+| `start_behind_m` | the drones start this far (default 10 m) upstream of gate 0, at its height, facing along it — every aircraft's lat/lon/alt/heading are **overwritten** from the course |
+| `grid_spacing_m` | lateral spacing (default 2 m) of the start grid when several drones race (§8b) |
 | `length_m` | target total leg length (m); derives the unstated leg limits and radius from `gates` (§3.1). `config/scenario.race.toml` ships `length_m = 500.0` and `sim.max_time_s = 300` so a run fits |
 | `[[course.gate]]` | explicit gates (`index`, `east_m`, `north_m`, `up_m`, `yaw_rad`), used verbatim — nothing is sampled, and `--seed` is an error |
 | `opening_m`, `bar_m` | the gate size the scenario was laid out for; a mismatch with this build is an error rather than a silent re-sizing |
@@ -546,6 +550,54 @@ environment variables) plus the course ones. The default endpoint is the sim's, 
 controller reaches either with no reconfiguration, and running both at once needs one moved.
 The run loop is `astrum_sim::run_to_exit`; SIGINT/SIGTERM end it cleanly with the bag
 finished.
+
+---
+
+## 8b. Several drones: duels
+
+A race may have 1 to 8 `[[aircraft]]` (all F450s, unique ids) racing the **same** gates;
+`config/scenario.duel.toml` is `scenario.race.toml` with a second drone. Everything below is
+additive: a one-aircraft race behaves exactly as before.
+
+**Start grid.** Aircraft sorted by id take slots `i = 0..n-1`; slot `i` starts `start_behind_m`
+upstream of gate 0, facing along its normal, at gate 0's height, offset along gate 0's `right`
+(starboard) vector by `(i − (n−1)/2) · grid_spacing_m` — two drones start ±1 m of the
+centreline, three at −2, 0, +2 m, one on it. Every drone's start pose is overwritten from the
+course, so the lat/lon/alt/heading in the file only satisfy the scenario schema.
+`ResolvedRace::grid()` and `--dump-course` list the resulting positions.
+
+**Ghosts — a limitation.** Drones do not collide with each other: each is judged only against
+the gates and the ground, as a lone drone is, and the gates are shared (several drones can be
+in the same opening at once). Two drones that fly through each other keep flying. That keeps
+the scoring rules and the hull unchanged and the duel a race between two flights rather than
+a combat; it also means a faster drone that "overtakes" one is simply ahead. Modelling contact
+(a drone hull against another's) would be a new termination rule and is not done.
+
+**Independent progress.** `Race` holds one `RaceProgress` per drone (next gate, passed, missed,
+last pass time, outcome), scored with the rules of §4 on that drone's own motion. Events carry
+the aircraft id (`gatePassed`, `gateMissed`, `crashed`), and each drone gets its own
+`astrum/race/course/<id>` and `astrum/race/state/<id>`.
+
+**A crash ends that drone's race only.** Its outcome becomes `CrashedGround` / `CrashedGate`
+and it is no longer scored. If other drones are still racing it is also **frozen**: the race
+marks it with the sim's existing `Dead` component, which the sim already treats as a wreck —
+no FDM step (the pose stays), no commands, no lockstep wait, telemetry `combat.alive = false` —
+so a dead drone's controller can neither stall the others nor make the run fatal. (The sim
+also reports it as a `kill` event with no killer.) A crash that ends the run (a lone drone,
+or the last one) freezes nothing, so the final telemetry of a one-drone race is as before. A
+drone that has *completed* the course is not frozen; it is simply no longer scored (its
+controller should hold the hover).
+
+**The end of the run.** When every drone's race is over — completed, crashed or timed out —
+the run ends: `RaceComplete` if at least one completed, `Crashed` if all crashed, and
+otherwise (drones out of time at `sim.max_time_s`) `MaxTime`.
+
+**Results (derived, not on the wire).** `Race::results()` ranks the drones: those that
+completed the course first, by *finish time* (the sim time of their last `gatePassed`)
+ascending; then the rest by gates passed descending and, on a tie, by the time of their last
+pass ascending; remaining ties go to the lower id. `place` is the 1-based rank and
+`Race::winner()` is the aircraft in first place if it completed the course (none otherwise).
+`astrum-bag`'s metrics derive the same from the bag's events.
 
 ---
 
@@ -580,6 +632,7 @@ a recorded scenario is for (`the_resolved_scenario_replays_to_the_same_course`).
 | `scoring.rs` | (rig) flythrough rules — long steps, backwards crossings, misses, ordering, under the sill, interpolated crossings — and that each pass/miss is announced as an event, with the CG's offset in the gate frame, and that the last gate ends the run as `RaceComplete` |
 | `crash.rs` | (rig) termination *behaviour*: the ground threshold is the hull's lowest part, a strike scores nothing and is reported as `Crashed` + `RunEnded(Crashed)`, a crash beats a same-tick pass with the CG inside the hole (the centred pass as the control), any gate is solid, a 4 m tick cannot tunnel one — plus one real-JSBSim fall from 30 m through the sim's own step and exit |
 | `app.rs` | scenario resolution — the shipped file, `[course]` marking a race, `course.seed` pinned vs `sim.seed` vs the override, explicit gates verbatim and the drone aimed at them, the resolved TOML round trip (a fixed point), the `CourseView`, a scenario for other gate sizes refused, only the F450 on a ground-level origin accepted — and on JSBSim: the spawn on the approach, and a recorded run whose bag carries the resolved gates, replays to the same course and ends `TimedOut` / `MaxTime` |
+| `duel.rs` | several drones: the start grid for 1, 2 and 3 drones (ids sorted, spacing, centred), independent scoring, one crash while the other completes (the wreck frozen and unscored, the run ending `RaceComplete`), a gate strike ending one drone's race only, all-crashed ending `Crashed`, the time cap, the ranking rules, and two scripted drones in lockstep on JSBSim replaying bit-identically |
 | `net.rs` | over an in-process session: the course (with each gate's explicit basis) and state reach a `RaceSubscriber` from the first tick, state time moves forward, the crash arrives as a final `finished` state, a `Crashed` event and `RunEnded(Crashed)` |
 | `flight.rs` | a scripted `Multirotor` controller flies gate 0 in lockstep over an in-process session, and the run replays bit-identically |
 | `spawn_failure.rs` | (its own binary: it breaks `JSBSIM_ROOT`) a drone that cannot spawn ends the race `SpawnFailed` and the run as an error |
@@ -615,7 +668,7 @@ arithmetic — no FDM, no world) and it is what caught the seed-60 wedge in §3.
 | Race scenario, resolution, `CourseView` | `crates/astrum-race/src/scenario.rs` |
 | `build_race_app` | `crates/astrum-race/src/lib.rs` |
 | Crash detection, scoring, the end of the run, `tick_systems`, the wire publication | `crates/astrum-race/src/systems.rs` |
-| `RaceProgress` (`RaceOutcome`, first-writer-wins `finish`), `RaceCourse` | `crates/astrum-race/src/components.rs` |
+| `Race`, `RaceProgress` (`RaceOutcome`, first-writer-wins `finish`), `DroneResult`, `RaceCourse` | `crates/astrum-race/src/components.rs` |
 | The race's Zenoh publisher | `crates/astrum-race/src/net.rs` |
 | `RaceCourse` / `RaceState` / race events schema and codecs | `crates/astrum-proto/schema/astrum.capnp`, `crates/astrum-proto/src/lib.rs` |
 | `RacePublisher` / `RaceSubscriber`, key space | `crates/astrum-net/src/lib.rs` |

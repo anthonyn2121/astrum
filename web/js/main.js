@@ -21,7 +21,8 @@ import { relativeGeometry } from "./geometry.js";
 import { loadPrefs, savePrefs } from "./prefs.js";
 import { SimControl } from "./simcontrol.js";
 import { RunPanel } from "./runpanel.js";
-import { courseKey, pendingGateAt } from "./race.js";
+import { courseKey, pendingGateAt, raceStandings } from "./race.js";
+import { Scoreboard } from "./scoreboard.js";
 
 // A playhead move longer than this (sim s) in one frame is a seek: the events
 // it skips over are not flashed.
@@ -78,6 +79,11 @@ const scene = new Scene(document.getElementById("view"), {
   onSelect: (id) => selectAircraft(id),
   onTarget: (id) => toggleTarget(id),
   onCameraMode: (mode) => ui.setCameraMode(mode),
+});
+
+const scoreboard = new Scoreboard({
+  root: document.getElementById("scoreboard"), body: document.getElementById("scoreboardBody"),
+  banner: document.getElementById("raceBanner"), onSelect: (id) => selectAircraft(id),
 });
 
 const ui = new UI({
@@ -550,7 +556,14 @@ function tick(now) {
   }
 
   updateEnvironment();
-  if (course) scene.setPendingGate(pendingGateAt(store.events, state.playhead, state.selectedId, course.gates.length));
+  if (course) {
+    // The gates' colours follow the selected aircraft; the scoreboard shows every one.
+    scene.setPendingGate(pendingGateAt(store.events, state.playhead, state.selectedId, course.gates.length));
+    scoreboard.update(raceStandings(store.events, state.playhead, store.ids(), course.gates.length),
+      { selectedId: state.selectedId, colorOf });
+  } else {
+    scoreboard.update(null, { selectedId: null, colorOf });
+  }
   scene.update(store, state.playhead, {
     showTrails: state.trails,
     showLabels: state.labels,

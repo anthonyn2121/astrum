@@ -8,7 +8,9 @@
 // box: its seed — the scenario's own, or a fresh random one with "Randomize
 // gates" — the number of gates, and a sketch of the course they give; the seed
 // and the gate count go in the POST /api/runs body when they are not the
-// scenario's own. `?scenario=<name>` picks that scenario as a click would.
+// scenario's own. A race scenario with one aircraft can also take opponents
+// (`opponents`, 1…7): more drones on the same course, each with its own row of
+// the controller form (a race controller, cpp-minsnap, preselected). `?scenario=<name>` picks that scenario as a click would.
 // Scenario names, summaries, errors and catalog text are untrusted: they reach
 // the DOM as text only.
 
@@ -24,6 +26,7 @@ import { drawCoursePreview, courseSummary } from "./coursepreview.js";
 
 const ACTIVE_POLL_MS = 2000;
 const GATES_MIN = 2, GATES_MAX = 64; // the gate counts a course may have
+const OPPONENT_CONTROLLER = "cpp-minsnap"; // an opponent's controller until another is picked
 const PREVIEW_DEBOUNCE_MS = 250; // typing a seed redraws the sketch this long after the last key
 
 const el = {
@@ -35,6 +38,7 @@ const el = {
   envList: $("envList"), planEnv: $("planEnv"), planScenario: $("planScenario"), planSpeed: $("planSpeed"),
   planMax: $("planMax"), planFleet: $("planFleet"), planLocked: $("planLocked"),
   courseBox: $("courseBox"), courseRandom: $("courseRandom"), courseSeed: $("courseSeed"),
+  courseOpponents: $("courseOpponents"), opponentsField: $("opponentsField"),
   courseGates: $("courseGates"), courseGatesHint: $("courseGatesHint"), courseGatesError: $("courseGatesError"),
   courseReroll: $("courseReroll"), courseSeedHint: $("courseSeedHint"), courseSeedError: $("courseSeedError"),
   coursePreview: $("coursePreview"), courseCaption: $("courseCaption"), courseError: $("courseError"),
@@ -83,6 +87,10 @@ function onPick(entry, doc, error) {
     : "empty: the scenario's limit; 0 = until stopped";
   showError(el.formError, "");
   setupCourse();
+  // A race that lists several drones: each races, by default.
+  if (isRace() && state.doc.scenario.aircraft.length > 1) {
+    for (const a of state.doc.scenario.aircraft) form.setController(a.id, OPPONENT_CONTROLLER, true);
+  }
   sync();
 }
 
@@ -130,6 +138,9 @@ function setupCourse() {
   c.ownSeed = c.own?.seed ?? null;
   c.ownGates = c.own?.gates.length ?? null;
   el.courseRandom.checked = false;
+  // Opponents are clones of the scenario's aircraft: for a scenario with one.
+  el.opponentsField.hidden = !race || state.doc.scenario.aircraft.length !== 1;
+  el.courseOpponents.value = "0";
   el.courseSeed.value = c.ownSeed ?? "";
   el.courseGates.value = c.ownGates ?? "";
   el.courseGatesHint.textContent = c.ownGates != null ? `the scenario's own count is ${c.ownGates}` : "";
@@ -209,6 +220,7 @@ function buildRequest() {
   showError(el.maxTimeError, max.error || "");
   const course = isRace() ? seedValue() : null;
   const count = isRace() ? gatesValue() : null;
+  const opponents = Number(el.courseOpponents.value);
   if (course) showError(el.courseSeedError, course.error || "");
   if (count) showError(el.courseGatesError, count.error || "");
   if (!ok || max.error || course?.error || count?.error) return null;
@@ -217,6 +229,7 @@ function buildRequest() {
   // The scenario's own seed is what a run without one flies: send only another.
   if (course && (el.courseRandom.checked || course.seed !== state.course.ownSeed)) body.seed = course.seed;
   if (count && count.gates !== state.course.ownGates) body.gates = count.gates;
+  if (isRace() && !el.opponentsField.hidden && opponents > 0) body.opponents = opponents;
   return body;
 }
 
@@ -275,8 +288,10 @@ function renderPlan() {
   el.planCourseRow.hidden = !isRace();
   el.planCourse.textContent = seed.error ? "invalid seed" : count.error ? "invalid gate count"
     : `seed ${seed.seed}${el.courseRandom.checked ? " (random)" : seed.seed === state.course.ownSeed ? " (scenario's)" : ""}`
-      + ` · ${count.gates} gates`;
-  const aircraft = state.doc ? [...state.doc.scenario.aircraft].sort((a, b) => a.id - b.id) : [];
+      + ` · ${count.gates} gates`
+      + (el.opponentsField.hidden || el.courseOpponents.value === "0" ? ""
+        : ` · ${el.courseOpponents.value} opponent${el.courseOpponents.value === "1" ? "" : "s"}`);
+  const aircraft = state.doc ? [...form.fleet()] : [];
   el.planFleet.replaceChildren(...aircraft.map((a) => {
     // The row's controller select (ctlform.js), when the form has one.
     const select = $(`ctl-${a.id}`);
@@ -381,6 +396,14 @@ el.maxTime.addEventListener("input", sync);
 el.envList.addEventListener("change", sync);
 el.courseRandom.addEventListener("change", onRandomizeChange);
 el.courseReroll.addEventListener("click", onRandomizeChange);
+el.courseOpponents.addEventListener("change", () => {
+  if (el.opponentsField.hidden) return;
+  const n = Number(el.courseOpponents.value);
+  form.setOpponents(n, OPPONENT_CONTROLLER);
+  if (n > 0) form.setController(1, OPPONENT_CONTROLLER, true); // a duel: the first drone races too
+  showError(el.formError, "");
+  sync();
+});
 el.courseSeed.addEventListener("input", onCourseSeedInput);
 el.courseGates.addEventListener("input", onCourseSeedInput);
 el.fleet.addEventListener("controllerchange", () => {

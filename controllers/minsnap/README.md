@@ -181,6 +181,36 @@ The default horizon stays 16: the cost of a plan is roughly linear in the gates 
 (16 gates, 20 iterations) take about 100–150 ms (below); a plan of 32 gates costs roughly twice as much,
 which is too close to the 0.5 s command lease for an extension.
 
+## Opponent presets (duels)
+
+Two (or more) instances fly one race: give each its own `--id` and run them against an
+`astrum-race` scenario with several `[[aircraft]]` (`config/scenario.duel.toml`; every aircraft needs
+`lockstep = true` in a lockstep run — an aircraft without it is not waited for and loses its command
+lease while its controller plans). Nothing in the law is per-drone state: telemetry, `RaceCourse` and
+`RaceState` are keyed by `--id`, so the instances do not know about each other. The drones are ghosts
+(no collisions) and start `grid_spacing_m` apart across gate 0's approach (±1 m for two), which the
+planner takes as an ordinary start position.
+
+The opponent's pace is the planner's. Measured in lockstep on 500 m courses, id 1 with the defaults
+against id 2 with the preset (lap time of id 2 relative to id 1; every run: both complete, 0 missed
+gates, worst gate-centre offset ≤ 8 cm):
+
+| id 2 flags | 8 gates (seeds 1–5) | 24 gates (seeds 1–3) |
+|---|---|---|
+| *(none: same as id 1)* | within 0.3 s either way (a ghost: who wins is the 1 m grid offset) | within 1 s |
+| `--limit-margin 0.97` | −2 … +3 % (can win; uses 97 % of the true limits) | not flown |
+| `--limit-margin 0.75` | +10 … +19 % | +5 … +7.5 % |
+| `--time-scale 1.15` | +13 … +16 % | +14 … +16 % |
+| `--planner heuristic` | +56 … +61 % (seeds 1–3) | not flown |
+| `--limit-margin 0.5` | +89 … +94 % (seeds 1–3) | not flown |
+
+`--time-scale` is the predictable knob (the whole plan, pinned gate speeds included, is stretched by that
+factor, so the lap is longer by about that factor and the aircraft flies gentler turns); `--limit-margin`
+is the "driver skill" knob (how close to the airframe's limits the plan goes: a time-optimal plan at 0.5 is
+a different, slower line, not a stretched one). Slower than `--time-scale 1.15` / `--limit-margin 0.75`
+lost all 16 of the duels flown against the defaults. Stronger than the defaults is `--limit-margin` toward
+1.0: at 0.97 it flew 4 of 4 clean here, but the margin the default keeps (0.9) is what absorbs tracking error.
+
 ## Build and test
 
 ```

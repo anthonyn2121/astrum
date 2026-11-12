@@ -73,6 +73,17 @@ function metricRows(m) {
   if (Number.isInteger(m.gates_missed)) add("gates missed", String(m.gates_missed));
   add("race time", unit(m.race_time_s, 2, "s"));
   if (typeof m.race_outcome === "string") add("race outcome", m.race_outcome);
+  // A race with several drones: each one's result, and the winner.
+  if (Array.isArray(m.race) && m.race.length > 1) {
+    for (const r of m.race) {
+      if (!Number.isInteger(r?.aircraft)) continue;
+      const time = num(r.race_time_s) != null ? ` · ${fmtNum(r.race_time_s, 2)} s` : "";
+      const place = Number.isInteger(r.place) ? `place ${r.place} · ` : "";
+      add(`aircraft ${r.aircraft}`, `${place}${Number.isInteger(r.gates_passed) ? r.gates_passed : "?"} passed`
+        + `${time}${typeof r.race_outcome === "string" ? ` · ${r.race_outcome}` : ""}`);
+    }
+    add("winner", Number.isInteger(m.race_winner) ? `aircraft ${m.race_winner}` : "none");
+  }
   for (const [key, label] of [
     ["failsafe_entries", "failsafe entries"], ["controller_losses", "controller losses"],
     ["command_refusals", "command refusals"], ["hits", "hits"], ["kills", "kills"],

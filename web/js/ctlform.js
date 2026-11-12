@@ -34,6 +34,7 @@ export class ControllerForm {
   #fleet = [];       // the scenario's aircraft (with kind), sorted by id
   #rows = new Map(); // aircraft id -> row
   #disabled = false;
+  #opponents = 0;    // opponent rows (ids 2…): clones of aircraft 1, see setOpponents
 
   constructor({ host, controllers }) {
     this.#host = host;
@@ -49,8 +50,49 @@ export class ControllerForm {
       ? doc.scenario.aircraft.map((a) => ({ ...a, kind: kinds.get(a.id) ?? a.kind })).sort((a, b) => a.id - b.id)
       : [];
     this.#rows = new Map();
+    this.#opponents = 0;
     this.#host.replaceChildren();
     for (const a of this.#fleet) this.#addRow(a);
+    this.#applyDisabled();
+  }
+
+  // The aircraft the form has a row for, by id: the scenario's, and the
+  // opponents setOpponents added.
+  fleet() {
+    return this.#fleet;
+  }
+
+  // Give aircraft `id` the catalog controller `controllerId`, unless it already has
+  // one and `onlyIfNone`; false when there is no such row or the controller does
+  // not fly its kind.
+  setController(id, controllerId, onlyIfNone = false) {
+    const row = this.#rows.get(id);
+    if (!row || (onlyIfNone && row.select.value !== "")) return false;
+    if (![...row.select.options].some((o) => o.value === controllerId)) return false;
+    row.select.value = controllerId;
+    row.select.dispatchEvent(new Event("change"));
+    return true;
+  }
+
+  // Race scenarios: show `n` opponents (0 = none) after the scenario's aircraft,
+  // as the server will add them to a run's fleet: clones of aircraft 1 with ids
+  // 2…1+n. Rows already there keep their controller and parameters; a new row
+  // starts with the catalog controller `defaultController`, when that one flies
+  // its kind. Call only for a scenario with one aircraft.
+  setOpponents(n, defaultController = null) {
+    const base = this.#fleet.find((a) => a.id === 1);
+    if (!base) return;
+    for (let id = 2 + n; id < 2 + this.#opponents; id++) {
+      this.#rows.get(id)?.el.remove();
+      this.#rows.delete(id);
+      this.#fleet = this.#fleet.filter((a) => a.id !== id);
+    }
+    for (let id = 2 + this.#opponents; id < 2 + n; id++) {
+      const row = this.#addRow({ ...base, id, opponent: true });
+      this.#fleet.push(row.aircraft);
+      if (defaultController) this.setController(id, defaultController);
+    }
+    this.#opponents = n;
     this.#applyDisabled();
   }
 
@@ -157,16 +199,20 @@ export class ControllerForm {
     const team = Number.isInteger(a.team) ? `team ${a.team}` : null;
     // --team colours the row's stripe (css/studio.css).
     const style = Number.isInteger(a.team) ? `--team: ${teamColor(a.team)}` : null;
-    this.#host.append(h("div", { class: "fleet-row", style },
+    const el = h("div", { class: "fleet-row", style },
       h("div", { class: "fleet-head" },
         h("span", { class: "fleet-id", text: `#${a.id}` }),
+        a.opponent ? h("span", { class: "tag", text: "opponent" }) : null,
         h("span", { class: "fleet-model", text: a.model }),
         h("span", { class: "tag", text: a.kind }),
         team ? h("span", { class: "muted small", text: team }) : null,
         h("label", { class: "fleet-ctl" }, h("span", { class: "muted small", text: "Controller" }), select)),
       error,
-      paramsBox));
+      paramsBox);
+    row.el = el;
+    this.#host.append(el);
     this.#rows.set(a.id, row);
+    return row;
   }
 
   // An aircraft's initial value of a parameter target (a scenario aircraft

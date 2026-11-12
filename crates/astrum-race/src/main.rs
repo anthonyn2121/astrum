@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 
 use astrum_net::{ScenarioServer, Session};
 use astrum_race::course::Course;
+use astrum_race::scenario::ResolvedRace;
 use astrum_race::{build_race_app, RaceScenario};
 use astrum_sim::components::{SimClock, SimParams};
 use astrum_sim::sweep::stopped_line;
@@ -96,6 +97,19 @@ fn dump(course: &Course) {
     }
 }
 
+/// Print where each drone starts (the grid behind gate 0).
+fn dump_grid(race: &ResolvedRace) {
+    println!(
+        "# start grid: {} drone(s), {} m apart",
+        race.scenario.aircraft.len(),
+        race.grid_spacing_m()
+    );
+    println!("# aircraft      east     north       alt");
+    for (id, at) in race.grid() {
+        println!("{id:10} {:9.2} {:9.2} {:9.2}", at.x, at.y, at.z);
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let mut race = match RaceScenario::load(&cli.scenario) {
@@ -132,6 +146,7 @@ fn main() -> ExitCode {
     };
     if cli.dump_course {
         dump(&resolved.course);
+        dump_grid(&resolved);
         return ExitCode::SUCCESS;
     }
 

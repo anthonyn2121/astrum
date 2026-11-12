@@ -92,6 +92,18 @@
                 <span id="courseGatesHint" class="muted small"></span>
                 <span id="courseGatesError" class="field-error" hidden></span>
               </div>
+              <!-- Opponents: more drones on the same course (a scenario that lists
+                   one aircraft only); each gets its own row under Controllers. -->
+              <div id="opponentsField" class="field course-opponents">
+                <label class="field-label" for="courseOpponents">Opponents</label>
+                <select id="courseOpponents">
+                  <option value="0">off</option>
+                  <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+                  <option value="4">4</option><option value="5">5</option><option value="6">6</option>
+                  <option value="7">7</option>
+                </select>
+                <span class="muted small">same course, own controller each</span>
+              </div>
             </div>
             <figure class="course-preview">
               <svg id="coursePreview" class="course-svg" role="img" aria-label="Top-down sketch of the course" preserveAspectRatio="xMidYMid meet"></svg>

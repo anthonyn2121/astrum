@@ -76,11 +76,17 @@ export function attitudeToQuaternion(phi, theta, psi, out = new THREE.Quaternion
   return out.setFromRotationMatrix(_m);
 }
 
+// Race colours (degrees of hue), by aircraft id: far from each other and from the
+// gates' blue / gold / green, so the drones of a duel are told apart at a glance.
+const RACE_HUES = [190, 320, 25, 270, 160, 60, 0, 230];
+
 // The colour of aircraft `id` into `out`. Plain (`sky` false): a distinct
 // per-id hue within a per-class band; an unknown vehicle class (a newer sim)
 // renders as a desaturated jet. Sky: the team's hue, ±12° and lightness
-// 0.46–0.56 per id; a missing team counts as team 0.
-export function aircraftColor(kind, id, team, sky, out = new THREE.Color()) {
+// 0.46–0.56 per id; a missing team counts as team 0. With `race` (a course is on
+// screen) each id has its own hue (RACE_HUES), whatever the environment.
+export function aircraftColor(kind, id, team, sky, out = new THREE.Color(), race = false) {
+  if (race) return out.setHSL(RACE_HUES[(id - 1 + RACE_HUES.length) % RACE_HUES.length] / 360, 0.85, 0.58);
   if (!sky) {
     const baseHue = kind === "multirotor" ? 32 : 205; // amber vs. steel blue
     const jitter = ((id * 47) % 70) - 35;             // ±35° spread across the fleet

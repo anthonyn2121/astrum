@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use astrum_bag::BagWriter;
 use astrum_net::keys;
-use astrum_proto::{encode_telemetry, Telemetry, VehicleKind};
+use astrum_proto::{
+    encode_event, encode_telemetry, EndReason, Event, EventKind, RaceOutcome, Telemetry,
+    VehicleKind,
+};
 use astrum_race::scenario::RaceScenario;
 use astrum_web::bridge::Bridge;
 use astrum_web::catalogs::Catalogs;
@@ -58,6 +61,17 @@ impl Tree {
              alt_hae_m = 50.0\nheading_deg = 0.0\ntas_mps = 0.0\n",
         )
         .unwrap();
+        // Two drones racing one course; their recording: aircraft 1 passes all four
+        // gates, aircraft 2 two and then crashes into the third.
+        let duel = common::RACE_SCENARIO.replace(
+            "[course]",
+            "[[aircraft]]\nid = 2\nmodel = \"F450\"\nlat_deg = 44.7258\nlon_deg = -93.0759\n\
+             alt_hae_m = 2.0\nheading_deg = 0.0\ntas_mps = 0.0\n[course]",
+        );
+        std::fs::write(config.join("scenario.duel.toml"), &duel).unwrap();
+        let duel_resolved =
+            RaceScenario::from_toml_str(&duel).unwrap().resolve(None).unwrap().to_toml();
+        write_duel_bag(&dir.path().join("duel.mcap"), &duel_resolved);
         write_bag(&dir.path().join("fixture.mcap"), &resolved);
         Self { dir, resolved }
     }
@@ -72,8 +86,8 @@ impl Tree {
 
     /// A stand-in `astrum-race`: prints its arguments, then runs until
     /// SIGTERM, when it copies the fixture bag to its `--record` path.
-    fn race_bin(&self) -> PathBuf {
-        let fixture = self.path().join("fixture.mcap");
+    fn race_bin_playing(&self, fixture: &str) -> PathBuf {
+        let fixture = self.path().join(fixture);
         let body = format!(
             "echo \"args $*\"\n\
              while [ $# -gt 0 ]; do [ \"$1\" = --record ] && bag=\"$2\"; shift; done\n\
@@ -89,6 +103,10 @@ impl Tree {
     }
 
     fn app(&self) -> (Router, Runs) {
+        self.app_playing("fixture.mcap")
+    }
+
+    fn app_playing(&self, fixture: &str) -> (Router, Runs) {
         // Ordinary runs would fly `astrum-sim`, which does not exist here: a
         // race that reached it would fail to start.
         common::app_with_race_runs(
@@ -96,7 +114,7 @@ impl Tree {
             Bridge::new(config()),
             self.catalogs(),
             &self.path().join("no-astrum-sim"),
-            &self.race_bin(),
+            &self.race_bin_playing(fixture),
         )
     }
 }
@@ -115,6 +133,45 @@ fn write_bag(path: &Path, scenario: &str) {
         let ns = (t.sim_time_s * 1e9) as u64;
         w.write(&keys::telemetry(1), ns, ns, &encode_telemetry(&t)).unwrap();
     }
+    w.finish().unwrap();
+}
+
+/// The recording of a duel on four gates: aircraft 1 passes them all (the last at
+/// 3 s), aircraft 2 passes two and crashes into the third.
+fn write_duel_bag(path: &Path, scenario: &str) {
+    let mut w = BagWriter::create(path, Some(scenario)).unwrap();
+    let mut at = 0u64;
+    let mut put = |topic: &str, payload: Vec<u8>| {
+        at += 1;
+        w.write(topic, at, at, &payload).unwrap();
+    };
+    let event =
+        |t: f64, kind| encode_event(&Event { tick: (t * 120.0) as u64, sim_time_s: t, kind });
+    for id in [1, 2] {
+        let t = Telemetry {
+            aircraft_id: id,
+            tick: 1,
+            sim_time_s: 1.0 / 120.0,
+            vehicle_kind: VehicleKind::Multirotor,
+            ..Telemetry::default()
+        };
+        put(&keys::telemetry(id), encode_telemetry(&t));
+    }
+    let passed = |aircraft_id, gate| EventKind::GatePassed {
+        aircraft_id,
+        gate,
+        offset_x_m: 0.0,
+        offset_y_m: 0.0,
+    };
+    for (t, id, gate) in
+        [(0.5, 1, 0), (0.6, 2, 0), (1.0, 1, 1), (1.2, 2, 1), (2.0, 1, 2), (3.0, 1, 3)]
+    {
+        put(keys::EVENTS, event(t, passed(id, gate)));
+    }
+    let crash = EventKind::Crashed { aircraft_id: 2, outcome: RaceOutcome::CrashedGate, gate: 2 };
+    put(keys::EVENTS, event(2.5, crash));
+    let end = EventKind::RunEnded { reason: EndReason::RaceComplete, message: String::new() };
+    put(keys::EVENTS, event(3.0, end));
     w.finish().unwrap();
 }
 
@@ -217,6 +274,15 @@ async fn a_race_run_flies_the_race_binary_with_the_scenario_and_its_course_seed(
 
     let done = stop(&app).await;
     assert_eq!(done["course"], preview, "the finished run still reports its course");
+    // Its results, from the recording's metrics: one entry per drone (the stand-in's
+    // bag has no gate event), and nobody has won.
+    let results = &done["race"];
+    assert_eq!(results["winner"], Value::Null, "{done}");
+    let drones = results["aircraft"].as_array().unwrap();
+    assert_eq!(drones.len(), 1, "{results}");
+    assert_eq!(drones[0]["aircraft"], 1);
+    assert_eq!(drones[0]["gates_passed"], 0);
+    assert_eq!(drones[0]["place"], 1);
     // The bag is the stand-in's fixture: its scenario lists the resolved gates.
     let (status, replay) = get(&app, &format!("/api/runs/{id}/replay")).await;
     assert_eq!(status, StatusCode::OK, "{replay}");
@@ -281,7 +347,12 @@ impl Tree {
     /// A stand-in `astrum-race` for sweeps: prints its arguments, copies the
     /// fixture bag to its `--record` path and ends by itself.
     fn short_race_bin(&self) -> PathBuf {
-        let fixture = self.path().join("fixture.mcap");
+        self.short_race_bin_playing("fixture.mcap", "short-race")
+    }
+
+    /// [`short_race_bin`](Self::short_race_bin) recording the bag `fixture`.
+    fn short_race_bin_playing(&self, fixture: &str, name: &str) -> PathBuf {
+        let fixture = self.path().join(fixture);
         let body = format!(
             "echo \"args $*\"\n\
              while [ $# -gt 0 ]; do [ \"$1\" = --record ] && bag=\"$2\"; shift; done\n\
@@ -289,18 +360,25 @@ impl Tree {
              echo '[astrum-sim] stopped at tick 300: sim 2.500 s in 0.100 s wall (25.0× real time)'\n",
             fixture.display()
         );
-        let path = self.path().join("short-race");
+        let path = self.path().join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
     fn sweep_app(&self) -> (Router, SweepRuns) {
+        self.sweep_app_playing("fixture.mcap")
+    }
+
+    fn sweep_app_playing(&self, fixture: &str) -> (Router, SweepRuns) {
         common::app_with_race_sweeps(
             self.path(),
             Bridge::new(config()),
             self.catalogs(),
-            (&self.path().join("no-astrum-sim"), &self.short_race_bin()),
+            (
+                &self.path().join("no-astrum-sim"),
+                &self.short_race_bin_playing(fixture, "short-race"),
+            ),
             BASE_PORT,
             STOP_GRACE,
         )
@@ -587,6 +665,85 @@ async fn a_race_sweep_flies_the_real_race_binary_with_a_real_controller() {
     shutdown_sweeps(sweeps).await;
 }
 
+#[tokio::test]
+async fn a_duel_flies_the_real_race_binary_with_two_real_controllers() {
+    let _serial = SERIAL.lock().await;
+    let Some(race) = real_race() else {
+        assert!(
+            std::env::var_os("ASTRUM_SKIP_REAL_SIM").is_some_and(|v| v == "1"),
+            "no astrum-race next to the test binaries: build it first (cargo build -p \
+             astrum-race), set ASTRUM_RACE_BIN, or skip this test with ASTRUM_SKIP_REAL_SIM=1"
+        );
+        return;
+    };
+    let tree = Tree::new();
+    // The repository's controllers, `py-autopilot` by absolute path: the race's
+    // directory is not the repository's.
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../controllers/python/example.py");
+    let controllers =
+        std::fs::read_to_string(common::repo_config().join("controllers.toml")).unwrap().replace(
+            "\"controllers/python/example.py\"",
+            &format!("{:?}", example.canonicalize().unwrap().display().to_string()),
+        );
+    std::fs::write(tree.path().join("config/controllers.toml"), controllers).unwrap();
+    let (app, sweeps) = common::app_with_race_sweeps(
+        tree.path(),
+        Bridge::new(config()),
+        tree.catalogs(),
+        (&tree.path().join("no-astrum-sim"), &race),
+        BASE_PORT + 40,
+        STOP_GRACE,
+    );
+    let body = sweep_request(json!({
+        "max_time_s": 3.0,
+        "repeats": 2,
+        "course_seed_mode": "randomize",
+        "opponents": 1,
+        "assignments": [
+            {"aircraft": 1, "controller": "py-autopilot", "params": {"alt": 2.5, "speed": 0.0}},
+            {"aircraft": 2, "controller": "py-autopilot", "params": {"alt": 2.5, "speed": 0.0}}
+        ]
+    }));
+    let (status, view) = send(&app, "POST", "/api/sweeps", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let done = loop {
+        let (_, current) = get(&app, "/api/sweeps/current").await;
+        if current["sweep"]["state"] != "running" {
+            break current["sweep"].clone();
+        }
+        assert!(Instant::now() < deadline, "the sweep never ended: {current}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(done["state"], "finished", "{done}");
+    assert_eq!(done["ok"], 2, "{done}");
+
+    let (_, results) = get(&app, &format!("/api/sweeps/{id}/results")).await;
+    let columns: Vec<&str> =
+        results["columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    let at =
+        |name: &str| columns.iter().position(|c| *c == name).unwrap_or_else(|| panic!("{name}"));
+    for row in results["rows"].as_array().unwrap() {
+        // Both drones hold station: no gate is passed by either, nobody wins.
+        for id in [1, 2] {
+            assert_eq!(row[at(&format!("a{id}_gates_passed"))], 0, "{row}");
+        }
+        assert_eq!(row[at("race_outcome")], "timed-out", "{row}");
+        assert_eq!(row[at("race_winner")], Value::Null, "{row}");
+    }
+    // Each recording lists its course's gates, so its replay carries them: the
+    // drawn course is the one the preview shows for the seed.
+    for (run, seed) in [(1, 5), (2, 6)] {
+        let (status, replay) = get(&app, &format!("/api/sweeps/{id}/runs/{run}/replay")).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        let (_, preview) = get(&app, &format!("/api/scenarios/race/course?seed={seed}")).await;
+        assert_eq!(replay["meta"]["course"]["gates"], preview["gates"], "run {run}");
+        assert_eq!(replay["meta"]["course"]["seed"], seed);
+    }
+    shutdown_sweeps(sweeps).await;
+}
+
 // --- Gate count -------------------------------------------------------------------
 
 #[tokio::test]
@@ -728,5 +885,193 @@ async fn a_race_sweeps_gate_count_is_in_its_plan_files_columns_and_saved_form() 
         &[json!("run"), json!("status"), json!("seed"), json!("course_seed"), json!("gates")]
     );
     assert!(results["rows"].as_array().unwrap().iter().all(|r| r[4] == 6), "{results}");
+    shutdown_sweeps(sweeps).await;
+}
+
+// --- Opponents ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_race_runs_opponents_are_copies_of_aircraft_1_in_the_scenario_it_flies() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, runs) = tree.app();
+
+    let (status, view) = start(&app, &json!({"scenario": "race", "opponents": 2})).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let dir = view["dir"].as_str().unwrap();
+    let written: toml::Table =
+        toml::from_str(&std::fs::read_to_string(format!("{dir}/scenario.toml")).unwrap()).unwrap();
+    let fleet = written["aircraft"].as_array().unwrap();
+    let ids: Vec<i64> = fleet.iter().map(|a| a["id"].as_integer().unwrap()).collect();
+    assert_eq!(ids, [1, 2, 3]);
+    assert!(fleet.iter().all(|a| a["model"].as_str() == Some("F450")));
+    // The course is the one aircraft 1 alone would fly: the opponents share it.
+    let (_, alone) = get(&app, "/api/scenarios/race/course").await;
+    assert_eq!(view["course"], alone);
+    assert_eq!(view["race"], Value::Null, "no results before the run has finished");
+    stop(&app).await;
+
+    // Without opponents (or with 0), the fleet is the scenario's own.
+    for body in [json!({"scenario": "race"}), json!({"scenario": "race", "opponents": 0})] {
+        let (status, view) = start(&app, &body).await;
+        assert_eq!(status, StatusCode::CREATED, "{view}");
+        let dir = view["dir"].as_str().unwrap();
+        let written: toml::Table =
+            toml::from_str(&std::fs::read_to_string(format!("{dir}/scenario.toml")).unwrap())
+                .unwrap();
+        assert_eq!(written["aircraft"].as_array().unwrap().len(), 1);
+        stop(&app).await;
+    }
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn opponents_are_refused_outside_0_to_7_and_off_a_race() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, runs) = tree.app();
+    for (body, needle) in [
+        (json!({"scenario": "race", "opponents": 8}), "opponents must be 0..=7, got 8"),
+        (json!({"scenario": "solo", "opponents": 1}), "opponents is for a race"),
+        // Aircraft 2 is the scenario's own already: a copy would clash with it.
+        (json!({"scenario": "duel", "opponents": 1}), "already has aircraft 2"),
+    ] {
+        let (status, reply) = start(&app, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+        assert!(reply["error"].as_str().unwrap().contains(needle), "{body}: {reply}");
+    }
+    let (_, current) = get(&app, "/api/runs/current").await;
+    assert_eq!(current["run"], Value::Null, "nothing was started");
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn a_duels_results_are_on_its_run_view_and_metrics() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, runs) = tree.app_playing("duel.mcap");
+    let (status, view) = start(&app, &json!({"scenario": "duel"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    assert_eq!(view["race"], Value::Null);
+    let id = view["id"].as_str().unwrap().to_owned();
+    let done = stop(&app).await;
+    assert_eq!(
+        done["race"],
+        json!({
+            "winner": 1,
+            "aircraft": [
+                {"aircraft": 1, "gates_passed": 4, "gates_missed": 0, "race_time_s": 3.0,
+                 "race_outcome": "complete", "place": 1},
+                {"aircraft": 2, "gates_passed": 2, "gates_missed": 0, "race_time_s": 1.2,
+                 "race_outcome": "crashed-gate", "place": 2},
+            ]
+        })
+    );
+    // The same results are in the recording's metrics, next to the fleet's totals.
+    let (status, metrics) = get(&app, &format!("/api/runs/{id}/metrics")).await;
+    assert_eq!(status, StatusCode::OK, "{metrics}");
+    assert_eq!(metrics["race_winner"], 1);
+    assert_eq!(metrics["race"], done["race"]["aircraft"]);
+    assert_eq!(metrics["gates_passed"], 6);
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn a_sweeps_opponents_are_planned_saved_flown_and_reported_per_aircraft() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, sweeps) = tree.sweep_app_playing("duel.mcap");
+
+    // Plan rows say how many opponents each run has.
+    let (status, none) = plan(&app, &sweep_request(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{none}");
+    assert_eq!(seeds(&none, "opponents"), [0, 0, 0].map(Value::from));
+    let request = sweep_request(json!({"opponents": 1, "gates": 4}));
+    let (status, one) = plan(&app, &request).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(seeds(&one, "opponents"), [1, 1, 1].map(Value::from));
+    // A scenario that lists its drones already races them.
+    let (_, listed) = plan(&app, &sweep_request(json!({"scenario": "duel"}))).await;
+    assert_eq!(seeds(&listed, "opponents"), [1, 1, 1].map(Value::from));
+    let (_, solo) = plan(&app, &sweep_request(json!({"scenario": "solo"}))).await;
+    assert_eq!(seeds(&solo, "opponents"), [const { Value::Null }; 3]);
+
+    // Controllers go to the opponents' ids, and only to ones that exist.
+    let both = json!([
+        {"aircraft": 1, "controller": "py-autopilot"},
+        {"aircraft": 2, "controller": "py-autopilot"}
+    ]);
+    let (status, reply) =
+        plan(&app, &sweep_request(json!({"opponents": 1, "assignments": both}))).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = plan(&app, &sweep_request(json!({"assignments": both}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    assert!(reply["error"].as_str().unwrap().contains("aircraft 2"), "{reply}");
+    for (extra, status, needle) in [
+        (json!({"opponents": 8}), 400, "opponents must be 0..=7, got 8"),
+        (json!({"scenario": "solo", "opponents": 1}), 400, "opponents is for a race"),
+        (json!({"scenario": "duel", "opponents": 1}), 400, "already has aircraft 2"),
+    ] {
+        let reply = plan(&app, &sweep_request(extra.clone())).await;
+        assert_eq!(reply.0.as_u16(), status, "{extra}: {}", reply.1);
+        assert!(reply.1["error"].as_str().unwrap().contains(needle), "{extra}: {}", reply.1);
+    }
+
+    // Saved: the file says so, and the request reads back with it.
+    let (status, _) =
+        send(&app, "PUT", "/api/sweeps/saved/duels", &json!({"request": request})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = std::fs::read_to_string(tree.path().join("config/sweep.duels.toml")).unwrap();
+    assert!(text.contains("opponents = 1"), "{text}");
+    let (status, loaded) = get(&app, "/api/sweeps/saved/duels").await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["request"]["opponents"], 1);
+    assert_eq!(plan(&app, &loaded["request"]).await.1, one);
+
+    // Flown: each run's scenario lists both drones, and the results say how each did.
+    let (status, view) = send(&app, "POST", "/api/sweeps", &request).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let done = loop {
+        let (_, current) = get(&app, "/api/sweeps/current").await;
+        if current["sweep"]["state"] == "finished" {
+            break current["sweep"].clone();
+        }
+        assert!(Instant::now() < deadline, "the sweep never finished: {current}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(done["ok"], 3, "{done}");
+    let out = PathBuf::from(done["out"].as_str().unwrap());
+    let written: toml::Table =
+        toml::from_str(&std::fs::read_to_string(out.join("run-0001.toml")).unwrap()).unwrap();
+    assert_eq!(written["aircraft"].as_array().unwrap().len(), 2);
+    let (_, results) = get(&app, &format!("/api/sweeps/{id}/results")).await;
+    let columns: Vec<&str> =
+        results["columns"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    let tail: Vec<&str> = columns[columns.len() - 7..].to_vec();
+    assert_eq!(
+        tail,
+        [
+            "a1_gates_passed",
+            "a1_race_time_s",
+            "a1_place",
+            "a2_gates_passed",
+            "a2_race_time_s",
+            "a2_place",
+            "race_winner"
+        ]
+    );
+    // The single-drone columns stay (fleet-wide for several drones).
+    assert!(columns.contains(&"gates_passed") && columns.contains(&"race_outcome"));
+    let at = |name: &str| columns.iter().position(|c| *c == name).unwrap();
+    for row in results["rows"].as_array().unwrap() {
+        assert_eq!(row[at("a1_gates_passed")], 4, "{row}");
+        assert_eq!(row[at("a1_race_time_s")], 3.0, "{row}");
+        assert_eq!(row[at("a1_place")], 1, "{row}");
+        assert_eq!(row[at("a2_gates_passed")], 2, "{row}");
+        assert_eq!(row[at("a2_place")], 2, "{row}");
+        assert_eq!(row[at("race_winner")], 1, "{row}");
+    }
     shutdown_sweeps(sweeps).await;
 }

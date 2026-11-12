@@ -1,7 +1,10 @@
 //! `astrum-race` — the ASTRUM drone-racing environment, as a client of `astrum-sim`.
 //!
-//! A race is an ordinary `astrum-sim` scenario (one DJI F450, flown by JSBSim)
-//! plus a `[course]` table: a randomized course of racing gates, or explicit gates.
+//! A race is an ordinary `astrum-sim` scenario (one to eight DJI F450s, flown by JSBSim)
+//! plus a `[course]` table: a randomized course of racing gates, or explicit gates. Several
+//! drones race the same course side by side on a start grid, each scored on its own (they
+//! are ghosts to each other.
+//!
 //! [`build_race_app`] builds the sim's own app with [`astrum_sim::build_app`] — fleet
 //! spawn, FDM stepping, command ownership and leases, lockstep, telemetry, events,
 //! recording, pacing, the control plane — and adds the race systems to its tick
@@ -41,7 +44,7 @@ use astrum_sim::components::SimStatus;
 use astrum_sim::{RunMode, TickSet};
 use bevy::prelude::*;
 
-use components::{RaceCourse, RaceProgress};
+use components::{Race, RaceCourse};
 use scenario::ResolvedRace;
 use systems::{fail_spawn, log_course, publish_race, tick_systems};
 
@@ -50,15 +53,15 @@ pub use scenario::{course_view, is_race_scenario, CourseView, RaceScenario, Race
 /// Build the sim's app for a resolved race, with the race systems added (does not
 /// run it; put it on the bus with [`astrum_sim::net::connect`] and [`net::connect`]).
 ///
-/// At startup, after the sim spawns the drone and before tick 0 is published, the
-/// course and the initial state go out. Every tick, after the step and before the
+/// At startup, after the sim spawns the drones and before tick 0 is published, each
+/// drone's course and initial state go out. Every tick, after the step and before the
 /// telemetry: crash detection → gate scoring → the time limit → the end of the run →
-/// the publication of the state.
+/// freezing the crashed → the publication of the states.
 pub fn build_race_app(race: ResolvedRace, mode: RunMode) -> App {
-    let aircraft_id = race.scenario.aircraft[0].id;
+    let ids: Vec<u32> = race.scenario.aircraft.iter().map(|a| a.id).collect();
     let mut app = astrum_sim::build_app(race.scenario, mode);
     app.insert_resource(RaceCourse(race.course))
-        .insert_resource(RaceProgress::new(aircraft_id))
+        .insert_resource(Race::new(ids))
         .add_systems(
             Startup,
             (

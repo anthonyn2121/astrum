@@ -3,7 +3,7 @@
 //! ```toml
 //! [world]  ...                 # the sim's own tables, unchanged
 //! [sim]    ...
-//! [[aircraft]]                 # exactly one: the F450 (its start pose is overwritten)
+//! [[aircraft]]                 # 1 to 8, all F450s (their start poses are overwritten)
 //! [course]
 //! gates = 8                    # the randomization envelope (`CourseParams`) ...
 //! seed = 7                     # ... drawn from this seed (default: `sim.seed`)
@@ -27,7 +27,7 @@
 use std::fmt;
 use std::path::Path;
 
-use astrum_geo::Enu;
+use astrum_geo::{Enu, Geodetic};
 use astrum_sim::scenario::{Scenario, ScenarioError};
 use astrum_sim::world_frame;
 use bevy::math::DVec3;
@@ -43,7 +43,11 @@ const DIM_TOL_M: f64 = 1e-9;
 const RACE_MODEL: &str = "F450";
 
 /// Keys of `[course]` that are not [`CourseParams`].
-const SPEC_KEYS: [&str; 6] = ["seed", "start_behind_m", "opening_m", "bar_m", "gate", "length_m"];
+const SPEC_KEYS: [&str; 7] =
+    ["seed", "start_behind_m", "opening_m", "bar_m", "gate", "length_m", "grid_spacing_m"];
+
+/// The most drones one race may have.
+pub const MAX_DRONES: usize = 8;
 
 /// The most gates a sampled course may have.
 pub const MAX_GATES: u32 = 64;
@@ -132,6 +136,7 @@ struct SpecKeys {
     bar_m: Option<f64>,
     gate: Vec<GateSpec>,
     length_m: Option<f64>,
+    grid_spacing_m: f64,
 }
 
 impl Default for SpecKeys {
@@ -143,6 +148,7 @@ impl Default for SpecKeys {
             bar_m: None,
             gate: Vec::new(),
             length_m: None,
+            grid_spacing_m: 2.0,
         }
     }
 }
@@ -175,6 +181,10 @@ pub struct CourseSpec {
     /// limits and the course radius that the file does not state are derived from it
     /// and the gate count ([`CourseSpec::effective_params`]).
     pub length_m: Option<f64>,
+    /// Lateral spacing of the start grid (m): the race's drones, by ascending aircraft
+    /// id, start side by side `grid_spacing_m` apart along gate 0's `right`, centred on
+    /// its centreline (see [`RaceScenario::resolve`]).
+    pub grid_spacing_m: f64,
     /// Which envelope fields the file stated, and so `length_m` must not derive.
     pub stated: Stated,
 }
@@ -190,6 +200,7 @@ impl Default for CourseSpec {
             bar_m: keys.bar_m,
             gates: keys.gate,
             length_m: keys.length_m,
+            grid_spacing_m: keys.grid_spacing_m,
             stated: Stated::default(),
         }
     }
@@ -219,6 +230,7 @@ impl CourseSpec {
             bar_m: keys.bar_m,
             gates: keys.gate,
             length_m: keys.length_m,
+            grid_spacing_m: keys.grid_spacing_m,
             stated,
         };
         spec.validate()?;
@@ -231,6 +243,12 @@ impl CourseSpec {
             return invalid(format!(
                 "course.start_behind_m must be >= 0, got {}",
                 self.start_behind_m
+            ));
+        }
+        if !(self.grid_spacing_m.is_finite() && self.grid_spacing_m >= 0.0) {
+            return invalid(format!(
+                "course.grid_spacing_m must be >= 0, got {}",
+                self.grid_spacing_m
             ));
         }
         for (name, given, built) in
@@ -343,16 +361,17 @@ impl RaceScenario {
             .try_into()
             .map_err(|e: toml::de::Error| RaceScenarioError::Parse(format!("parsing: {e}")))?;
         sim.validate()?;
-        let [drone] = sim.aircraft.as_slice() else {
+        if !(1..=MAX_DRONES).contains(&sim.aircraft.len()) {
             return invalid(format!(
-                "a race flies exactly one aircraft, the scenario has {}",
+                "a race flies 1 to {MAX_DRONES} aircraft, the scenario has {}",
                 sim.aircraft.len()
             ));
-        };
-        if drone.model != RACE_MODEL {
+        }
+        if let Some(other) = sim.aircraft.iter().find(|a| a.model != RACE_MODEL) {
             return invalid(format!(
-                "a race flies the {RACE_MODEL} (its hull is that airframe's), not '{}'",
-                drone.model
+                "a race flies the {RACE_MODEL} (its hull is that airframe's), not '{}' \
+                 (aircraft {})",
+                other.model, other.id
             ));
         }
         if sim.world.origin_alt_hae_m != 0.0 {
@@ -391,16 +410,22 @@ impl RaceScenario {
         };
 
         let first = course.gates[0];
-        let start = first.center - self.course.start_behind_m * first.normal();
-        let geo =
-            world_frame(&self.sim).0.enu_to_geodetic(&Enu { e: start.x, n: start.y, u: start.z });
         let mut scenario = self.sim.clone();
-        let drone = &mut scenario.aircraft[0];
-        drone.lat_deg = geo.lat_deg();
-        drone.lon_deg = geo.lon_deg();
-        drone.alt_hae_m = geo.alt_hae_m;
-        drone.heading_deg = first.yaw_rad.to_degrees();
-        drone.tas_mps = 0.0;
+        let frame = world_frame(&scenario);
+        let mut ids: Vec<u32> = scenario.aircraft.iter().map(|a| a.id).collect();
+        ids.sort_unstable();
+        let centre = (ids.len() - 1) as f64 / 2.0;
+        for drone in &mut scenario.aircraft {
+            let slot = ids.iter().position(|id| *id == drone.id).expect("its own id") as f64;
+            let start = first.center - self.course.start_behind_m * first.normal()
+                + (slot - centre) * self.course.grid_spacing_m * first.right();
+            let geo = frame.0.enu_to_geodetic(&Enu { e: start.x, n: start.y, u: start.z });
+            drone.lat_deg = geo.lat_deg();
+            drone.lon_deg = geo.lon_deg();
+            drone.alt_hae_m = geo.alt_hae_m;
+            drone.heading_deg = first.yaw_rad.to_degrees();
+            drone.tas_mps = 0.0;
+        }
         scenario.validate()?;
         let spec = CourseSpec { params, ..self.course.clone() };
         Ok(ResolvedRace { scenario, course, spec })
@@ -437,6 +462,7 @@ impl ResolvedRace {
             toml::Value::Integer(i64::try_from(self.course.seed).expect("checked in resolve")),
         );
         course.insert("start_behind_m".into(), self.spec.start_behind_m.into());
+        course.insert("grid_spacing_m".into(), self.spec.grid_spacing_m.into());
         if let Some(length) = self.spec.length_m {
             course.insert("length_m".into(), length.into());
         }
@@ -451,6 +477,31 @@ impl ResolvedRace {
         course.insert("gate".into(), toml::Value::Array(gates));
         table.insert("course".into(), toml::Value::Table(course));
         toml::to_string(&table).expect("a scenario table serialises")
+    }
+
+    /// The spacing of the start grid this race was resolved with (m).
+    pub fn grid_spacing_m(&self) -> f64 {
+        self.spec.grid_spacing_m
+    }
+
+    /// Where each drone starts on the world grid (ENU, m), by ascending aircraft id.
+    pub fn grid(&self) -> Vec<(u32, DVec3)> {
+        let frame = world_frame(&self.scenario);
+        let mut grid: Vec<(u32, DVec3)> = self
+            .scenario
+            .aircraft
+            .iter()
+            .map(|a| {
+                let at = frame.0.geodetic_to_enu(&Geodetic::from_degrees(
+                    a.lat_deg,
+                    a.lon_deg,
+                    a.alt_hae_m,
+                ));
+                (a.id, DVec3::new(at.e, at.n, at.u))
+            })
+            .collect();
+        grid.sort_by_key(|(id, _)| *id);
+        grid
     }
 
     /// The course as the viewer and the web API see it.

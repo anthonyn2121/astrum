@@ -255,7 +255,7 @@ fn an_unflown_drone_crashes_and_the_run_ends_as_crashed() {
     app.cleanup();
 
     app.update();
-    let start = app.world().resource::<RaceProgress>();
+    let start = progress(&app);
     assert_eq!(start.outcome, RaceOutcome::Running);
 
     let mut events = Vec::new();

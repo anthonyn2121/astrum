@@ -54,6 +54,7 @@ length_m = 500.0          # target total length of the legs (3-D). From it, and 
                           # remove length_m for the plain envelope (legs 15-30, radius 100).
 # seed = 1                # course seed (default: sim.seed)
 start_behind_m = 10.0     # launch this far up gate 0's approach
+# grid_spacing_m = 2.0    # several [[aircraft]]: they start this far apart across it (config/scenario.duel.toml)
 
 # Flyability: how far apart gates are, and how hard the course may turn or climb.
 # leg_min_m = 15.0        # gate-to-gate, 3-D (derived from length_m while that is set)

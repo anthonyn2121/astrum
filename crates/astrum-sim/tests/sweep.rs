@@ -16,8 +16,8 @@ use astrum_sim::catalog::{METRICS, RACE_METRICS};
 use astrum_sim::perturb::{self, Axis, Group, Offset};
 use astrum_sim::scenario::Scenario;
 use astrum_sim::sweep::{
-    execute, run_in_process, scenario_toml, Base, CourseSeedMode, Outcome, Purpose, RunEvent,
-    Status, Sweep, SweepFile,
+    execute, run_in_process, scenario_toml, with_opponents, Base, CourseSeedMode, Outcome, Purpose,
+    RunEvent, Status, Sweep, SweepFile,
 };
 use astrum_sim::systems::StopRequested;
 
@@ -963,5 +963,90 @@ fn a_race_sweeps_gate_count_overrides_the_scenarios_and_reaches_every_runs_cours
     file.gates = Some(12);
     let text = file.to_toml().unwrap();
     assert!(text.contains("gates = 12"), "{text}");
+    assert_eq!(toml::from_str::<SweepFile>(&text).unwrap(), file);
+}
+
+// --- Opponents ---------------------------------------------------------------------
+
+/// A race whose one drone is aircraft 1.
+const DRONE_RACE: &str = "[world]\norigin_lat_deg = 44.7\norigin_lon_deg = -93.0\n\
+    origin_alt_hae_m = 0.0\n[sim]\nrate_hz = 120.0\nmax_time_s = 5.0\nseed = 3\n\
+    [[aircraft]]\nid = 1\nmodel = \"F450\"\nlat_deg = 44.7\nlon_deg = -93.0\n\
+    alt_hae_m = 2.0\nheading_deg = 0.0\ntas_mps = 0.0\n[course]\ngates = 4\n";
+
+#[test]
+fn opponents_are_copies_of_aircraft_1_with_the_next_ids() {
+    let scenario =
+        Scenario::from_toml_str(&DRONE_RACE.replace("[course]\ngates = 4\n", "")).unwrap();
+    assert_eq!(with_opponents(&scenario, 0).unwrap(), scenario);
+    let three = with_opponents(&scenario, 2).unwrap();
+    let ids: Vec<u32> = three.aircraft.iter().map(|a| a.id).collect();
+    assert_eq!(ids, [1, 2, 3]);
+    for copy in &three.aircraft[1..] {
+        assert_eq!(copy.model, "F450");
+        assert_eq!((copy.lat_deg, copy.alt_hae_m), (scenario.aircraft[0].lat_deg, 2.0));
+    }
+    assert_eq!(with_opponents(&scenario, 7).unwrap().aircraft.len(), 8);
+    let e = with_opponents(&scenario, 8).unwrap_err();
+    assert!(e.contains("opponents must be 0..=7, got 8"), "{e}");
+    // Their ids may not clash with the scenario's own; and there must be an aircraft 1.
+    let e = with_opponents(&three, 1).unwrap_err();
+    assert!(e.contains("already has aircraft 2"), "{e}");
+    let e = with_opponents(&Scenario::from_toml_str(BASE).unwrap(), 1).unwrap_err();
+    assert!(e.contains("aircraft 1"), "{e}");
+}
+
+#[test]
+fn a_race_sweeps_opponents_join_every_run_and_get_their_own_result_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let stop = StopRequested::default();
+    let finished = |_: &_| Outcome { status: Status::Ok, sim_time_s: Some(1.0), wall_s: 0.1 };
+    let duel = plan_on(
+        dir.path(),
+        DRONE_RACE,
+        "repeats = 2\nopponents = 2\ncontrollers = [\"true\"]\n[set]\n\"sim.lockstep\" = true\n\"aircraft.2.lockstep\" = true",
+    )
+    .unwrap();
+    for run in &duel.runs {
+        let ids: Vec<u32> = run.scenario.aircraft.iter().map(|a| a.id).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        assert!(run.scenario.aircraft[1].lockstep, "an override reaches an opponent");
+    }
+    let mut duel = duel;
+    duel.out = dir.path().join("duel-out");
+    execute(&duel, 1, &stop, |_| {}, finished).unwrap();
+    let header = header_of(&duel.out.join("summary.csv"));
+    let tail = &header[header.len() - 10..];
+    assert_eq!(
+        tail,
+        [
+            "a1_gates_passed",
+            "a1_race_time_s",
+            "a1_place",
+            "a2_gates_passed",
+            "a2_race_time_s",
+            "a2_place",
+            "a3_gates_passed",
+            "a3_race_time_s",
+            "a3_place",
+            "race_winner"
+        ]
+    );
+    // The per-run scenario files list the whole fleet, the course after it.
+    let mut alone = plan_on(dir.path(), DRONE_RACE, "repeats = 1").unwrap();
+    alone.out = dir.path().join("alone-out");
+    execute(&alone, 1, &stop, |_| {}, finished).unwrap();
+    let header = header_of(&alone.out.join("summary.csv"));
+    assert!(!header.iter().any(|h| h.starts_with("a1_") || h == "race_winner"), "{header:?}");
+
+    let e = plan_on(dir.path(), DRONE_RACE, "opponents = 8").unwrap_err();
+    assert!(e.contains("opponents must be 0..=7, got 8"), "{e}");
+    let e = plan_on(dir.path(), BASE, "opponents = 1").unwrap_err();
+    assert!(e.contains("opponents needs a race scenario"), "{e}");
+
+    let mut file = SweepFile::for_scenario(base_file(dir.path(), DRONE_RACE).into());
+    file.opponents = Some(2);
+    let text = file.to_toml().unwrap();
+    assert!(text.contains("opponents = 2"), "{text}");
     assert_eq!(toml::from_str::<SweepFile>(&text).unwrap(), file);
 }

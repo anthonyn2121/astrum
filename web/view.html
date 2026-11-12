@@ -146,6 +146,12 @@
 
       <ol id="killFeed" class="overlay" aria-live="polite"></ol>
 
+      <!-- A race's standings (js/scoreboard.js): shown with a course. -->
+      <section id="scoreboard" class="overlay" aria-label="Race standings" hidden>
+        <table><tbody id="scoreboardBody"></tbody></table>
+      </section>
+      <div id="raceBanner" class="overlay" role="status" aria-live="polite" hidden></div>
+
       <div id="sceneMeta" class="overlay">
         <!-- Ground-map credit (default tile source is Esri World Imagery); shown
              while the streamed map is in use (F-16 fleets). -->
