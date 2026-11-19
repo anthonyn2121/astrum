@@ -1075,3 +1075,181 @@ async fn a_sweeps_opponents_are_planned_saved_flown_and_reported_per_aircraft() 
     }
     shutdown_sweeps(sweeps).await;
 }
+
+// --- Course length -------------------------------------------------------------------
+
+/// A drawn course's length, as a number.
+fn length_of(course: &Value) -> f64 {
+    course["length_m"].as_f64().unwrap()
+}
+
+#[tokio::test]
+async fn a_race_runs_course_length_reaches_its_course_and_the_scenario_it_flies() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, runs) = tree.app();
+
+    let (status, view) =
+        start(&app, &json!({"scenario": "race", "seed": 7, "gates": 8, "length_m": 300.0})).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    // About the length asked for (the legs of a drawn course only add up to about it).
+    let length = length_of(&view["course"]);
+    assert!((200.0..400.0).contains(&length), "{length}");
+    let (status, preview) =
+        get(&app, "/api/scenarios/race/course?seed=7&gates=8&length_m=300").await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(view["course"], preview);
+    let dir = view["dir"].as_str().unwrap();
+    let written: toml::Table =
+        toml::from_str(&std::fs::read_to_string(format!("{dir}/scenario.toml")).unwrap()).unwrap();
+    assert_eq!(written["course"]["length_m"].as_float(), Some(300.0));
+    stop(&app).await;
+
+    // A longer course is longer.
+    let (_, long) = get(&app, "/api/scenarios/race/course?seed=7&gates=8&length_m=900").await;
+    assert!(length_of(&long) > length * 2.0, "{} vs {length}", length_of(&long));
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn a_course_length_outside_the_range_or_off_a_drawn_race_is_refused() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, runs) = tree.app();
+    for (body, needle) in [
+        (json!({"scenario": "race", "length_m": 99.0}), "length_m must be 100..=5000 m, got 99"),
+        (json!({"scenario": "race", "length_m": 5001.0}), "got 5001"),
+        (json!({"scenario": "solo", "length_m": 300.0}), "length_m is for a race"),
+        (json!({"scenario": "gated", "length_m": 300.0}), "[[course.gate]]"),
+    ] {
+        let (status, reply) = start(&app, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+        assert!(reply["error"].as_str().unwrap().contains(needle), "{body}: {reply}");
+    }
+    for (uri, needle) in [
+        ("/api/scenarios/race/course?length_m=99", "100..=5000"),
+        ("/api/scenarios/race/course?length_m=5001", "100..=5000"),
+        ("/api/scenarios/race/course?length_m=x", "length_m"),
+        ("/api/scenarios/gated/course?length_m=300", "[[course.gate]]"),
+        ("/api/scenarios/gated/course?gates=5", "[[course.gate]]"),
+    ] {
+        let (status, reply) = get(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {reply}");
+        assert!(reply["error"].as_str().unwrap().contains(needle), "{uri}: {reply}");
+    }
+    // A count and a length that cannot be flown together say which they are: a
+    // clear refusal, not a failure to start.
+    let (status, reply) =
+        start(&app, &json!({"scenario": "race", "gates": 64, "length_m": 100.0})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reply}");
+    let message = reply["error"].as_str().unwrap();
+    assert!(message.contains("course.gates") && message.contains("course.length_m"), "{message}");
+    let (status, reply) = get(&app, "/api/scenarios/race/course?gates=64&length_m=100").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reply}");
+    assert!(reply["error"].as_str().unwrap().contains("course.length_m"), "{reply}");
+    let (_, current) = get(&app, "/api/runs/current").await;
+    assert_eq!(current["run"], Value::Null, "nothing was started");
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn a_scenario_doc_tells_what_its_own_course_asks_for() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let config = tree.path().join("config");
+    // The scenario's own targets: a gate count, a length and a course seed.
+    std::fs::write(
+        config.join("scenario.long.toml"),
+        common::RACE_SCENARIO.replace("gates = 4", "gates = 6\nlength_m = 400.0\nseed = 9"),
+    )
+    .unwrap();
+    // Nothing set: the default gate count, no length, the sim's seed.
+    std::fs::write(
+        config.join("scenario.bare.toml"),
+        common::RACE_SCENARIO.replace("gates = 4", "start_behind_m = 8.0"),
+    )
+    .unwrap();
+    let (app, runs) = tree.app();
+    for (name, want) in [
+        ("race", json!({"gates": 4, "length_m": null, "seed": 5})),
+        ("long", json!({"gates": 6, "length_m": 400.0, "seed": 9})),
+        ("bare", json!({"gates": 8, "length_m": null, "seed": 5})),
+        ("gated", json!({"gates": 4, "length_m": null, "seed": 5})),
+    ] {
+        let (status, doc) = get(&app, &format!("/api/scenarios/{name}")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {doc}");
+        assert_eq!(doc["course_params"], want, "{name}");
+    }
+    let (_, solo) = get(&app, "/api/scenarios/solo").await;
+    assert_eq!(solo["course_params"], Value::Null);
+    // The course shown is the one those parameters draw.
+    let (_, long) = get(&app, "/api/scenarios/long").await;
+    assert_eq!(long["course"]["seed"], 9);
+    assert_eq!(long["course"]["gates"].as_array().unwrap().len(), 6);
+    shutdown(runs).await;
+}
+
+#[tokio::test]
+async fn a_race_sweeps_course_length_is_in_its_plan_files_columns_and_saved_form() {
+    let _serial = SERIAL.lock().await;
+    let tree = Tree::new();
+    let (app, sweeps) = tree.sweep_app();
+
+    // The scenario sets no length: none is reported unless the request sets one.
+    let (_, plain) = plan(&app, &sweep_request(json!({}))).await;
+    assert_eq!(seeds(&plain, "length_m"), [const { Value::Null }; 3]);
+    let request = sweep_request(json!({"gates": 8, "length_m": 300.0}));
+    let (status, set) = plan(&app, &request).await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    assert_eq!(seeds(&set, "length_m"), [300.0; 3].map(Value::from));
+    let (_, solo) = plan(&app, &sweep_request(json!({"scenario": "solo"}))).await;
+    assert_eq!(seeds(&solo, "length_m"), [const { Value::Null }; 3]);
+    for (extra, status, needle) in [
+        (json!({"length_m": 99.0}), 400, "length_m must be 100..=5000 m, got 99"),
+        (json!({"length_m": 5001.0}), 400, "got 5001"),
+        (json!({"scenario": "solo", "length_m": 300.0}), 400, "length_m is for a race"),
+        (json!({"scenario": "gated", "length_m": 300.0}), 422, "[[course.gate]]"),
+        (json!({"gates": 64, "length_m": 100.0}), 422, "course.length_m"),
+    ] {
+        let reply = plan(&app, &sweep_request(extra.clone())).await;
+        assert_eq!(reply.0.as_u16(), status, "{extra}: {}", reply.1);
+        assert!(reply.1["error"].as_str().unwrap().contains(needle), "{extra}: {}", reply.1);
+    }
+
+    // Saved: the file says it and the request reads back with it.
+    let (status, _) =
+        send(&app, "PUT", "/api/sweeps/saved/short", &json!({"request": request})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let text = std::fs::read_to_string(tree.path().join("config/sweep.short.toml")).unwrap();
+    assert!(text.contains("length_m = 300.0"), "{text}");
+    let (status, loaded) = get(&app, "/api/sweeps/saved/short").await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["request"]["length_m"], 300.0);
+    assert_eq!(plan(&app, &loaded["request"]).await.1, set);
+
+    // Flown: every run's file has the length, and the results report it after the gate count.
+    let (status, view) = send(&app, "POST", "/api/sweeps", &request).await;
+    assert_eq!(status, StatusCode::CREATED, "{view}");
+    let id = view["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let done = loop {
+        let (_, current) = get(&app, "/api/sweeps/current").await;
+        if current["sweep"]["state"] == "finished" {
+            break current["sweep"].clone();
+        }
+        assert!(Instant::now() < deadline, "the sweep never finished: {current}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(done["ok"], 3, "{done}");
+    let out = PathBuf::from(done["out"].as_str().unwrap());
+    let written: toml::Table =
+        toml::from_str(&std::fs::read_to_string(out.join("run-0001.toml")).unwrap()).unwrap();
+    assert_eq!(written["course"]["length_m"].as_float(), Some(300.0));
+    let (_, results) = get(&app, &format!("/api/sweeps/{id}/results")).await;
+    assert_eq!(
+        &results["columns"].as_array().unwrap()[..6],
+        &["run", "status", "seed", "course_seed", "gates", "length_m"].map(Value::from)
+    );
+    assert!(results["rows"].as_array().unwrap().iter().all(|r| r[5] == 300.0), "{results}");
+    shutdown_sweeps(sweeps).await;
+}

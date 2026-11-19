@@ -143,6 +143,10 @@ async fn the_bundled_scenarios_are_all_valid_studio_scenarios() {
     let (status, doc) = get(&app, "/api/scenarios/race").await;
     assert_eq!(status, StatusCode::OK, "{doc}");
     assert!(!doc["course"]["gates"].as_array().unwrap().is_empty(), "{doc}");
+    // What the shipped scenario asks for: the targets a UI defaults to.
+    assert_eq!(doc["course_params"]["gates"], doc["course"]["gates"].as_array().unwrap().len());
+    assert_eq!(doc["course_params"]["length_m"], 500.0, "{doc}");
+    assert_eq!(doc["course_params"]["seed"], doc["course"]["seed"]);
 }
 
 #[tokio::test]

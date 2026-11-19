@@ -275,6 +275,8 @@ struct StartBody {
     seed: Option<u64>,
     /// A race scenario's gate count (2–64), over its own.
     gates: Option<u32>,
+    /// A race scenario's course length (m, 100–5000), over its own.
+    length_m: Option<f64>,
     /// Opponents flown against aircraft 1 on the same course (0–7): copies of
     /// aircraft 1 with ids 2.., in a race scenario only.
     opponents: Option<u32>,
@@ -646,6 +648,7 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
         for (set, key) in [
             (body.seed.is_some(), "seed"),
             (body.gates.is_some(), "gates"),
+            (body.length_m.is_some(), "length_m"),
             (body.opponents.is_some(), "opponents"),
         ] {
             if set {
@@ -657,6 +660,9 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
     }
     if let Some(gates) = body.gates {
         race::check_gates(gates).map_err(RunError::BadRequest)?;
+    }
+    if let Some(length_m) = body.length_m {
+        race::check_length_m(length_m).map_err(RunError::BadRequest)?;
     }
     if let Some(opponents) = body.opponents {
         scenario = with_opponents(&scenario, opponents).map_err(RunError::BadRequest)?;
@@ -695,13 +701,15 @@ fn resolve(body: StartBody, catalogs: &Catalogs) -> Result<Plan, RunError> {
         .collect();
     let race = course
         .map(|table| {
-            if (body.seed.is_some() || body.gates.is_some()) && race::has_explicit_gates(&table) {
+            let overrides = body.seed.is_some() || body.gates.is_some() || body.length_m.is_some();
+            if overrides && race::has_explicit_gates(&table) {
                 return Err(RunError::BadRequest(
-                    "seed and gates have no effect: the course lists its gates ([[course.gate]])"
+                    "seed, gates and length_m have no effect: the course lists its gates \
+                     ([[course.gate]])"
                         .into(),
                 ));
             }
-            let table = race::with_gates(&table, body.gates);
+            let table = race::with_gates(&table, body.gates, body.length_m);
             let view = race::course_view_of(&scenario, &table, body.seed)
                 .map_err(|e| RunError::InvalidScenario(format!("course: {e}")))?;
             Ok((table, view))

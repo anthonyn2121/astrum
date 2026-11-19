@@ -910,6 +910,7 @@ fn the_summary_of_a_race_sweep_has_the_course_seed_and_the_race_metrics() {
         "seed",
         "course_seed",
         "gates",
+        "length_m",
         "sim_time_s",
         "wall_s",
         "speed_x",
@@ -1048,5 +1049,39 @@ fn a_race_sweeps_opponents_join_every_run_and_get_their_own_result_columns() {
     file.opponents = Some(2);
     let text = file.to_toml().unwrap();
     assert!(text.contains("opponents = 2"), "{text}");
+    assert_eq!(toml::from_str::<SweepFile>(&text).unwrap(), file);
+}
+
+#[test]
+fn a_race_sweeps_course_length_overrides_the_scenarios_and_reaches_every_runs_course() {
+    let dir = tempfile::tempdir().unwrap();
+    let from_scenario =
+        plan_on(dir.path(), &race_base("gates = 4\nlength_m = 500.0\n"), "repeats = 2").unwrap();
+    assert_eq!(from_scenario.runs.iter().map(|r| r.length_m).collect::<Vec<_>>(), [Some(500.0); 2]);
+    let race = race_base("gates = 4\n");
+    let set = plan_on(dir.path(), &race, "repeats = 2\nlength_m = 300.0").unwrap();
+    assert_eq!(set.runs.iter().map(|r| r.length_m).collect::<Vec<_>>(), [Some(300.0); 2]);
+    assert_eq!(set.course.as_ref().unwrap()["length_m"].as_float(), Some(300.0));
+    // A scenario that sets none has none to report.
+    assert_eq!(plan_on(dir.path(), &race, "").unwrap().runs[0].length_m, None);
+
+    for (body, needle) in [
+        ("length_m = 99.0", "length_m must be 100..=5000 m, got 99"),
+        ("length_m = 5001.0", "got 5001"),
+        ("length_m = nan", "length_m must be"),
+    ] {
+        let e = plan_on(dir.path(), &race, body).unwrap_err();
+        assert!(e.contains(needle), "{body}: {e}");
+    }
+    let e = plan_on(dir.path(), BASE, "length_m = 300.0").unwrap_err();
+    assert!(e.contains("length_m needs a race scenario"), "{e}");
+    let e = plan_on(dir.path(), &race_base("[[course.gate]]\nindex = 0\n"), "length_m = 300.0")
+        .unwrap_err();
+    assert!(e.contains("lists its gates"), "{e}");
+
+    let mut file = SweepFile::for_scenario(base_file(dir.path(), &race).into());
+    file.length_m = Some(300.0);
+    let text = file.to_toml().unwrap();
+    assert!(text.contains("length_m = 300.0"), "{text}");
     assert_eq!(toml::from_str::<SweepFile>(&text).unwrap(), file);
 }

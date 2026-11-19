@@ -10,7 +10,8 @@
 #   "fixed"      every run flies the base seed: the same track; `sim.seed`
 #                (the sim's other randomness) still moves with the repeat
 # The base seed is the scenario's `course.seed`, else its `sim.seed` (1). `gates`
-# sets every run's gate count; leave it out to keep the scenario's.
+# sets every run's gate count, `length_m` (100..=5000 m) every run's course length;
+# leave them out to keep the scenario's.
 #
 #   astrum sweep config/sweep.race.toml
 #   astrum sweep config/sweep.race.toml --dry-run   # the runs and their course seeds
@@ -26,6 +27,7 @@ repeats = 10
 course_seed_mode = "randomize"
 gates = 12              # gates per course (2..=64), over the scenario's own; the
                         # course stays ~500 m long, so more gates means shorter legs
+# length_m = 800.0       # course length (100..=5000 m), over the scenario's own
 
 controllers = [
   "build/controllers/cpp/astrum-controller --law autopilot --id 1 --heading 0 --alt 2.5 --speed 0",

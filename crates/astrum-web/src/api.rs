@@ -34,9 +34,10 @@
 //!   cannot be a file name, 404 when there is none, 422 when the file is not a
 //!   valid scenario. A race scenario's `course` is its [`CourseView`]
 //!   ([`crate::race`]) drawn from its own seed; `null` for any other scenario.
-//! * **`GET /api/scenarios/<name>/course?seed=N&gates=M`** — a race scenario's
-//!   course drawn from seed `N` (default: the scenario's own) with `M` gates
-//!   (2–64; default: the scenario's own) as a
+//! * **`GET /api/scenarios/<name>/course?seed=N&gates=M&length_m=X`** — a race
+//!   scenario's course drawn from seed `N` (default: the scenario's own) with `M`
+//!   gates (2–64) and a length of `X` m (100–5000; both default: the scenario's
+//!   own) as a
 //!   [`CourseView`](crate::race::CourseView) (`{"seed", "opening_m", "bar_m",
 //!   "top_bar_m", "gates": [{"index", "east_m", "north_m", "up_m",
 //!   "yaw_rad"}]}`); 400 for a bad name or query or a scenario that is no
@@ -56,7 +57,8 @@
 //!   `{"scenario": "<name>", "assignments": [...], "perturb": [...], "vary":
 //!   {"aircraft.<id>.offset.<axis>": [...]}, "samples", "sample_seed",
 //!   "min_separation_m", "min_alt_hae_m", "repeats", "max_time_s",
-//!   "run_timeout_s", "jobs", "check_trim", "course_seed_mode", "gates"}` → 200 with its
+//!   "run_timeout_s", "jobs", "check_trim", "course_seed_mode", "gates", "length_m", "opponents"}`
+//!   → 200 with its
 //!   runs (each row's `course_seed` too, for a race), their values and the
 //!   moving aircraft's starting positions; `course_seed_mode` (`"fixed"` |
 //!   `"randomize"`, race scenarios only) says whether every run flies the
@@ -111,8 +113,9 @@
 //! * **`POST /api/runs`** — start the live interactive run
 //!   ([`crate::runs`]): `{"scenario": "<name>" | {…}, "assignments":
 //!   [{"aircraft", "controller", "params"}], "speed", "max_time_s", "seed",
-//!   "gates"}` (`seed`, `gates` (2–64): a race scenario's course seed and gate
-//!   count) → 201
+//!   "gates", "length_m", "opponents"}` (`seed`, `gates` (2–64), `length_m`
+//!   (100–5000 m), `opponents` (0–7): a race scenario's course seed, gate count,
+//!   course length and opponents) → 201
 //!   [`RunView`](crate::runs::RunView) (a race flies `astrum-race` and the view
 //!   carries its `course`); 400 for bad input (the message names
 //!   the aircraft / parameter), 409 while a run is active, 422 for an invalid
@@ -227,11 +230,13 @@ async fn scenario(State(state): State<AppState>, Path(name): Path<String>) -> Re
 struct CourseQuery {
     seed: Option<u64>,
     gates: Option<u32>,
+    length_m: Option<f64>,
 }
 
-/// `GET /api/scenarios/<name>/course?seed=N&gates=M`: the course a race scenario
-/// draws from seed `N` (default: its own seed) with `M` gates (default: its own;
-/// 2–64) as a [`CourseView`]; 400 for a bad
+/// `GET /api/scenarios/<name>/course?seed=N&gates=M&length_m=X`: the course a race
+/// scenario draws from seed `N` (default: its own seed) with `M` gates (default:
+/// its own; 2–64) and a length of `X` m (default: its own; 100–5000) as a
+/// [`CourseView`]; 400 for a bad
 /// name or query, or a scenario that is not a race; 404 when there is none; 422
 /// when the scenario or its course is invalid.
 async fn course(
@@ -239,11 +244,14 @@ async fn course(
     Path(name): Path<String>,
     query: Result<Query<CourseQuery>, QueryRejection>,
 ) -> Response {
-    let CourseQuery { seed, gates } = match query {
+    let CourseQuery { seed, gates, length_m } = match query {
         Ok(Query(q)) => q,
         Err(rejection) => return error(rejection.status(), &rejection.body_text()),
     };
     if let Some(Err(why)) = gates.map(crate::race::check_gates) {
+        return error(StatusCode::BAD_REQUEST, &why);
+    }
+    if let Some(Err(why)) = length_m.map(crate::race::check_length_m) {
         return error(StatusCode::BAD_REQUEST, &why);
     }
     let catalogs = state.catalogs.clone();
@@ -252,7 +260,13 @@ async fn course(
         let table = base
             .course
             .ok_or_else(|| ScenarioError::BadName(format!("scenario {name:?} is not a race")))?;
-        let table = crate::race::with_gates(&table, gates);
+        if (gates.is_some() || length_m.is_some()) && crate::race::has_explicit_gates(&table) {
+            return Err(ScenarioError::BadName(
+                "gates and length_m have no effect: the course lists its gates ([[course.gate]])"
+                    .into(),
+            ));
+        }
+        let table = crate::race::with_gates(&table, gates, length_m);
         crate::race::course_view_of(&base.scenario, &table, seed).map_err(ScenarioError::Invalid)
     })
     .await;

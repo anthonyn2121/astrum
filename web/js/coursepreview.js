@@ -19,14 +19,15 @@ function svgEl(tag, attrs = {}, text = null) {
 }
 
 // A one-line summary of a course (validated, race.js parseCourse): the gate
-// count and course length, seed, footprint and height range. Empty for no course.
-export function courseSummary(course) {
+// count and realised length (and the length asked for, `targetM`, when given),
+// seed, footprint and height range. Empty for no course.
+export function courseSummary(course, targetM = null) {
   if (!course) return "";
   const { minE, maxE, minN, maxN } = extent(course);
   const ups = course.gates.map((g) => g.up_m);
   const fmt = (v) => v.toFixed(v < 10 ? 1 : 0);
   const seed = course.seed == null ? "" : ` · seed ${course.seed}`;
-  return `${course.gates.length} gates, ${Math.round(course.length_m)} m${seed} · ${fmt(maxE - minE)} × ${fmt(maxN - minN)} m`
+  return `${course.gates.length} gates, ${Math.round(course.length_m)} m${targetM != null ? ` (target ${Math.round(targetM)} m)` : ""}${seed} · ${fmt(maxE - minE)} × ${fmt(maxN - minN)} m`
     + ` · ${fmt(Math.min(...ups))}–${fmt(Math.max(...ups))} m up`;
 }
 

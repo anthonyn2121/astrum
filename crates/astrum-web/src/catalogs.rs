@@ -19,7 +19,7 @@ use astrum_sim::sweep::Base;
 use serde::Serialize;
 
 use crate::api::safe_name;
-use crate::race::{self, CourseView};
+use crate::race::{self, CourseParams, CourseView};
 
 /// The controller catalog's file name inside the config directory.
 pub const CONTROLLERS_FILE: &str = "controllers.toml";
@@ -90,6 +90,11 @@ pub struct ScenarioDoc {
     /// A race scenario's course, drawn from the scenario's own seed
     /// (`course.seed`, else `sim.seed`); `null` for any other scenario.
     pub course: Option<CourseView>,
+    /// What a race scenario's own `[course]` asks for — `gates` (the default 8
+    /// when it sets none), `length_m` (`null` when it sets none) and the seed
+    /// (`course.seed`, else `sim.seed`) — for a UI that overrides them; `null`
+    /// for any other scenario.
+    pub course_params: Option<CourseParams>,
 }
 
 /// Why [`Catalogs::scenario`] has no scenario to give.
@@ -200,6 +205,10 @@ impl Catalogs {
             summary: summary(&text),
             environment: environment_of(&base),
             fleet: fleet(&base.scenario),
+            course_params: base
+                .course
+                .as_ref()
+                .map(|c| CourseParams::of(c, base.scenario.sim.seed)),
             scenario: base.scenario,
             course,
         })

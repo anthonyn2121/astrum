@@ -89,6 +89,9 @@ pub struct SweepRequest {
     /// A race scenario's gate count in every run (2–64), over its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gates: Option<u32>,
+    /// A race scenario's course length in every run (m, 100–5000), over its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_m: Option<f64>,
     /// A race scenario's opponents in every run (0–7): copies of aircraft 1 with
     /// ids 2.., racing the same course.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,6 +181,7 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         let set = [
             (req.course_seed_mode.is_some(), "course_seed_mode"),
             (req.gates.is_some(), "gates"),
+            (req.length_m.is_some(), "length_m"),
             (req.opponents.is_some(), "opponents"),
         ];
         if let Some((_, key)) = set.into_iter().find(|(set, _)| *set) {
@@ -188,6 +192,9 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
     }
     if let Some(gates) = req.gates {
         crate::race::check_gates(gates).map_err(SweepInputError::BadRequest)?;
+    }
+    if let Some(length_m) = req.length_m {
+        crate::race::check_length_m(length_m).map_err(SweepInputError::BadRequest)?;
     }
     // The fleet every run flies: the scenario's, and the opponents it is given.
     let fleet = with_opponents(&base.scenario, req.opponents.unwrap_or(0))
@@ -235,6 +242,7 @@ pub fn resolve(req: &SweepRequest, catalogs: &Catalogs) -> Result<Resolved, Swee
         controllers,
         course_seed_mode: req.course_seed_mode,
         gates: req.gates,
+        length_m: req.length_m,
         opponents: req.opponents,
         set,
         vary,
@@ -321,6 +329,9 @@ struct RowView {
     /// The course's gate count, when the scenario or the request sets it
     /// (race sweeps); `null` otherwise.
     gates: Option<u32>,
+    /// The course's target length (m), when the scenario or the request sets it
+    /// (race sweeps); `null` otherwise.
+    length_m: Option<f64>,
     /// Opponents flown against aircraft 1 (race sweeps: the fleet's size − 1);
     /// `null` otherwise.
     opponents: Option<usize>,
@@ -403,6 +414,7 @@ impl PlanView {
                 sample: run.sample.map(|k| k + 1),
                 course_seed: run.course_seed,
                 gates: run.gates,
+                length_m: run.length_m,
                 opponents: sweep.course.is_some().then(|| run.scenario.aircraft.len() - 1),
                 values: sweep
                     .value_keys
@@ -636,6 +648,7 @@ fn first_difference(disk: &SweepFile, planned: &SweepFile) -> Option<&'static st
         ("perturb", disk.perturb == planned.perturb),
         ("course_seed_mode", disk.course_seed_mode == planned.course_seed_mode),
         ("gates", disk.gates == planned.gates),
+        ("length_m", disk.length_m == planned.length_m),
         ("opponents", disk.opponents == planned.opponents),
     ]
     .into_iter()
@@ -700,6 +713,7 @@ fn read_saved(catalogs: &Catalogs, name: &str) -> Result<SavedSweep, Refusal> {
         check_trim: false,
         course_seed_mode: file.course_seed_mode,
         gates: file.gates,
+        length_m: file.length_m,
         opponents: file.opponents,
     };
     let cannot_edit = |why: &str| {

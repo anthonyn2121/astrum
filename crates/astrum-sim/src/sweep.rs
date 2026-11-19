@@ -96,6 +96,10 @@ pub struct SweepFile {
     /// (`course.gates`, [`MIN_GATES`]..=[`MAX_GATES`]), over the scenario's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gates: Option<u32>,
+    /// Race sweeps only: every run's course length (`course.length_m`, m,
+    /// [`MIN_LENGTH_M`]..=[`MAX_LENGTH_M`]), over the scenario's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_m: Option<f64>,
     /// Race sweeps only: opponents flown against aircraft 1 on the same course,
     /// `0..=`[`MAX_OPPONENTS`]: copies of aircraft 1 with ids 2..=1+n
     /// ([`with_opponents`]). Poses are the race's to set, so the copies need no
@@ -137,6 +141,7 @@ impl SweepFile {
             perturb: Vec::new(),
             course_seed_mode: None,
             gates: None,
+            length_m: None,
             opponents: None,
         }
     }
@@ -150,6 +155,19 @@ impl SweepFile {
 /// Fewest and most gates a race sweep may ask for.
 pub const MIN_GATES: u32 = 2;
 pub const MAX_GATES: u32 = 64;
+/// Shortest and longest course a race sweep may ask for (m).
+pub const MIN_LENGTH_M: f64 = 100.0;
+pub const MAX_LENGTH_M: f64 = 5000.0;
+
+/// Check a requested course length: finite, [`MIN_LENGTH_M`]..=[`MAX_LENGTH_M`].
+pub fn check_length_m(length_m: f64) -> Result<(), String> {
+    if length_m.is_finite() && (MIN_LENGTH_M..=MAX_LENGTH_M).contains(&length_m) {
+        Ok(())
+    } else {
+        Err(format!("length_m must be {MIN_LENGTH_M}..={MAX_LENGTH_M} m, got {length_m}"))
+    }
+}
+
 /// Most opponents a race may add to aircraft 1 (8 drones in all).
 pub const MAX_OPPONENTS: u32 = 7;
 
@@ -295,6 +313,9 @@ pub struct Run {
     /// How many gates the course has, when the scenario's `[course]` (or the
     /// sweep's `gates`) says; `None` leaves it to the course envelope.
     pub gates: Option<u32>,
+    /// The course's target length (m), when the scenario's `[course]` (or the
+    /// sweep's `length_m`) says.
+    pub length_m: Option<f64>,
 }
 
 impl Run {
@@ -523,9 +544,19 @@ impl Sweep {
         if let Some(opponents) = file.opponents {
             base.scenario = with_opponents(&base.scenario, opponents).map_err(err)?;
         }
-        if let (Some(gates), Some(course)) = (file.gates, base.course.as_mut()) {
-            course.insert("gates".to_owned(), toml::Value::Integer(i64::from(gates)));
+        if let Some(course) = base.course.as_mut() {
+            if let Some(gates) = file.gates {
+                course.insert("gates".to_owned(), toml::Value::Integer(i64::from(gates)));
+            }
+            if let Some(length_m) = file.length_m {
+                course.insert("length_m".to_owned(), toml::Value::Float(length_m));
+            }
         }
+        let length_m = base
+            .course
+            .as_ref()
+            .and_then(|c| c.get("length_m"))
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)));
         let gates = base
             .course
             .as_ref()
@@ -632,6 +663,7 @@ impl Sweep {
                         params: point.params.clone(),
                         course_seed,
                         gates,
+                        length_m,
                     };
                     check_run(&file, purpose, &run).map_err(|e| {
                         err(format!("run {} ({}): {e}", index + 1, describe(&value_keys, &values)))
@@ -726,6 +758,9 @@ fn check_course(file: &SweepFile, base: &Base) -> Result<(), SweepError> {
         if file.opponents.is_some() {
             return Err(err("opponents needs a race scenario (one with a [course])"));
         }
+        if file.length_m.is_some() {
+            return Err(err("length_m needs a race scenario (one with a [course])"));
+        }
         return Ok(());
     }
     if let Some(gates) = file.gates {
@@ -734,6 +769,14 @@ fn check_course(file: &SweepFile, base: &Base) -> Result<(), SweepError> {
         }
         if base.course.as_ref().is_some_and(|c| c.contains_key("gate")) {
             return Err(err("gates has no effect: the course lists its gates ([[course.gate]])"));
+        }
+    }
+    if let Some(length_m) = file.length_m {
+        check_length_m(length_m).map_err(err)?;
+        if base.course.as_ref().is_some_and(|c| c.contains_key("gate")) {
+            return Err(err(
+                "length_m has no effect: the course lists its gates ([[course.gate]])",
+            ));
         }
     }
     if file.course_seed_mode == Some(CourseSeedMode::Randomize)
@@ -1087,7 +1130,7 @@ fn race_fleet(sweep: &Sweep) -> Vec<u32> {
 }
 
 /// Write `summary.csv` (via a temporary file, so a reader never sees half of
-/// it): one row per run in run order — status, seed, the course seed and gate count (race
+/// it): one row per run in run order — status, seed, the course seed, gate count and length (race
 /// sweeps), the sample (when the sweep samples), the `vary` values and drawn
 /// offsets, sim time, wall time, speed, the bag, then the fleet metrics
 /// ([`METRICS`], and [`RACE_METRICS`] for a race; but for `sim_time_s`, a
@@ -1101,7 +1144,7 @@ fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Resu
     let race = sweep.course.is_some();
     let mut header = vec!["run".to_owned(), "status".into(), "seed".into()];
     if race {
-        header.extend(["course_seed", "gates"].map(String::from));
+        header.extend(["course_seed", "gates", "length_m"].map(String::from));
     }
     if sampled {
         header.push("sample".into());
@@ -1144,6 +1187,7 @@ fn write_summary(path: &Path, sweep: &Sweep, rows: &[RunState]) -> std::io::Resu
         if race {
             row.push(run.course_seed.map_or(String::new(), |s| s.to_string()));
             row.push(run.gates.map_or(String::new(), |g| g.to_string()));
+            row.push(run.length_m.map_or(String::new(), |l| format!("{l:.3}")));
         }
         if sampled {
             row.push(run.sample.map_or(String::new(), |k| (k + 1).to_string()));

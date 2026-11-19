@@ -94,6 +94,12 @@
               </div>
               <!-- Opponents: more drones on the same course (a scenario that lists
                    one aircraft only); each gets its own row under Controllers. -->
+              <div class="field course-length">
+                <label class="field-label" for="courseLength">Length (m)</label>
+                <input id="courseLength" type="number" min="100" max="5000" step="any" inputmode="decimal" aria-describedby="courseLengthHint" />
+                <span id="courseLengthHint" class="muted small"></span>
+                <span id="courseLengthError" class="field-error" role="alert" hidden></span>
+              </div>
               <div id="opponentsField" class="field course-opponents">
                 <label class="field-label" for="courseOpponents">Opponents</label>
                 <select id="courseOpponents">

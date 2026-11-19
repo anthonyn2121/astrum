@@ -21,6 +21,7 @@ import { $, h, showError } from "./dom.js";
 import { ControllerForm } from "./ctlform.js";
 import { ScenarioPicker } from "./scenariopicker.js";
 import { VariationForm } from "./variation.js";
+import { scaledMaxTime, COURSE_LENGTH_MIN_M, COURSE_LENGTH_MAX_M, LEG_MIN_M } from "./race.js";
 import { StartCloud } from "./startcloud.js";
 
 const PLAN_DEBOUNCE_MS = 400;
@@ -40,6 +41,7 @@ const el = {
   jobs: $("jobs"), jobsError: $("jobsError"), runTimeout: $("runTimeout"), runTimeoutError: $("runTimeoutError"),
   variationRace: $("variationRace"), courseSection: $("courseSection"), courseMode: $("courseMode"), courseModeHint: $("courseModeHint"),
   courseOpponents: $("courseOpponents"), courseOpponentsError: $("courseOpponentsError"), opponentsField: $("opponentsField"),
+  courseLength: $("courseLength"), courseLengthHint: $("courseLengthHint"), courseLengthError: $("courseLengthError"),
   courseGates: $("courseGates"), courseGatesHint: $("courseGatesHint"), courseGatesError: $("courseGatesError"),
   planNote: $("planNote"), planBusy: $("planBusy"), planError: $("planError"), planBody: $("planBody"),
   planSummary: $("planSummary"), planTrim: $("planTrim"), planWrap: $("planWrap"), planTable: $("planTable"),
@@ -56,6 +58,8 @@ const el = {
 };
 
 const state = {
+  ownLength: null,   // the picked race's own course length (m)
+  maxEdited: false,  // the user set the max sim time (it no longer follows the course length)
   scenario: null,    // the picked ScenarioEntry
   doc: null,         // its ScenarioDoc
   loading: false,    // the picked scenario's doc is being read
@@ -113,6 +117,11 @@ function onPick(entry, doc, error) {
   const own = doc?.course?.gates.length;
   el.courseGates.value = own ?? ""; // ...and the scenario's own gate count
   el.courseGatesHint.textContent = own != null ? `the scenario's own count is ${own}` : "";
+  state.ownLength = isRace() ? (doc.course_params?.length_m ?? (doc.course ? Math.round(doc.course.length_m) : null)) : null;
+  el.courseLength.value = state.ownLength ?? "";
+  state.maxEdited = false;
+  showError(el.courseLengthError, "");
+  renderLengthHint();
   showError(el.courseGatesError, "");
   // Opponents are clones of the scenario's aircraft: for a scenario with one.
   el.opponentsField.hidden = !isRace() || doc.scenario.aircraft.length !== 1;
@@ -170,6 +179,37 @@ function opponents() {
   return bad ? undefined : x;
 }
 
+// The Length setting (m): the number in the field (100 to 5000), or undefined
+// after showing why it is refused.
+function courseLength() {
+  const raw = el.courseLength.value.trim();
+  const x = Number(raw);
+  const bad = raw === "" || !Number.isFinite(x) || x < COURSE_LENGTH_MIN_M || x > COURSE_LENGTH_MAX_M;
+  showError(el.courseLengthError, bad ? `must be a number from ${COURSE_LENGTH_MIN_M} to ${COURSE_LENGTH_MAX_M} m` : "");
+  el.courseLength.setAttribute("aria-invalid", String(bad));
+  return bad ? undefined : x;
+}
+
+// The hint under Length: legs are about length / (gates - 1) long.
+function renderLengthHint() {
+  const x = Number(el.courseLength.value), g = Number(el.courseGates.value);
+  const own = state.ownLength != null ? `the scenario's own length is ${state.ownLength} m` : "";
+  const legs = Number.isFinite(x) && x > 0 && Number.isInteger(g) && g >= 2
+    ? ` · ≈ ${Math.round(x / (g - 1))} m per leg; the default envelope needs about ${LEG_MIN_M * (g - 1)} m or more for ${g} gates`
+    : "";
+  el.courseLengthHint.textContent = own + legs;
+}
+
+// A longer course needs more time: until the user types a max sim time, it
+// follows the length (race.js scaledMaxTime), else the scenario's own.
+function followLength() {
+  renderLengthHint();
+  if (state.maxEdited || !state.doc || !isRace()) return;
+  const x = Number(el.courseLength.value);
+  const scaled = Number.isFinite(x) ? scaledMaxTime(state.doc.scenario?.sim?.max_time_s, state.ownLength, x) : null;
+  el.maxTime.value = String(scaled ?? defaultMaxTime(state.doc));
+}
+
 // The max sim time a new sweep starts from: the scenario's, when it has one.
 function defaultMaxTime(doc) {
   const max = doc.scenario?.sim?.max_time_s;
@@ -210,8 +250,9 @@ function buildRequest() {
   const settings = runSettings();
   const fields = variation.fields();
   const gates = isRace() ? courseGates() : null;
+  const length = isRace() ? courseLength() : null;
   const rivals = isRace() && !el.opponentsField.hidden ? opponents() : 0;
-  if (!ok || !fields || !settings || gates === undefined || rivals === undefined) return null;
+  if (!ok || !fields || !settings || gates === undefined || length === undefined || rivals === undefined) return null;
   return {
     scenario: state.scenario.name,
     assignments,
@@ -220,6 +261,7 @@ function buildRequest() {
     ...(isRace() ? { course_seed_mode: el.courseMode.value } : {}),
     // The scenario's own gate count is what a sweep without one flies: send only another.
     ...(gates != null && gates !== state.doc.course?.gates.length ? { gates } : {}),
+    ...(length != null && length !== state.ownLength ? { length_m: length } : {}),
     ...(rivals > 0 ? { opponents: rivals } : {}),
   };
 }
@@ -353,6 +395,7 @@ function renderPlan(plan) {
   // A race sweep's rows also say which course (seed) each run flies.
   const withCourse = plan.rows.some((r) => r.course_seed != null);
   const withGates = plan.rows.some((r) => r.gates != null);
+  const withLength = plan.rows.some((r) => r.length_m != null);
   const withOpponents = plan.rows.some((r) => r.opponents != null);
   const shown = plan.rows.slice(0, PLAN_ROWS);
   el.planTable.replaceChildren(
@@ -362,6 +405,7 @@ function renderPlan(plan) {
       withSample ? h("th", { text: "sample" }) : null,
       withCourse ? h("th", { text: "course seed" }) : null,
       withGates ? h("th", { text: "gates" }) : null,
+      withLength ? h("th", { text: "length_m" }) : null,
       withOpponents ? h("th", { text: "opponents" }) : null,
       ...plan.keys.map((k) => h("th", { text: k })))),
     h("tbody", {}, ...shown.map((r) => h("tr", {},
@@ -370,6 +414,7 @@ function renderPlan(plan) {
       withSample ? h("td", { text: r.sample == null ? "" : String(r.sample) }) : null,
       withCourse ? h("td", { text: r.course_seed == null ? "" : String(r.course_seed) }) : null,
       withGates ? h("td", { text: r.gates == null ? "" : String(r.gates) }) : null,
+      withLength ? h("td", { text: r.length_m == null ? "" : String(Math.round(r.length_m)) }) : null,
       withOpponents ? h("td", { text: r.opponents == null ? "" : String(r.opponents) }) : null,
       ...plan.keys.map((k) => h("td", { text: formatValue(r.values[k]) }))))));
   el.planWrap.hidden = false;
@@ -497,8 +542,11 @@ async function openSweep(name) {
   variation.setFields(request);
   el.courseMode.value = request.course_seed_mode ?? "fixed";
   if (request.gates != null) el.courseGates.value = String(request.gates);
+  if (request.length_m != null) el.courseLength.value = String(request.length_m);
   syncCourse();
   el.maxTime.value = String(request.max_time_s);
+  state.maxEdited = true; // the saved sweep's limit is not the course's default
+  renderLengthHint();
   el.repeats.value = String(request.repeats);
   el.jobs.value = String(request.jobs);
   el.runTimeout.value = String(request.run_timeout_s);
@@ -661,6 +709,9 @@ el.form.addEventListener("change", changed); // any edit: the scenario, controll
 el.form.addEventListener("input", changed); // typing re-plans after the debounce, not only on blur
 el.form.addEventListener("submit", (e) => e.preventDefault());
 el.courseMode.addEventListener("change", syncCourse);
+el.courseLength.addEventListener("input", followLength);
+el.courseGates.addEventListener("input", renderLengthHint);
+el.maxTime.addEventListener("input", () => { state.maxEdited = true; });
 el.courseOpponents.addEventListener("input", () => {
   const n = opponents();
   if (el.opponentsField.hidden || n === undefined) return;

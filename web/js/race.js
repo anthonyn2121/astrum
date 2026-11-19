@@ -111,3 +111,19 @@ export function raceStandings(events, t, ids, gateCount) {
   out.forEach((r, i) => { r.place = i + 1; });
   return { rows: out, ended, winner: out.length && out[0].finished ? out[0].id : null };
 }
+
+// The course lengths the UI accepts (m), and the shortest leg a default envelope
+// draws (m): a course of N gates has N - 1 legs of about length / (N - 1).
+export const COURSE_LENGTH_MIN_M = 100;
+export const COURSE_LENGTH_MAX_M = 5000;
+export const LEG_MIN_M = 15;
+
+// The time limit a longer course needs: the scenario's `maxS` scaled by
+// length / `ownLength`, rounded up to 10 s, never below `maxS`. Null when it
+// would be the scenario's own anyway (a course no longer than its own, or a
+// scenario with no limit).
+export function scaledMaxTime(maxS, ownLength, length) {
+  if (!(maxS > 0) || !(ownLength > 0) || !(length > ownLength)) return null;
+  const scaled = Math.max(maxS, Math.ceil((maxS * length / ownLength) / 10) * 10);
+  return scaled > maxS ? scaled : null;
+}

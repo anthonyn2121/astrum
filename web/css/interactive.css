@@ -102,6 +102,7 @@
 .course-random input { width: auto; }
 .course-seed { max-width: 260px; }
 .course-gates { max-width: 140px; }
+.course-length { max-width: 220px; }
 .course-opponents { max-width: 180px; }
 .course-seed-row { display: flex; gap: 8px; align-items: center; }
 .course-seed-row input { flex: 1; min-width: 0; }

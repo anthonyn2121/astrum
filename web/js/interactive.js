@@ -21,7 +21,7 @@ import { $, h, showError } from "./dom.js";
 import { teamColor } from "./format.js";
 import { ControllerForm } from "./ctlform.js";
 import { ScenarioPicker } from "./scenariopicker.js";
-import { parseCourse } from "./race.js";
+import { parseCourse, scaledMaxTime, COURSE_LENGTH_MIN_M, COURSE_LENGTH_MAX_M, LEG_MIN_M } from "./race.js";
 import { drawCoursePreview, courseSummary } from "./coursepreview.js";
 
 const ACTIVE_POLL_MS = 2000;
@@ -39,6 +39,7 @@ const el = {
   planMax: $("planMax"), planFleet: $("planFleet"), planLocked: $("planLocked"),
   courseBox: $("courseBox"), courseRandom: $("courseRandom"), courseSeed: $("courseSeed"),
   courseOpponents: $("courseOpponents"), opponentsField: $("opponentsField"),
+  courseLength: $("courseLength"), courseLengthHint: $("courseLengthHint"), courseLengthError: $("courseLengthError"),
   courseGates: $("courseGates"), courseGatesHint: $("courseGatesHint"), courseGatesError: $("courseGatesError"),
   courseReroll: $("courseReroll"), courseSeedHint: $("courseSeedHint"), courseSeedError: $("courseSeedError"),
   coursePreview: $("coursePreview"), courseCaption: $("courseCaption"), courseError: $("courseError"),
@@ -61,7 +62,7 @@ const state = {
   // The picked race scenario's course: its own seed, its own course (the
   // ScenarioDoc's, drawn while that seed is the one chosen) and the count of
   // the latest preview request (an older reply is dropped).
-  course: { ownSeed: null, ownGates: null, own: null, request: 0 },
+  course: { ownSeed: null, ownGates: null, ownLength: null, own: null, request: 0 },
 };
 
 let form = null; // the controller form; made once the catalogs are loaded
@@ -81,10 +82,6 @@ function onPick(entry, doc, error) {
   form.setScenario(doc);
   el.fleetEmpty.hidden = !!entry && !error;
   el.fleetEmpty.textContent = error ? `Cannot read scenario ${entry.name}: ${error}` : "Pick a scenario first.";
-  const max = doc?.scenario?.sim?.max_time_s;
-  el.maxTimeHint.textContent = !doc ? ""
-    : Number.isFinite(max) ? `empty: the scenario's ${max > 0 ? `${max} s` : "no limit"}; 0 = until stopped`
-    : "empty: the scenario's limit; 0 = until stopped";
   showError(el.formError, "");
   setupCourse();
   // A race that lists several drones: each races, by default.
@@ -112,6 +109,44 @@ function seedValue() {
   return { seed };
 }
 
+// The length field: { length } (m) or { error }.
+function lengthValue() {
+  const raw = el.courseLength.value.trim();
+  const length = Number(raw);
+  if (raw === "" || !Number.isFinite(length) || length < COURSE_LENGTH_MIN_M || length > COURSE_LENGTH_MAX_M) {
+    return { error: `must be a number from ${COURSE_LENGTH_MIN_M} to ${COURSE_LENGTH_MAX_M} m` };
+  }
+  return { length };
+}
+
+// The time limit a run on a longer course gets when the max-time field is empty
+// (race.js scaledMaxTime), or null: the scenario's own.
+function scaledLimit() {
+  const length = lengthValue();
+  if (!isRace() || length.error) return null;
+  return scaledMaxTime(state.doc.scenario?.sim?.max_time_s, state.course.ownLength, length.length);
+}
+
+// The hint under the Max sim time field: what an empty field means.
+function renderMaxHint() {
+  const max = state.doc?.scenario?.sim?.max_time_s;
+  const scaled = scaledLimit();
+  el.maxTimeHint.textContent = !state.doc ? ""
+    : scaled != null ? `empty: ${scaled} s, scaled to the ${lengthValue().length} m course (the scenario's ${max} s for ${state.course.ownLength} m); 0 = until stopped`
+    : Number.isFinite(max) ? `empty: the scenario's ${max > 0 ? `${max} s` : "no limit"}; 0 = until stopped`
+    : "empty: the scenario's limit; 0 = until stopped";
+}
+
+// The hint under the Length field: legs are about length / (gates - 1) long.
+function renderLengthHint() {
+  const c = state.course, length = lengthValue(), count = gatesValue();
+  const own = c.ownLength != null ? `the scenario's own length is ${c.ownLength} m` : "";
+  const legs = !length.error && !count.error
+    ? ` · ≈ ${Math.round(length.length / (count.gates - 1))} m per leg; the default envelope needs about ${LEG_MIN_M * (count.gates - 1)} m or more for ${count.gates} gates`
+    : "";
+  el.courseLengthHint.textContent = own + legs;
+}
+
 // The gates field: { gates } or { error }.
 function gatesValue() {
   const raw = el.courseGates.value.trim();
@@ -137,6 +172,9 @@ function setupCourse() {
   c.own = race ? parseCourse(state.doc.course) : null;
   c.ownSeed = c.own?.seed ?? null;
   c.ownGates = c.own?.gates.length ?? null;
+  c.ownLength = race ? (state.doc.course_params?.length_m ?? (c.own ? Math.round(c.own.length_m) : null)) : null;
+  el.courseLength.value = c.ownLength ?? "";
+  showError(el.courseLengthError, "");
   el.courseRandom.checked = false;
   // Opponents are clones of the scenario's aircraft: for a scenario with one.
   el.opponentsField.hidden = !race || state.doc.scenario.aircraft.length !== 1;
@@ -147,7 +185,7 @@ function setupCourse() {
   showError(el.courseSeedError, "");
   showError(el.courseGatesError, "");
   showError(el.courseError, race && !c.own ? "The scenario's course could not be read." : "");
-  showCourse(c.own);
+  showCourse(c.own, c.ownLength);
   syncSeedMode();
 }
 
@@ -161,37 +199,45 @@ function syncSeedMode() {
     : state.course.ownSeed != null ? `the scenario's own seed is ${state.course.ownSeed}` : "";
 }
 
-function showCourse(course) {
+// `targetM`: the length the course was asked for.
+function showCourse(course, targetM = null) {
   drawCoursePreview(el.coursePreview, course);
-  el.courseCaption.textContent = courseSummary(course);
+  el.courseCaption.textContent = courseSummary(course, targetM);
 }
 
 // Draw the course the seed and gates fields give: the scenario's own, already
 // read, or the API's preview for them.
 async function updateCoursePreview() {
   const c = state.course;
-  const s = seedValue(), n = gatesValue();
+  const s = seedValue(), n = gatesValue(), len = lengthValue();
   showError(el.courseSeedError, s.error || "");
   showError(el.courseGatesError, n.error || "");
-  if (s.error || n.error) return;
-  if (c.own && s.seed === c.ownSeed && n.gates === c.ownGates) {
+  showError(el.courseLengthError, len.error || "");
+  if (s.error || n.error || len.error) return;
+  const sendLength = len.length !== c.ownLength; // the scenario's own length is what a request without one draws
+  if (c.own && s.seed === c.ownSeed && n.gates === c.ownGates && !sendLength) {
     c.request++;
-    showCourse(c.own);
+    showCourse(c.own, c.ownLength);
     showError(el.courseError, "");
     return;
   }
   const request = ++c.request;
   try {
-    const reply = await getScenarioCourse(state.scenario.name, s.seed, n.gates === c.ownGates ? null : n.gates);
+    const reply = await getScenarioCourse(state.scenario.name, s.seed, n.gates === c.ownGates ? null : n.gates,
+      sendLength ? len.length : null);
     if (request !== c.request) return;
     const course = parseCourse(reply?.gates ? reply : reply?.course);
     if (!course) throw new Error("the reply holds no course");
-    showCourse(course);
+    showCourse(course, len.length);
     showError(el.courseError, "");
   } catch (e) {
     if (request !== c.request) return;
     showCourse(null);
-    showError(el.courseError, `Cannot preview the course: ${e.message || e}`);
+    // A gates / length combination the course cannot be drawn for: the server's
+    // reason goes under the Length control.
+    const msg = e.message || String(e);
+    if (sendLength) showError(el.courseLengthError, msg);
+    else showError(el.courseError, `Cannot preview the course: ${msg}`);
   }
 }
 
@@ -220,15 +266,19 @@ function buildRequest() {
   showError(el.maxTimeError, max.error || "");
   const course = isRace() ? seedValue() : null;
   const count = isRace() ? gatesValue() : null;
+  const length = isRace() ? lengthValue() : null;
   const opponents = Number(el.courseOpponents.value);
   if (course) showError(el.courseSeedError, course.error || "");
   if (count) showError(el.courseGatesError, count.error || "");
-  if (!ok || max.error || course?.error || count?.error) return null;
+  if (length) showError(el.courseLengthError, length.error || "");
+  if (!ok || max.error || course?.error || count?.error || length?.error) return null;
   const body = { scenario: state.scenario.name, assignments, speed: state.speed };
   if (max.value !== undefined) body.max_time_s = max.value;
+  else if (scaledLimit() != null) body.max_time_s = scaledLimit(); // a longer course needs more time
   // The scenario's own seed is what a run without one flies: send only another.
   if (course && (el.courseRandom.checked || course.seed !== state.course.ownSeed)) body.seed = course.seed;
   if (count && count.gates !== state.course.ownGates) body.gates = count.gates;
+  if (length && length.length !== state.course.ownLength) body.length_m = length.length;
   if (isRace() && !el.opponentsField.hidden && opponents > 0) body.opponents = opponents;
   return body;
 }
@@ -250,6 +300,8 @@ function sync() {
   el.runNote.textContent = active ? "Another run is active."
     : state.starting ? "Starting…" : "";
   el.planLocked.hidden = !active;
+  renderMaxHint();
+  renderLengthHint();
   syncSteps();
   renderPlan();
 }
@@ -283,12 +335,13 @@ function renderPlan() {
     : max.value !== undefined ? `${max.value} s`
     : !state.doc ? "—"
     : !Number.isFinite(limit) ? "scenario's limit"
+    : scaledLimit() != null ? `${scaledLimit()} s (scaled to the course)`
     : limit > 0 ? `${limit} s (scenario)` : "no limit (scenario)";
-  const seed = seedValue(), count = gatesValue();
+  const seed = seedValue(), count = gatesValue(), length = lengthValue();
   el.planCourseRow.hidden = !isRace();
-  el.planCourse.textContent = seed.error ? "invalid seed" : count.error ? "invalid gate count"
+  el.planCourse.textContent = seed.error ? "invalid seed" : count.error ? "invalid gate count" : length.error ? "invalid length"
     : `seed ${seed.seed}${el.courseRandom.checked ? " (random)" : seed.seed === state.course.ownSeed ? " (scenario's)" : ""}`
-      + ` · ${count.gates} gates`
+      + ` · ${count.gates} gates · ${Math.round(length.length)} m`
       + (el.opponentsField.hidden || el.courseOpponents.value === "0" ? ""
         : ` · ${el.courseOpponents.value} opponent${el.courseOpponents.value === "1" ? "" : "s"}`);
   const aircraft = state.doc ? [...form.fleet()] : [];
@@ -406,6 +459,7 @@ el.courseOpponents.addEventListener("change", () => {
 });
 el.courseSeed.addEventListener("input", onCourseSeedInput);
 el.courseGates.addEventListener("input", onCourseSeedInput);
+el.courseLength.addEventListener("input", onCourseSeedInput);
 el.fleet.addEventListener("controllerchange", () => {
   showError(el.formError, "");
   sync();
