@@ -3,6 +3,8 @@ name = "astrum-race"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "ASTRUM drone-racing environment: gates, a Monte-Carlo course sampler, scoring and crash detection, run on astrum-sim."
 
 [lib]
