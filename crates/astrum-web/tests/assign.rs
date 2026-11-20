@@ -32,7 +32,7 @@ fn fleet_json() -> Value {
 }
 
 fn fleet() -> Scenario {
-    scenario_input(fleet_json(), &repo_catalogs()).unwrap().1
+    scenario_input(fleet_json(), &repo_catalogs()).unwrap().1.scenario
 }
 
 fn request(value: Value) -> AssignmentBody {
@@ -41,9 +41,10 @@ fn request(value: Value) -> AssignmentBody {
 
 #[test]
 fn a_saved_name_resolves_to_its_scenario() {
-    let (name, scenario) = scenario_input(json!("formation"), &repo_catalogs()).unwrap();
+    let (name, base) = scenario_input(json!("formation"), &repo_catalogs()).unwrap();
     assert_eq!(name.as_deref(), Some("formation"));
-    assert_eq!(scenario.aircraft.len(), 4);
+    assert_eq!(base.scenario.aircraft.len(), 4);
+    assert_eq!(base.course, None);
 }
 
 #[test]
@@ -67,9 +68,10 @@ fn an_invalid_saved_scenario_is_invalid_and_named() {
 
 #[test]
 fn an_inline_document_resolves_without_a_name() {
-    let (name, scenario) = scenario_input(fleet_json(), &repo_catalogs()).unwrap();
+    let (name, base) = scenario_input(fleet_json(), &repo_catalogs()).unwrap();
     assert_eq!(name, None);
-    assert_eq!(scenario.aircraft.len(), 3);
+    assert_eq!(base.scenario.aircraft.len(), 3);
+    assert_eq!(base.course, None);
 }
 
 #[test]

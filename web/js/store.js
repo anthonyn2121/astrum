@@ -75,11 +75,14 @@ export function parseFrame(f) {
 const EVENT_KINDS = new Set([
   "trigger-pressed", "trigger-released", "hit", "kill", "mode-change",
   "controller-up", "controller-down", "run-ended",
+  "gate-passed", "gate-missed", "crashed",
 ]);
 // Aircraft-id fields an event may carry (by kind).
 const EVENT_IDS = ["aircraft_id", "shooter_id", "target_id", "victim_id"];
-const EVENT_NUMBERS = ["ammo", "rounds_fired", "damage", "hit_points"];
-const EVENT_NAMES = ["from", "to", "reason", "message"];
+// `gate` is a race gate's index; `offset_x_m` / `offset_y_m` where a pass crossed
+// the opening (m right of / above its centre).
+const EVENT_NUMBERS = ["ammo", "rounds_fired", "damage", "hit_points", "gate", "offset_x_m", "offset_y_m"];
+const EVENT_NAMES = ["from", "to", "reason", "message", "outcome"];
 
 function validId(v) {
   return Number.isInteger(v) && v >= 0 && v <= MAX_ID;

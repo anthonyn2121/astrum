@@ -42,6 +42,13 @@ export const getModels = () => apiGet("/models");
 export const getControllers = () => apiGet("/controllers").then((c) => c.entries);
 export const getScenarios = () => apiGet("/scenarios");
 export const getScenario = (name) => apiGet(`/scenarios/${encodeURIComponent(name)}`);
+// A race scenario's course (race.js parseCourse reads the reply) for course seed
+// `seed` and, when given, `gates` gates and a course of `lengthM` metres in place
+// of the scenario's own.
+export const getScenarioCourse = (name, seed, gates = null, lengthM = null) =>
+  apiGet(`/scenarios/${encodeURIComponent(name)}/course?seed=${encodeURIComponent(seed)}`
+    + (gates == null ? "" : `&gates=${encodeURIComponent(gates)}`)
+    + (lengthM == null ? "" : `&length_m=${encodeURIComponent(lengthM)}`));
 // Scenario writes and checks (crates/astrum-web/src/scenarios.rs).
 export const saveScenario = (name, body) => apiPut("/scenarios/" + encodeURIComponent(name), body);
 export const checkScenario = (scenario) => apiPost("/scenario-check", { scenario });

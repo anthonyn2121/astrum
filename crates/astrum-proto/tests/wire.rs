@@ -2,9 +2,11 @@
 //! arm, plus the decoder's rejection rules.
 
 use astrum_proto::{
-    decode_command, decode_telemetry, decode_tick_end, encode_command, encode_telemetry,
-    encode_tick_end, AutopilotTargets, Command, CommandStatus, Control, ControlMode, MultirotorRaw,
-    RawActuators, Refusal, Telemetry, TickEnd, VehicleKind,
+    decode_command, decode_event, decode_race_course, decode_race_state, decode_telemetry,
+    decode_tick_end, encode_command, encode_event, encode_race_course, encode_race_state,
+    encode_telemetry, encode_tick_end, AutopilotTargets, Command, CommandStatus, Control,
+    ControlMode, EndReason, Enu, Event, EventKind, MultirotorRaw, RaceCourse, RaceGate,
+    RaceOutcome, RaceState, RawActuators, Refusal, Telemetry, TickEnd, VehicleKind,
 };
 
 #[test]
@@ -105,4 +107,99 @@ fn decoding_reads_unaligned_payloads() {
     let mut shifted = vec![0u8; bytes.len() + 1];
     shifted[1..].copy_from_slice(&bytes);
     assert_eq!(decode_telemetry(&shifted[1..]).unwrap().aircraft_id, 5);
+}
+
+fn gate(index: u32) -> RaceGate {
+    let f = f64::from(index);
+    RaceGate {
+        index,
+        center: Enu { e: f, n: 2.0 * f, u: 1.5 },
+        yaw_rad: 0.1 * f,
+        normal: Enu { e: 0.0, n: 1.0, u: 0.0 },
+        right: Enu { e: 1.0, n: 0.0, u: 0.0 },
+        up: Enu { e: 0.0, n: 0.0, u: 1.0 },
+    }
+}
+
+#[test]
+fn race_course_roundtrips_with_any_gate_count() {
+    for n in [0, 1, 16, 200] {
+        let c = RaceCourse {
+            seed: u64::MAX,
+            opening_m: 1.016,
+            bar_m: 0.0762,
+            top_bar_m: 1.1684,
+            gates: (0..n).map(gate).collect(),
+        };
+        let bytes = encode_race_course(&c);
+        assert_eq!(decode_race_course(&bytes).unwrap(), c);
+        assert!(decode_race_course(&bytes[..bytes.len() - 8]).is_err());
+    }
+}
+
+#[test]
+fn race_state_roundtrips_every_outcome() {
+    for outcome in [
+        RaceOutcome::Running,
+        RaceOutcome::Complete,
+        RaceOutcome::CrashedGround,
+        RaceOutcome::CrashedGate,
+        RaceOutcome::TimedOut,
+        RaceOutcome::SpawnFailed,
+    ] {
+        let s = RaceState {
+            aircraft_id: 3,
+            pending_gate: 4,
+            passed: 4,
+            missed: 1,
+            gate_count: 9,
+            last_pass_s: 6.5,
+            sim_time_s: 7.0,
+            finished: outcome != RaceOutcome::Running,
+            outcome,
+        };
+        assert_eq!(decode_race_state(&encode_race_state(&s)).unwrap(), s);
+    }
+}
+
+#[test]
+fn race_events_and_end_reasons_roundtrip() {
+    let kinds = [
+        EventKind::GatePassed { aircraft_id: 1, gate: 2, offset_x_m: -0.25, offset_y_m: 0.5 },
+        EventKind::GateMissed { aircraft_id: 1, gate: 3 },
+        EventKind::Crashed { aircraft_id: 1, outcome: RaceOutcome::CrashedGround, gate: 3 },
+        EventKind::RunEnded { reason: EndReason::RaceComplete, message: String::new() },
+        EventKind::RunEnded { reason: EndReason::Crashed, message: String::new() },
+    ];
+    for kind in kinds {
+        let e = Event { tick: 7, sim_time_s: 0.5, kind };
+        assert_eq!(decode_event(&encode_event(&e)).unwrap(), e);
+    }
+}
+
+#[test]
+fn an_event_kind_this_build_does_not_know_is_a_decode_error_to_skip() {
+    // Event = tick, simTimeS, then the 16-bit union discriminant in the third data word,
+    // after the 8-byte segment table and the 8-byte root pointer.
+    const DISCRIMINANT: usize = 8 + 8 + 16;
+    let e =
+        Event { tick: 1, sim_time_s: 0.0, kind: EventKind::GateMissed { aircraft_id: 1, gate: 0 } };
+    let mut bytes = encode_event(&e);
+    // A known discriminant (controllerUp, member 5) proves the offset: it decodes as that kind.
+    bytes[DISCRIMINANT..DISCRIMINANT + 2].copy_from_slice(&5u16.to_le_bytes());
+    assert!(matches!(decode_event(&bytes).unwrap().kind, EventKind::ControllerUp { .. }));
+    // An ordinal past the schema's last kind is an error (a subscriber skips the event).
+    bytes[DISCRIMINANT..DISCRIMINANT + 2].copy_from_slice(&99u16.to_le_bytes());
+    assert!(decode_event(&bytes).is_err());
+}
+
+#[test]
+fn an_outcome_this_build_does_not_know_decodes_as_unknown() {
+    let s = RaceState { outcome: RaceOutcome::Complete, ..Default::default() };
+    let mut bytes = encode_race_state(&s);
+    // Locate the outcome's byte as the one that differs between two outcomes.
+    let probe = encode_race_state(&RaceState { outcome: RaceOutcome::SpawnFailed, ..s });
+    let at = bytes.iter().zip(&probe).position(|(a, b)| a != b).unwrap();
+    bytes[at] = 99;
+    assert_eq!(decode_race_state(&bytes).unwrap().outcome, RaceOutcome::Unknown(99));
 }

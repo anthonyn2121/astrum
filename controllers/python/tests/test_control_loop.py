@@ -301,6 +301,8 @@ def test_stop_in_configure_is_refused(make_state):
         (EndReason.MAX_TIME, 0),
         (EndReason.ENGAGEMENT_DECIDED, 0),
         (EndReason.STOPPED, 0),
+        (EndReason.RACE_COMPLETE, 0),
+        (EndReason.CRASHED, 0),
         (EndReason.FATAL, 1),
     ],
 )

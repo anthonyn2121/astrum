@@ -136,12 +136,60 @@ TEST(Wire, UnknownEnumValuesSurviveAsUnknown) {
   EXPECT_EQ(to_string(std::get<RunEnded>(end.value->detail).reason), "unknown(9)");
 }
 
+TEST(Wire, AnEventKindThisBuildLacksIsADecodeErrorToSkip) {
+  // Segment table (8) + root pointer (8) + tick + simTimeS, then the 16-bit union
+  // discriminant; ControllerUp is member 5.
+  constexpr std::size_t kDiscriminant = 8 + 8 + 16;
+  std::vector<std::uint8_t> bytes = encode_event(Event{1, 0.0, ControllerUp{4}});
+  ASSERT_EQ(bytes[kDiscriminant], 5);
+  bytes[kDiscriminant] = 99;
+  const auto unknown = decode_event(bytes);
+  EXPECT_FALSE(unknown);
+  EXPECT_NE(unknown.error.find("unknown event kind"), std::string::npos) << unknown.error;
+}
+
 TEST(Wire, EnumNamesAreKebabCase) {
   EXPECT_EQ(to_string(VehicleKind::FixedWing), "fixed-wing");
   EXPECT_EQ(to_string(Refusal::FromTheFuture), "from-the-future");
   EXPECT_EQ(to_string(Refusal::WrongVehicleKind), "wrong-vehicle-kind");
   EXPECT_EQ(to_string(ModeReason::LeaseExpired), "lease-expired");
   EXPECT_EQ(to_string(EndReason::EngagementDecided), "engagement-decided");
+  EXPECT_EQ(to_string(EndReason::RaceComplete), "race-complete");
+  EXPECT_EQ(to_string(RaceOutcome::CrashedGround), "crashed-ground");
+  EXPECT_EQ(to_string(RaceOutcome::TimedOut), "timed-out");
+}
+
+RaceGate gate(std::uint32_t index) {
+  const double f = index;
+  return RaceGate{index, Enu{f, 2.0 * f, 1.5}, 0.1 * f, Enu{0, 1, 0}, Enu{1, 0, 0}, Enu{0, 0, 1}};
+}
+
+TEST(Wire, RaceCourseRoundTripsWithAnyGateCount) {
+  for (const std::uint32_t n : {0U, 1U, 16U, 200U}) {
+    RaceCourse c{0xFFFFFFFFFFFFFFFFULL, 1.016, 0.0762, 1.1684, {}};
+    for (std::uint32_t i = 0; i < n; ++i) c.gates.push_back(gate(i));
+    const auto decoded = decode_race_course(encode_race_course(c));
+    ASSERT_TRUE(decoded) << decoded.error;
+    EXPECT_TRUE(*decoded.value == c) << n << " gates";
+  }
+  const std::vector<std::uint8_t> bytes =
+      encode_race_course(RaceCourse{1, 1.0, 0.1, 1.2, {gate(0)}});
+  EXPECT_FALSE(decode_race_course(std::span(bytes).first(bytes.size() - 8)));
+  EXPECT_FALSE(decode_race_course(std::span<const std::uint8_t>{}));
+}
+
+TEST(Wire, RaceStateRoundTripsEveryOutcomeAndKeepsUnknownOnes) {
+  for (std::uint16_t o = 0; o < 6; ++o) {
+    const RaceState s{3, 4, 4, 1, 9, 6.5, 7.0, o != 0, static_cast<RaceOutcome>(o)};
+    const auto decoded = decode_race_state(encode_race_state(s));
+    ASSERT_TRUE(decoded) << decoded.error;
+    EXPECT_TRUE(*decoded.value == s) << "outcome " << o;
+  }
+  RaceState s;
+  s.outcome = static_cast<RaceOutcome>(9);
+  const auto decoded = decode_race_state(encode_race_state(s));
+  ASSERT_TRUE(decoded) << decoded.error;
+  EXPECT_EQ(to_string(decoded.value->outcome), "unknown(9)");
 }
 
 TEST(Wire, CommandRoundTripsEveryControlVariant) {
@@ -174,6 +222,10 @@ TEST(Wire, EveryEventKindRoundTrips) {
       {0, 0.0, ControllerUp{5}},
       {999, 8.3125, ControllerDown{7}},
       {7200, 60.0, RunEnded{EndReason::Fatal, "aircraft 3: non-finite state"}},
+      {3600, 30.0, RunEnded{EndReason::RaceComplete, ""}},
+      {960, 8.0, GatePassed{1, 3, -0.125, 0.0625}},
+      {1200, 10.0, GateMissed{1, 4}},
+      {1500, 12.5, Crashed{1, RaceOutcome::CrashedGate, 2}},
   };
   for (const Event& e : events) {
     const auto decoded = decode_event(encode_event(e));

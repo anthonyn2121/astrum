@@ -177,6 +177,10 @@ pub const METRICS: &[&str] = &[
     "kills",
 ];
 
+/// The metric ids a race run reports on top of [`METRICS`] (`astrum_bag::metrics`;
+/// `None` for a run that is not a race).
+pub const RACE_METRICS: &[&str] = &["gates_passed", "gates_missed", "race_time_s", "race_outcome"];
+
 /// A world new scenarios are authored in: where it can be placed, the
 /// `[sim]` a new scenario starts with, the models it offers and the metrics
 /// its runs report.
@@ -207,7 +211,7 @@ pub struct Location {
 
 /// Every environment, in display order.
 pub fn environments() -> Vec<Environment> {
-    vec![empty()]
+    vec![empty(), race()]
 }
 
 /// The environment with id `id`, if there is one.
@@ -253,5 +257,38 @@ fn empty() -> Environment {
         },
         models: KNOWN_MODELS.iter().map(|(m, ..)| (*m).to_owned()).collect(),
         metrics: METRICS.to_vec(),
+    }
+}
+
+/// Drone racing (`astrum-race`): an F450 quadrotor flies a course of randomly
+/// drawn gates. A scenario of this environment is an ordinary scenario plus a
+/// `[course]` table; its only location is the bundled race field's origin
+/// (`config/scenario.race.toml`). The `[sim]` defaults are a race's: 120 Hz, a
+/// 120 s limit, real time for watching and course seed 1; lockstep stays off, as
+/// in the empty world.
+fn race() -> Environment {
+    Environment {
+        id: "race",
+        name: "Drone racing",
+        description: "An F450 quadrotor flies a course of randomly drawn racing gates; the \
+                      course seed picks the track.",
+        locations: vec![Location {
+            name: "Race field, Minnesota (44.726° N, 93.076° W)",
+            origin_lat_deg: 44.7258,
+            origin_lon_deg: -93.0759,
+            origin_alt_hae_m: 0.0,
+        }],
+        sim: Sim {
+            rate_hz: 120.0,
+            max_time_s: 120.0,
+            speed: 1.0,
+            seed: 1,
+            threads: 1,
+            command_lease_s: 0.5,
+            lockstep: false,
+            lockstep_timeout_s: 30.0,
+        },
+        models: vec!["F450".to_owned()],
+        metrics: METRICS.iter().chain(RACE_METRICS).copied().collect(),
     }
 }

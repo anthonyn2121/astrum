@@ -22,6 +22,10 @@ from astrum_client.wire import (
     ControlMode,
     Event,
     MultirotorRaw,
+    RaceCourse,
+    RaceGate,
+    RaceOutcome,
+    RaceState,
     RawActuators,
     Refusal,
     TickEnd,
@@ -29,13 +33,15 @@ from astrum_client.wire import (
     VehicleState,
     encode_command,
     encode_event,
+    encode_race_course,
+    encode_race_state,
     encode_telemetry,
     encode_tick_end,
     enum_member,
 )
 
 COMMAND_KINDS = ("command_raw", "command_autopilot", "command_multirotor")
-KINDS = ("telemetry", *COMMAND_KINDS, "tick_end")
+KINDS = ("telemetry", *COMMAND_KINDS, "tick_end", "race_course", "race_state")
 EVENT_KINDS = (
     "event_trigger_pressed",
     "event_trigger_released",
@@ -46,6 +52,11 @@ EVENT_KINDS = (
     "event_controller_up",
     "event_controller_down",
     "event_run_ended",
+    "event_run_ended_race_complete",
+    "event_run_ended_crashed",
+    "event_gate_passed",
+    "event_gate_missed",
+    "event_crashed",
 )
 LANGS = ("rust", "cpp", "python")
 
@@ -130,11 +141,48 @@ def expected_tick_end(v: dict) -> TickEnd:
     return TickEnd(v["tick"], float(v["sim_time_s"]))
 
 
+def _vec3(v: dict) -> tuple[float, float, float]:
+    return (v["e"], v["n"], v["u"])
+
+
+def expected_race_course(v: dict) -> RaceCourse:
+    gates = tuple(
+        RaceGate(
+            g["index"],
+            _vec3(g["center"]),
+            g["yaw_rad"],
+            _vec3(g["normal"]),
+            _vec3(g["right"]),
+            _vec3(g["up"]),
+        )
+        for g in v["gates"]
+    )
+    return RaceCourse(v["seed"], v["opening_m"], v["bar_m"], v["top_bar_m"], gates)
+
+
+def expected_race_state(v: dict) -> RaceState:
+    return RaceState(
+        v["aircraft_id"],
+        v["pending_gate"],
+        v["passed"],
+        v["missed"],
+        v["gate_count"],
+        v["last_pass_s"],
+        v["sim_time_s"],
+        v["finished"],
+        enum_member(RaceOutcome, v["outcome"]),
+    )
+
+
 def encode_kind(kind: str, values: dict) -> bytes:
     if kind == "telemetry":
         return encode_telemetry(expected_telemetry(values[kind]))
     if kind == "tick_end":
         return encode_tick_end(expected_tick_end(values[kind]))
+    if kind == "race_course":
+        return encode_race_course(expected_race_course(values[kind]))
+    if kind == "race_state":
+        return encode_race_state(expected_race_state(values[kind]))
     if kind in EVENT_KINDS:
         return encode_event(Event.from_dict(values[kind]))
     return encode_command(expected_command(values[kind]))

@@ -18,6 +18,15 @@
 //! `stop_at_max_time` → `count_steps` → `pace`; and always `publish_status` →
 //! `exit_on_signal` → `exit_on_fatal` → `publish_events` → `publish_tick_end`.
 //! Startup spawns the fleet and publishes tick 0 (telemetry, then its tick end).
+//!
+//! # Extending the tick
+//! A client crate (`astrum-race`) adds its own systems to [`build_app`]'s app with
+//! [`TickSet`]: systems `.in_set(TickSet::Spawned)` run in Startup right after
+//! `spawn_fleet`, before tick 0 is published; systems `.in_set(TickSet::Stepped)`
+//! run every tick after `end_on_elimination` and before `publish_telemetry`, under
+//! the tick's own conditions (the run is not paused and not fatal), so they see
+//! the state the telemetry is about to report and their events and exit requests
+//! are published with it.
 
 pub mod catalog;
 pub mod combat;
@@ -58,6 +67,16 @@ use systems::{
     advance_clock, exit_on_fatal, exit_on_signal, freeze_dead, pace, report_progress, spawn_fleet,
     step_fdm, stop_at_max_time, Diag, Pacer, StepPool,
 };
+
+/// Where a client crate hooks its systems into [`build_app`]'s schedules (see the
+/// crate docs, "Extending the tick").
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TickSet {
+    /// Startup: the fleet is spawned and tick 0 not yet published.
+    Spawned,
+    /// Update: the step is done and the clock advanced; telemetry not yet published.
+    Stepped,
+}
 
 /// Resolve the scenario's timing into [`SimParams`].
 pub fn sim_params(scenario: &Scenario) -> SimParams {
@@ -172,6 +191,15 @@ pub fn build_app(scenario: Scenario, mode: RunMode) -> App {
         .insert_resource(scenario)
         .insert_resource(mode)
         .add_observer(on_kill)
+        .configure_sets(Startup, TickSet::Spawned.after(spawn_fleet).before(publish_telemetry))
+        .configure_sets(
+            Update,
+            TickSet::Stepped
+                .after(end_on_elimination)
+                .before(publish_telemetry)
+                .run_if(SimStatus::running)
+                .run_if(RunControl::ticking),
+        )
         .add_systems(
             Startup,
             (

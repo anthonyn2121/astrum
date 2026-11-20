@@ -9,6 +9,7 @@
 #                  plus the cross-language wire-fixture tool and the tests
 #   cpp            astrum-controller: the hold / autopilot laws
 #   optimal/cpp    astrum-optimal-controller: the LQR / MPC laws (ASTRUM_BUILD_OPTIMAL)
+#   minsnap        astrum-minsnap-controller: the min-snap race controller (multirotor)
 #
 # Build + test (inside the dev image):
 #   cmake -S controllers -B build/controllers -DCMAKE_BUILD_TYPE=Release
@@ -35,9 +36,7 @@ find_package(CapnProto CONFIG REQUIRED)
 find_package(zenohc CONFIG REQUIRED)
 find_package(zenohcxx CONFIG REQUIRED)
 find_package(Threads REQUIRED)
-if(ASTRUM_BUILD_OPTIMAL)
-  find_package(Eigen3 CONFIG REQUIRED)
-endif()
+find_package(Eigen3 CONFIG REQUIRED)
 if(ASTRUM_BUILD_TESTS)
   find_package(nlohmann_json CONFIG REQUIRED)
   find_package(GTest CONFIG REQUIRED)
@@ -63,6 +62,7 @@ endfunction()
 
 add_subdirectory(common/cpp)
 add_subdirectory(cpp)
+add_subdirectory(minsnap)
 if(ASTRUM_BUILD_OPTIMAL)
   add_subdirectory(optimal/cpp)
 endif()

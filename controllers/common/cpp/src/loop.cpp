@@ -182,6 +182,10 @@ class Loop {
     if (fleet_) input.fleet = telemetry_.snapshot();
     input.events = take_events(s.tick);
     input.control_period_s = s.control_period_s;
+    if (options_.race != nullptr) {
+      input.race_course = options_.race->take_course();
+      input.race_state = options_.race->take_state();
+    }
     LawResult result;
     try {
       result = law_.step(input);
@@ -341,7 +345,9 @@ int exit_code(const Outcome& outcome) {
     case OutcomeKind::RunEnded:
       if (outcome.end_reason == EndReason::MaxTime ||
           outcome.end_reason == EndReason::EngagementDecided ||
-          outcome.end_reason == EndReason::Stopped) {
+          outcome.end_reason == EndReason::Stopped ||
+          outcome.end_reason == EndReason::RaceComplete ||
+          outcome.end_reason == EndReason::Crashed) {
         return 0;
       }
       return 1;

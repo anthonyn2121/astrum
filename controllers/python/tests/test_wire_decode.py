@@ -13,14 +13,21 @@ from astrum_client.wire import (
     ControllerDown,
     ControllerUp,
     ControlMode,
+    Crashed,
     DecodeError,
     EndReason,
     Event,
+    GateMissed,
+    GatePassed,
     Hit,
     Kill,
     ModeChange,
     ModeReason,
     MultirotorRaw,
+    RaceCourse,
+    RaceGate,
+    RaceOutcome,
+    RaceState,
     RawActuators,
     Refusal,
     RunEnded,
@@ -30,10 +37,14 @@ from astrum_client.wire import (
     VehicleKind,
     decode_command,
     decode_event,
+    decode_race_course,
+    decode_race_state,
     decode_telemetry,
     decode_tick_end,
     encode_command,
     encode_event,
+    encode_race_course,
+    encode_race_state,
     encode_telemetry,
     encode_tick_end,
 )
@@ -49,6 +60,10 @@ EVENTS = [
     Event(999, 8.3125, ControllerDown(7)),
     Event(7200, 60.0, RunEnded(EndReason.FATAL, "aircraft 3: non-finite state")),
     Event(7200, 60.0, RunEnded(EndReason.MAX_TIME, "")),
+    Event(3600, 30.0, RunEnded(EndReason.RACE_COMPLETE, "")),
+    Event(960, 8.0, GatePassed(1, 3, -0.125, 0.0625)),
+    Event(1200, 10.0, GateMissed(1, 4)),
+    Event(1500, 12.5, Crashed(1, RaceOutcome.CRASHED_GATE, 2)),
 ]
 
 
@@ -256,6 +271,31 @@ def test_event_dict_is_the_shared_flat_shape():
         Event.from_dict({"tick": 0, "sim_time_s": 0.0, "kind": "teleport"})
 
 
+def test_race_messages_round_trip():
+    gate = RaceGate(2, (1.0, -2.5, 1.5), 0.5, (0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    for n in (0, 1, 16):
+        course = RaceCourse(2**64 - 1, 1.016, 0.0762, 1.1684, (gate,) * n)
+        assert decode_race_course(encode_race_course(course)) == course
+    for outcome in RaceOutcome:
+        state = RaceState(3, 4, 4, 1, 9, 6.5, 7.0, outcome != RaceOutcome.RUNNING, outcome)
+        assert decode_race_state(encode_race_state(state)) == state
+    for bad in (b"", b"garbage!garbage!", encode_race_state(state)[:-8]):
+        with pytest.raises(DecodeError):
+            decode_race_course(bad)
+        with pytest.raises(DecodeError):
+            decode_race_state(bad)
+
+
+def test_unknown_race_outcome_decodes_as_a_raw_ordinal():
+    def state(outcome):
+        return encode_race_state(RaceState(1, 0, 0, 0, 3, 0.0, 0.0, False, outcome))
+
+    ev = decode_race_state(
+        _patch_single_diff(state(RaceOutcome.COMPLETE), state(RaceOutcome.TIMED_OUT), 9)
+    )
+    assert ev.outcome == 9 and not isinstance(ev.outcome, RaceOutcome)
+
+
 def _patch_single_diff(a: bytes, b: bytes, value: int) -> bytes:
     """``a`` with the one byte where it differs from ``b`` set to ``value``."""
     diff = [i for i, (x, y) in enumerate(zip(a, b, strict=True)) if x != y]
@@ -279,7 +319,7 @@ def test_event_kind_unknown_to_this_schema_is_a_decode_error():
     up = encode_event(Event(1, 0.0, ControllerUp(4)))
     down = encode_event(Event(1, 0.0, ControllerDown(4)))
     with pytest.raises(DecodeError):
-        decode_event(_patch_single_diff(up, down, 10))  # discriminant past runEnded
+        decode_event(_patch_single_diff(up, down, 11))  # discriminant past crashed
 
 
 @pytest.mark.parametrize(

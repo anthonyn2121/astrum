@@ -9,6 +9,7 @@ members = [
     "crates/astrum-sim",
     "crates/astrum-web",
     "crates/astrum-env",
+    "crates/astrum-race",
 ]
 
 [workspace.package]

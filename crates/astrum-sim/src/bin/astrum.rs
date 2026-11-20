@@ -19,6 +19,10 @@
 //! date as runs start and finish. Ctrl-C stops starting runs and ends the
 //! running ones cleanly; the summary marks the runs that never ran.
 //!
+//! A race — a scenario with a `[course]` table — flies `astrum-race` in place of
+//! `astrum-sim`, its course drawn from the scenario's seed (`course_seed_mode` in a
+//! sweep file picks each run's); a race sweep always runs as processes.
+//!
 //! Exit status: 0 ok, 1 a run not ok, 2 invalid input; a `run` stopped by
 //! Ctrl-C exits 130.
 
@@ -35,10 +39,12 @@ use astrum_sim::catalog;
 use astrum_sim::components::VehicleKind;
 use astrum_sim::controllers::ControllerCatalog;
 use astrum_sim::launch::{
-    connect_endpoint, numbered, run_processes, run_timeout, sibling, Children, Companion, LiveRun,
-    LiveSpec, Log, ProcessCtx, StartError,
+    connect_endpoint, numbered, run_processes, run_timeout, sibling, Children, Companion,
+    CourseLaunch, LiveRun, LiveSpec, Log, ProcessCtx, StartError,
 };
-use astrum_sim::sweep::{execute, run_in_process, Purpose, RunEvent, Status, Sweep, SweepFile};
+use astrum_sim::sweep::{
+    execute, run_in_process, scenario_toml, Purpose, RunEvent, Status, Sweep, SweepFile,
+};
 use astrum_sim::systems::StopRequested;
 use clap::{Args, Parser, Subcommand};
 
@@ -131,6 +137,11 @@ struct RunArgs {
     /// The astrum-sim binary (default: next to this one).
     #[arg(long, env = "ASTRUM_SIM_BIN")]
     sim: Option<PathBuf>,
+
+    /// The astrum-race binary a race (a scenario with a `[course]`) flies instead
+    /// (default: next to this one).
+    #[arg(long, env = "ASTRUM_RACE_BIN")]
+    race: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -204,6 +215,11 @@ struct SweepArgs {
     /// Process mode: the astrum-sim binary (default: next to this one).
     #[arg(long, env = "ASTRUM_SIM_BIN")]
     sim: Option<PathBuf>,
+
+    /// Process mode: the astrum-race binary a race sweep flies instead (default:
+    /// next to this one).
+    #[arg(long, env = "ASTRUM_RACE_BIN")]
+    race: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -265,6 +281,23 @@ fn on_ctrl_c(
 
 // --- astrum run ---------------------------------------------------------------
 
+/// The binary that flies `sweep`'s runs: `astrum-race` for a race (a base with
+/// a `[course]`), else `astrum-sim`.
+fn sim_name(sweep: &Sweep) -> &'static str {
+    if sweep.course.is_some() {
+        "astrum-race"
+    } else {
+        "astrum-sim"
+    }
+}
+
+/// The binary that flies `sweep`'s runs: the race's (`--race`) or the sim's
+/// (`--sim`) if given, else the one next to this executable.
+fn sim_binary(sweep: &Sweep, sim: Option<PathBuf>, race: Option<PathBuf>) -> PathBuf {
+    let given = if sweep.course.is_some() { race } else { sim };
+    given.unwrap_or_else(|| sibling(sim_name(sweep)))
+}
+
 fn file_stem(path: &Path) -> String {
     path.file_stem().map_or("run".into(), |s| s.to_string_lossy().into_owned())
 }
@@ -321,12 +354,16 @@ fn run(args: &RunArgs) -> ExitCode {
         for (k, line) in controllers.iter().enumerate() {
             println!("# controller {}: {line}", k + 1);
         }
-        print!("{}", run.scenario.to_toml());
+        print!("{}", scenario_toml(&run.scenario, sweep.course.as_ref()));
         return ExitCode::SUCCESS;
     }
-    let sim_bin = args.sim.clone().unwrap_or_else(|| sibling("astrum-sim"));
+    let sim_name = sim_name(&sweep);
+    let sim_bin = sim_binary(&sweep, args.sim.clone(), args.race.clone());
     if !sim_bin.exists() {
-        eprintln!("[astrum] no astrum-sim at {} (build it, or pass --sim)", sim_bin.display());
+        eprintln!(
+            "[astrum] no {sim_name} at {} (build it, or pass --sim / --race)",
+            sim_bin.display()
+        );
         return ExitCode::from(2);
     }
     let stop = StopRequested::default();
@@ -351,6 +388,7 @@ fn run(args: &RunArgs) -> ExitCode {
     let spec = LiveSpec {
         sim: sim_bin,
         scenario: run.scenario.clone(),
+        course: sweep.course.clone().map(|table| CourseLaunch { table, seed: run.course_seed }),
         scenario_file: None,
         listen: args.listen.clone(),
         record: args.record.clone(),
@@ -438,8 +476,13 @@ fn sweep(args: SweepArgs) -> ExitCode {
                 .map(|(k, v)| format!("{k} = {v}"))
                 .collect();
             let sample = run.sample.map_or(String::new(), |k| format!(" sample {}", k + 1));
+            let course = run.course_seed.map_or(String::new(), |s| format!(" course {s}"));
+            let course = match run.gates {
+                Some(gates) => format!("{course} ({gates} gates)"),
+                None => course,
+            };
             println!(
-                "  {} seed {}{sample}: {}",
+                "  {} seed {}{course}{sample}: {}",
                 run.stem(),
                 run.scenario.sim.seed,
                 values.join(", ")
@@ -452,9 +495,10 @@ fn sweep(args: SweepArgs) -> ExitCode {
         eprintln!("[sweep] {} exists; pass --overwrite to replace it", summary.display());
         return ExitCode::from(2);
     }
-    let sim = args.sim.unwrap_or_else(|| sibling("astrum-sim"));
+    let sim_name = sim_name(&sweep);
+    let sim = sim_binary(&sweep, args.sim, args.race);
     if !sweep.in_process() && !sim.exists() {
-        eprintln!("[sweep] no astrum-sim at {} (build it, or pass --sim)", sim.display());
+        eprintln!("[sweep] no {sim_name} at {} (build it, or pass --sim / --race)", sim.display());
         return ExitCode::from(2);
     }
 

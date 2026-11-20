@@ -5,10 +5,14 @@
 use std::time::Duration;
 
 use astrum_net::{
-    fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, SampledTelemetry,
-    ScenarioServer, Selection, Session, TelemetryPublisher, TickPublisher, TickReceiver,
+    fetch_scenario, keys, CommandReceiver, CommandSender, LatestTelemetry, RacePublisher,
+    RaceSubscriber, SampledTelemetry, ScenarioServer, Selection, Session, TelemetryPublisher,
+    TickPublisher, TickReceiver,
 };
-use astrum_proto::{encode_command, Command, Control, RawActuators, Telemetry, TickEnd};
+use astrum_proto::{
+    encode_command, Command, Control, RaceCourse, RaceGate, RaceOutcome, RaceState, RawActuators,
+    Telemetry, TickEnd,
+};
 use zenoh::Wait;
 
 fn sample(id: u32, tick: u64) -> Telemetry {
@@ -324,4 +328,78 @@ fn scenario_fetch_without_a_server_returns_none_after_the_timeout() {
     let started = std::time::Instant::now();
     assert_eq!(fetch_scenario(&session, Duration::from_millis(300)).unwrap(), None);
     assert!(started.elapsed() >= Duration::from_millis(300));
+}
+
+fn course(seed: u64) -> RaceCourse {
+    RaceCourse {
+        seed,
+        opening_m: 1.0,
+        bar_m: 0.1,
+        top_bar_m: 1.2,
+        gates: vec![RaceGate::default()],
+    }
+}
+
+fn race_state(passed: u32) -> RaceState {
+    RaceState { aircraft_id: 1, passed, gate_count: 5, ..Default::default() }
+}
+
+#[test]
+fn race_messages_are_latest_wins_and_per_aircraft() {
+    assert_eq!(keys::race_course(3), "astrum/race/course/3");
+    assert_eq!(keys::race_state(3), "astrum/race/state/3");
+    let session = Session::in_process().unwrap();
+    let publisher = RacePublisher::new(&session, 1).unwrap();
+    let other = RacePublisher::new(&session, 2).unwrap();
+    let rx = RaceSubscriber::new(&session, 1).unwrap();
+    // Establish the subscriptions.
+    let (mut first_course, mut first_state) = (None, None);
+    for _ in 0..1000 {
+        publisher.publish_course(&course(0)).unwrap();
+        publisher.publish_state(&race_state(0)).unwrap();
+        first_course = first_course.or(rx.try_recv_course());
+        first_state = first_state.or(rx.try_recv_state());
+        if first_course.is_some() && first_state.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(first_course, Some(course(0)));
+    assert_eq!(first_state, Some(race_state(0)));
+    // Drain what the retry loop left behind, then publish a burst: only the newest is kept.
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = (rx.try_recv_course(), rx.try_recv_state());
+    for n in 1..=5 {
+        publisher.publish_course(&course(u64::from(n))).unwrap();
+        publisher.publish_state(&race_state(n)).unwrap();
+        other
+            .publish_state(&RaceState { aircraft_id: 2, passed: 99, ..Default::default() })
+            .unwrap();
+    }
+    let (mut got_course, mut got_state) = (None, None);
+    for _ in 0..1000 {
+        got_course = rx.try_recv_course().or(got_course);
+        got_state = rx.try_recv_state().or(got_state);
+        if got_course.as_ref().map(|c| c.seed) == Some(5) && got_state.map(|s| s.passed) == Some(5)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(got_course, Some(course(5)));
+    assert_eq!(got_state, Some(race_state(5)), "aircraft 2's state must not reach aircraft 1");
+    // Taken: nothing until the next message arrives.
+    assert_eq!((rx.try_recv_course(), rx.try_recv_state()), (None, None));
+    assert_eq!(rx.decode_errors(), 0);
+    let finished = RaceState { finished: true, outcome: RaceOutcome::Complete, ..race_state(5) };
+    publisher.publish_state(&finished).unwrap();
+    let mut last = None;
+    for _ in 0..1000 {
+        last = rx.try_recv_state();
+        if last.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(last, Some(finished));
 }

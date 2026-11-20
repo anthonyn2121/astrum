@@ -1,9 +1,10 @@
 // The control loop (part of astrum::client): controllers/README.md, "The control loop".
 //
 // run_control_loop drives one Law for one aircraft on the caller's thread against three
-// interfaces — TelemetrySource, EventSource, CommandSink — so it runs on the Zenoh
-// transport (astrum/transport.hpp) in a controller and on scripted fakes in tests. Its
-// result is an Outcome; exit_code() maps it to the process exit code.
+// interfaces — TelemetrySource, EventSource, CommandSink (plus an optional RaceSource) —
+// so it runs on the Zenoh transport (astrum/transport.hpp) in a controller and on
+// scripted fakes in tests. Its result is an Outcome; exit_code() maps it to the process
+// exit code.
 
 #ifndef ASTRUM_LOOP_HPP
 #define ASTRUM_LOOP_HPP
@@ -62,12 +63,26 @@ class CommandSink {
   virtual std::uint64_t send(const Action& action, std::uint64_t telemetry_tick) = 0;
 };
 
+// A race run's course and progress for one aircraft (astrum/race/*/<id>), latest-value.
+class RaceSource {
+ public:
+  virtual ~RaceSource() = default;
+  // The newest RaceCourse received since the previous call, else nullopt.
+  virtual std::optional<RaceCourse> take_course() = 0;
+  // The newest RaceState received since the previous call, else nullopt.
+  virtual std::optional<RaceState> take_state() = 0;
+};
+
 // What a law sees for one new telemetry tick.
 struct StepInput {
   VehicleState state;                           // this aircraft, the newest sample
   std::map<std::uint32_t, VehicleState> fleet;  // every aircraft (empty unless needs_fleet)
   std::vector<Event> events;      // not delivered yet, of ticks < state.tick, oldest first
   double control_period_s = 0.0;  // state.control_period_s: the law's dt
+  // Race runs (Law::wants_race): set only on the step where a new one arrived since the
+  // previous step — the law keeps its own copy.
+  std::optional<RaceCourse> race_course;
+  std::optional<RaceState> race_state;
 };
 
 // A law's refusal to fly (Outcome Refused, exit 2).
@@ -86,6 +101,9 @@ class Law {
   virtual std::vector<VehicleKind> vehicle_kinds() const = 0;
   // True: subscribe fleet-wide, wait for each tick's TickEnd and fill StepInput::fleet.
   virtual bool needs_fleet() const { return false; }
+  // True: subscribe to the aircraft's race course and state (astrum/race/*/<id>) and fill
+  // StepInput::race_course / race_state.
+  virtual bool wants_race() const { return false; }
   // Gain design for the control period, once, before the first step. Throw
   // std::invalid_argument if the law cannot fly at this period (Outcome Refused); any
   // other exception is a LawFault.
@@ -108,8 +126,8 @@ struct Outcome {
 };
 
 // The process exit code (controllers/README.md, "Outcomes and exit codes"): RunEnded
-// maxTime / engagementDecided / stopped 0; RunEnded fatal (or an unknown reason),
-// TelemetryLost, NoTelemetry 1; Refused 2; LawFault 3.
+// maxTime / engagementDecided / stopped / raceComplete / crashed 0; RunEnded fatal (or an unknown
+// reason), TelemetryLost, NoTelemetry 1; Refused 2; LawFault 3.
 int exit_code(const Outcome& outcome);
 
 struct LoopOptions {
@@ -120,6 +138,8 @@ struct LoopOptions {
   double telemetry_timeout_s = 10.0;
   // The longest wait for a sample's TickEnd (needs_fleet laws only) before stepping anyway.
   double tick_end_wait_s = 0.05;
+  // The race course and state of the aircraft (Law::wants_race laws); null: none.
+  RaceSource* race = nullptr;
   std::function<SteadyClock::time_point()> clock = SteadyClock::now;
   Logger log = stderr_logger("astrum");
   // Log a status line every this many steps (0: never).

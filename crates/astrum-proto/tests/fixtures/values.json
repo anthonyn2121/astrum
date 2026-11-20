@@ -104,5 +104,72 @@
     "kind": "run-ended",
     "reason": "fatal",
     "message": "aircraft 3: non-finite state (NaN airspeed) — stopping"
+  },
+  "event_run_ended_race_complete": {
+    "tick": 3600,
+    "sim_time_s": 30.0,
+    "kind": "run-ended",
+    "reason": "race-complete",
+    "message": ""
+  },
+  "event_run_ended_crashed": {
+    "tick": 1800,
+    "sim_time_s": 15.0,
+    "kind": "run-ended",
+    "reason": "crashed",
+    "message": ""
+  },
+  "event_gate_passed": {
+    "tick": 960,
+    "sim_time_s": 8.0,
+    "kind": "gate-passed",
+    "aircraft_id": 1,
+    "gate": 3,
+    "offset_x_m": -0.125,
+    "offset_y_m": 0.0625
+  },
+  "event_gate_missed": { "tick": 1200, "sim_time_s": 10.0, "kind": "gate-missed", "aircraft_id": 1, "gate": 4 },
+  "event_crashed": {
+    "tick": 1500,
+    "sim_time_s": 12.5,
+    "kind": "crashed",
+    "aircraft_id": 1,
+    "outcome": "crashed-gate",
+    "gate": 2
+  },
+  "race_course": {
+    "seed": 18446744073709551615,
+    "opening_m": 1.25,
+    "bar_m": 0.125,
+    "top_bar_m": 1.5,
+    "gates": [
+      {
+        "index": 0,
+        "center": { "e": 10.5, "n": -20.25, "u": 1.5 },
+        "yaw_rad": 0.5,
+        "normal": { "e": 0.25, "n": 0.5, "u": 0.0 },
+        "right": { "e": 0.5, "n": -0.25, "u": 0.0 },
+        "up": { "e": 0.0, "n": 0.0, "u": 1.0 }
+      },
+      {
+        "index": 1,
+        "center": { "e": -3.75, "n": 40.0, "u": 2.25 },
+        "yaw_rad": -1.5,
+        "normal": { "e": -1.0, "n": 0.0, "u": 0.0 },
+        "right": { "e": 0.0, "n": 1.0, "u": 0.0 },
+        "up": { "e": 0.0, "n": 0.0, "u": 1.0 }
+      }
+    ]
+  },
+  "race_state": {
+    "aircraft_id": 1,
+    "pending_gate": 2,
+    "passed": 2,
+    "missed": 1,
+    "gate_count": 5,
+    "last_pass_s": 7.5,
+    "sim_time_s": 8.25,
+    "finished": true,
+    "outcome": "crashed-gate"
   }
 }

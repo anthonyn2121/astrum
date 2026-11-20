@@ -104,6 +104,9 @@ int run_main(int argc, char** argv, std::span<const LawEntry> laws, std::string_
     // Events first, so nothing published once the publisher's presence is seen is missed.
     // Only a fleet law waits for TickEnd, so only it subscribes to astrum/tick.
     EventSubscriber events(*session, law->needs_fleet(), log);
+    // Likewise the race course and state, for a law that flies a race.
+    std::optional<RaceSubscriber> race;
+    if (law->wants_race()) race.emplace(*session, connection.id, log);
     std::optional<TelemetrySubscriber> telemetry;
     if (law->needs_fleet()) {
       telemetry.emplace(*session, kFleet, log);
@@ -125,6 +128,7 @@ int run_main(int argc, char** argv, std::span<const LawEntry> laws, std::string_
     loop.startup_deadline = startup_deadline;
     loop.telemetry_timeout_s = connection.telemetry_timeout_s;
     loop.log = log;
+    loop.race = race ? &*race : nullptr;
     const Outcome outcome = run_control_loop(*telemetry, events, publisher, *law, loop);
     const int code = exit_code(outcome);
     std::string line = std::string(to_string(outcome.kind));

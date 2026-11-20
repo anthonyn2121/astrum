@@ -4,8 +4,9 @@
 //! builders directly.
 //!
 //! Four payloads: [`Telemetry`] (sim → subscribers), [`Command`] (controllers →
-//! sim), [`Event`] (sim → subscribers: hits, kills, mode changes, ...) and
-//! [`TickEnd`] (sim → subscribers: the end of a tick's publications).
+//! sim), [`Event`] (sim → subscribers: hits, kills, mode changes, gate passes, ...)
+//! and [`TickEnd`] (sim → subscribers: the end of a tick's publications); a race
+//! run adds [`RaceCourse`] and [`RaceState`].
 //! Decoding reads straight from the payload slice (no segment copy) and rejects
 //! trailing bytes. Enum values from a newer schema decode to an `Unknown(n)`
 //! variant instead of being silently mapped to a known one.
@@ -241,8 +242,78 @@ pub enum EndReason {
     Fatal,
     /// SIGINT / SIGTERM.
     Stopped,
+    /// A race's aircraft passed every gate.
+    RaceComplete,
+    /// A race's aircraft crashed.
+    Crashed,
     /// A value this build's schema does not know (sent by a newer peer).
     Unknown(u16),
+}
+
+/// How a race ended for an aircraft. Mirrors the schema's `RaceOutcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RaceOutcome {
+    /// Not over yet.
+    #[default]
+    Running,
+    /// Every gate passed.
+    Complete,
+    /// Hit the ground.
+    CrashedGround,
+    /// Hit a gate frame or bar.
+    CrashedGate,
+    /// The race's time limit ran out.
+    TimedOut,
+    /// The start pose could not be set up.
+    SpawnFailed,
+    /// A value this build's schema does not know (sent by a newer peer).
+    Unknown(u16),
+}
+
+/// One race gate. Mirrors `RaceGate`. The gate-local basis is left-handed
+/// (x = `right`, y = `up`, z = `normal`), so use the explicit vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RaceGate {
+    pub index: u32,
+    pub center: Enu,
+    /// Heading of `normal`, 0 = North, +East.
+    pub yaw_rad: f64,
+    /// Unit vector through the opening in the flight direction.
+    pub normal: Enu,
+    /// Unit vector, starboard of the flight direction.
+    pub right: Enu,
+    /// Unit vector, up.
+    pub up: Enu,
+}
+
+/// A race course (`astrum/race/course/<id>`). Mirrors `RaceCourse`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RaceCourse {
+    pub seed: u64,
+    /// Square clear opening side (m).
+    pub opening_m: f64,
+    /// Frame stock width (m).
+    pub bar_m: f64,
+    /// Outer frame side (m).
+    pub top_bar_m: f64,
+    pub gates: Vec<RaceGate>,
+}
+
+/// One aircraft's race progress (`astrum/race/state/<id>`). Mirrors `RaceState`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RaceState {
+    pub aircraft_id: u32,
+    /// Index of the next gate to pass; `gate_count` once finished.
+    pub pending_gate: u32,
+    pub passed: u32,
+    pub missed: u32,
+    pub gate_count: u32,
+    /// Sim time of the last gate passed; 0 if none.
+    pub last_pass_s: f64,
+    pub sim_time_s: f64,
+    /// No more gates will be scored (`outcome` is not `Running`).
+    pub finished: bool,
+    pub outcome: RaceOutcome,
 }
 
 /// What happened. Mirrors the schema's `Event.kind`.
@@ -287,6 +358,25 @@ pub enum EventKind {
     RunEnded {
         reason: EndReason,
         message: String,
+    },
+    /// `aircraft_id`'s CG crossed gate `gate`'s opening at (`offset_x_m` along the gate's
+    /// `right`, `offset_y_m` along its `up`) from the centre.
+    GatePassed {
+        aircraft_id: u32,
+        gate: u32,
+        offset_x_m: f64,
+        offset_y_m: f64,
+    },
+    /// `aircraft_id` crossed gate `gate`'s plane outside its opening (or skipped it).
+    GateMissed {
+        aircraft_id: u32,
+        gate: u32,
+    },
+    /// `aircraft_id` crashed (`outcome`); `gate` is the gate it hit or was flying to.
+    Crashed {
+        aircraft_id: u32,
+        outcome: RaceOutcome,
+        gate: u32,
     },
 }
 
@@ -349,7 +439,23 @@ impl EndReason {
             EndReason::EngagementDecided => "engagement-decided",
             EndReason::Fatal => "fatal",
             EndReason::Stopped => "stopped",
+            EndReason::RaceComplete => "race-complete",
+            EndReason::Crashed => "crashed",
             EndReason::Unknown(_) => "unknown",
+        }
+    }
+}
+
+impl RaceOutcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            RaceOutcome::Running => "running",
+            RaceOutcome::Complete => "complete",
+            RaceOutcome::CrashedGround => "crashed-ground",
+            RaceOutcome::CrashedGate => "crashed-gate",
+            RaceOutcome::TimedOut => "timed-out",
+            RaceOutcome::SpawnFailed => "spawn-failed",
+            RaceOutcome::Unknown(_) => "unknown",
         }
     }
 }
@@ -365,6 +471,9 @@ impl EventKind {
             EventKind::ControllerUp { .. } => "controller-up",
             EventKind::ControllerDown { .. } => "controller-down",
             EventKind::RunEnded { .. } => "run-ended",
+            EventKind::GatePassed { .. } => "gate-passed",
+            EventKind::GateMissed { .. } => "gate-missed",
+            EventKind::Crashed { .. } => "crashed",
         }
     }
 }
@@ -689,6 +798,122 @@ fn control_mode_of(m: Result<wire::ControlMode, capnp::NotInSchema>) -> ControlM
     }
 }
 
+fn wire_race_outcome(o: RaceOutcome) -> wire::RaceOutcome {
+    match o {
+        RaceOutcome::Running => wire::RaceOutcome::Running,
+        RaceOutcome::Complete => wire::RaceOutcome::Complete,
+        RaceOutcome::CrashedGround => wire::RaceOutcome::CrashedGround,
+        RaceOutcome::CrashedGate => wire::RaceOutcome::CrashedGate,
+        RaceOutcome::TimedOut => wire::RaceOutcome::TimedOut,
+        RaceOutcome::SpawnFailed => wire::RaceOutcome::SpawnFailed,
+        RaceOutcome::Unknown(n) => {
+            panic!("cannot encode RaceOutcome value {n} unknown to this schema")
+        }
+    }
+}
+
+fn race_outcome_of(o: Result<wire::RaceOutcome, capnp::NotInSchema>) -> RaceOutcome {
+    match o {
+        Ok(wire::RaceOutcome::Running) => RaceOutcome::Running,
+        Ok(wire::RaceOutcome::Complete) => RaceOutcome::Complete,
+        Ok(wire::RaceOutcome::CrashedGround) => RaceOutcome::CrashedGround,
+        Ok(wire::RaceOutcome::CrashedGate) => RaceOutcome::CrashedGate,
+        Ok(wire::RaceOutcome::TimedOut) => RaceOutcome::TimedOut,
+        Ok(wire::RaceOutcome::SpawnFailed) => RaceOutcome::SpawnFailed,
+        Err(capnp::NotInSchema(n)) => RaceOutcome::Unknown(n),
+    }
+}
+
+/// Serialise a race course to one flat Cap'n Proto message.
+pub fn encode_race_course(c: &RaceCourse) -> Vec<u8> {
+    // Room for the header plus ~15 words per gate, so a course allocates once.
+    let words = FIRST_SEGMENT_WORDS + 16 * c.gates.len() as u32;
+    let mut msg = Builder::new(HeapAllocator::new().first_segment_words(words));
+    {
+        let mut b = msg.init_root::<wire::race_course::Builder>();
+        b.set_seed(c.seed);
+        b.set_opening_m(c.opening_m);
+        b.set_bar_m(c.bar_m);
+        b.set_top_bar_m(c.top_bar_m);
+        let mut gates = b.init_gates(c.gates.len() as u32);
+        for (i, g) in c.gates.iter().enumerate() {
+            let mut w = gates.reborrow().get(i as u32);
+            w.set_index(g.index);
+            set_enu(w.reborrow().init_center(), g.center);
+            w.set_yaw_rad(g.yaw_rad);
+            set_enu(w.reborrow().init_normal(), g.normal);
+            set_enu(w.reborrow().init_right(), g.right);
+            set_enu(w.init_up(), g.up);
+        }
+    }
+    serialize::write_message_to_words(&msg)
+}
+
+/// Deserialise a race course.
+pub fn decode_race_course(bytes: &[u8]) -> capnp::Result<RaceCourse> {
+    let msg = reader(bytes)?;
+    let r = msg.get_root::<wire::race_course::Reader>()?;
+    let gates = r
+        .get_gates()?
+        .iter()
+        .map(|g| {
+            Ok(RaceGate {
+                index: g.get_index(),
+                center: get_enu(g.get_center()?),
+                yaw_rad: g.get_yaw_rad(),
+                normal: get_enu(g.get_normal()?),
+                right: get_enu(g.get_right()?),
+                up: get_enu(g.get_up()?),
+            })
+        })
+        .collect::<capnp::Result<Vec<_>>>()?;
+    Ok(RaceCourse {
+        seed: r.get_seed(),
+        opening_m: r.get_opening_m(),
+        bar_m: r.get_bar_m(),
+        top_bar_m: r.get_top_bar_m(),
+        gates,
+    })
+}
+
+/// Serialise a race state to one flat Cap'n Proto message.
+///
+/// # Panics
+/// If `outcome` is `Unknown(_)` (only produced by decoding).
+pub fn encode_race_state(s: &RaceState) -> Vec<u8> {
+    let mut msg = builder();
+    {
+        let mut b = msg.init_root::<wire::race_state::Builder>();
+        b.set_aircraft_id(s.aircraft_id);
+        b.set_pending_gate(s.pending_gate);
+        b.set_passed(s.passed);
+        b.set_missed(s.missed);
+        b.set_gate_count(s.gate_count);
+        b.set_last_pass_s(s.last_pass_s);
+        b.set_sim_time_s(s.sim_time_s);
+        b.set_finished(s.finished);
+        b.set_outcome(wire_race_outcome(s.outcome));
+    }
+    serialize::write_message_to_words(&msg)
+}
+
+/// Deserialise a race state.
+pub fn decode_race_state(bytes: &[u8]) -> capnp::Result<RaceState> {
+    let msg = reader(bytes)?;
+    let r = msg.get_root::<wire::race_state::Reader>()?;
+    Ok(RaceState {
+        aircraft_id: r.get_aircraft_id(),
+        pending_gate: r.get_pending_gate(),
+        passed: r.get_passed(),
+        missed: r.get_missed(),
+        gate_count: r.get_gate_count(),
+        last_pass_s: r.get_last_pass_s(),
+        sim_time_s: r.get_sim_time_s(),
+        finished: r.get_finished(),
+        outcome: race_outcome_of(r.get_outcome()),
+    })
+}
+
 /// Serialise an event to one flat Cap'n Proto message.
 ///
 /// # Panics
@@ -752,11 +977,31 @@ pub fn encode_event(e: &Event) -> Vec<u8> {
                     EndReason::EngagementDecided => wire::EndReason::EngagementDecided,
                     EndReason::Fatal => wire::EndReason::Fatal,
                     EndReason::Stopped => wire::EndReason::Stopped,
+                    EndReason::RaceComplete => wire::EndReason::RaceComplete,
+                    EndReason::Crashed => wire::EndReason::Crashed,
                     EndReason::Unknown(n) => {
                         panic!("cannot encode EndReason value {n} unknown to this schema")
                     }
                 });
                 w.set_message(message.as_str());
+            }
+            EventKind::GatePassed { aircraft_id, gate, offset_x_m, offset_y_m } => {
+                let mut w = k.init_gate_passed();
+                w.set_aircraft_id(*aircraft_id);
+                w.set_gate(*gate);
+                w.set_offset_x_m(*offset_x_m);
+                w.set_offset_y_m(*offset_y_m);
+            }
+            EventKind::GateMissed { aircraft_id, gate } => {
+                let mut w = k.init_gate_missed();
+                w.set_aircraft_id(*aircraft_id);
+                w.set_gate(*gate);
+            }
+            EventKind::Crashed { aircraft_id, outcome, gate } => {
+                let mut w = k.init_crashed();
+                w.set_aircraft_id(*aircraft_id);
+                w.set_outcome(wire_race_outcome(*outcome));
+                w.set_gate(*gate);
             }
         }
     }
@@ -827,9 +1072,32 @@ pub fn decode_event(bytes: &[u8]) -> capnp::Result<Event> {
                     Ok(wire::EndReason::EngagementDecided) => EndReason::EngagementDecided,
                     Ok(wire::EndReason::Fatal) => EndReason::Fatal,
                     Ok(wire::EndReason::Stopped) => EndReason::Stopped,
+                    Ok(wire::EndReason::RaceComplete) => EndReason::RaceComplete,
+                    Ok(wire::EndReason::Crashed) => EndReason::Crashed,
                     Err(capnp::NotInSchema(n)) => EndReason::Unknown(n),
                 },
                 message: w.get_message()?.to_string()?,
+            }
+        }
+        Which::GatePassed(w) => {
+            let w = w?;
+            EventKind::GatePassed {
+                aircraft_id: w.get_aircraft_id(),
+                gate: w.get_gate(),
+                offset_x_m: w.get_offset_x_m(),
+                offset_y_m: w.get_offset_y_m(),
+            }
+        }
+        Which::GateMissed(w) => {
+            let w = w?;
+            EventKind::GateMissed { aircraft_id: w.get_aircraft_id(), gate: w.get_gate() }
+        }
+        Which::Crashed(w) => {
+            let w = w?;
+            EventKind::Crashed {
+                aircraft_id: w.get_aircraft_id(),
+                outcome: race_outcome_of(w.get_outcome()),
+                gate: w.get_gate(),
             }
         }
     };

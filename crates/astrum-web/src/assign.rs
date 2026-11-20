@@ -12,6 +12,7 @@ use std::path::Path;
 
 use astrum_sim::controllers::ControllerCatalog;
 use astrum_sim::scenario::Scenario;
+use astrum_sim::sweep::Base;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -49,15 +50,16 @@ pub enum InputError {
 }
 
 /// Resolve a request's scenario: a saved scenario's name (returned with the
-/// scenario), or an inline scenario document (no name), validated, with every
-/// aircraft's model a safe directory name.
+/// scenario, and its `[course]` if it is a race), or an inline scenario
+/// document (no name, never a race), validated, with every aircraft's model a
+/// safe directory name.
 pub fn scenario_input(
     input: Value,
     catalogs: &Catalogs,
-) -> Result<(Option<String>, Scenario), InputError> {
+) -> Result<(Option<String>, Base), InputError> {
     match input {
-        Value::String(name) => match catalogs.scenario(&name) {
-            Ok(doc) => Ok((Some(doc.name), doc.scenario)),
+        Value::String(name) => match catalogs.base(&name) {
+            Ok(base) => Ok((Some(name), base)),
             Err(e @ (ScenarioError::BadName(_) | ScenarioError::NotFound(_))) => {
                 Err(InputError::Bad(format!("scenario: {e}")))
             }
@@ -74,7 +76,7 @@ pub fn scenario_input(
                 safe_name(&a.model)
                     .map_err(|e| invalid(format!("aircraft {}: model: {e}", a.id)))?;
             }
-            Ok((None, scenario))
+            Ok((None, Base { scenario, course: None }))
         }
         _ => Err(InputError::Bad(
             "scenario must be a saved scenario's name or a scenario object".into(),

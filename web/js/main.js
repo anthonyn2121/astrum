@@ -21,6 +21,8 @@ import { relativeGeometry } from "./geometry.js";
 import { loadPrefs, savePrefs } from "./prefs.js";
 import { SimControl } from "./simcontrol.js";
 import { RunPanel } from "./runpanel.js";
+import { courseKey, pendingGateAt, raceStandings } from "./race.js";
+import { Scoreboard } from "./scoreboard.js";
 
 // A playhead move longer than this (sim s) in one frame is a seek: the events
 // it skips over are not flashed.
@@ -55,6 +57,7 @@ const state = {
   modelScale: Number.isInteger(prefs.modelScale) && prefs.modelScale >= 1 && prefs.modelScale <= 20
     ? prefs.modelScale : 4,
   needsFrame: false, // frame + auto-select once the first aircraft appears
+  cameraChosen: false, // the user picked a camera mode (a race opens in chase until then)
   prevPlayhead: NaN, // last frame's playhead; events crossed since get flashed
   fleetDirty: true,
   models: new Map(), // aircraft id -> JSBSim model (scenario), when known
@@ -76,6 +79,11 @@ const scene = new Scene(document.getElementById("view"), {
   onSelect: (id) => selectAircraft(id),
   onTarget: (id) => toggleTarget(id),
   onCameraMode: (mode) => ui.setCameraMode(mode),
+});
+
+const scoreboard = new Scoreboard({
+  root: document.getElementById("scoreboard"), body: document.getElementById("scoreboardBody"),
+  banner: document.getElementById("raceBanner"), onSelect: (id) => selectAircraft(id),
 });
 
 const ui = new UI({
@@ -100,7 +108,7 @@ const ui = new UI({
   onConnect: (url) => connect(url || defaultWsUrl()),
   onRetry: () => connect(state.wsUrl || defaultWsUrl()),
   onFile: (file) => openFile(file, file.name),
-  onCamera: (mode) => { scene.setCameraMode(mode); ui.setCameraMode(scene.cameraMode); },
+  onCamera: (mode) => { state.cameraChosen = true; scene.setCameraMode(mode); ui.setCameraMode(scene.cameraMode); },
   onFit: () => { scene.frameFleet(); ui.setCameraMode(scene.cameraMode); },
   onToggle: (key, val) => {
     state[key] = val;
@@ -170,7 +178,9 @@ const params = new URLSearchParams(location.search);
 const sweepId = params.get("sweep");
 const runId = sweepId === null ? params.get("run") : null;
 const simControl = new SimControl({ enabled: () => state.mode === "live" });
-const runPanel = runId ? new RunPanel({ runId, onReplay: (doc, label) => openFile(doc, label) }) : null;
+const runPanel = runId
+  ? new RunPanel({ runId, onReplay: (doc, label) => openFile(doc, label), onCourse: (c) => setCourse(c) })
+  : null;
 
 ui.setToggles(state);
 ui.setModelScale(state.modelScale);
@@ -208,6 +218,7 @@ const net = new Net({
     // (its models follow), following it live like a fresh connection.
     if (state.liveRun !== null && run !== state.liveRun) {
       startLiveRun();
+      setCourse(null);
       state.models = new Map();
       state.followLive = true;
       state.playing = true;
@@ -239,6 +250,31 @@ function resetSelection() {
   ui.clearKillFeed();
 }
 
+// ---- the race course ----
+
+// The race course on screen (race.js parseCourse), or null: a live run's, as
+// its panel reads it, or an opened recording's. It is not part of the
+// timeline, so a new source clears it and brings its own.
+let course = null;
+let courseId = "";
+
+// A course is drawn at true scale (Size 1×) unless the user has picked a size.
+const COURSE_MODEL_SCALE = 1;
+
+function setCourse(next) {
+  const id = courseKey(next);
+  if (id === courseId) return;
+  course = next;
+  courseId = id;
+  scene.setCourse(next);
+  if (next) state.needsFrame = true; // open the camera on it
+  if (!Number.isInteger(prefs.modelScale)) {
+    state.modelScale = next ? COURSE_MODEL_SCALE : 4;
+    ui.setModelScale(state.modelScale);
+    scene.setModelScale(state.modelScale);
+  }
+}
+
 // Empty the timeline and the scene for a fresh live run.
 function startLiveRun() {
   store.reset("live");
@@ -249,6 +285,7 @@ function startLiveRun() {
 
 function connect(url) {
   startLiveRun();
+  setCourse(null);
   state.models = new Map(); // the bridge sends the scenario's models on connect
   state.liveRun = null; // ...and its run, which this connection starts on
   state.mode = "live";
@@ -266,10 +303,11 @@ async function openFile(source, name) {
   net.disconnect();
   state.connected = false;
   try {
-    const { meta, frames, events, models } = await loadExportFile(source);
+    const { meta, frames, events, models, course: recorded } = await loadExportFile(source);
     store.loadFile(frames, events);
     state.models = models;
     scene.clearFleet();
+    setCourse(recorded);
     const b = store.bounds();
     state.mode = "file";
     state.fileError = "";
@@ -518,6 +556,14 @@ function tick(now) {
   }
 
   updateEnvironment();
+  if (course) {
+    // The gates' colours follow the selected aircraft; the scoreboard shows every one.
+    scene.setPendingGate(pendingGateAt(store.events, state.playhead, state.selectedId, course.gates.length));
+    scoreboard.update(raceStandings(store.events, state.playhead, store.ids(), course.gates.length),
+      { selectedId: state.selectedId, colorOf });
+  } else {
+    scoreboard.update(null, { selectedId: null, colorOf });
+  }
   scene.update(store, state.playhead, {
     showTrails: state.trails,
     showLabels: state.labels,
@@ -532,7 +578,12 @@ function tick(now) {
   if (state.needsFrame && store.ids().length) {
     autoSelect();
     const mode = scene.cameraMode;
-    if (mode === "orbit" || mode === "follow") {
+    if (course && !state.cameraChosen) {
+      // A race is metres across at true scale: open close behind the drone (Fit
+      // frames the whole course).
+      scene.setCameraMode("chase");
+      ui.setCameraMode(scene.cameraMode);
+    } else if (mode === "orbit" || mode === "follow") {
       scene.frameFleet();
       if (mode === "follow") scene.setCameraMode("follow");
       ui.setCameraMode(scene.cameraMode);

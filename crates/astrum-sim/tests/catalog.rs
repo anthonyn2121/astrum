@@ -7,10 +7,11 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use astrum_sim::catalog::{
-    environment, environments, jsbsim_models, list, summary, CatalogEntry, FileKind,
+    environment, environments, jsbsim_models, list, summary, CatalogEntry, FileKind, METRICS,
+    RACE_METRICS,
 };
-use astrum_sim::scenario::{Scenario, World, KNOWN_MODELS};
-use astrum_sim::sweep::{Purpose, Sweep, SweepFile};
+use astrum_sim::scenario::{World, KNOWN_MODELS};
+use astrum_sim::sweep::{Base, Purpose, Sweep, SweepFile};
 
 fn write(root: &Path, rel: &str, text: &str) -> PathBuf {
     let path = root.join(rel);
@@ -104,10 +105,11 @@ fn jsbsim_models_are_aircraft_directories_holding_their_own_xml() {
 }
 
 #[test]
-fn there_is_exactly_one_environment_the_empty_world() {
+fn there_are_two_environments_the_empty_world_and_the_race() {
     let all = environments();
-    assert_eq!(all.iter().map(|e| e.id).collect::<Vec<_>>(), ["empty"]);
+    assert_eq!(all.iter().map(|e| e.id).collect::<Vec<_>>(), ["empty", "race"]);
     assert_eq!(environment("empty"), Some(all[0].clone()));
+    assert_eq!(environment("race"), Some(all[1].clone()));
     assert_eq!(environment("dogfight"), None);
     let empty = &all[0];
     assert_eq!(empty.name, "Empty world");
@@ -129,6 +131,32 @@ fn there_is_exactly_one_environment_the_empty_world() {
             "kills",
         ]
     );
+}
+
+#[test]
+fn the_race_environment_flies_the_f450_and_reports_the_race_metrics_on_top() {
+    let race = environment("race").unwrap();
+    assert_eq!(race.models, ["F450"]);
+    let mut metrics: Vec<&str> = METRICS.to_vec();
+    metrics.extend(RACE_METRICS);
+    assert_eq!(race.metrics, metrics);
+    assert_eq!(RACE_METRICS, ["gates_passed", "gates_missed", "race_time_s", "race_outcome"]);
+    assert_eq!((race.sim.rate_hz, race.sim.max_time_s, race.sim.speed), (120.0, 120.0, 1.0));
+    assert!(!environment("empty").unwrap().metrics.contains(&"gates_passed"));
+    // Its one place is the bundled race scenario's origin, and the defaults are a valid `[sim]`.
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+    let bundled = Base::load(&config.join("scenario.race.toml")).unwrap();
+    assert!(bundled.course.is_some());
+    let w = bundled.scenario.world;
+    assert_eq!(race.locations.len(), 1);
+    let place = &race.locations[0];
+    assert_eq!(
+        (place.origin_lat_deg, place.origin_lon_deg, place.origin_alt_hae_m),
+        (w.origin_lat_deg, w.origin_lon_deg, w.origin_alt_hae_m)
+    );
+    let mut scenario = bundled.scenario;
+    scenario.sim = race.sim;
+    scenario.validate().unwrap();
 }
 
 #[test]
@@ -159,8 +187,12 @@ fn the_empty_world_offers_every_bundled_scenario_origin_once() {
         if !(name.starts_with("scenario.") && name.ends_with(".toml")) {
             continue;
         }
+        let base = Base::load(&path).unwrap();
+        if base.course.is_some() {
+            continue; // a race: the race environment's place
+        }
         origins += 1;
-        let w = Scenario::load(&path).unwrap().world;
+        let w = base.scenario.world;
         let at = |l: &&astrum_sim::catalog::Location| {
             (l.origin_lat_deg, l.origin_lon_deg, l.origin_alt_hae_m)
                 == (w.origin_lat_deg, w.origin_lon_deg, w.origin_alt_hae_m)

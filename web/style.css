@@ -281,6 +281,28 @@ a.brand { color: inherit; text-decoration: none; }
 #killFeed .kf-x { color: var(--live); }
 @keyframes kf-in { from { transform: translateX(16px); opacity: 0; } }
 
+/* Race scoreboard and winner banner (js/scoreboard.js). */
+#scoreboard {
+  z-index: 6; top: 54px; left: 10px; padding: 4px 6px; border-radius: var(--radius);
+  background: var(--panel); backdrop-filter: blur(8px); border: 1px solid var(--line);
+  font-variant-numeric: tabular-nums; font-size: 12px;
+}
+#scoreboard table { border-collapse: collapse; }
+#scoreboard td { padding: 3px 7px; white-space: nowrap; }
+#scoreboard tr { cursor: pointer; }
+#scoreboard tr:hover { background: var(--accent-dim); }
+#scoreboard tr.sel { background: var(--accent-dim); }
+#scoreboard tr.crashed .sb-state { color: var(--live); }
+#scoreboard tr.finished .sb-state { color: var(--ok); }
+#scoreboard .sb-place { font-weight: 700; }
+#scoreboard .sb-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+#raceBanner {
+  z-index: 8; top: 62px; left: 50%; transform: translateX(-50%); padding: 8px 20px; border-radius: 999px;
+  font-size: 18px; font-weight: 700; letter-spacing: 0.03em; pointer-events: none;
+  background: var(--panel-raised); border: 2px solid var(--winner, var(--muted)); box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+}
+#raceBanner.none { border-color: var(--live); }
+
 #presentHint {
   display: none; top: 14px; left: 50%; transform: translateX(-50%);
   padding: 6px 12px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line);
@@ -409,6 +431,7 @@ a.brand { color: inherit; text-decoration: none; }
 .ev-kind.mode { color: var(--accent); }
 .ev-kind.ctrl { color: var(--ok); }
 .ev-kind.run { color: var(--text); }
+.ev-kind.race { color: var(--ok); }
 
 /* ---- Plots (js/plots.js) ----
    Chips + "+ Channel" in the dock header, one row per channel in the body

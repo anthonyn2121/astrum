@@ -15,6 +15,7 @@ and the same exit codes:
 
 Programs built on them: [`cpp`](cpp) (`astrum-controller`: `hold`, `autopilot`),
 [`optimal/cpp`](optimal/cpp) (`astrum-optimal-controller`: `lqr`, `mpc`),
+[`minsnap`](minsnap) (`astrum-minsnap-controller`: `minsnap`, the multirotor race controller),
 [`python/example.py`](python/example.py) (`hold`, `autopilot`) and
 [`optimal/python/run.py`](optimal/python/run.py) (`lqr`, `mpc`, `figure8`, `formation`).
 
@@ -89,6 +90,7 @@ An out-of-tree C++ project uses `find_package(astrum CONFIG REQUIRED)` and links
 | `fleet` | `{aircraft_id: VehicleState}` snapshot of every aircraft (empty unless `needs_fleet`), taken after the tick's `TickEnd`, so every aircraft is at the same tick |
 | `events` | every event of an **earlier** tick (`tick < state.tick`) not delivered yet, oldest first. The sim sends a tick's events after its telemetry and before the next tick's, so this set is exact on every run; an event shows in `state` first (a kill: `alive = false`) and in `events` one step later |
 | `control_period_s` | `Telemetry.controlPeriodS`: the sim time between this aircraft's samples — the law's `dt` |
+| `race_course`, `race_state` | (C++, laws with `wants_race()`) the `RaceCourse` / `RaceState` that arrived since the previous step, else empty — the law keeps its own copy |
 
 `LawContext` (C++) and the parsed `args` (Python) carry the shared flags: `reference`
 (`Reference{heading_rad, alt_hae_m, tas_mps}` from `--heading` / `--alt` / `--speed`) and
@@ -109,8 +111,14 @@ comes from the telemetry.
 - `Action{control, trigger = false}` — what a law returns.
 - `Command{target_id, seq, telemetry_tick, trigger, epoch, control}` — the wire message.
 - `Event{tick, sim_time_s, detail}` with `detail` one of `TriggerPressed`, `TriggerReleased`,
-  `Hit`, `Kill`, `ModeChange`, `ControllerUp`, `ControllerDown`, `RunEnded`; `TickEnd{tick,
-  sim_time_s}`; enums `VehicleKind`, `ControlMode`, `ModeReason`, `EndReason`, `Refusal`.
+  `Hit`, `Kill`, `ModeChange`, `ControllerUp`, `ControllerDown`, `RunEnded`, and for race runs
+  `GatePassed{aircraft_id, gate, offset_x_m, offset_y_m}`, `GateMissed{aircraft_id, gate}`,
+  `Crashed{aircraft_id, outcome, gate}`; `TickEnd{tick, sim_time_s}`; enums `VehicleKind`,
+  `ControlMode`, `ModeReason`, `EndReason`, `Refusal`, `RaceOutcome`.
+- Race runs: `RaceCourse{seed, opening_m, bar_m, top_bar_m, gates}` with `RaceGate{index, center,
+  yaw_rad, normal, right, up}` (explicit unit basis vectors — the gate-local basis is
+  left-handed, never derive it from `yaw_rad`) and `RaceState{aircraft_id, pending_gate, passed,
+  missed, gate_count, last_pass_s, sim_time_s, finished, outcome}`.
 
 Decoding treats every payload as untrusted: a malformed one is an error value (C++
 `Decoded<T>`) or `DecodeError` (Python), counted and skipped — never an exception into Zenoh.
@@ -123,6 +131,8 @@ Decoding treats every payload as untrusted: a malformed one is an error value (C
 | `TelemetrySubscriber(session, id \| fleet)` | latest-value telemetry for one aircraft or every aircraft: the Zenoh callback only stores the newest sample per aircraft, nothing is queued; a sample whose `aircraftId` differs from its key is a decode error |
 | `CommandPublisher(session, id)` | `astrum/command/<id>` with DROP / express / INTERACTIVE_HIGH; a random non-zero `epoch` and `seq` = 1, 2, … per publisher; holds the presence token `astrum/alive/controller/<id>` while it lives |
 | `EventSubscriber(session, tick_ends)` | FIFO of `astrum/events` (unknown kinds skipped), plus — only when `tick_ends` is set (the runtime sets it for a `needs_fleet` law) — the newest `astrum/tick` (`TickEnd`) |
+
+| `RaceSubscriber(session, id)` | (C++; Python decodes the messages only) `astrum/race/course/<id>` and `astrum/race/state/<id>`, latest-value: `take_course()` / `take_state()` return the newest message received since the previous call, else nothing (the runtime sets it up for a law whose `wants_race()` is true) |
 
 One session can carry any number of subscribers and publishers (several aircraft per process).
 Every subscriber callback runs on Zenoh's receive thread, in arrival order (zenoh-c does this
@@ -169,7 +179,7 @@ tested without Zenoh. `options`: `aircraft_id`, `startup_deadline`, `telemetry_t
 
 | Outcome | Exit |
 |---|---|
-| `RunEnded` — `maxTime`, `engagementDecided`, `stopped` | 0 |
+| `RunEnded` — `maxTime`, `engagementDecided`, `stopped`, `raceComplete`, `crashed` | 0 |
 | `RunEnded(fatal)` or an end reason this build doesn't know, `TelemetryLost`, `NoTelemetry`, sim unreachable at startup | 1 |
 | usage error, `Refused` (vehicle kind, another controller owns the aircraft, no control period, the law refused) | 2 |
 | `LawFault` (non-finite output, raw control for the wrong vehicle class, exception in the law) | 3 |

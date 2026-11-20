@@ -24,6 +24,7 @@ pub mod assign;
 pub mod bridge;
 pub mod catalogs;
 pub mod export;
+pub mod race;
 pub mod runs;
 pub mod scenarios;
 pub mod server;
@@ -191,6 +192,25 @@ pub enum EventFields {
         reason: &'static str,
         message: String,
     },
+    /// A race gate crossed through its opening; the offsets (m) are the CG's
+    /// from the gate centre along its `right` and `up`.
+    GatePassed {
+        aircraft_id: u32,
+        gate: u32,
+        offset_x_m: f64,
+        offset_y_m: f64,
+    },
+    GateMissed {
+        aircraft_id: u32,
+        gate: u32,
+    },
+    /// `outcome` is [`astrum_proto::RaceOutcome::name`]; `gate` is the gate it hit or was
+    /// flying to.
+    Crashed {
+        aircraft_id: u32,
+        outcome: &'static str,
+        gate: u32,
+    },
 }
 
 /// One run event as the browser consumes it: `{"tick", "sim_time_s", "kind",
@@ -240,6 +260,15 @@ impl EventJson {
             },
             &EventKind::ControllerUp { aircraft_id }
             | &EventKind::ControllerDown { aircraft_id } => EventFields::Controller { aircraft_id },
+            &EventKind::GatePassed { aircraft_id, gate, offset_x_m, offset_y_m } => {
+                EventFields::GatePassed { aircraft_id, gate, offset_x_m, offset_y_m }
+            }
+            &EventKind::GateMissed { aircraft_id, gate } => {
+                EventFields::GateMissed { aircraft_id, gate }
+            }
+            &EventKind::Crashed { aircraft_id, outcome, gate } => {
+                EventFields::Crashed { aircraft_id, outcome: outcome.name(), gate }
+            }
             EventKind::RunEnded { reason, message } => {
                 EventFields::RunEnded { reason: reason.name(), message: message.clone() }
             }
@@ -323,6 +352,9 @@ pub struct ExportMeta {
     /// The embedded scenario's aircraft models ([`aircraft_models`]), sorted by
     /// id; empty without a (parseable) scenario.
     pub models: Vec<AircraftModel>,
+    /// The race course the embedded scenario describes (its explicit
+    /// `[[course.gate]]`, as recorded); `null` for any other recording.
+    pub course: Option<race::CourseView>,
     /// Telemetry or event messages skipped because they failed to decode, or
     /// (telemetry) their payload id disagreed with their topic.
     pub rejected: u64,
@@ -366,6 +398,7 @@ impl ExportDoc {
             .unwrap_or((0.0, 0.0));
         events.sort_by_key(|e| e.tick); // stable: ties keep bag order
         let models = scenario.as_deref().map(aircraft_models).unwrap_or_default();
+        let course = scenario.as_deref().and_then(race::recorded_course);
         let meta = ExportMeta {
             frames: frames.len() as u64,
             events: events.len() as u64,
@@ -374,6 +407,7 @@ impl ExportDoc {
             sim_time_end,
             scenario,
             models,
+            course,
             rejected,
         };
         Self { kind: Self::KIND, version: Self::VERSION, meta, frames, events }

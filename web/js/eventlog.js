@@ -21,12 +21,18 @@ export const EVENT_GROUPS = [
   { key: "mode", label: "Mode", kinds: ["mode-change"], on: true },
   { key: "ctrl", label: "Controller", kinds: ["controller-up", "controller-down"], on: true },
   { key: "run", label: "Run", kinds: ["run-ended"], on: true },
+  { key: "race", label: "Race", kinds: ["gate-passed", "gate-missed", "crashed"], on: true },
 ];
 const GROUP_OF = new Map(EVENT_GROUPS.flatMap((g) => g.kinds.map((k) => [k, g.key])));
-const BADGE = { hit: "HIT", kill: "KILL", trigger: "TRIG", mode: "MODE", ctrl: "CTRL", run: "END" };
+const BADGE = { hit: "HIT", kill: "KILL", trigger: "TRIG", mode: "MODE", ctrl: "CTRL", run: "END", race: "GATE" };
 const ID_FIELDS = ["aircraft_id", "shooter_id", "target_id", "victim_id", "killer_id"];
 
 const n0 = (v) => (Number.isFinite(v) ? v.toFixed(0) : "?");
+
+// Gates are numbered from 1 on screen, as their tags in the scene are.
+const gateNo = (e) => (Number.isInteger(e.gate) ? e.gate + 1 : "?");
+const offsetText = (e) => (Number.isFinite(e.offset_x_m) && Number.isFinite(e.offset_y_m)
+  ? ` · ${(e.offset_x_m * 100).toFixed(0)} cm right, ${(e.offset_y_m * 100).toFixed(0)} cm up` : "");
 
 // One-line description of an event (plain text; set via textContent).
 export function describeEvent(e) {
@@ -38,6 +44,9 @@ export function describeEvent(e) {
     case "mode-change": return `${e.aircraft_id ?? "?"} ${e.from ?? "?"} → ${e.to ?? "?"}${e.reason ? ` (${e.reason})` : ""}`;
     case "controller-up": return `${e.aircraft_id ?? "?"} controller connected`;
     case "controller-down": return `${e.aircraft_id ?? "?"} controller lost`;
+    case "gate-passed": return `${e.aircraft_id ?? "?"} passed gate ${gateNo(e)}${offsetText(e)}`;
+    case "gate-missed": return `${e.aircraft_id ?? "?"} missed gate ${gateNo(e)}`;
+    case "crashed": return `${e.aircraft_id ?? "?"} crashed${e.outcome ? ` (${e.outcome})` : ""} at gate ${gateNo(e)}`;
     case "run-ended": return `run ended: ${e.reason ?? "?"}${e.message ? ` — ${e.message}` : ""}`;
     default: return e.kind;
   }

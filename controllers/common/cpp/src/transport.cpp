@@ -373,4 +373,96 @@ std::uint64_t EventSubscriber::decode_errors() const {
   return impl_->errors.load() + impl_->bad_ticks.load() + impl_->lost.load();
 }
 
+// --- RaceSubscriber --------------------------------------------------------------------
+
+struct RaceSubscriber::Impl {
+  // The newest raw payload of one stream, until taken.
+  struct Latest {
+    std::optional<std::vector<std::uint8_t>> payload;
+  };
+
+  Impl(zenoh::Session& session, std::uint32_t aircraft_id, Logger logger)
+      : id(aircraft_id),
+        log(std::move(logger)),
+        course_sub(session.declare_subscriber(
+            zenoh::KeyExpr("astrum/race/course/" + std::to_string(aircraft_id)),
+            [this](zenoh::Sample& s) { store(course, s); }, [] {})),
+        state_sub(session.declare_subscriber(
+            zenoh::KeyExpr("astrum/race/state/" + std::to_string(aircraft_id)),
+            [this](zenoh::Sample& s) { store(state, s); }, [] {})) {}
+
+  // Zenoh RX thread: overwrite the stream's payload. Never throws.
+  void store(Latest& latest, zenoh::Sample& sample) noexcept {
+    try {
+      const zenoh::Bytes& payload = sample.get_payload();
+      std::vector<std::uint8_t> bytes(payload.size());
+      payload.reader().read(bytes.data(), bytes.size());
+      std::lock_guard<std::mutex> lock(mutex);
+      latest.payload = std::move(bytes);
+    } catch (...) {
+      // Allocation failure: drop this sample; the next one replaces it anyway.
+    }
+  }
+
+  std::optional<std::vector<std::uint8_t>> take(Latest& latest) {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::optional<std::vector<std::uint8_t>> out = std::move(latest.payload);
+    latest.payload.reset();
+    return out;
+  }
+
+  // Decode a taken payload on the caller's thread; nullopt (counted, logged) when it is
+  // malformed or names another aircraft.
+  template <class T>
+  std::optional<T> decoded(const char* what, const std::vector<std::uint8_t>& bytes,
+                           Decoded<T> (*decode)(std::span<const std::uint8_t>) noexcept) {
+    Decoded<T> d = decode(bytes);
+    if (d) return std::move(d.value);
+    const std::uint64_t count = ++errors;
+    if (report_error(count)) {
+      log_to(log, LogLevel::Warning,
+             std::string("dropped undecodable race ") + what + " for aircraft " +
+                 std::to_string(id) + " (" + std::to_string(count) + " so far): " + d.error);
+    }
+    return std::nullopt;
+  }
+
+  std::uint32_t id;
+  Logger log;
+  std::atomic<std::uint64_t> errors{0};
+
+  // Declared before the subscribers, so that they are undeclared before these are destroyed.
+  std::mutex mutex;
+  Latest course;
+  Latest state;
+
+  zenoh::Subscriber<void> course_sub;
+  zenoh::Subscriber<void> state_sub;
+};
+
+RaceSubscriber::RaceSubscriber(Session& session, std::uint32_t aircraft_id, Logger log)
+    : impl_(std::make_unique<Impl>(session.impl_->session, aircraft_id, std::move(log))) {}
+
+RaceSubscriber::~RaceSubscriber() = default;
+
+std::optional<RaceCourse> RaceSubscriber::take_course() {
+  Impl& z = *impl_;
+  const auto bytes = z.take(z.course);
+  return bytes ? z.decoded<RaceCourse>("course", *bytes, decode_race_course) : std::nullopt;
+}
+
+std::optional<RaceState> RaceSubscriber::take_state() {
+  Impl& z = *impl_;
+  const auto bytes = z.take(z.state);
+  if (!bytes) return std::nullopt;
+  std::optional<RaceState> state = z.decoded<RaceState>("state", *bytes, decode_race_state);
+  if (state && state->aircraft_id != z.id) {
+    ++z.errors;
+    return std::nullopt;
+  }
+  return state;
+}
+
+std::uint64_t RaceSubscriber::decode_errors() const { return impl_->errors.load(); }
+
 }  // namespace astrum

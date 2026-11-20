@@ -113,6 +113,11 @@ struct Cli {
     /// The `astrum-sim` binary live runs fly on (default: next to this one).
     #[arg(long, env = "ASTRUM_SIM_BIN")]
     sim: Option<PathBuf>,
+
+    /// The `astrum-race` binary race scenarios (those with a `[course]`) fly on
+    /// (default: next to this one).
+    #[arg(long, env = "ASTRUM_RACE_BIN")]
+    race: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -141,13 +146,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bridge = Bridge::new(BridgeConfig { min_period, sample_period, models_poll: MODELS_POLL });
     bridge.attach(&cli.connect);
     let sim = cli.sim.unwrap_or_else(|| sibling("astrum-sim"));
+    let race = cli.race.unwrap_or_else(|| sibling("astrum-race"));
     let runs = Runs::new(
-        RunsConfig { dir: cli.runs_dir, sim, connect: cli.connect.clone() },
+        RunsConfig { dir: cli.runs_dir, sim, race, connect: cli.connect.clone() },
         bridge.clone(),
     );
     let sweeps = SweepRuns::new(SweepRunsConfig {
         dir: runs.config().dir.join("sweeps"),
         sim: runs.config().sim.clone(),
+        race: runs.config().race.clone(),
         base_port: SWEEP_BASE_PORT,
         stop_grace: STOP_GRACE,
     });
@@ -181,8 +188,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("[astrum-web] map tiles: {tiles}");
     println!(
-        "[astrum-web] live runs: {} into {}",
+        "[astrum-web] live runs: {} (races: {}) into {}",
         runs.config().sim.display(),
+        runs.config().race.display(),
         runs.config().dir.display()
     );
     let host =

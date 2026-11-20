@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace astrum {
 
@@ -40,7 +41,24 @@ enum class Refusal : std::uint16_t {
 enum class ModeReason : std::uint16_t { Command = 0, LeaseExpired = 1, ControllerLost = 2 };
 
 // Why a run ended (RunEnded.reason).
-enum class EndReason : std::uint16_t { MaxTime = 0, EngagementDecided = 1, Fatal = 2, Stopped = 3 };
+enum class EndReason : std::uint16_t {
+  MaxTime = 0,
+  EngagementDecided = 1,
+  Fatal = 2,
+  Stopped = 3,
+  RaceComplete = 4,
+  Crashed = 5,
+};
+
+// How a race ended for an aircraft (RaceState.outcome, Crashed.outcome).
+enum class RaceOutcome : std::uint16_t {
+  Running = 0,
+  Complete = 1,
+  CrashedGround = 2,
+  CrashedGate = 3,
+  TimedOut = 4,
+  SpawnFailed = 5,
+};
 
 // Kebab-case names as in values.json ("fixed-wing", "not-owner", "max-time", ...);
 // "unknown(<n>)" for a value this build does not know.
@@ -49,6 +67,7 @@ std::string to_string(ControlMode mode);
 std::string to_string(Refusal refusal);
 std::string to_string(ModeReason reason);
 std::string to_string(EndReason reason);
+std::string to_string(RaceOutcome outcome);
 
 // The sim's command bookkeeping for one aircraft (Telemetry.command).
 struct CommandStatus {
@@ -239,8 +258,37 @@ struct RunEnded {
   bool operator==(const RunEnded&) const = default;
 };
 
-using EventDetail = std::variant<TriggerPressed, TriggerReleased, Hit, Kill, ModeChange,
-                                 ControllerUp, ControllerDown, RunEnded>;
+// Race runs: the aircraft's CG crossed gate `gate`'s opening at (offset_x_m along the
+// gate's `right`, offset_y_m along its `up`) from the gate centre.
+struct GatePassed {
+  std::uint32_t aircraft_id = 0;
+  std::uint32_t gate = 0;
+  double offset_x_m = 0.0;
+  double offset_y_m = 0.0;
+
+  bool operator==(const GatePassed&) const = default;
+};
+
+// Race runs: the aircraft crossed gate `gate`'s plane outside its opening (or skipped it).
+struct GateMissed {
+  std::uint32_t aircraft_id = 0;
+  std::uint32_t gate = 0;
+
+  bool operator==(const GateMissed&) const = default;
+};
+
+// Race runs: the aircraft crashed; `gate` is the gate it hit or was flying to.
+struct Crashed {
+  std::uint32_t aircraft_id = 0;
+  RaceOutcome outcome = RaceOutcome::Running;
+  std::uint32_t gate = 0;
+
+  bool operator==(const Crashed&) const = default;
+};
+
+using EventDetail =
+    std::variant<TriggerPressed, TriggerReleased, Hit, Kill, ModeChange, ControllerUp,
+                 ControllerDown, RunEnded, GatePassed, GateMissed, Crashed>;
 
 // Something that happened (astrum/events).
 struct Event {
@@ -258,6 +306,45 @@ struct TickEnd {
   double sim_time_s = 0.0;
 
   bool operator==(const TickEnd&) const = default;
+};
+
+// One race gate (RaceCourse.gates). The gate-local basis is LEFT-handed (x = right,
+// y = up, z = normal), so use the explicit vectors rather than deriving them from yaw.
+struct RaceGate {
+  std::uint32_t index = 0;  // 0-based order in the course
+  Enu center;               // world grid (m)
+  double yaw_rad = 0.0;     // heading of `normal`, 0 = North, +East
+  Enu normal;               // unit vector through the opening in the flight direction
+  Enu right;                // unit vector, starboard of the flight direction
+  Enu up;                   // unit vector, up
+
+  bool operator==(const RaceGate&) const = default;
+};
+
+// A race course (astrum/race/course/<id>).
+struct RaceCourse {
+  std::uint64_t seed = 0;
+  double opening_m = 0.0;  // square clear opening side
+  double bar_m = 0.0;      // frame stock width
+  double top_bar_m = 0.0;  // outer frame side (opening_m + 2 bar_m)
+  std::vector<RaceGate> gates;
+
+  bool operator==(const RaceCourse&) const = default;
+};
+
+// One aircraft's race progress (astrum/race/state/<id>).
+struct RaceState {
+  std::uint32_t aircraft_id = 0;
+  std::uint32_t pending_gate = 0;  // next gate to pass; gate_count once finished
+  std::uint32_t passed = 0;
+  std::uint32_t missed = 0;
+  std::uint32_t gate_count = 0;
+  double last_pass_s = 0.0;  // sim time of the last gate passed; 0 if none
+  double sim_time_s = 0.0;
+  bool finished = false;  // no more gates will be scored (outcome != Running)
+  RaceOutcome outcome = RaceOutcome::Running;
+
+  bool operator==(const RaceState&) const = default;
 };
 
 }  // namespace astrum
